@@ -1,13 +1,14 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import CorporateIcon from "../assets/icons/Corporate.svg?react";
 import TeamIcon from "../assets/icons/Team.svg?react";
-import { teamApi, accountsApi } from "../lib/api";
+import { accountsApi } from "../lib/api";
 import type { Account, TeamMember } from "../types";
 import { getTitleRole, ROLE_META, ROLE_ORDER } from "../lib/titleRoles";
 import type { TitleRole } from "../lib/titleRoles";
 import { addLog } from "../lib/appLog";
 import { useLogGlow } from "../hooks/useLogGlow";
 import { useCurrentUser } from "../context/CurrentUserContext";
+import { useTeam } from "../hooks/useTeam";
 
 type ViewMode = "cards" | "list" | "table";
 
@@ -646,11 +647,8 @@ function MemberDetailSidebar({
 }
 
 export default function TeamPage() {
-  const [members, setMembers] = useState<TeamMember[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
   const [search, setSearch] = useState("");
-  const [total, setTotal] = useState(0);
   const [modal, setModal] = useState<Partial<TeamMember> | null | "new">(null);
   const [selectedMember, setSelectedMember] = useState<TeamMember | null>(null);
   const [accountPanelOpen, setAccountPanelOpen] = useState(false);
@@ -662,6 +660,14 @@ export default function TeamPage() {
 
   const currentUser = useCurrentUser();
   const isStaffAdmin = !!(currentUser?.is_staff && currentUser?.staff_view_override);
+
+  const {
+    data: members,
+    loading: isLoading,
+    createMember,
+    updateMember,
+    deleteMember,
+  } = useTeam({ search });
 
   // Role overrides (staff admin only) — persisted to localStorage
   const [roleOverrides, setRoleOverrides] = useState<Record<number, string>>(() => {
@@ -733,23 +739,6 @@ export default function TeamPage() {
     });
   }
 
-  const fetchMembers = useCallback(async () => {
-    setIsLoading(true);
-    try {
-      const params: Record<string, string> = {};
-      if (search) params["search"] = search;
-      const { data } = await teamApi.listMembers(params);
-      setMembers(data.results);
-      setTotal(data.count);
-    } catch {
-      setMembers([]);
-    } finally {
-      setIsLoading(false);
-    }
-  }, [search]);
-
-  useEffect(() => { void fetchMembers(); }, [fetchMembers]);
-
   useEffect(() => {
     accountsApi.listAccounts().then(({ data }) => setAccounts(data.results)).catch(() => {});
   }, []);
@@ -764,14 +753,14 @@ export default function TeamPage() {
       Object.entries(form).filter(([, v]) => v !== "")
     ) as Partial<TeamMember>;
     if (modal && modal !== "new" && modal.id) {
-      const { data } = await teamApi.updateMember(modal.id, payload);
+      const data = await updateMember(modal.id, payload);
       addLog({
         category: "team",
         message: `Team member "${data.full_name || data.email}" updated`,
         links: [{ label: "View team", path: "/team?glow=1" }],
       });
     } else {
-      const { data } = await teamApi.createMember(payload);
+      const data = await createMember(payload);
       addLog({
         category: "team",
         message: `Team member "${data.full_name || data.email}" added`,
@@ -779,13 +768,12 @@ export default function TeamPage() {
       });
     }
     setModal(null);
-    void fetchMembers();
     notifyTeamUpdated();
   }
 
   async function handleDelete(id: number) {
     const member = members.find((m) => m.id === id);
-    await teamApi.deleteMember(id);
+    await deleteMember(id);
     if (member) {
       addLog({
         category: "team",
@@ -795,7 +783,6 @@ export default function TeamPage() {
     }
     setModal(null);
     setSelectedMember(null);
-    void fetchMembers();
     notifyTeamUpdated();
   }
 
@@ -874,7 +861,7 @@ export default function TeamPage() {
             <div>
               <h1 className="text-3xl font-semibold text-[var(--twilio-navy)] flex items-center gap-2"><TeamIcon width={24} height={24} style={{ flexShrink: 0 }} />Team</h1>
               <p className="text-sm text-[var(--twilio-navy)] mt-1">
-                {total} member{total !== 1 ? "s" : ""} in your organisation.
+                {members.length} member{members.length !== 1 ? "s" : ""} in your organisation.
               </p>
             </div>
             <div className="flex items-center gap-2">
