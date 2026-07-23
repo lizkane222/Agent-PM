@@ -1,12 +1,13 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { schedulerApi } from "../lib/api";
+import { useRef, useState } from "react";
 import ScheduleIcon from "../assets/icons/Schedule.svg?react";
 import { useNotificationDefaults } from "../context/NotificationDefaultsContext";
-import type { Reminder, ReminderResourceType } from "../types";
+import type { ReminderResourceType } from "../types";
 import { useExport } from "../context/ExportContext";
 import { useRightClickComment } from "../components/comments/CommentContext";
 import { addLog } from "../lib/appLog";
 import ActivityLogSection from "../components/ActivityLogSection";
+import { useReminders } from "../hooks/useReminders";
+import type { Reminder } from "../types/scheduler";
 
 const CHANNEL_LABELS: { key: keyof Pick<Reminder, "notify_in_app" | "notify_slack" | "notify_push" | "notify_sms">; label: string }[] = [
   { key: "notify_in_app", label: "In-App" },
@@ -70,8 +71,6 @@ function fromLocalDatetimeValue(val: string): string {
 type FilterTab = "pending" | "all" | "dismissed";
 
 export default function RemindersPage() {
-  const [reminders, setReminders] = useState<Reminder[]>([]);
-  const [loading, setLoading] = useState(true);
   const [tab, setTab] = useState<FilterTab>("pending");
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ ...BLANK });
@@ -82,18 +81,8 @@ export default function RemindersPage() {
   const { exportMode, toggleItem, isSelected } = useExport();
   const { defaults: notifDefaults, setDefaults: setNotifDefaults } = useNotificationDefaults();
 
-  const load = useCallback(() => {
-    setLoading(true);
-    const params: Record<string, string> = {};
-    if (tab === "pending") params.status = "pending";
-    if (tab === "dismissed") params.status = "dismissed";
-    schedulerApi.listReminders(params)
-      .then(({ data }) => setReminders(data.results))
-      .catch(() => {})
-      .finally(() => setLoading(false));
-  }, [tab]);
-
-  useEffect(() => { load(); }, [load]);
+  const { data: reminders, loading, createReminder, updateReminder, deleteReminder, dismissReminder } =
+    useReminders({ tab });
 
   function openNew() {
     setEditId(null);
@@ -136,14 +125,14 @@ export default function RemindersPage() {
     const payload = { ...form, due_at: fromLocalDatetimeValue(form.due_at as string) };
     try {
       if (editId !== null) {
-        await schedulerApi.updateReminder(editId, payload);
+        await updateReminder(editId, payload);
         addLog({
           category: "calendar",
           message: `Reminder "${form.title}" updated`,
           resource: { type: "reminder", id: editId },
         });
       } else {
-        const { data } = await schedulerApi.createReminder(payload);
+        const data = await createReminder(payload as Parameters<typeof createReminder>[0]);
         addLog({
           category: "calendar",
           message: `Reminder "${data.title}" created`,
@@ -160,7 +149,7 @@ export default function RemindersPage() {
 
   async function dismiss(id: number) {
     const rem = reminders.find((r) => r.id === id);
-    await schedulerApi.dismissReminder(id);
+    await dismissReminder(id);
     if (rem) {
       addLog({
         category: "calendar",
@@ -168,12 +157,11 @@ export default function RemindersPage() {
         resource: { type: "reminder", id: id },
       });
     }
-    load();
   }
 
   async function del(id: number) {
     const rem = reminders.find((r) => r.id === id);
-    await schedulerApi.deleteReminder(id);
+    await deleteReminder(id);
     if (rem) {
       addLog({
         category: "calendar",
@@ -181,7 +169,6 @@ export default function RemindersPage() {
         resource: { type: "reminder", id: id },
       });
     }
-    load();
   }
 
   function parseVoice() {
