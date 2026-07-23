@@ -1,22 +1,13 @@
 import { useRef, useState, useId, useEffect } from "react";
 import { useLogGlow } from "../hooks/useLogGlow";
-import { teamApi, discoverApi } from "../lib/api";
 import InnovationIcon from "../assets/icons/Innovation.svg?react";
 import { useCurrentUser } from "../context/CurrentUserContext";
-import type { TeamMember, DiscoverApplet } from "../types";
+import type { TeamMember } from "../types";
+import type { DiscoverApplet, AppletCategory, ItemType, UrlStatus } from "../types/discover";
+import { useDiscover } from "../hooks/useDiscover";
+import { useTeam } from "../hooks/useTeam";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
-
-type AppletCategory =
-  | "Automation"
-  | "Dashboard"
-  | "Bot"
-  | "Integration"
-  | "Tool"
-  | "Game"
-  | "Utility";
-
-type ItemType = "applet" | "repo";
 
 type NewAppletData = Omit<DiscoverApplet, "id" | "airtable_id" | "submitted_by_username" | "created_at" | "updated_at">;
 
@@ -150,8 +141,6 @@ function AppletCard({ item, canEdit, canDelete, onEdit, onDelete }: {
 }
 
 // ── URL test ──────────────────────────────────────────────────────────────────
-
-type UrlStatus = "idle" | "testing" | "ok" | "unreachable";
 
 async function testUrl(url: string): Promise<UrlStatus> {
   try {
@@ -443,31 +432,14 @@ export default function DiscoverPage() {
   useLogGlow(pageRef);
   const currentUser = useCurrentUser();
 
-  const [items, setItems] = useState<DiscoverApplet[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [members, setMembers] = useState<TeamMember[]>([]);
+  const { data: items, loading, createApplet, updateApplet, deleteApplet } = useDiscover();
+  const { data: members } = useTeam();
   const [showForm, setShowForm] = useState(false);
   const [editingItem, setEditingItem] = useState<DiscoverApplet | null>(null);
   const [search, setSearch] = useState("");
   const [typeFilter, setTypeFilter] = useState<"all" | "applet" | "repo">("all");
   const [categoryFilter, setCategoryFilter] = useState<string>("");
   const [authorFilter, setAuthorFilter] = useState("");
-
-  const loadApplets = () => {
-    setLoading(true);
-    discoverApi.listApplets({ page_size: "200" })
-      .then(({ data }) => setItems(data.results))
-      .catch(() => {})
-      .finally(() => setLoading(false));
-  };
-
-  useEffect(() => { loadApplets(); }, []);
-
-  useEffect(() => {
-    teamApi.listMembers({ page_size: "200" })
-      .then(({ data }) => setMembers(data.results))
-      .catch(() => {});
-  }, []);
 
   const defaultAuthor = currentUser?.display_name ?? "";
 
@@ -493,11 +465,8 @@ export default function DiscoverPage() {
   const repos   = filtered.filter((i) => i.type === "repo");
 
   const handleFormSave = (data: NewAppletData, id?: number) => {
-    const req = id
-      ? discoverApi.updateApplet(id, data)
-      : discoverApi.createApplet(data);
+    const req = id ? updateApplet(id, data) : createApplet(data);
     req.then(() => {
-      loadApplets();
       setShowForm(false);
       setEditingItem(null);
     }).catch(() => {});
@@ -712,7 +681,7 @@ export default function DiscoverPage() {
                         canEdit={item.submitted_by_username === currentUser?.username}
                         canDelete={item.submitted_by_username === currentUser?.username}
                         onEdit={() => setEditingItem(item)}
-                        onDelete={() => discoverApi.deleteApplet(item.id).then(loadApplets).catch(() => {})}
+                        onDelete={() => deleteApplet(item.id).catch(() => {})}
                       />
                     ))}
                   </div>
@@ -737,7 +706,7 @@ export default function DiscoverPage() {
                         canEdit={item.submitted_by_username === currentUser?.username}
                         canDelete={item.submitted_by_username === currentUser?.username}
                         onEdit={() => setEditingItem(item)}
-                        onDelete={() => discoverApi.deleteApplet(item.id).then(loadApplets).catch(() => {})}
+                        onDelete={() => deleteApplet(item.id).catch(() => {})}
                       />
                     ))}
                   </div>

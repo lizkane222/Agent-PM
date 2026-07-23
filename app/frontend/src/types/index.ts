@@ -582,22 +582,8 @@ export interface FeedbackItem {
   updated_at: string;
 }
 
-// ── Discover / Applets ────────────────────────────────────────────────────────
-
-export interface DiscoverApplet {
-  id: number;
-  type: "applet" | "repo";
-  name: string;
-  description: string;
-  url: string;
-  category: string;
-  author: string;
-  tags: string[];
-  airtable_id: string;
-  submitted_by_username: string | null;
-  created_at: string;
-  updated_at: string;
-}
+// ── Discover (moved to types/discover.ts — re-exported here for backwards compat) ────
+export type { DiscoverApplet, AppletCategory, ItemType, UrlStatus } from "./discover";
 
 // ── Page Layouts ──────────────────────────────────────────────────────────────
 
