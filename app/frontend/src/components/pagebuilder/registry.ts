@@ -1,0 +1,297 @@
+// Component registry — every entry here appears in the sidebar palette.
+
+export type ComponentCategory = "AgentPM" | "Layout" | "Content" | "Data" | "Media" | "Interactive" | "Shapes" | "Brand";
+
+export interface ComponentDef {
+  type: string;
+  label: string;
+  category: ComponentCategory;
+  icon: string; // emoji or short text icon
+  defaultProps: Record<string, unknown>;
+  canHaveChildren: boolean;
+}
+
+export const COMPONENT_REGISTRY: ComponentDef[] = [
+  // ── AgentPM ────────────────────────────────────────────────────────────────
+  {
+    type: "ActionItemCard",
+    label: "Action Item",
+    category: "AgentPM",
+    icon: "✓",
+    defaultProps: {
+      taskTitle: "Action item title",
+      status: "Open",
+      priority: "Normal",
+      dueDate: "",
+      accountName: "",
+      assigneeName: "",
+      accentColor: "#0263E0",
+      background: "#ffffff",
+      borderRadius: 8,
+      width: 260,
+    },
+    canHaveChildren: false,
+  },
+  {
+    type: "AccountCard",
+    label: "Account",
+    category: "AgentPM",
+    icon: "🏢",
+    defaultProps: {
+      companyName: "Company Name",
+      status: "active",
+      arr: "",
+      industry: "",
+      accentColor: "#0263E0",
+      background: "#ffffff",
+      borderRadius: 8,
+      width: 240,
+    },
+    canHaveChildren: false,
+  },
+  {
+    type: "ReminderCard",
+    label: "Reminder",
+    category: "AgentPM",
+    icon: "🔔",
+    defaultProps: {
+      title: "Reminder title",
+      body: "",
+      dueAt: "",
+      status: "pending",
+      accentColor: "#F59E0B",
+      background: "#ffffff",
+      borderRadius: 8,
+      width: 240,
+    },
+    canHaveChildren: false,
+  },
+  {
+    type: "CalendarEventCard",
+    label: "Calendar Event",
+    category: "AgentPM",
+    icon: "📅",
+    defaultProps: {
+      title: "Event Title",
+      startDatetime: "",
+      endDatetime: "",
+      location: "",
+      attendeeCount: 0,
+      accentColor: "#7C3AED",
+      background: "#ffffff",
+      borderRadius: 8,
+      width: 260,
+    },
+    canHaveChildren: false,
+  },
+  {
+    type: "TeamMemberCard",
+    label: "Team Member",
+    category: "AgentPM",
+    icon: "👤",
+    defaultProps: {
+      fullName: "Full Name",
+      title: "",
+      email: "",
+      role: "",
+      accentColor: "#059669",
+      background: "#ffffff",
+      borderRadius: 8,
+      width: 240,
+    },
+    canHaveChildren: false,
+  },
+  // ── Layout ─────────────────────────────────────────────────────────────────
+  {
+    type: "Container",
+    label: "Container",
+    category: "Layout",
+    icon: "▭",
+    defaultProps: { direction: "column", gap: 16, padding: 16, background: "rgba(255,255,255,0.5)", border: "none", borderRadius: 8, width: 320, height: 200 },
+    canHaveChildren: true,
+  },
+  {
+    type: "Row",
+    label: "Row",
+    category: "Layout",
+    icon: "⇌",
+    defaultProps: { gap: 16, padding: 0, alignItems: "center", justifyContent: "flex-start", background: "rgba(255,255,255,0.5)", width: 320, height: 80 },
+    canHaveChildren: true,
+  },
+  {
+    type: "Column",
+    label: "Column",
+    category: "Layout",
+    icon: "⇅",
+    defaultProps: { gap: 12, padding: 0, flex: 1, background: "rgba(255,255,255,0.5)", width: 160, height: 200 },
+    canHaveChildren: true,
+  },
+  {
+    type: "Card",
+    label: "Card",
+    category: "Layout",
+    icon: "◻",
+    defaultProps: { padding: 20, background: "#FFFFFF", borderRadius: 12, shadow: "0 1px 3px 0 rgba(0,0,0,0.10)", width: 280, height: 180 },
+    canHaveChildren: true,
+  },
+  {
+    type: "Section",
+    label: "Section",
+    category: "Layout",
+    icon: "▬",
+    defaultProps: { padding: 24, background: "rgba(255,255,255,0.5)", borderRadius: 16, width: 360, height: 220 },
+    canHaveChildren: true,
+  },
+  // ── Content ────────────────────────────────────────────────────────────────
+  {
+    type: "Heading",
+    label: "Heading",
+    category: "Content",
+    icon: "H",
+    defaultProps: { text: "Heading", level: 1, color: "#121C2D", fontWeight: 700, fontStyle: "normal", textDecoration: "none", verticalAlign: "baseline", letterSpacing: "0em", lineHeight: 1.25 },
+    canHaveChildren: false,
+  },
+  {
+    type: "Text",
+    label: "Text",
+    category: "Content",
+    icon: "T",
+    defaultProps: { text: "Text content", color: "#354052", fontSize: 14, fontWeight: 400, fontStyle: "normal", textDecoration: "none", verticalAlign: "baseline", letterSpacing: "0em", lineHeight: 1.5 },
+    canHaveChildren: false,
+  },
+  {
+    type: "RichText",
+    label: "Rich Text",
+    category: "Content",
+    icon: "✎",
+    defaultProps: { html: "<p>Rich text content…</p>", color: "#354052" },
+    canHaveChildren: false,
+  },
+  {
+    type: "Label",
+    label: "Label",
+    category: "Content",
+    icon: "⌂",
+    defaultProps: { text: "LABEL", color: "#606B85", fontSize: 10, fontWeight: 600, fontStyle: "normal", textDecoration: "none", letterSpacing: "0.1em", lineHeight: 1.2, uppercase: true },
+    canHaveChildren: false,
+  },
+  {
+    type: "Divider",
+    label: "Divider",
+    category: "Content",
+    icon: "─",
+    defaultProps: { color: "#E1E3EA", thickness: 1, margin: 8 },
+    canHaveChildren: false,
+  },
+  // ── Interactive ────────────────────────────────────────────────────────────
+  {
+    type: "Button",
+    label: "Button",
+    category: "Interactive",
+    icon: "⬜",
+    defaultProps: { label: "Button", variant: "primary", background: "#0263E0", color: "#FFFFFF", borderRadius: 8 },
+    canHaveChildren: false,
+  },
+  {
+    type: "Badge",
+    label: "Badge",
+    category: "Interactive",
+    icon: "●",
+    defaultProps: { text: "Badge", background: "#E4F7FF", color: "#0263E0", borderRadius: 999 },
+    canHaveChildren: false,
+  },
+  {
+    type: "Pill",
+    label: "Pill",
+    category: "Interactive",
+    icon: "⬭",
+    defaultProps: { text: "Pill", background: "#E8EAF4", color: "#2D3561", borderRadius: 999 },
+    canHaveChildren: false,
+  },
+  // ── Data ───────────────────────────────────────────────────────────────────
+  {
+    type: "StatCard",
+    label: "Stat Card",
+    category: "Data",
+    icon: "📊",
+    defaultProps: { label: "Metric", value: "—", background: "#FFFFFF", borderRadius: 12 },
+    canHaveChildren: false,
+  },
+  {
+    type: "Table",
+    label: "Table",
+    category: "Data",
+    icon: "⊞",
+    defaultProps: { columns: ["Column 1", "Column 2", "Column 3"], rows: [["Cell", "Cell", "Cell"]], headerRow: true, headerCol: false },
+    canHaveChildren: false,
+  },
+  {
+    type: "Timeline",
+    label: "Timeline",
+    category: "Data",
+    icon: "⟼",
+    defaultProps: {
+      startDate: "",
+      endDate: "",
+      accentColor: "#0263E0",
+      accountId: 0,
+      accountName: "",
+      meetings: [],
+      width: 560,
+    },
+    canHaveChildren: false,
+  },
+  // ── Media ──────────────────────────────────────────────────────────────────
+  {
+    type: "Avatar",
+    label: "Avatar",
+    category: "Media",
+    icon: "👤",
+    defaultProps: { initials: "AB", size: 40, background: "#0263E0", color: "#FFFFFF", borderRadius: 999 },
+    canHaveChildren: false,
+  },
+  {
+    type: "Icon",
+    label: "Icon",
+    category: "Media",
+    icon: "✦",
+    defaultProps: { glyph: "✦", size: 20, color: "#606B85" },
+    canHaveChildren: false,
+  },
+  {
+    type: "PhotoShape",
+    label: "Photo Shape",
+    category: "Media",
+    icon: "⬡",
+    defaultProps: { shape: "", fillColor: "", imageUrl: "", size: 200 },
+    canHaveChildren: false,
+  },
+  // ── Shapes ─────────────────────────────────────────────────────────────────
+  {
+    type: "ProductShape",
+    label: "Product Shape",
+    category: "Shapes",
+    icon: "⬟",
+    defaultProps: { shape: "", tintColor: "", size: 200 },
+    canHaveChildren: false,
+  },
+  // ── Brand ──────────────────────────────────────────────────────────────────
+  {
+    type: "LucidchartIcon",
+    label: "Twilio Icon",
+    category: "Brand",
+    icon: "⬡",
+    defaultProps: { icon: "", size: 80 },
+    canHaveChildren: false,
+  },
+  {
+    type: "TwilioFont",
+    label: "Twilio Font",
+    category: "Brand",
+    icon: "Aa",
+    defaultProps: { text: "Twilio Sans Mono", fontWeight: 400, fontSize: 24, color: "#121C2D", fontStyle: "normal", textDecoration: "none", letterSpacing: "0em", lineHeight: 1.3 },
+    canHaveChildren: false,
+  },
+];
+
+export const CATEGORIES: ComponentCategory[] = ["AgentPM", "Layout", "Content", "Interactive", "Data", "Media", "Shapes", "Brand"];

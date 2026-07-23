@@ -1,0 +1,5 @@
+# Railway reads railway.toml for the main web service (start.sh runs migrate + daphne).
+# These entries are for reference and for running worker/beat as separate Railway services.
+web: ./start.sh
+worker: celery -A core.celery worker --loglevel=info --concurrency=2
+beat: celery -A core.celery beat --loglevel=info

@@ -1,0 +1,56 @@
+import { useCallback, useEffect, useState } from "react";
+import { commentsApi } from "../../lib/api";
+import type { Comment, CommentMention, CommentReference, CommentResourceType } from "../../types";
+
+export function useComments(resourceType: CommentResourceType | null, resourceId: number | null) {
+  const [comments, setComments] = useState<Comment[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  const load = useCallback(async () => {
+    if (!resourceType || !resourceId) return;
+    setLoading(true);
+    try {
+      const { data } = await commentsApi.list(resourceType, resourceId);
+      setComments(data.results);
+    } catch {
+      // ignore
+    } finally {
+      setLoading(false);
+    }
+  }, [resourceType, resourceId]);
+
+  useEffect(() => { void load(); }, [load]);
+
+  const addComment = useCallback(async (opts: {
+    content: string;
+    parentId?: number | null;
+    references?: CommentReference[];
+    mentions?: CommentMention[];
+    resourceLabel?: string;
+  }) => {
+    if (!resourceType || !resourceId) return null;
+    const { data } = await commentsApi.create({
+      resource_type: resourceType,
+      resource_id: resourceId,
+      resource_label: opts.resourceLabel ?? "",
+      content: opts.content,
+      parent: opts.parentId ?? null,
+      references: opts.references ?? [],
+      mentions: opts.mentions ?? [],
+    });
+    await load();
+    return data;
+  }, [resourceType, resourceId, load]);
+
+  const editComment = useCallback(async (id: number, content: string) => {
+    await commentsApi.update(id, content);
+    await load();
+  }, [load]);
+
+  const deleteComment = useCallback(async (id: number) => {
+    await commentsApi.delete(id);
+    await load();
+  }, [load]);
+
+  return { comments, loading, addComment, editComment, deleteComment, reload: load };
+}

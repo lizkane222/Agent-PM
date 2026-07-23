@@ -1,0 +1,432 @@
+@import "tailwindcss";
+
+/* ── Twilio Sans Mono font faces ─────────────────────────────────────────────
+   Fonts are bundled via Vite (src/assets/fonts/Twilio-Sans-Mono/WOFF2/) and
+   never served as raw public files. Vite hashes the filenames at build time.
+   ─────────────────────────────────────────────────────────────────────────── */
+
+@font-face {
+  font-family: 'TwilioSansMono';
+  src: url('./assets/fonts/Twilio-Sans-Mono/WOFF2/TwilioSansMono-Light.woff2') format('woff2');
+  font-weight: 300;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'TwilioSansMono';
+  src: url('./assets/fonts/Twilio-Sans-Mono/WOFF2/TwilioSansMono-LightItl.woff2') format('woff2');
+  font-weight: 300;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'TwilioSansMono';
+  src: url('./assets/fonts/Twilio-Sans-Mono/WOFF2/TwilioSansMono-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'TwilioSansMono';
+  src: url('./assets/fonts/Twilio-Sans-Mono/WOFF2/TwilioSansMono-RegularItl.woff2') format('woff2');
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'TwilioSansMono';
+  src: url('./assets/fonts/Twilio-Sans-Mono/WOFF2/TwilioSansMono-Retina.woff2') format('woff2');
+  font-weight: 450;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'TwilioSansMono';
+  src: url('./assets/fonts/Twilio-Sans-Mono/WOFF2/TwilioSansMono-Medium.woff2') format('woff2');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'TwilioSansMono';
+  src: url('./assets/fonts/Twilio-Sans-Mono/WOFF2/TwilioSansMono-MediumItl.woff2') format('woff2');
+  font-weight: 500;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'TwilioSansMono';
+  src: url('./assets/fonts/Twilio-Sans-Mono/WOFF2/TwilioSansMono-Semibold.woff2') format('woff2');
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'TwilioSansMono';
+  src: url('./assets/fonts/Twilio-Sans-Mono/WOFF2/TwilioSansMono-SemiboldItl.woff2') format('woff2');
+  font-weight: 600;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'TwilioSansMono';
+  src: url('./assets/fonts/Twilio-Sans-Mono/WOFF2/TwilioSansMono-Bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'TwilioSansMono';
+  src: url('./assets/fonts/Twilio-Sans-Mono/WOFF2/TwilioSansMono-BoldItl.woff2') format('woff2');
+  font-weight: 700;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'TwilioSansMono';
+  src: url('./assets/fonts/Twilio-Sans-Mono/WOFF2/TwilioSansMono-Extrabold.woff2') format('woff2');
+  font-weight: 800;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'TwilioSansMono';
+  src: url('./assets/fonts/Twilio-Sans-Mono/WOFF2/TwilioSansMono-Heavy.woff2') format('woff2');
+  font-weight: 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ── Twilio design tokens ─────────────────────────────────────────────────────
+   Source: Twilio Paste design system
+   https://paste.twilio.design/tokens/
+   ─────────────────────────────────────────────────────────────────────────── */
+
+:root {
+  /* Brand — matched to twilio.com CSS tokens */
+  --twilio-red:        #DB131A;  /* --color-twilio-red rgb(219 19 42) */
+  --twilio-red-dark:   #B10F12;  /* --color-red-dark rgb(177 15 35) */
+  --twilio-red-light:  #FDECED;  /* --color-red-10 rgb(254 236 236) */
+  --twilio-blue:       #0263E0;  /* --color-blue-60 (primary CTA) */
+  --twilio-blue-dark:  #043CB5;  /* --color-blue-70 */
+  --twilio-blue-light: #E4F7FF;  /* --color-blue-50 */
+
+  /* Neutrals — matched to twilio.com */
+  --twilio-navy:       #121C2D;  /* sidebar background */
+  --twilio-navy-light: #1C2B45;  /* sidebar hover */
+  --twilio-slate:      #354052;  /* secondary text on dark */
+  --twilio-white:      #FFFFFF;
+  --twilio-gray-10:    #F4F4F6;  /* page background */
+  --twilio-gray-20:    #E1E3EA;  /* borders */
+  --twilio-gray-40:    #AEBBC1;  /* placeholder / disabled */
+  --twilio-gray-60:    #606B85;  /* secondary text */
+  --twilio-gray-80:    #39476A;  /* body text */
+  --twilio-gray-100:   #000D25;  /* headings — --color-ink */
+
+  /* Semantic */
+  --twilio-focus:      #0263E0;
+  --twilio-success:    #0E7C3A;
+  --twilio-warning:    #E67E22;
+  --twilio-error:      #DB131A;
+
+  /* Typography — body uses system sans (Whitney SSm equivalent); mono for code */
+  --font-base: system-ui, -apple-system, 'Segoe UI', helvetica, arial, sans-serif;
+  --font-mono: 'TwilioSansMono', 'Courier New', monospace;
+  --font-size-base: 16px;
+  --line-height-base: 1.5;
+}
+
+/* ── Dark mode tokens ────────────────────────────────────────────────────────*/
+
+[data-theme="dark"] {
+  --twilio-gray-10:    #0D1321;
+  --twilio-gray-20:    #1C2B45;
+  --twilio-gray-40:    #354052;
+  --twilio-gray-60:    #8891AA;
+  --twilio-gray-80:    #CACDD8;
+  --twilio-gray-100:   #F4F4F6;
+  --twilio-white:      #1C2B45;
+  --twilio-navy:       #060D19;
+  --twilio-navy-light: #121C2D;
+}
+
+[data-theme="dark"] body {
+  background-color: var(--twilio-gray-10);
+  color: var(--twilio-gray-100);
+}
+
+
+/* ── Base reset ──────────────────────────────────────────────────────────────*/
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html {
+  /* Fluid base: shrinks from 16px → 12px as viewport narrows (1450px → 1080px).
+     All rem-based Tailwind text-* classes scale with this before wrapping. */
+  font-size: clamp(12px, 1.1vw, 16px);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  font-family: var(--font-base);
+  font-weight: 400;
+  color: var(--twilio-gray-100);
+  background-color: var(--twilio-gray-10);
+  line-height: var(--line-height-base);
+  margin: 0;
+}
+
+code, pre, kbd, samp {
+  font-family: var(--font-mono);
+}
+
+/* ── Fluid text — elements that must not overflow before shrinking ───────────
+   Applied to any leaf text node via the .fluid class or the global rules below.
+   Tailwind text-* classes already ride the fluid html font-size; this handles
+   hardcoded px values and provides the break-word last resort. */
+
+* {
+  min-width: 0; /* let flex/grid children shrink below their content size */
+}
+
+p, span, li, td, th, label, button, a, h1, h2, h3, h4, h5, h6 {
+  overflow-wrap: break-word;
+}
+
+/* ── Sidebar nav link hover ──────────────────────────────────────────────────*/
+
+.nav-main-link:not([aria-current="page"]):hover,
+.nav-bottom-link:not([aria-current="page"]):hover {
+  background: var(--twilio-navy-light) !important;
+  color: #ffffff !important;
+}
+
+/* ── Fully rounded buttons globally ─────────────────────────────────────────*/
+
+button:not(.card-btn) {
+  border-radius: 9999px !important;
+}
+
+/* ── Remap Tailwind indigo → Twilio blue ─────────────────────────────────────
+   All buttons and links use bg-indigo-* / text-indigo-* / border-indigo-*.
+   Override them globally here so every component matches twilio.com CTAs.
+   ────────────────────────────────────────────────────────────────────────── */
+
+.bg-indigo-600      { background-color: #0263E0 !important; }
+.bg-indigo-700      { background-color: #043CB5 !important; }
+.hover\:bg-indigo-700:hover { background-color: #043CB5 !important; }
+.disabled\:bg-indigo-300:disabled { background-color: #92BFEF !important; }
+.text-indigo-600    { color: #0263E0 !important; }
+.text-indigo-700    { color: #043CB5 !important; }
+.text-indigo-500    { color: #0263E0 !important; }
+.border-indigo-600  { border-color: #0263E0 !important; }
+.border-r-2.border-indigo-600 { border-color: #0263E0 !important; }
+.focus\:ring-indigo-500:focus,
+.focus\:border-indigo-500:focus { --tw-ring-color: #0263E0 !important; border-color: #0263E0 !important; }
+.bg-indigo-50       { background-color: #E4F7FF !important; }
+.bg-indigo-100      { background-color: #CCE9FF !important; }
+.hover\:bg-indigo-100:hover { background-color: #CCE9FF !important; }
+.border-indigo-200  { border-color: #A8D4F7 !important; }
+.text-indigo-800    { color: #04308A !important; }
+
+/* ── Focus ring — Twilio blue ────────────────────────────────────────────────*/
+
+*:focus-visible {
+  outline: 2px solid var(--twilio-focus);
+  outline-offset: 2px;
+}
+
+/* ── Blue-gray shadow utilities (all-sides, cool tint) ──────────────────────*/
+
+.shadow-blue-sm  { box-shadow:  0 0  6px 1px rgba(30, 58, 100, 0.10); }
+.shadow-blue-md  { box-shadow:  0 0 12px 2px rgba(30, 58, 100, 0.14); }
+.shadow-blue-lg  { box-shadow:  0 0 20px 4px rgba(30, 58, 100, 0.18); }
+
+/* ── Scrollbar — subtle ──────────────────────────────────────────────────────*/
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--twilio-gray-40); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--twilio-gray-60); }
+
+/* ── FullCalendar overrides ──────────────────────────────────────────────────*/
+
+.fc .fc-day-today {
+  background-color: #eff6ff !important;
+}
+.fc .fc-col-header-cell.fc-day-today {
+  background-color: #dbeafe !important;
+  color: #1d4ed8 !important;
+}
+.fc .fc-button {
+  border-radius: 4px !important;
+  background-color: var(--twilio-navy) !important;
+  border-color: var(--twilio-navy) !important;
+  font-family: var(--font-base) !important;
+  font-size: 13px !important;
+  font-weight: 500 !important;
+}
+.fc .fc-button:hover {
+  background-color: #4e5870 !important;
+  border-color: #4e5870 !important;
+}
+.fc .fc-button-primary:not(:disabled).fc-button-active {
+  background-color: #1f2937 !important;
+  border-color: #1f2937 !important;
+}
+.fc .fc-button-group .fc-button:first-child  { border-radius: 4px 0 0 4px !important; }
+.fc .fc-button-group .fc-button:last-child   { border-radius: 0 4px 4px 0 !important; }
+.fc .fc-button-group .fc-button:not(:first-child):not(:last-child) { border-radius: 0 !important; }
+
+.fc .fc-timegrid-event,
+.fc .fc-daygrid-event {
+  border-radius: 10px !important;
+}
+.fc .fc-scrollgrid {
+  border-radius: 8px !important;
+  overflow: hidden;
+}
+.fc-timegrid-slot { height: 0.75rem !important; }
+.fc .fc-event-main { padding: 1px 0 !important; }
+.fc .fc-event-main * { font-size: 11px !important; }
+
+/* Google Calendar-style hour labels */
+.fc .fc-timegrid-slot-label { vertical-align: top !important; }
+.fc .fc-timegrid-slot-label-cushion {
+  font-size: 10px !important;
+  font-weight: 500 !important;
+  color: #70757a !important;
+  padding: 0 6px 0 0 !important;
+  line-height: 1 !important;
+  transform: translateY(-6px);
+  display: inline-block; /* must stay inline-block — FC measures this element's width to size the axis <col>; block would fill parent and break the measurement */
+}
+/* Hide the half-hour label (only show on-the-hour) */
+.fc .fc-timegrid-slot-minor .fc-timegrid-slot-label-cushion { visibility: hidden !important; }
+.fc .fc-toolbar-title {
+  font-family: var(--font-base) !important;
+  font-weight: 600 !important;
+  font-size: 1.1rem !important;
+  color: var(--twilio-gray-100) !important;
+}
+
+/* ── Dark mode — hardcoded Tailwind class overrides ─────────────────────────
+   All pages use bg-white / bg-gray-50 / border-gray-* / text-gray-* directly.
+   These overrides flip those to dark-appropriate values without touching every
+   component file.
+   ─────────────────────────────────────────────────────────────────────────── */
+
+[data-theme="dark"] {
+
+  /* --twilio-navy resolves to #060D19 in dark mode (sidebar bg), but is also
+     used as text color everywhere. Restore legible values for text uses. */
+  .text-\[var\(--twilio-navy\)\]    { color: #F4F4F6 !important; }
+  .text-\[var\(--twilio-gray-80\)\] { color: #CACDD8 !important; }
+  .text-\[var\(--twilio-gray-60\)\] { color: #8891AA !important; }
+  .text-\[var\(--twilio-gray-40\)\] { color: #606b85 !important; }
+
+  /* Surfaces */
+  .bg-white        { background-color: #1C2B45 !important; }
+  .bg-gray-50      { background-color: #0D1321 !important; }
+  .bg-gray-100     { background-color: #1C2B45 !important; }
+  .bg-amber-50     { background-color: #2a1f00 !important; }
+
+  /* Borders */
+  .border-gray-100 { border-color: #354052 !important; }
+  .border-gray-200 { border-color: #354052 !important; }
+  .border-gray-300 { border-color: #4a5568 !important; }
+  .border-gray-400 { border-color: #606b85 !important; }
+  .divide-gray-50  > * + * { border-color: #354052 !important; }
+  .divide-gray-100 > * + * { border-color: #354052 !important; }
+
+  /* Text */
+  .text-gray-400   { color: #8891AA !important; }
+  .text-gray-300   { color: #CACDD8 !important; }
+
+  /* Inputs & selects */
+  input:not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"]),
+  select,
+  textarea {
+    background-color: #0D1321 !important;
+    border-color: #4a5568 !important;
+    color: #F4F4F6 !important;
+  }
+  input::placeholder,
+  textarea::placeholder { color: #606b85 !important; }
+
+  /* Code snippets */
+  code { background-color: #354052 !important; color: #F4F4F6 !important; }
+
+  /* Table rows */
+  .bg-gray-50.border-b { background-color: #121C2D !important; }
+  tr:hover .hover\:bg-indigo-50,
+  .hover\:bg-indigo-50:hover { background-color: #1e2d4a !important; }
+  .hover\:bg-gray-50:hover   { background-color: #121C2D !important; }
+  .hover\:bg-gray-100:hover  { background-color: #1C2B45 !important; }
+
+  /* Modals */
+  .bg-white.rounded-xl,
+  .bg-white.rounded-lg,
+  .bg-white.shadow-xl {
+    background-color: #1C2B45 !important;
+    border-color: #354052 !important;
+  }
+
+  /* Sidebar drawer (AccountDetail) */
+  .ml-auto.bg-white { background-color: #1C2B45 !important; }
+
+  /* Chat page sidebar */
+  aside.bg-gray-50 { background-color: #0D1321 !important; }
+  .bg-white.border-r { background-color: #1C2B45 !important; }
+
+  /* Chat bubbles — assistant */
+  .bg-white.border.border-gray-200.rounded-bl-sm {
+    background-color: #1C2B45 !important;
+    border-color: #354052 !important;
+  }
+
+  /* User avatar in chat */
+  .bg-gray-300 { background-color: #354052 !important; }
+
+  /* TranscriptFooter */
+  footer.bg-white { background-color: #1C2B45 !important; }
+
+  /* Settings — inline code bg */
+  .bg-gray-100.px-1 { background-color: #354052 !important; }
+
+  /* Note cards */
+  .bg-gray-50.rounded-lg { background-color: #121C2D !important; }
+
+  /* Stat cards (Dashboard) */
+  .bg-white.rounded-lg.border { background-color: #1C2B45 !important; }
+
+  /* Login page */
+  .min-h-screen.bg-gray-50 { background-color: #060D19 !important; }
+
+  /* Action Items card footers */
+  .bg-white.rounded-b-xl,
+  .bg-white.rounded-b-lg { background-color: #1C2B45 !important; }
+
+  /* Active session highlight in Chat sidebar */
+  .bg-white.font-medium { background-color: #1C2B45 !important; }
+}
+
+/* ── Log-routed glow animation ───────────────────────────────────────────── */
+@keyframes log-glow {
+  0%   { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0); outline: 2px solid rgba(99, 102, 241, 0); }
+  10%  { box-shadow: 0 0 24px 8px rgba(99, 102, 241, 0.55); outline: 2px solid rgba(99, 102, 241, 0.8); }
+  60%  { box-shadow: 0 0 24px 8px rgba(99, 102, 241, 0.35); outline: 2px solid rgba(99, 102, 241, 0.5); }
+  100% { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0); outline: 2px solid rgba(99, 102, 241, 0); }
+}
+.log-glow {
+  animation: log-glow 5s ease-out forwards;
+  border-radius: 8px;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
