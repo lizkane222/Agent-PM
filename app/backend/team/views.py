@@ -8,15 +8,7 @@ from rest_framework.permissions import IsAuthenticated, SAFE_METHODS
 from rest_framework.response import Response
 
 
-def _staff_sees_all(user) -> bool:
-    """True when the user has staff-level data visibility (is_staff AND staff_view_override enabled)."""
-    if not user.is_staff:
-        return False
-    profile = getattr(user, "profile", None)
-    if profile is None:
-        return True
-    return profile.staff_view_override
-
+from core.mixins import _staff_sees_all
 from .models import Tag, Team, TeamMember, TeamMembership, UserProfile
 from .serializers import (
     TagSerializer,

@@ -8,7 +8,7 @@ import ActionItemsPage from "./pages/ActionItemsPage";
 import CalendarPage from "./pages/CalendarPage";
 import ChatPage from "./pages/ChatPage";
 import DashboardPage from "./pages/DashboardPage";
-import EditPreviewPage from "./pages/EditPreviewPage";
+import PageBuilder from "./components/pagebuilder/PageBuilder";
 import LogsPage from "./pages/LogsPage";
 import LoginPage from "./pages/LoginPage";
 import RemindersPage from "./pages/RemindersPage";
@@ -124,7 +124,7 @@ export default function App() {
           <Route path="settings" element={<SettingsPage />} />
           <Route path="admin-data" element={<AdminDataPage />} />
           <Route path="logs" element={<LogsPage />} />
-          <Route path="edit-preview" element={<EditPreviewPage />} />
+          <Route path="edit-preview" element={<PageBuilder />} />
           <Route path="profile" element={<ProfilePage />} />
         </Route>
       </Routes>

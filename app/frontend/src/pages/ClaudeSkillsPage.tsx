@@ -10,7 +10,7 @@ import TrustHubLogo from "../assets/Product Logos/logo-trust-hub-red.svg?react";
 import UnderstandLogo from "../assets/Product Logos/logo-understand-red.svg?react";
 import VirtualAgentLogo from "../assets/Product Logos/virtual-agent-logo-red.svg?react";
 import type { SkillFile } from "../lib/api";
-import { useLogGlow } from "../lib/useLogGlow";
+import { useLogGlow } from "../hooks/useLogGlow";
 import type { AgentSkill, AgentSkillStatus, ClaudeSkill, ClaudeSkillStatus } from "../types";
 import { ROLE_OPTIONS } from "../types";
 import { useCommentContext, useRightClickComment } from "../components/comments/CommentContext";

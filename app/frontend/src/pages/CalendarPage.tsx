@@ -15,7 +15,7 @@ import { useActionItemFieldOptions } from "../hooks/useActionItemFieldOptions";
 import DOMPurify from "dompurify";
 import { schedulerApi, integrationsApi, teamApi, airtableApi, accountsApi, salesforceApi } from "../lib/api";
 import { addLog } from "../lib/appLog";
-import { useLogGlow } from "../lib/useLogGlow";
+import { useLogGlow } from "../hooks/useLogGlow";
 import { useCurrentUser } from "../context/CurrentUserContext";
 import { useCommentContext } from "../components/comments/CommentContext";
 import DayBar from "../components/calendar/DayBar";

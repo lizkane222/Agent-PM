@@ -25,7 +25,7 @@ import type {
 } from "../types";
 import { ROLE_META, SLUG_TO_ROLE, ROLED_PAGES } from "../lib/titleRoles";
 import type { TitleRole } from "../lib/titleRoles";
-import { useLogGlow } from "../lib/useLogGlow";
+import { useLogGlow } from "../hooks/useLogGlow";
 import { useCurrentUser } from "../context/CurrentUserContext";
 import TimeAllocationPanel from "../components/TimeAllocationPanel";
 

@@ -6,7 +6,7 @@ import type { Account, TeamMember } from "../types";
 import { getTitleRole, ROLE_META, ROLE_ORDER } from "../lib/titleRoles";
 import type { TitleRole } from "../lib/titleRoles";
 import { addLog } from "../lib/appLog";
-import { useLogGlow } from "../lib/useLogGlow";
+import { useLogGlow } from "../hooks/useLogGlow";
 import { useCurrentUser } from "../context/CurrentUserContext";
 
 type ViewMode = "cards" | "list" | "table";

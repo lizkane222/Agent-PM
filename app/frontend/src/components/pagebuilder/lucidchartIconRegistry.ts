@@ -1,7 +1,7 @@
-// Auto-discovers every SVG in assets/Lucidchart Assets/ via Vite's import.meta.glob.
+// Auto-discovers every SVG in assets/lucidchart-assets/ via Vite's import.meta.glob.
 
 const svgModules = import.meta.glob<{ default: string }>(
-  "../../assets/Lucidchart Assets/*.svg",
+  "../../assets/lucidchart-assets/*.svg",
   { eager: true }
 );
 

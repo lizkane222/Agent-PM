@@ -1,5 +1,5 @@
 import { useRef, useState, useId, useEffect } from "react";
-import { useLogGlow } from "../lib/useLogGlow";
+import { useLogGlow } from "../hooks/useLogGlow";
 import { teamApi, discoverApi } from "../lib/api";
 import InnovationIcon from "../assets/icons/Innovation.svg?react";
 import { useCurrentUser } from "../context/CurrentUserContext";

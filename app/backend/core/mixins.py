@@ -16,9 +16,8 @@ logger = logging.getLogger(__name__)
 def _staff_sees_all(user) -> bool:
     """True when the user has staff-level data visibility (is_staff AND staff_view_override enabled).
 
-    Duplicated in accounts/views.py, team/views.py, and airtable_sync/views.py — the
-    intentional-not-fixed LOW item. Kept as a private helper here for the mixins so
-    they don't have to import from those app modules (which would create a cycle).
+    Import from here — this is the single canonical implementation. Do NOT re-define
+    this helper in individual app views; use `from core.mixins import _staff_sees_all`.
     """
     if not getattr(user, "is_staff", False):
         return False

@@ -23,7 +23,7 @@ import KanbanCard from "./KanbanCard";
 import LogTimeModal from "./LogTimeModal";
 import ChatterPost from "./ChatterPost";
 import ActivityLogSection from "../ActivityLogSection";
-import { convertActionItemToEvent, convertEventToActionItem, restoreConversion } from "../../lib/useConvert";
+import { convertActionItemToEvent, convertEventToActionItem, restoreConversion } from "../../hooks/useConvert";
 
 interface Props {
   event: CalendarEvent;

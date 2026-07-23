@@ -10,7 +10,7 @@ import { accountsApi, airtableApi, teamApi, skillsApi, schedulerApi, integration
 import type { GmailThread, SearchResult } from "../lib/api";
 import type { Account, AccountArtifact, AccountNote, AccountQuickLink, ActionItemAttachment, AirtableAccount, AirtableActionItem, AirtableMeeting, CalendarEvent, CustomerContact, CustomerContactNote, MeetingNote, Reminder, TeamMember } from "../types";
 import { ROLE_META, getTitleRole } from "../lib/titleRoles";
-import { useLogGlow } from "../lib/useLogGlow";
+import { useLogGlow } from "../hooks/useLogGlow";
 import { addLog } from "../lib/appLog";
 import { useScheduledOccurrences } from "../hooks/useScheduledOccurrences";
 import { useActionItemFieldOptions } from "../hooks/useActionItemFieldOptions";
@@ -18,7 +18,7 @@ import { useCurrentUser } from "../context/CurrentUserContext";
 import { useRightClickComment, useCommentContext } from "../components/comments/CommentContext";
 import InlineCommentThread from "../components/comments/InlineCommentThread";
 import ActivityLogSection from "../components/ActivityLogSection";
-import { convertActionItemToEvent, restoreConversion } from "../lib/useConvert";
+import { convertActionItemToEvent, restoreConversion } from "../hooks/useConvert";
 
 // ── Edit Modal ────────────────────────────────────────────────────────────────
 
