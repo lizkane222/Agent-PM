@@ -11,49 +11,8 @@ export interface AuthUser {
   email: string;
 }
 
-// ── Agent ─────────────────────────────────────────────────────────────────────
-
-export interface SessionParticipant {
-  id: number;
-  username: string;
-  email: string;
-  display_name: string;
-}
-
-export interface AgentSession {
-  id: number;
-  title: string;
-  status: "active" | "completed" | "error";
-  is_shared: boolean;
-  owner_username: string;
-  participants: SessionParticipant[];
-  started_at: string;
-  ended_at: string | null;
-  messages: AgentMessage[];
-  created_at: string;
-  updated_at: string;
-}
-
-export interface AgentMessage {
-  id: number;
-  role: "user" | "assistant" | "tool_result";
-  content: string;
-  input_tokens: number;
-  output_tokens: number;
-  tool_calls: ToolCall[];
-  created_at: string;
-}
-
-export interface ToolCall {
-  id: number;
-  tool_name: string;
-  arguments: Record<string, unknown>;
-  result: unknown;
-  status: "pending" | "success" | "error";
-  error_message: string;
-  duration_ms: number;
-  created_at: string;
-}
+// ── Agent (moved to types/agents.ts — re-exported here for backwards compat) ────
+export type { SessionParticipant, AgentSession, AgentMessage, ToolCall, AgentSkill, AgentSkillStatus, AgentSkillVisibility, AgentSkillScript } from "./agents";
 
 // ── Scheduler (moved to types/scheduler.ts — re-exported here for backwards compat) ────
 export type { Reminder, ReminderStatus, ReminderResourceType, CalendarEvent, MeetingNote, Attendee } from "./scheduler";
@@ -464,37 +423,6 @@ export interface ClaudeSkill {
   updated_at: string;
 }
 
-// ── Agent Skills (structured, instructions-based) ────────────────────────────
-
-export type AgentSkillStatus = "draft" | "pending_review" | "approved" | "rejected";
-export type AgentSkillVisibility = "private" | "team" | "public";
-
-export interface AgentSkillScript {
-  filename: string;
-  language: string;
-  code: string;
-}
-
-export interface AgentSkill {
-  id: number;
-  name: string;
-  description: string;
-  instructions: string;
-  allowed_tools: string[];
-  scripts: AgentSkillScript[];
-  references: string[];
-  status: AgentSkillStatus;
-  visibility: AgentSkillVisibility;
-  review_verdict: string;
-  review_findings: Record<string, string>;
-  reviewed_at: string | null;
-  pinned_to_roles: string[];
-  pinned_by_me: boolean;
-  version: number;
-  created_by_username: string | null;
-  created_at: string;
-  updated_at: string;
-}
 
 // ── API Pagination ────────────────────────────────────────────────────────────
 
@@ -550,37 +478,8 @@ export interface Comment {
   updated_at: string;
 }
 
-// ── Feedback ──────────────────────────────────────────────────────────────────
-
-export type FeedbackStatus = "open" | "in_progress" | "resolved" | "wont_fix";
-
-export interface FeedbackComment {
-  id: number;
-  feedback: number;
-  author: number | null;
-  author_username: string | null;
-  author_display: string;
-  content: string;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface FeedbackItem {
-  id: number;
-  author: number | null;
-  author_username: string | null;
-  author_display: string;
-  description: string;
-  element_label: string;
-  element_path: string;
-  page_url: string;
-  attachment: string | null;
-  status: FeedbackStatus;
-  comments: FeedbackComment[];
-  comment_count: number;
-  created_at: string;
-  updated_at: string;
-}
+// ── Feedback (moved to types/feedback.ts — re-exported here for backwards compat) ────
+export type { FeedbackStatus, FeedbackComment, FeedbackItem } from "./feedback";
 
 // ── Discover (moved to types/discover.ts — re-exported here for backwards compat) ────
 export type { DiscoverApplet, AppletCategory, ItemType, UrlStatus } from "./discover";

@@ -3,10 +3,14 @@ import { Link } from "react-router-dom";
 import { getLogs, LOG_STORAGE_KEY, syncLogsFromBackend } from "../lib/appLog";
 import NotificationIcon from "../assets/icons/Notification.svg?react";
 import type { LogEntry, LogCategory } from "../lib/appLog";
-import { schedulerApi, commentsApi, feedbackApi, agentApi, skillsApi } from "../lib/api";
+import { commentsApi, agentApi, skillsApi } from "../lib/api";
 import type { TokenStats, SkillTokenStats } from "../lib/api";
-import type { CalendarEvent, Comment, Reminder, FeedbackItem } from "../types";
+import type { Comment } from "../types";
+import type { FeedbackItem } from "../types/feedback";
 import FeedbackDetailModal from "../components/feedback/FeedbackDetailModal";
+import { useCalendarEvents } from "../hooks/useCalendarEvents";
+import { useReminders } from "../hooks/useReminders";
+import { useFeedbackItems } from "../hooks/useFeedbackItems";
 
 // ── Tab definition ────────────────────────────────────────────────────────────
 
@@ -72,15 +76,7 @@ const EVENT_STATUS_COLOR: Record<string, string> = {
 };
 
 function EventsTab() {
-  const [events, setEvents] = useState<CalendarEvent[]>([]);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    schedulerApi.listEvents({ ordering: "-start_datetime", page_size: "200" })
-      .then(r => setEvents(r.data ?? []))
-      .catch(() => {})
-      .finally(() => setLoading(false));
-  }, []);
+  const { data: events, loading } = useCalendarEvents({ ordering: "-start_datetime", page_size: "200" });
 
   if (loading) return <LoadingState />;
   if (events.length === 0) return <EmptyState text="No events found." />;
@@ -203,19 +199,8 @@ const NOTIF_STATUS_COLOR: Record<string, string> = {
 };
 
 function NotificationsTab() {
-  const [items, setItems] = useState<Reminder[]>([]);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    // Fetch all statuses and show those with notify_in_app true
-    schedulerApi.listReminders({ page_size: "200" })
-      .then(r => {
-        const all = r.data.results ?? [];
-        setItems(all.filter(rem => rem.notify_in_app));
-      })
-      .catch(() => {})
-      .finally(() => setLoading(false));
-  }, []);
+  const { data: allReminders, loading } = useReminders({ tab: "all" });
+  const items = allReminders.filter(rem => rem.notify_in_app);
 
   if (loading) return <LoadingState />;
   if (items.length === 0) return <EmptyState text="No in-app notifications on record." />;
@@ -272,15 +257,7 @@ const REMINDER_STATUS_COLOR: Record<string, string> = {
 };
 
 function RemindersTab() {
-  const [reminders, setReminders] = useState<Reminder[]>([]);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    schedulerApi.listReminders({ page_size: "200" })
-      .then(r => setReminders(r.data.results ?? []))
-      .catch(() => {})
-      .finally(() => setLoading(false));
-  }, []);
+  const { data: reminders, loading } = useReminders({ tab: "all" });
 
   if (loading) return <LoadingState />;
   if (reminders.length === 0) return <EmptyState text="No reminders found." />;
@@ -329,16 +306,8 @@ const FB_STATUS_LABEL: Record<string, string> = {
 };
 
 function FeedbackTab() {
-  const [items, setItems] = useState<FeedbackItem[]>([]);
-  const [loading, setLoading] = useState(true);
+  const { data: items, loading } = useFeedbackItems();
   const [selected, setSelected] = useState<FeedbackItem | null>(null);
-
-  useEffect(() => {
-    feedbackApi.list()
-      .then(r => setItems(r.data.results ?? []))
-      .catch(() => {})
-      .finally(() => setLoading(false));
-  }, []);
 
   if (loading) return <LoadingState />;
   if (items.length === 0) return <EmptyState text="No feedback submitted yet." />;

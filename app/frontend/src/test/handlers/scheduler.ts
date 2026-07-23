@@ -1,5 +1,5 @@
 import { http, HttpResponse } from "msw";
-import type { Reminder } from "../../types";
+import type { Reminder, CalendarEvent } from "../../types";
 
 export const mockReminders: Reminder[] = [
   {
@@ -40,6 +40,53 @@ export const mockReminders: Reminder[] = [
   },
 ];
 
+export const mockCalendarEvents: CalendarEvent[] = [
+  {
+    id: 1,
+    owner: 1,
+    owner_username: "alice",
+    title: "Q3 Planning",
+    description: "",
+    location: "",
+    start_datetime: "2026-07-28T10:00:00Z",
+    end_datetime: "2026-07-28T11:00:00Z",
+    all_day: false,
+    status: "confirmed",
+    account: null,
+    account_name: null,
+    google_event_id: "",
+    meet_link: "",
+    calendar_id: "",
+    is_synced: false,
+    agentpm_airtable_id: "",
+    attendees: [],
+    created_at: "2026-07-01T00:00:00Z",
+    updated_at: "2026-07-01T00:00:00Z",
+  },
+  {
+    id: 2,
+    owner: 1,
+    owner_username: "alice",
+    title: "Customer Demo",
+    description: "",
+    location: "",
+    start_datetime: "2026-07-29T14:00:00Z",
+    end_datetime: "2026-07-29T15:00:00Z",
+    all_day: false,
+    status: "confirmed",
+    account: 5,
+    account_name: "Acme Corp",
+    google_event_id: "",
+    meet_link: "",
+    calendar_id: "",
+    is_synced: false,
+    agentpm_airtable_id: "",
+    attendees: [],
+    created_at: "2026-07-02T00:00:00Z",
+    updated_at: "2026-07-02T00:00:00Z",
+  },
+];
+
 export const schedulerHandlers = [
   http.get("/api/v1/scheduler/reminders/", () =>
     HttpResponse.json({ results: mockReminders, count: mockReminders.length })
@@ -63,5 +110,8 @@ export const schedulerHandlers = [
   ),
   http.post("/api/v1/scheduler/reminders/:id/snooze/", () =>
     HttpResponse.json({ ...mockReminders[0], status: "snoozed" })
+  ),
+  http.get("/api/v1/scheduler/events/", () =>
+    HttpResponse.json(mockCalendarEvents)
   ),
 ];
