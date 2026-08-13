@@ -4,7 +4,7 @@
 
 import { realtimeApi } from "./api";
 
-export type LogCategory = "account" | "team" | "action_item" | "calendar";
+export type LogCategory = "account" | "team" | "action_item" | "calendar" | "comment_reply";
 
 export interface LogResource {
   type: "account" | "action_item" | "calendar_event" | "reminder";
@@ -123,6 +123,20 @@ export async function syncLogsFromBackend(): Promise<void> {
   } catch {
     // Backend unreachable — local log (even if empty) is the fallback
   }
+}
+
+/** Write a backend-sourced event to localStorage without POSTing back to the server. */
+export function addBackendLog(entry: { id: string; ts: number; category: string; message: string }): void {
+  const existing = readAll();
+  if (existing.some((e) => e.id === entry.id)) return; // deduplicate
+  const full: LogEntry = {
+    id: entry.id,
+    ts: entry.ts,
+    category: entry.category as LogCategory,
+    message: entry.message,
+  };
+  writeAll([...existing, full]);
+  window.dispatchEvent(new StorageEvent("storage", { key: STORAGE_KEY, newValue: "1" }));
 }
 
 export { STORAGE_KEY as LOG_STORAGE_KEY };

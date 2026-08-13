@@ -56,10 +56,15 @@ INSTALLED_APPS = [
     "accounts",
     "airtable_sync",
     "salesforce_sync",
+    "confluence_sync",
+    "jira_sync",
+    "zendesk_sync",
     "layouts",
     "comments",
     "discover",
     "feedback",
+    "account_feed",
+    "sync_review",
 ]
 
 # ── Middleware ────────────────────────────────────────────────────────────────
@@ -295,6 +300,8 @@ TWILIO_CONVERSATIONS_SERVICE_SID = os.getenv("TWILIO_CONVERSATIONS_SERVICE_SID",
 # embedded in the TwiML <ConversationRelay url="wss://host/ws/voice-relay/?relay_token=..."/>.
 # Leave empty in local dev to disable the check; MUST be set in production.
 VOICE_RELAY_TOKEN = os.getenv("VOICE_RELAY_TOKEN", "")
+# Claude model to use for ConversationRelay voice sessions via AWS Bedrock.
+VOICE_BEDROCK_MODEL_ID = os.getenv("VOICE_BEDROCK_MODEL_ID", "anthropic.claude-3-5-haiku-20241022:0")
 
 # ── Google ────────────────────────────────────────────────────────────────────
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
@@ -363,6 +370,47 @@ NOTION_REDIRECT_URI = os.getenv("NOTION_REDIRECT_URI", "http://localhost:8000/ap
 MICROSOFT_CLIENT_ID = os.getenv("MICROSOFT_CLIENT_ID", "")
 MICROSOFT_CLIENT_SECRET = os.getenv("MICROSOFT_CLIENT_SECRET", "")
 MICROSOFT_REDIRECT_URI = os.getenv("MICROSOFT_REDIRECT_URI", "http://localhost:8000/api/v1/integrations/microsoft/callback/")
+
+# ── Confluence (per-user OAuth 2.0) ──────────────────────────────────────────
+CONFLUENCE_CLIENT_ID = os.getenv("CONFLUENCE_CLIENT_ID", "")
+CONFLUENCE_CLIENT_SECRET = os.getenv("CONFLUENCE_CLIENT_SECRET", "")
+CONFLUENCE_REDIRECT_URI = os.getenv(
+    "CONFLUENCE_REDIRECT_URI",
+    "http://localhost:8000/api/v1/integrations/confluence/callback/",
+)
+
+# ── JIRA (per-user OAuth 2.0) ─────────────────────────────────────────────────
+JIRA_CLIENT_ID = os.getenv("JIRA_CLIENT_ID", "")
+JIRA_CLIENT_SECRET = os.getenv("JIRA_CLIENT_SECRET", "")
+JIRA_REDIRECT_URI = os.getenv(
+    "JIRA_REDIRECT_URI",
+    "http://localhost:8000/api/v1/integrations/jira/callback/",
+)
+
+# ── Zendesk (per-user + org-admin OAuth 2.0 confidential client) ─────────────
+ZENDESK_CLIENT_ID = os.getenv("ZENDESK_CLIENT_ID", "")
+ZENDESK_CLIENT_SECRET = os.getenv("ZENDESK_CLIENT_SECRET", "")
+ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "twilio")
+ZENDESK_REDIRECT_URI = os.getenv(
+    "ZENDESK_REDIRECT_URI",
+    "http://localhost:8000/api/v1/integrations/zendesk/callback/",
+)
+ZENDESK_ADMIN_REDIRECT_URI = os.getenv(
+    "ZENDESK_ADMIN_REDIRECT_URI",
+    "http://localhost:8000/api/v1/integrations/zendesk/admin-callback/",
+)
+
+# ── Atlassian / Confluence + JIRA (org scraper) ───────────────────────────────
+ATLASSIAN_EMAIL = os.getenv("ATLASSIAN_EMAIL", "")
+ATLASSIAN_API_TOKEN = os.getenv("ATLASSIAN_API_TOKEN", "")
+ATLASSIAN_BASE_URL = os.getenv("ATLASSIAN_BASE_URL", "https://twilio-productivity.atlassian.net")
+
+# ── Gong (org scraper) ────────────────────────────────────────────────────────
+GONG_ACCESS_KEY = os.getenv("GONG_ACCESS_KEY", "")
+GONG_ACCESS_SECRET = os.getenv("GONG_ACCESS_SECRET", "")
+
+# ── Notion integration token (org scraper) ───────────────────────────────────
+NOTION_INTEGRATION_TOKEN = os.getenv("NOTION_INTEGRATION_TOKEN", "")
 
 # ── Content-Security-Policy (django-csp) ──────────────────────────────────────
 CSP_DEFAULT_SRC = ("'self'",)

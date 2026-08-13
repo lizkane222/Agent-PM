@@ -10,6 +10,7 @@ export interface Tag {
 export interface TeamMember {
   id: number;
   user: number | null;
+  username?: string | null;
   full_name: string;
   email: string;
   title: string;

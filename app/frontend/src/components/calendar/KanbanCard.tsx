@@ -3,6 +3,9 @@ import type { AirtableActionItem } from "../../types";
 import { airtableApi } from "../../lib/api";
 import CorporateIcon from "../../assets/icons/Corporate.svg?react";
 import { useActionItemFieldOptions } from "../../hooks/useActionItemFieldOptions";
+import { useExportTray } from "../../hooks/useExportTray";
+import { ContextMenu, type ContextMenuItem } from "../action-items/ContextMenu";
+import { useCommentContext } from "../comments/CommentContext";
 
 interface Props {
   item: AirtableActionItem;
@@ -27,9 +30,21 @@ function formatDuration(seconds: number): string {
 
 export default function KanbanCard({ item, onStatusChange, onDoubleClick }: Props) {
   const { status: statusOptions } = useActionItemFieldOptions();
+  const { addToTray } = useExportTray();
+  const { openComments } = useCommentContext();
   const [expanded, setExpanded] = useState(false);
   const [updating, setUpdating] = useState(false);
   const [dragging, setDragging] = useState(false);
+  const [ctxPos, setCtxPos] = useState<{ x: number; y: number } | null>(null);
+
+  const ctxItems: ContextMenuItem[] = [
+    { label: "Open details", onClick: () => { setExpanded(true); onDoubleClick?.(item); } },
+    { label: "Mark as Done", onClick: () => void handleStatusChange("Done") },
+    { label: "Copy task name", onClick: () => { void navigator.clipboard.writeText(item.task || "").catch(() => {}); } },
+    { label: "Add comment", onClick: () => { if (item.id && ctxPos) openComments({ resourceType: "action_item", resourceId: item.id, resourceLabel: item.task || "", x: ctxPos.x, y: ctxPos.y }); } },
+    { separator: true, label: "", onClick: () => {} },
+    { label: "→ Export tray", icon: <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5"><path d="M1 9v4h12V9"/><path d="M4.5 5.5 7 3l2.5 2.5"/><path d="M7 3v7"/></svg>, onClick: () => addToTray(item) },
+  ];
 
   async function handleStatusChange(newStatus: AirtableActionItem["status"]) {
     setUpdating(true);
@@ -42,6 +57,7 @@ export default function KanbanCard({ item, onStatusChange, onDoubleClick }: Prop
   }
 
   return (
+    <>
     <div
       draggable
       onDragStart={(e) => {
@@ -53,6 +69,7 @@ export default function KanbanCard({ item, onStatusChange, onDoubleClick }: Prop
       className={["bg-white border border-gray-200 rounded-lg shadow-sm overflow-hidden cursor-grab active:cursor-grabbing select-none transition-opacity", dragging ? "opacity-40" : ""].join(" ")}
       onClick={() => setExpanded((v) => !v)}
       onDoubleClick={(e) => { e.stopPropagation(); onDoubleClick?.(item); }}
+      onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setCtxPos({ x: e.clientX, y: e.clientY }); }}
     >
       {/* Collapsed header */}
       <div className="flex items-start gap-2 px-3 py-2.5">
@@ -173,5 +190,14 @@ export default function KanbanCard({ item, onStatusChange, onDoubleClick }: Prop
         </div>
       )}
     </div>
+    {ctxPos && (
+      <ContextMenu
+        x={ctxPos.x}
+        y={ctxPos.y}
+        items={ctxItems}
+        onClose={() => setCtxPos(null)}
+      />
+    )}
+    </>
   );
 }

@@ -8,7 +8,7 @@ import statisticsIconUrl from "../assets/icons/Statistics.svg";
 import cloudUploadIconUrl from "../assets/icons/Cloud Upload.svg";
 import { accountsApi, airtableApi, teamApi, skillsApi, schedulerApi, integrationsApi, searchApi } from "../lib/api";
 import type { GmailThread, SearchResult } from "../lib/api";
-import type { Account, AccountArtifact, AccountNote, AccountQuickLink, ActionItemAttachment, AirtableAccount, AirtableActionItem, AirtableMeeting, CalendarEvent, CustomerContact, CustomerContactNote, MeetingNote, Reminder, TeamMember } from "../types";
+import type { Account, AccountArtifact, AccountNote, AccountQuickLink, ActionItemAttachment, AirtableAccount, AirtableActionItem, AirtableMeeting, Attendee, CalendarEvent, CustomerContact, CustomerContactNote, MeetingNote, Reminder, TeamMember } from "../types";
 import { ROLE_META, getTitleRole } from "../lib/titleRoles";
 import { useLogGlow } from "../hooks/useLogGlow";
 import { addLog } from "../lib/appLog";
@@ -176,14 +176,6 @@ function EditAccountModal({
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-const STATUS_STYLES: Record<string, React.CSSProperties> = {
-  "Open": { background: "var(--bg, #f5f5f5)", color: "var(--text-secondary, #888)" },
-  "In Progress": { background: "rgba(226,34,34,0.06)", color: "var(--twilio-red, #e22)" },
-  "Done": { background: "#dcfce7", color: "#15803d" },
-  "Blocked": { background: "#fee2e2", color: "#dc2626" },
-  "Backlogged": { background: "#f1f5f9", color: "#475569" },
-};
 
 const PRIORITY_COLORS: Record<string, string> = {
   Critical: "bg-red-50 text-red-700",
@@ -918,9 +910,9 @@ const REMINDER_STATUS_COLORS: Record<string, string> = {
   snoozed: "#6366f1",
 };
 
-function ReminderBell({ className }: { className?: string }) {
+function ReminderBell({ className, style }: { className?: string; style?: React.CSSProperties }) {
   return (
-    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" className={className}>
+    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" className={className} style={style}>
       <path d="M10 2a6 6 0 00-6 6v3l-1.5 2.5h15L16 11V8a6 6 0 00-6-6z" strokeLinejoin="round"/>
       <path d="M8.5 16.5a1.5 1.5 0 003 0" strokeLinecap="round"/>
     </svg>
@@ -1895,255 +1887,6 @@ function CustomerContactModal({
           <button onClick={onClose} className="text-sm font-medium text-[var(--twilio-gray-60)] hover:text-[var(--twilio-navy)] transition-colors ml-auto">Close</button>
         </div>
       </div>
-    </div>
-  );
-}
-
-function CustomerContactsPanel({ accountId, accountName }: { accountId: number; accountName: string }) {
-  const [contacts, setContacts] = useState<CustomerContact[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [showForm, setShowForm] = useState(false);
-  const [expandedId, setExpandedId] = useState<number | null>(null);
-  const [noteDraft, setNoteDraft] = useState<Record<number, string>>({});
-  const BLANK = (): Partial<CustomerContact> => ({ name: "", role: "", description: "", email: "" });
-  const [form, setForm] = useState<Partial<CustomerContact>>(BLANK());
-  const [editId, setEditId] = useState<number | null>(null);
-  const [saving, setSaving] = useState(false);
-
-  useEffect(() => {
-    accountsApi.listContacts(accountId)
-      .then(({ data }) => setContacts(data.results))
-      .catch(() => {})
-      .finally(() => setLoading(false));
-  }, [accountId]);
-
-  function setField(k: keyof CustomerContact, v: string) {
-    setForm((f) => ({ ...f, [k]: v }));
-  }
-
-  async function handleSave() {
-    if (!form.name?.trim() || saving) return;
-    setSaving(true);
-    try {
-      if (editId) {
-        const { data } = await accountsApi.updateContact(editId, form);
-        setContacts((prev) => prev.map((c) => c.id === editId ? data : c));
-      } else {
-        const { data } = await accountsApi.createContact(accountId, form);
-        setContacts((prev) => [data, ...prev]);
-      }
-      setForm(BLANK());
-      setEditId(null);
-      setShowForm(false);
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  function startEdit(c: CustomerContact) {
-    setForm({ name: c.name, role: c.role, description: c.description, email: c.email });
-    setEditId(c.id);
-    setShowForm(true);
-  }
-
-  async function handleDelete(c: CustomerContact) {
-    await accountsApi.deleteContact(c.id);
-    setContacts((prev) => prev.filter((x) => x.id !== c.id));
-    if (expandedId === c.id) setExpandedId(null);
-  }
-
-  async function handleAddNote(contactId: number) {
-    const content = (noteDraft[contactId] ?? "").trim();
-    if (!content) return;
-    const { data } = await accountsApi.addContactNote(contactId, content);
-    setContacts((prev) => prev.map((c) => c.id === contactId
-      ? { ...c, notes: [data, ...c.notes], notes_count: c.notes_count + 1 }
-      : c
-    ));
-    setNoteDraft((d) => ({ ...d, [contactId]: "" }));
-  }
-
-  async function handleDeleteNote(contactId: number, noteId: number) {
-    await accountsApi.deleteContactNote(noteId);
-    setContacts((prev) => prev.map((c) => c.id === contactId
-      ? { ...c, notes: c.notes.filter((n) => n.id !== noteId), notes_count: Math.max(0, c.notes_count - 1) }
-      : c
-    ));
-  }
-
-  async function handleUpdateNote(contactId: number, noteId: number, content: string) {
-    const { data } = await accountsApi.updateContactNote(noteId, content);
-    setContacts((prev) => prev.map((c) => c.id === contactId
-      ? { ...c, notes: c.notes.map((n) => (n.id === noteId ? data : n)) }
-      : c
-    ));
-  }
-
-  const cancelForm = () => { setShowForm(false); setForm(BLANK()); setEditId(null); };
-
-  return (
-    <div className="rounded-xl border border-gray-200 bg-white overflow-hidden">
-      <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100">
-        <p className="text-xs font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide">
-          {accountName} Contacts
-          {contacts.length > 0 && <span className="ml-1.5 font-normal normal-case text-[10px] opacity-70">({contacts.length})</span>}
-        </p>
-        <button
-          onClick={() => { cancelForm(); setShowForm((v) => !v); }}
-          className="text-[11px] font-semibold text-indigo-600 hover:text-indigo-800 transition-colors"
-        >
-          {showForm && !editId ? "Cancel" : "+ Add contact"}
-        </button>
-      </div>
-
-      {showForm && (
-        <div className="px-4 py-3 border-b border-gray-100 space-y-2.5" style={{ background: "#f9fafb" }}>
-          <p className="text-[11px] font-semibold text-[var(--twilio-navy)] uppercase tracking-wide">
-            {editId ? "Edit contact" : "New contact"}
-          </p>
-          <div className="grid grid-cols-2 gap-2">
-            <input
-              autoFocus
-              value={form.name ?? ""}
-              onChange={(e) => setField("name", e.target.value)}
-              placeholder="Full name *"
-              className="col-span-2 rounded-md border border-gray-200 px-2.5 py-1.5 text-xs text-[var(--twilio-navy)] placeholder:text-gray-400 focus:border-indigo-400 focus:outline-none focus:ring-1 focus:ring-indigo-100"
-            />
-            <input
-              value={form.role ?? ""}
-              onChange={(e) => setField("role", e.target.value)}
-              placeholder="Role / title"
-              className="rounded-md border border-gray-200 px-2.5 py-1.5 text-xs text-[var(--twilio-navy)] placeholder:text-gray-400 focus:border-indigo-400 focus:outline-none focus:ring-1 focus:ring-indigo-100"
-            />
-            <input
-              type="email"
-              value={form.email ?? ""}
-              onChange={(e) => setField("email", e.target.value)}
-              placeholder="Email"
-              className="rounded-md border border-gray-200 px-2.5 py-1.5 text-xs text-[var(--twilio-navy)] placeholder:text-gray-400 focus:border-indigo-400 focus:outline-none focus:ring-1 focus:ring-indigo-100"
-            />
-          </div>
-          <textarea
-            value={form.description ?? ""}
-            onChange={(e) => setField("description", e.target.value)}
-            rows={2}
-            placeholder="Description or context…"
-            className="w-full rounded-md border border-gray-200 px-2.5 py-1.5 text-xs text-[var(--twilio-navy)] placeholder:text-gray-400 focus:border-indigo-400 focus:outline-none focus:ring-1 focus:ring-indigo-100 resize-none"
-          />
-          <div className="flex justify-end gap-2">
-            <button onClick={cancelForm} className="text-[11px] text-[var(--twilio-gray-60)] hover:text-[var(--twilio-navy)] transition-colors">Cancel</button>
-            <button
-              onClick={() => void handleSave()}
-              disabled={saving || !form.name?.trim()}
-              className="px-3 py-1 text-[11px] font-semibold rounded-md bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-40 transition-colors"
-            >
-              {saving ? "Saving…" : editId ? "Update" : "Add"}
-            </button>
-          </div>
-        </div>
-      )}
-
-      {loading && (
-        <p className="px-4 py-3 text-xs text-[var(--twilio-gray-60)] italic">Loading…</p>
-      )}
-
-      {!loading && contacts.length === 0 && !showForm && (
-        <p className="px-4 py-3 text-xs text-[var(--twilio-gray-60)] italic">No contacts yet.</p>
-      )}
-
-      {contacts.map((c) => {
-        const isOpen = expandedId === c.id;
-        const initials = c.name.split(" ").map((p) => p[0]).join("").toUpperCase().slice(0, 2);
-        return (
-          <div key={c.id} className="border-b border-gray-100 last:border-0">
-            <div
-              className="flex items-center gap-3 px-4 py-2.5 cursor-pointer hover:bg-gray-50 transition-colors group"
-              onClick={() => setExpandedId(isOpen ? null : c.id)}
-            >
-              <div
-                className="w-7 h-7 rounded-full flex items-center justify-center text-[10px] font-bold shrink-0"
-                style={{ background: "rgba(99,102,241,0.12)", color: "#4f46e5" }}
-              >
-                {initials}
-              </div>
-              <div className="flex-1 min-w-0">
-                <p className="text-xs font-semibold text-[var(--twilio-navy)] truncate">{c.name}</p>
-                {c.role && <p className="text-[10px] text-[var(--twilio-gray-60)] truncate">{c.role}</p>}
-              </div>
-              {c.email && (
-                <a
-                  href={`mailto:${c.email}`}
-                  onClick={(e) => e.stopPropagation()}
-                  className="text-[10px] text-indigo-500 hover:underline shrink-0 opacity-0 group-hover:opacity-100 transition-opacity"
-                >
-                  {c.email}
-                </a>
-              )}
-              <div className="flex items-center gap-1 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">
-                <button
-                  onClick={(e) => { e.stopPropagation(); startEdit(c); }}
-                  className="p-1 rounded hover:bg-gray-200 text-[var(--twilio-gray-60)] hover:text-[var(--twilio-navy)] transition-colors"
-                  title="Edit"
-                >
-                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-3 h-3"><path d="M11.5 2.5l2 2-8 8H3.5v-2l8-8z" strokeLinejoin="round"/></svg>
-                </button>
-                <button
-                  onClick={(e) => { e.stopPropagation(); void handleDelete(c); }}
-                  className="p-1 rounded hover:bg-red-50 text-[var(--twilio-gray-60)] hover:text-red-500 transition-colors"
-                  title="Delete"
-                >
-                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-3 h-3"><path d="M2 4h12M5 4V2h6v2M6 7v5M10 7v5M3 4l1 9h8l1-9" strokeLinecap="round" strokeLinejoin="round"/></svg>
-                </button>
-              </div>
-              <svg viewBox="0 0 10 6" fill="none" stroke="currentColor" strokeWidth="1.5" className={`w-3 h-3 shrink-0 text-[var(--twilio-gray-60)] transition-transform ${isOpen ? "rotate-180" : ""}`}><path d="M1 1l4 4 4-4" strokeLinecap="round" strokeLinejoin="round"/></svg>
-            </div>
-
-            {isOpen && (
-              <div className="px-4 pb-3 space-y-2" style={{ background: "#f9fafb" }}>
-                {c.description && (
-                  <p className="text-[11px] text-[var(--twilio-navy)] opacity-70 leading-relaxed">{c.description}</p>
-                )}
-                {c.email && (
-                  <a href={`mailto:${c.email}`} className="text-[11px] text-indigo-600 hover:underline">{c.email}</a>
-                )}
-                <div>
-                  <p className="text-[10px] font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide mb-1.5">Notes</p>
-                  <div className="flex gap-2 mb-1.5">
-                    <input
-                      value={noteDraft[c.id] ?? ""}
-                      onChange={(e) => setNoteDraft((d) => ({ ...d, [c.id]: e.target.value }))}
-                      onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void handleAddNote(c.id); } }}
-                      placeholder="Add a note…"
-                      className="flex-1 rounded border border-gray-200 bg-white px-2 py-1 text-[11px] text-[var(--twilio-navy)] placeholder:text-gray-400 focus:border-indigo-300 focus:outline-none"
-                    />
-                    {(noteDraft[c.id] ?? "").trim() && (
-                      <button
-                        onClick={() => void handleAddNote(c.id)}
-                        className="text-[11px] font-medium text-indigo-600 hover:text-indigo-800 transition-colors shrink-0"
-                      >Add</button>
-                    )}
-                  </div>
-                  {c.notes.length > 0 ? (
-                    <ul className="space-y-1">
-                      {c.notes.map((n) => (
-                        <ContactNoteRow
-                          key={n.id}
-                          note={n}
-                          size="xs"
-                          onSave={(noteId, content) => handleUpdateNote(c.id, noteId, content)}
-                          onDelete={(noteId) => void handleDeleteNote(c.id, noteId)}
-                        />
-                      ))}
-                    </ul>
-                  ) : (
-                    <p className="text-[10px] text-gray-400 italic">No notes yet.</p>
-                  )}
-                </div>
-              </div>
-            )}
-          </div>
-        );
-      })}
     </div>
   );
 }
@@ -5493,8 +5236,6 @@ export default function AccountDetailPage() {
   const [loading, setLoading] = useState(true);
   const [editOpen, setEditOpen] = useState(false);
   const [panel, setPanel] = useState<PanelItem | null>(null);
-  const [newNote, setNewNote] = useState("");
-  const [savingNote, setSavingNote] = useState(false);
   const [goals, setGoals] = useState<GoalSection[]>([]);
   const [goalsLoaded, setGoalsLoaded] = useState(false);
   const prevGoalsRef = useRef<GoalSection[]>([]);
@@ -5507,7 +5248,8 @@ export default function AccountDetailPage() {
   >({ stage: "idle" });
   const [noteDragOverSection, setNoteDragOverSection] = useState<"actions" | "reminders" | "artifacts" | null>(null);
   const [kanbanDragOverCol, setKanbanDragOverCol] = useState<string | null>(null);
-  const noteRef = useRef<HTMLTextAreaElement>(null);
+  const [kanbanMemberFilter, setKanbanMemberFilter] = useState<Set<string>>(new Set());
+  const [kanbanViewMode, setKanbanViewMode] = useState<"all" | "unassigned" | "before_next">("all");
   const pageRef = useRef<HTMLDivElement>(null);
   useLogGlow(pageRef);
 
@@ -5651,18 +5393,6 @@ export default function AccountDetailPage() {
     } catch { /* best effort */ }
   }
 
-  async function handleAddNote() {
-    if (!newNote.trim() || !account) return;
-    setSavingNote(true);
-    try {
-      const { data } = await accountsApi.createNote(account.id, newNote.trim());
-      setNotes((prev) => [data, ...prev]);
-      setNewNote("");
-    } finally {
-      setSavingNote(false);
-    }
-  }
-
   async function handleDeleteNote(noteId: number) {
     setNotes((prev) => prev.filter((n) => n.id !== noteId));
     await accountsApi.deleteNote(noteId);
@@ -5687,7 +5417,7 @@ export default function AccountDetailPage() {
     setAccountReminders((prev) => prev.map((r) => r.id === id ? { ...r, status: "dismissed" as const } : r));
   }
 
-  async function handleAddMeetingReminder(calendarEventId: number, accountId: number, calTitle: string) {
+  async function handleAddMeetingReminder(calendarEventId: number, _accountId: number, calTitle: string) {
     return async (due_at: string, title: string) => {
       const { data } = await schedulerApi.createReminder({
         title,
@@ -6149,6 +5879,7 @@ export default function AccountDetailPage() {
 
         {/* Action Items — status columns */}
         <div
+          data-testid="action-items-section"
           className="rounded-lg px-4 py-4"
           style={{
             background: "var(--surface, #fff)",
@@ -6160,14 +5891,80 @@ export default function AccountDetailPage() {
           onDragLeave={() => setNoteDragOverSection(null)}
           onDrop={(e) => { void handleNoteDropOnActions(e); }}
         >
-          <p className="text-xs font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide mb-3">
+          <p className="text-xs font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide mb-1">
             Action Items
             <span className="ml-2 text-[10px] font-normal normal-case" style={{ color: "var(--twilio-gray-60)" }}>
               {actionItems.length > 0 ? "drag to goals or timeline · drag a note here" : "drag a note here to create one"}
             </span>
           </p>
+          {/* Kanban view selector bar */}
+          {(() => {
+            const today = new Date().toISOString().slice(0, 10);
+            const nextFutureMeeting = meetings
+              .filter((m): m is typeof m & { date: string } => m.date !== null && m.date >= today)
+              .sort((a, b) => a.date.localeCompare(b.date))[0];
+            const activeMembers = kanbanMemberFilter.size > 0 ? kanbanMemberFilter : null;
+            return (
+              <div data-testid="kanban-view-bar" className="flex flex-wrap gap-1 mb-3 mt-1">
+                <button
+                  className={`px-2 py-0.5 rounded text-xs font-medium ${activeMembers === null && kanbanViewMode === "all" ? "bg-indigo-600 text-white" : "bg-gray-100 text-gray-600 hover:bg-gray-200"}`}
+                  onClick={() => { setKanbanViewMode("all"); setKanbanMemberFilter(new Set()); }}
+                >All</button>
+                <button
+                  className={`px-2 py-0.5 rounded text-xs font-medium ${activeMembers === null && kanbanViewMode === "unassigned" ? "bg-indigo-600 text-white" : "bg-gray-100 text-gray-600 hover:bg-gray-200"}`}
+                  onClick={() => { setKanbanViewMode("unassigned"); setKanbanMemberFilter(new Set()); }}
+                >Unassigned</button>
+                {nextFutureMeeting && (
+                  <button
+                    className={`px-2 py-0.5 rounded text-xs font-medium ${activeMembers === null && kanbanViewMode === "before_next" ? "bg-indigo-600 text-white" : "bg-gray-100 text-gray-600 hover:bg-gray-200"}`}
+                    onClick={() => { setKanbanViewMode("before_next"); setKanbanMemberFilter(new Set()); }}
+                  >Before Next Meeting</button>
+                )}
+                {internalMembers.map(m => (
+                  <button
+                    key={m.id}
+                    className={`px-2 py-0.5 rounded text-xs font-medium ${activeMembers?.has(m.full_name) ? "bg-indigo-600 text-white" : "bg-gray-100 text-gray-600 hover:bg-gray-200"}`}
+                    onClick={() => {
+                      setKanbanViewMode("all");
+                      setKanbanMemberFilter(prev => {
+                        const next = new Set(prev);
+                        if (next.has(m.full_name)) next.delete(m.full_name);
+                        else next.add(m.full_name);
+                        return next;
+                      });
+                    }}
+                  >{m.full_name}</button>
+                ))}
+              </div>
+            );
+          })()}
           {/* Status columns — responsive grid */}
           {((): React.ReactNode => {
+            const today = new Date().toISOString().slice(0, 10);
+            const nextFutureMeeting = meetings
+              .filter((m): m is typeof m & { date: string } => m.date !== null && m.date >= today)
+              .sort((a, b) => a.date.localeCompare(b.date))[0];
+            const kanbanItems = (() => {
+              if (kanbanMemberFilter.size > 0) return actionItems.filter(i => kanbanMemberFilter.has(i.assignee_name ?? ""));
+              if (kanbanViewMode === "unassigned") return actionItems.filter(i => !i.assignee_name);
+              return actionItems;
+            })();
+            if (kanbanViewMode === "before_next" && kanbanMemberFilter.size === 0 && nextFutureMeeting) {
+              const beforeItems = actionItems.filter(i => i.due_date && i.due_date <= nextFutureMeeting.date);
+              const otherItems = actionItems.filter(i => !i.due_date || i.due_date > nextFutureMeeting.date);
+              return (
+                <div className="space-y-4">
+                  <div>
+                    <p className="text-xs font-medium text-indigo-700 mb-2">Due on or before: {nextFutureMeeting.name}</p>
+                    <div className="text-xs text-gray-400">{beforeItems.length} item{beforeItems.length !== 1 ? "s" : ""}</div>
+                  </div>
+                  <div>
+                    <p className="text-xs font-medium text-gray-500 mb-2">Other items</p>
+                    <div className="text-xs text-gray-400">{otherItems.length} item{otherItems.length !== 1 ? "s" : ""}</div>
+                  </div>
+                </div>
+              );
+            }
             const KANBAN_COL_STYLE: Record<string, { header: string; dot: string; bg: string; dropBg: string }> = {
               "Open":        { header: "text-gray-500",    dot: "bg-gray-400",    bg: "bg-gray-50",       dropBg: "bg-gray-100" },
               "In Progress": { header: "text-indigo-600",  dot: "bg-indigo-500",  bg: "bg-indigo-50/50",  dropBg: "bg-indigo-100/60" },
@@ -6194,7 +5991,7 @@ export default function AccountDetailPage() {
             return (
               <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(200px, 1fr)) minmax(200px, 1fr) minmax(252px, auto)", gap: "10px", alignItems: "start" }}>
                 {(["Open", "In Progress", "Done"] as const).map((status) => {
-                  const colItems = actionItems.filter((i) => i.status === status);
+                  const colItems = kanbanItems.filter((i) => i.status === status);
                   const { header, dot, bg, dropBg } = KANBAN_COL_STYLE[status];
                   const isOver = kanbanDragOverCol === status;
                   return (
@@ -6241,7 +6038,7 @@ export default function AccountDetailPage() {
                 {/* Blocked + Backlogged share one column, stacked */}
                 <div className="flex flex-col gap-0" style={{ minHeight: 80 }}>
                   {(["Blocked", "Backlogged"] as const).map((status, i) => {
-                    const colItems = actionItems.filter((item) => item.status === status);
+                    const colItems = kanbanItems.filter((item) => item.status === status);
                     const { header, dot, bg, dropBg } = KANBAN_COL_STYLE[status];
                     const isOver = kanbanDragOverCol === status;
                     return (

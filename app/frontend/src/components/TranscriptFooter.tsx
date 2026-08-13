@@ -9,7 +9,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
-import { agentApi, skillsApi } from "../lib/api";
+import { skillsApi } from "../lib/api";
 import { fmtBytes } from "twilio-agent-pm-shared";
 import type { ClaudeSkill } from "../types";
 import VoiceButton, { type VoiceTurn } from "./VoiceButton";

@@ -16,8 +16,8 @@ from realtime.sync import publish_activity_event
 from scheduler.models import Reminder
 from scheduler.serializers import ActionItemSerializer, CalendarEventSerializer, ReminderSerializer
 
-from .models import Account, AccountArtifact, AccountNote, AccountProject, AccountQuickLink, CustomerContact, CustomerContactNote
-from .serializers import AccountArtifactSerializer, AccountNoteSerializer, AccountProjectSerializer, AccountQuickLinkSerializer, AccountSerializer, CustomerContactNoteSerializer, CustomerContactSerializer
+from .models import Account, AccountArtifact, AccountNote, AccountProject, AccountQuickLink, AccountRole, CustomerContact, CustomerContactNote
+from .serializers import AccountArtifactSerializer, AccountNoteSerializer, AccountProjectSerializer, AccountQuickLinkSerializer, AccountRoleSerializer, AccountSerializer, CustomerContactNoteSerializer, CustomerContactSerializer
 
 logger = logging.getLogger(__name__)
 
@@ -706,3 +706,32 @@ class AccountProjectViewSet(viewsets.ModelViewSet):
         target = serializer.validated_data.get("account") or serializer.instance.account
         self._require_account_membership(target)
         serializer.save()
+
+
+class AccountRoleViewSet(
+    mixins.ListModelMixin,
+    mixins.CreateModelMixin,
+    mixins.DestroyModelMixin,
+    viewsets.GenericViewSet,
+):
+    """CRUD for AccountRole — staff only for create/delete, all auth'd users can list their own."""
+    serializer_class = AccountRoleSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        if _staff_sees_all(user):
+            return AccountRole.objects.select_related("user", "account", "assigned_by").all()
+        return AccountRole.objects.select_related("user", "account", "assigned_by").filter(user=user)
+
+    def perform_create(self, serializer):
+        if not _staff_sees_all(self.request.user):
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("Only staff can assign account roles.")
+        serializer.save(assigned_by=self.request.user)
+
+    def destroy(self, request, *args, **kwargs):
+        if not _staff_sees_all(request.user):
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("Only staff can remove account roles.")
+        return super().destroy(request, *args, **kwargs)

@@ -166,13 +166,14 @@ function renderContent(
   _refs: Comment["references"],
   _navigate: ReturnType<typeof useNavigate>
 ): React.ReactNode {
-  // Highlight @mentions
-  const parts = content.split(/(@\w+)/g);
-  return parts.map((part, i) =>
-    part.startsWith("@")
-      ? <span key={i} className="text-indigo-600 font-medium">{part}</span>
-      : part
-  );
+  const parts = content.split(/(https?:\/\/[^\s)>\]]+|@\w+)/g);
+  return parts.map((part, i) => {
+    if (part.match(/^https?:\/\//))
+      return <a key={i} href={part} target="_blank" rel="noopener noreferrer" className="text-indigo-600 underline">{part}</a>;
+    if (part.startsWith("@"))
+      return <span key={i} className="text-indigo-600 font-medium">{part}</span>;
+    return part;
+  });
 }
 
 export default function CommentPanel({ resourceType, resourceId, resourceLabel, onClose }: Props) {

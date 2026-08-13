@@ -173,10 +173,22 @@ class AccountArtifact(models.Model):
 
 class AccountProject(models.Model):
     """A project/initiative belonging to an account, created and tracked in-app."""
+    KIND_CHOICES = [
+        ("project", "Project"),
+        ("goal", "Goal"),
+    ]
+
     account = models.ForeignKey(Account, on_delete=models.CASCADE, related_name="projects")
     name = models.CharField(max_length=512)
     description = models.TextField(blank=True, default="")
     position = models.PositiveSmallIntegerField(default=0)
+    url = models.CharField(max_length=2048, blank=True, default="")
+    action_ids = models.JSONField(default=list)
+    meeting_ids = models.JSONField(default=list)
+    goal_ids = models.JSONField(default=list)
+    resources = models.JSONField(default=list)
+    sf_data = models.JSONField(blank=True, default=dict)
+    kind = models.CharField(max_length=20, choices=KIND_CHOICES, default="project")
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -184,3 +196,34 @@ class AccountProject(models.Model):
 
     def __str__(self):
         return f"{self.name} ({self.account.company_name})"
+
+
+class AccountRole(models.Model):
+    """A user's role on a specific account (e.g. sync_reviewer, account_owner)."""
+    ROLE_CHOICES = [
+        ("sync_reviewer", "Sync Reviewer"),
+        ("account_owner", "Account Owner"),
+    ]
+
+    user = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name="account_roles"
+    )
+    account = models.ForeignKey(
+        Account, on_delete=models.CASCADE, related_name="account_roles"
+    )
+    role = models.CharField(max_length=32, choices=ROLE_CHOICES)
+    assigned_by = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="assigned_account_roles",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["account", "role"]
+        unique_together = [("user", "account", "role")]
+
+    def __str__(self):
+        return f"{self.user} — {self.role} on {self.account}"

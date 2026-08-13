@@ -71,35 +71,22 @@ class VoiceTwiMLView(TwilioSignatureRequiredMixin, APIView):
     """
     TwiML endpoint called by Twilio when a browser-initiated call connects.
 
-    Returns a ConversationRelay instruction that bridges the call audio to our
-    WebSocket consumer at ws://<host>/ws/voice-relay/. The consumer handles
-    transcription events from Twilio and responds with Claude-generated text
-    that Twilio converts to speech.
+    Returns <Connect><ConversationRelay> which hands the call to our WebSocket
+    consumer at /ws/voice-relay/ for real-time Claude Bedrock conversation.
     """
 
     permission_classes = [AllowAny]
 
     def post(self, request):
-        import urllib.parse
-
+        scheme = "wss" if request.is_secure() else "ws"
+        host = request.get_host()
+        relay_url = f"{scheme}://{host}/ws/voice-relay/"
         response = VoiceResponse()
         connect = Connect()
-
-        # Build the WebSocket URL for this host. Twilio requires wss:// in prod;
-        # we derive the host from the request so it works with ngrok in dev.
-        host = request.get_host()
-        scheme = "wss" if request.is_secure() else "ws"
-        ws_url = f"{scheme}://{host}/ws/voice-relay/"
-
-        # Append the pre-shared VOICE_RELAY_TOKEN as a query param so the consumer
-        # accepts the incoming Twilio connection. Without this the consumer closes
-        # every socket with 4001 whenever VOICE_RELAY_TOKEN is configured.
-        relay_token = getattr(settings, "VOICE_RELAY_TOKEN", "")
-        if relay_token:
-            ws_url = f"{ws_url}?relay_token={urllib.parse.quote(relay_token, safe='')}"
-
-        relay = ConversationRelay(url=ws_url, welcomeGreeting="Hello, I'm Agent PM. How can I help?")
-        connect.append(relay)
+        connect.conversation_relay(
+            url=relay_url,
+            welcome_greeting="Hello, I'm Agent PM. How can I help you today?",
+        )
         response.append(connect)
         return HttpResponse(str(response), content_type="application/xml")
 

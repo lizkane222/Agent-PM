@@ -1,0 +1,13 @@
+# ── Editor / OS ───────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+
+# ── Claude Code local state (not for version control) ────────────────────────
+.claude/
+
+# ── Node (in case dependencies are ever installed at the repo root) ───────────
+node_modules/
+
+# ── Claude-generated scratch planning docs (not for version control) ─────────
+MIGRATION_PLAN_*.md

@@ -3,7 +3,7 @@
 from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
-from .views import AccountArtifactViewSet, AccountNoteViewSet, AccountProjectViewSet, AccountQuickLinkViewSet, AccountViewSet, AdminAccountView, CustomerContactNoteViewSet, CustomerContactViewSet
+from .views import AccountArtifactViewSet, AccountNoteViewSet, AccountProjectViewSet, AccountQuickLinkViewSet, AccountRoleViewSet, AccountViewSet, AdminAccountView, CustomerContactNoteViewSet, CustomerContactViewSet
 
 router = DefaultRouter()
 router.register("accounts", AccountViewSet, basename="account")
@@ -13,6 +13,7 @@ router.register("quick-links", AccountQuickLinkViewSet, basename="account-quick-
 router.register("contacts", CustomerContactViewSet, basename="customer-contact")
 router.register("contact-notes", CustomerContactNoteViewSet, basename="customer-contact-note")
 router.register("projects", AccountProjectViewSet, basename="account-project")
+router.register("roles", AccountRoleViewSet, basename="account-role")
 
 urlpatterns = [
     path("", include(router.urls)),

@@ -130,6 +130,7 @@ class CalendarEventMatchSerializer(serializers.Serializer):
 class ManualCategorizationSerializer(serializers.Serializer):
     event_uid = serializers.CharField()
     account_id = serializers.IntegerField(allow_null=True, required=False)
+    account_name = serializers.CharField(allow_blank=True, required=False, default="")
     categorization = serializers.CharField(allow_blank=True, default="")
 
 

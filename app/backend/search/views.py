@@ -81,7 +81,9 @@ def global_search(request):
                           "status", "priority"], term)
         ).select_related("account")
         if _allowed_airtable_ids is not None:
-            qs = qs.filter(account__airtable_id__in=_allowed_airtable_ids)
+            qs = qs.filter(
+                Q(account__isnull=True) | Q(account__airtable_id__in=_allowed_airtable_ids)
+            )
         qs = qs[:20]
         for obj in qs:
             results.append({
@@ -90,7 +92,7 @@ def global_search(request):
                 "id": obj.airtable_id,
                 "title": obj.task or "(Untitled)",
                 "detail": obj.task_details[:120] if obj.task_details else "",
-                "account": obj.account_name or "",
+                "account": (obj.account.name if obj.account_id else "") or "",
                 "meta": f"{obj.status} · {obj.priority}" + (f" · Due {obj.due_date}" if obj.due_date else ""),
                 "url": "/action-items",
                 "accent": "#6366f1",
@@ -116,7 +118,7 @@ def global_search(request):
                 "id": obj.airtable_id,
                 "title": obj.name or "(Untitled)",
                 "detail": (obj.expected_topics or obj.gong_notes or "")[:120],
-                "account": obj.account_name or "",
+                "account": (obj.account.name if obj.account_id else "") or "",
                 "meta": (f"Date {obj.date}" if obj.date else ""),
                 "url": "/calendar",
                 "accent": "#0ea5e9",
@@ -316,6 +318,30 @@ def global_search(request):
             })
     except Exception:
         logger.exception("search: skills section failed")
+
+    # ── Comments ──────────────────────────────────────────────────────────────
+    try:
+        from comments.models import Comment
+        qs = Comment.objects.filter(
+            author=user,
+            parent__isnull=True,
+        ).filter(
+            _icontains_q(["content", "resource_label"], term)
+        ).select_related("author")[:15]
+        for obj in qs:
+            results.append({
+                "type": "comment",
+                "type_label": "Comment",
+                "id": obj.id,
+                "title": obj.content[:80],
+                "detail": obj.content[:200],
+                "account": obj.resource_label or "",
+                "meta": obj.resource_type,
+                "url": f"/accounts/{obj.resource_id}" if obj.resource_type == "account" else f"/{obj.resource_type}s",
+                "accent": "#64748b",
+            })
+    except Exception:
+        logger.exception("search: comments section failed")
 
     # Sort: page_context type first, then by rough relevance score
     TYPE_ORDER = {

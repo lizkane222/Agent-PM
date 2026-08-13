@@ -2,9 +2,10 @@
  * SettingsPage — OAuth connections, Twilio config, and notification preferences.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { integrationsApi, teamApi } from "../lib/api";
+import { logout } from "../lib/auth";
 import SettingsIcon from "../assets/icons/Settings.svg?react";
 import { useNotificationDefaults } from "../context/NotificationDefaultsContext";
 import type { OAuthCredential, UserProfile } from "../types";
@@ -36,6 +37,7 @@ function ConnectionCard({
   onTest,
   provider,
   onDisconnected,
+  afterContent,
 }: {
   name: string;
   description: string;
@@ -46,6 +48,7 @@ function ConnectionCard({
   onTest?: () => Promise<{ label: string; ok: boolean; detail: string }>;
   provider?: string;
   onDisconnected?: () => void;
+  afterContent?: ReactNode;
 }) {
   const [testState, setTestState] = useState<"idle" | "running" | "pass" | "fail">("idle");
   const [testDetail, setTestDetail] = useState("");
@@ -155,6 +158,9 @@ function ConnectionCard({
       {disconnectError && (
         <p className="mt-2 text-xs rounded px-2 py-1 bg-red-50 text-red-700">{disconnectError}</p>
       )}
+      {afterContent && (
+        <div className="mt-3 border-t border-gray-50 pt-3">{afterContent}</div>
+      )}
     </div>
   );
 }
@@ -167,18 +173,22 @@ export default function SettingsPage() {
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [airtableSynced, setAirtableSynced] = useState(false);
   const [pushStatus, setPushStatus] = useState<"idle" | "requesting" | "registered" | "denied" | "unsupported">("idle");
+  const [gmailWatchState, setGmailWatchState] = useState<"idle" | "registering" | "success" | "error">("idle");
+  const [scraperStatus, setScraperStatus] = useState<{ confluence: boolean; jira: boolean; zendesk: boolean; gong: boolean; notion: boolean } | null>(null);
   const pushRegistered = useRef(false);
   const { defaults: notifDefaults, setDefaults: setNotifDefaults } = useNotificationDefaults();
 
   useEffect(() => {
     (async () => {
       try {
-        const [statusRes, profileRes] = await Promise.all([
+        const [statusRes, profileRes, scraperRes] = await Promise.all([
           integrationsApi.getStatus(),
           teamApi.getMyProfile(),
+          integrationsApi.getScraperStatus(),
         ]);
         setCredentials(statusRes.data.connected);
         setProfile(profileRes.data);
+        setScraperStatus(scraperRes.data);
         if (profileRes.data.push_subscription_active) {
           setPushStatus("registered");
           pushRegistered.current = true;
@@ -241,7 +251,7 @@ export default function SettingsPage() {
     }
   }, []);
 
-  const handleOAuthPopup = useCallback((provider: string, url: string) => {
+  const handleOAuthPopup = useCallback((_provider: string, url: string) => {
     const popup = window.open(url, "_blank");
     const poll = setInterval(async () => {
       if (popup?.closed) {
@@ -281,6 +291,23 @@ export default function SettingsPage() {
       setIsSavingProfile(false);
     }
   }, [profile]);
+
+  const handleGmailWatchRegister = useCallback(async () => {
+    setGmailWatchState("registering");
+    try {
+      await integrationsApi.registerGmailWatch();
+      setGmailWatchState("success");
+      setTimeout(() => setGmailWatchState("idle"), 4000);
+    } catch {
+      setGmailWatchState("error");
+      setTimeout(() => setGmailWatchState("idle"), 4000);
+    }
+  }, []);
+
+  const handleSignOut = useCallback(async () => {
+    await logout();
+    window.location.href = "/oidc/logout/";
+  }, []);
 
   const handlePushRegister = useCallback(async () => {
     if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
@@ -332,7 +359,7 @@ export default function SettingsPage() {
       // Subscribe to push
       const sub = await reg.pushManager.subscribe({
         userVisibleOnly: true,
-        applicationServerKey: _urlBase64ToUint8Array(vapid_public_key),
+        applicationServerKey: _urlBase64ToUint8Array(vapid_public_key) as BufferSource,
       });
 
       await teamApi.savePushSubscription(sub.toJSON());
@@ -356,11 +383,19 @@ export default function SettingsPage() {
 
   return (
     <div className="px-6 py-8 max-w-3xl mx-auto space-y-10">
-      <div>
-        <h1 className="text-3xl font-semibold text-[var(--twilio-navy)] flex items-center gap-2"><SettingsIcon width={24} height={24} style={{ flexShrink: 0 }} />Settings</h1>
-        <p className="text-sm text-[var(--twilio-navy)] mt-1">
-          Manage your integrations, profile, and notification preferences.
-        </p>
+      <div className="flex items-start justify-between">
+        <div>
+          <h1 className="text-3xl font-semibold text-[var(--twilio-navy)] flex items-center gap-2"><SettingsIcon width={24} height={24} style={{ flexShrink: 0 }} />Settings</h1>
+          <p className="text-sm text-[var(--twilio-navy)] mt-1">
+            Manage your integrations, profile, and notification preferences.
+          </p>
+        </div>
+        <button
+          onClick={() => void handleSignOut()}
+          className="rounded-md border border-gray-300 px-3 py-1.5 text-sm font-medium text-gray-600 hover:bg-gray-50"
+        >
+          Sign out
+        </button>
       </div>
 
       {/* Integrations */}
@@ -421,6 +456,25 @@ export default function SettingsPage() {
               }
               return { label: "Gmail test", ok: false, detail: data.error ?? "Unknown error" };
             }}
+            afterContent={
+              isConnected("gmail") ? (
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={() => void handleGmailWatchRegister()}
+                    disabled={gmailWatchState === "registering"}
+                    className="rounded-md border border-gray-300 px-3 py-1.5 text-sm font-medium text-gray-600 hover:bg-gray-50 disabled:opacity-50"
+                  >
+                    {gmailWatchState === "registering" ? "Registering…" : "Register Gmail watch"}
+                  </button>
+                  {gmailWatchState === "success" && (
+                    <span className="text-sm text-green-600 font-medium">Watch registered — new emails will be synced automatically.</span>
+                  )}
+                  {gmailWatchState === "error" && (
+                    <span className="text-sm text-red-600">Failed to register watch. Check that Celery is running.</span>
+                  )}
+                </div>
+              ) : undefined
+            }
           />
           <ConnectionCard
             name="Slack"
@@ -537,6 +591,31 @@ export default function SettingsPage() {
               }
             }}
           />
+        </div>
+      </section>
+
+      {/* Organization Data Sources */}
+      <section className="bg-white rounded-lg border border-gray-200 shadow-sm">
+        <div className="px-6 py-4 border-b border-gray-100">
+          <h2 className="text-sm font-semibold text-[var(--twilio-navy)]">Organization Data Sources</h2>
+          <p className="text-sm text-[var(--twilio-navy)] mt-0.5">
+            Server-side scrapers that index your organization's knowledge bases on a schedule.
+          </p>
+        </div>
+        <div className="px-6 py-2 divide-y divide-gray-100">
+          {(["confluence", "jira", "zendesk", "gong", "notion"] as const).map((key) => (
+            <div key={key} className="py-3 flex items-center justify-between">
+              <p className="text-sm font-medium text-[var(--twilio-navy)] capitalize">{key}</p>
+              {scraperStatus?.[key] ? (
+                <span className="inline-flex items-center gap-1.5 rounded-full bg-green-50 px-3 py-1 text-sm font-medium text-green-700">
+                  <span className="h-1.5 w-1.5 rounded-full bg-green-500" />
+                  Active
+                </span>
+              ) : (
+                <span className="text-sm text-[var(--twilio-gray-60)]">Token not configured</span>
+              )}
+            </div>
+          ))}
         </div>
       </section>
 

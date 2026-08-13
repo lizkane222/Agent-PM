@@ -1,6 +1,8 @@
 // Scheduler domain types — moved from types/index.ts in Pass 1.
 // types/index.ts re-exports these for backwards compat during transition.
 
+import type { EventCategory } from "./calendar";
+
 export type ReminderStatus = "pending" | "sent" | "dismissed" | "snoozed";
 export type ReminderResourceType = "account" | "calendar_event" | "action_item" | "task" | "general";
 
@@ -47,6 +49,7 @@ export interface CalendarEvent {
   meet_link: string;
   calendar_id: string;
   is_synced: boolean;
+  event_category?: EventCategory;
   agentpm_airtable_id: string;
   created_at: string;
   updated_at: string;

@@ -17,6 +17,7 @@ class VoiceSessionSerializer(serializers.ModelSerializer):
             "duration_seconds",
             "recording_url",
             "transcript",
+            "conversation_sid",
             "started_at",
             "ended_at",
             "created_at",

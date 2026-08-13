@@ -47,14 +47,15 @@ function InlineText({
     setEditing(false);
   }, [onChange]);
 
+  const TagEl = Tag as React.ElementType;
   return (
-    <Tag
+    <TagEl
       ref={ref as React.RefObject<never>}
       contentEditable={editing}
       suppressContentEditableWarning
       style={{ ...style, outline: editing ? "2px solid var(--twilio-blue)" : undefined, outlineOffset: 2, cursor: editing ? "text" : "default" }}
       className={className}
-      onDoubleClick={(e) => {
+      onDoubleClick={(e: React.SyntheticEvent) => {
         e.stopPropagation();
         setEditing(true);
         // place cursor at end after paint
@@ -71,7 +72,7 @@ function InlineText({
         });
       }}
       onBlur={commit}
-      onKeyDown={(e) => {
+      onKeyDown={(e: React.KeyboardEvent) => {
         if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); commit(); }
         if (e.key === "Escape") {
           // revert
@@ -82,10 +83,10 @@ function InlineText({
         e.stopPropagation();
       }}
       // prevent drag-start while editing
-      onPointerDown={(e) => { if (editing) e.stopPropagation(); }}
+      onPointerDown={(e: React.SyntheticEvent) => { if (editing) e.stopPropagation(); }}
     >
       {value}
-    </Tag>
+    </TagEl>
   );
 }
 

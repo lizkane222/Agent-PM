@@ -15,6 +15,15 @@ class CalendarEvent(models.Model):
         ("cancelled", "Cancelled"),
     ]
 
+    EVENT_CATEGORY_CHOICES = [
+        ("meeting", "Meeting"),
+        ("task", "Task"),
+        ("out_of_office", "Out of Office"),
+        ("focus_time", "Focus Time"),
+        ("working_location", "Working Location"),
+        ("appointment", "Appointment Schedule"),
+    ]
+
     owner = models.ForeignKey(
         User,
         on_delete=models.CASCADE,
@@ -42,6 +51,9 @@ class CalendarEvent(models.Model):
     meet_link = models.URLField(blank=True)
     calendar_id = models.CharField(max_length=255, default="primary")
     is_synced = models.BooleanField(default=False)
+    event_category = models.CharField(
+        max_length=30, choices=EVENT_CATEGORY_CHOICES, blank=True, default="meeting"
+    )
     # For events pushed from AgentPM (action items), stores the originating Airtable record ID
     agentpm_airtable_id = models.CharField(max_length=255, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)

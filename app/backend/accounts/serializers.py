@@ -2,7 +2,7 @@
 
 from rest_framework import serializers
 
-from .models import Account, AccountArtifact, AccountNote, AccountProject, AccountQuickLink, CustomerContact, CustomerContactNote
+from .models import Account, AccountArtifact, AccountNote, AccountProject, AccountQuickLink, AccountRole, CustomerContact, CustomerContactNote
 
 
 class AccountArtifactSerializer(serializers.ModelSerializer):
@@ -133,5 +133,16 @@ class CustomerContactSerializer(serializers.ModelSerializer):
 class AccountProjectSerializer(serializers.ModelSerializer):
     class Meta:
         model = AccountProject
-        fields = ["id", "account", "name", "description", "position", "created_at"]
+        fields = [
+            "id", "account", "name", "description", "position",
+            "url", "action_ids", "meeting_ids", "goal_ids", "resources",
+            "sf_data", "kind", "created_at",
+        ]
         read_only_fields = ["id", "created_at"]
+
+
+class AccountRoleSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AccountRole
+        fields = ["id", "user", "account", "role", "assigned_by", "created_at"]
+        read_only_fields = ["id", "assigned_by", "created_at"]

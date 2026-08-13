@@ -2,7 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { fileIcon, fmtBytes, dueDateGroup } from "twilio-agent-pm-shared";
 import { airtableApi, accountsApi, schedulerApi, teamApi, searchApi } from "../lib/api";
 import type { SearchResult } from "../lib/api";
-import { useRightClickComment, useCommentContext } from "../components/comments/CommentContext";
+import { useCommentContext } from "../components/comments/CommentContext";
 import type { ActionItemAttachment, ActionItemDependency, AirtableActionItem, AirtableAccount, CalendarEvent, TeamMember, UserProfile } from "../types";
 import { addLog } from "../lib/appLog";
 import { convertActionItemToEvent, restoreConversion } from "../hooks/useConvert";
@@ -38,6 +38,9 @@ function getLinkFaviconSrc(href: string): string | null {
   } catch { return null; }
 }
 import { useExport } from "../context/ExportContext";
+import { useExportTray } from "../hooks/useExportTray";
+import { useAppError } from "../context/AppErrorContext";
+import { ContextMenu, type ContextMenuItem } from "../components/action-items/ContextMenu";
 import ActivityLogSection from "../components/ActivityLogSection";
 
 // Unified account shape used in the kanban accounts zone.
@@ -84,7 +87,7 @@ function fmtTime(seconds: number): string {
 
 // ── Zones ─────────────────────────────────────────────────────────────────────
 
-type Zone = "unstaged" | "today" | "active" | "complete" | "accounts" | "done-accounts";
+type Zone = "unstaged" | "today" | "active" | "complete" | "accounts" | "done-accounts" | `done-accounts-${string}`;
 
 interface TimerState {
   running: boolean;
@@ -1425,6 +1428,9 @@ function KanbanCard({
   onTimerEdit,
   teamMembers = [],
   accounts = [],
+  focusMode,
+  focusPinnedIds,
+  onToggleFocusPin,
 }: {
   item: AirtableActionItem;
   zone: Zone;
@@ -1439,10 +1445,15 @@ function KanbanCard({
   onTimerEdit?: (seconds: number) => void;
   teamMembers?: TeamMember[];
   accounts?: KanbanAccount[];
+  focusMode?: boolean;
+  focusPinnedIds?: Set<string>;
+  onToggleFocusPin?: (id: string) => void;
 }) {
   const [form, setForm] = useState<Partial<AirtableActionItem>>({ ...item });
   const [saving, setSaving] = useState(false);
-  const { onContextMenu: onCommentContextMenu } = useRightClickComment("action_item", item.id, item.task);
+  const { openComments } = useCommentContext();
+  const { addToTray } = useExportTray();
+  const [ctxPos, setCtxPos] = useState<{ x: number; y: number } | null>(null);
 
   // Keep form in sync when item changes from outside (e.g. after a save or promotion),
   // but preserve unsaved user edits when only the account assignment changed (star action).
@@ -1473,12 +1484,6 @@ function KanbanCard({
   const elapsed = timer
     ? timer.elapsed + (timer.running && timer.startedAt ? Math.floor((Date.now() - timer.startedAt) / 1000) : 0)
     : 0;
-
-  async function handleSave() {
-    setSaving(true);
-    await onSave(form);
-    setSaving(false);
-  }
 
   const { status: statusOptions } = useActionItemFieldOptions();
   const isUnstaged = zone === "unstaged";
@@ -1677,6 +1682,23 @@ function KanbanCard({
             <ReminderButton item={item} onUpdated={onUpdated} />
           )}
           {onDelete && <DeleteButton onDelete={onDelete} />}
+          {focusMode && zone === "today" && !focusPinnedIds?.has(item.airtable_id) && (
+            <button
+              title="Pin to Focus"
+              onClick={(e) => { e.stopPropagation(); onToggleFocusPin?.(item.airtable_id); }}
+              className="shrink-0 text-[10px] text-violet-600 hover:text-violet-800 transition-colors"
+            >
+              📌
+            </button>
+          )}
+          {focusMode && zone === "today" && focusPinnedIds?.has(item.airtable_id) && (
+            <span
+              title="Pinned to Focus"
+              className="shrink-0 inline-flex items-center justify-center w-4 h-4 rounded-full bg-violet-500 text-white text-[8px]"
+            >
+              📌
+            </span>
+          )}
         </div>
 
         {/* Row 3: calendar occurrences spanning content columns */}
@@ -1797,12 +1819,22 @@ function KanbanCard({
     );
   }
 
+  const kanbanCtxItems: ContextMenuItem[] = [
+    { label: "Open details", onClick: () => onExpandClick() },
+    { label: "Mark as Done", onClick: () => void onSave({ status: "Done" }) },
+    { label: "Copy task name", onClick: () => { try { navigator.clipboard.writeText(item.task ?? ""); } catch { /* best effort */ } } },
+    { label: "Add comment", onClick: () => openComments({ resourceType: "action_item", resourceId: item.id, resourceLabel: item.task ?? "", x: ctxPos?.x ?? 0, y: ctxPos?.y ?? 0 }) },
+    { separator: true, label: "", onClick: () => {} },
+    { label: "→ Export tray", icon: <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5"><path d="M1 9v4h12V9"/><path d="M4.5 5.5 7 3l2.5 2.5"/><path d="M7 3v7"/></svg>, onClick: () => addToTray(item) },
+  ];
+
   return (
+    <>
     <div
       draggable
       onDragStart={handleDragStartWithGhost}
       onClick={(e) => { e.stopPropagation(); onExpandClick(); }}
-      onContextMenu={onCommentContextMenu}
+      onContextMenu={(e) => { e.preventDefault(); setCtxPos({ x: e.clientX, y: e.clientY }); }}
       className="rounded-lg shadow-blue-md cursor-grab active:cursor-grabbing select-none hover:shadow-blue-lg transition-all flex flex-col overflow-hidden"
       style={{ background: "#F4F4F6" }}
     >
@@ -1855,6 +1887,15 @@ function KanbanCard({
         <KanbanCardOccurrences airtableId={item.airtable_id} />
       </div>
     </div>
+    {ctxPos && (
+      <ContextMenu
+        x={ctxPos.x}
+        y={ctxPos.y}
+        items={kanbanCtxItems}
+        onClose={() => setCtxPos(null)}
+      />
+    )}
+    </>
   );
 }
 
@@ -1994,6 +2035,9 @@ function DropZone({
   onRestoreToViews,
   externalDragId,
   onExternalDropWithStatus,
+  focusMode,
+  focusPinnedIds,
+  onToggleFocusPin,
 }: {
   zone: Zone;
   label: string;
@@ -2036,6 +2080,9 @@ function DropZone({
   // The airtable_id being dragged from outside this zone (so status columns can accept external drops)
   externalDragId?: string | null;
   onExternalDropWithStatus?: (airtableId: string, status: AirtableActionItem["status"]) => void;
+  focusMode?: boolean;
+  focusPinnedIds?: Set<string>;
+  onToggleFocusPin?: (id: string) => void;
 }) {
   const isOver = dragOverZone === zone;
   const [accountView, setAccountView] = useState<"mine" | "team">("mine");
@@ -2156,7 +2203,7 @@ function DropZone({
         )}
         {currentView === "due" && (
           <div className="flex-1 p-4 overflow-auto">
-            <DueDateView items={viewItems} onExpand={onExpand} onDragStart={onDragStart} onDragEnd={onDragLeave} />
+            <DueDateView items={viewItems} onExpand={onExpand} onSave={onSaveFieldsOnly ?? onSave} onDragStart={onDragStart} onDragEnd={onDragLeave} />
           </div>
         )}
         {currentView === "projects" && (
@@ -2492,6 +2539,9 @@ function DropZone({
                 onTimerEdit={onTimerEdit ? (s) => onTimerEdit(item.airtable_id, s) : undefined}
                 teamMembers={teamMembers}
                 accounts={accounts}
+                focusMode={focusMode}
+                focusPinnedIds={focusPinnedIds}
+                onToggleFocusPin={onToggleFocusPin}
               />
             </div>
             );
@@ -2553,6 +2603,10 @@ function StatusBoardView({
   const [overCol, setOverCol] = useState<AirtableActionItem["status"] | null>(null);
   // Optimistic local status overrides so the move feels instant
   const [localStatus, setLocalStatus] = useState<Record<string, AirtableActionItem["status"]>>({});
+  const [ctxState, setCtxState] = useState<{ x: number; y: number; item: AirtableActionItem } | null>(null);
+  const { exportMode, toggleItem, isSelected } = useExport();
+  const { openComments } = useCommentContext();
+  const { addToTray } = useExportTray();
 
   function effectiveStatus(item: AirtableActionItem): AirtableActionItem["status"] {
     return localStatus[item.airtable_id] ?? item.status;
@@ -2581,6 +2635,7 @@ function StatusBoardView({
   }
 
   return (
+  <>
     <div className="flex gap-4 overflow-x-auto pb-2 flex-1" style={{ scrollbarWidth: "thin", alignItems: "stretch" }}>
       {STATUS_COLUMNS.map((col) => {
         const colItems = items.filter((i) => effectiveStatus(i) === col);
@@ -2606,8 +2661,16 @@ function StatusBoardView({
                   onDragStart={(e) => { e.dataTransfer.effectAllowed = "move"; setDragId(item.airtable_id); onOuterDragStart?.(e, item); }}
                   onDragEnd={() => { setDragId(null); setOverCol(null); onOuterDragEnd?.(); }}
                   onClick={() => onExpand(item)}
+                  onContextMenu={(e) => { e.preventDefault(); setCtxState({ x: e.clientX, y: e.clientY, item }); }}
                   className={`group flex items-start gap-2 px-2 py-3 cursor-grab active:cursor-grabbing hover:bg-gray-50 transition-colors border-b border-gray-100 last:border-b-0 select-none ${dragId === item.airtable_id ? "opacity-40" : ""}`}
+                  style={{ position: "relative" }}
                 >
+                  {exportMode && (
+                    <button
+                      onClick={(e) => { e.stopPropagation(); toggleItem({ id: `action_item:${item.airtable_id}`, type: "action_item", label: item.task || "Untitled", summary: `${item.status} · ${item.priority}`, content: `Action Item: ${item.task}`, accountName: item.account_name ?? undefined }); }}
+                      style={{ position: "absolute", inset: 0, zIndex: 10, background: isSelected(`action_item:${item.airtable_id}`) ? "rgba(99,102,241,0.15)" : "rgba(99,102,241,0.07)", border: "2px solid " + (isSelected(`action_item:${item.airtable_id}`) ? "#6366f1" : "transparent"), borderRadius: "inherit", cursor: "pointer" }}
+                    />
+                  )}
                   <div className="flex-1 min-w-0 flex flex-col gap-1.5">
                     <p className="text-sm text-[var(--twilio-navy)] leading-snug">
                       {item.task || <span className="italic opacity-40">Untitled</span>}
@@ -2676,8 +2739,16 @@ function StatusBoardView({
                     onDragStart={(e) => { e.dataTransfer.effectAllowed = "move"; setDragId(item.airtable_id); onOuterDragStart?.(e, item); }}
                     onDragEnd={() => { setDragId(null); setOverCol(null); onOuterDragEnd?.(); }}
                     onClick={() => onExpand(item)}
+                    onContextMenu={(e) => { e.preventDefault(); setCtxState({ x: e.clientX, y: e.clientY, item }); }}
                     className={`group flex items-start gap-2 px-2 py-3 cursor-grab active:cursor-grabbing hover:bg-gray-50 transition-colors border-b border-gray-100 last:border-b-0 select-none ${dragId === item.airtable_id ? "opacity-40" : ""}`}
+                    style={{ position: "relative" }}
                   >
+                    {exportMode && (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); toggleItem({ id: `action_item:${item.airtable_id}`, type: "action_item", label: item.task || "Untitled", summary: `${item.status} · ${item.priority}`, content: `Action Item: ${item.task}`, accountName: item.account_name ?? undefined }); }}
+                        style={{ position: "absolute", inset: 0, zIndex: 10, background: isSelected(`action_item:${item.airtable_id}`) ? "rgba(99,102,241,0.15)" : "rgba(99,102,241,0.07)", border: "2px solid " + (isSelected(`action_item:${item.airtable_id}`) ? "#6366f1" : "transparent"), borderRadius: "inherit", cursor: "pointer" }}
+                      />
+                    )}
                     <div className="flex-1 min-w-0 flex flex-col gap-1.5">
                       <p className="text-sm text-[var(--twilio-navy)] leading-snug">
                         {item.task || <span className="italic opacity-40">Untitled</span>}
@@ -2712,6 +2783,22 @@ function StatusBoardView({
         })}
       </div>
     </div>
+    {ctxState && (
+      <ContextMenu
+        x={ctxState.x}
+        y={ctxState.y}
+        items={[
+          { label: "Open details", onClick: () => onExpand(ctxState.item) },
+          { label: "Mark as Done", onClick: () => void onSave(ctxState.item, { status: "Done" }) },
+          { label: "Copy task name", onClick: () => { try { navigator.clipboard.writeText(ctxState.item.task ?? ""); } catch { /* best effort */ } } },
+          { label: "Add comment", onClick: () => openComments({ resourceType: "action_item", resourceId: ctxState.item.id, resourceLabel: ctxState.item.task ?? "", x: ctxState.x, y: ctxState.y }) },
+          { separator: true, label: "", onClick: () => {} },
+          { label: "→ Export tray", icon: <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5"><path d="M1 9v4h12V9"/><path d="M4.5 5.5 7 3l2.5 2.5"/><path d="M7 3v7"/></svg>, onClick: () => addToTray(ctxState.item) },
+        ]}
+        onClose={() => setCtxState(null)}
+      />
+    )}
+  </>
   );
 }
 
@@ -2730,14 +2817,20 @@ const DUE_GROUP_STYLES: Record<string, { badge: string; label: string }> = {
 function DueDateView({
   items,
   onExpand,
+  onSave,
   onDragStart,
   onDragEnd,
 }: {
   items: AirtableActionItem[];
   onExpand: (item: AirtableActionItem) => void;
+  onSave?: (item: AirtableActionItem, fields: Partial<AirtableActionItem>) => Promise<void>;
   onDragStart?: (e: React.DragEvent, item: AirtableActionItem) => void;
   onDragEnd?: () => void;
 }) {
+  const [ctxState, setCtxState] = useState<{ x: number; y: number; item: AirtableActionItem } | null>(null);
+  const { exportMode, toggleItem, isSelected } = useExport();
+  const { openComments } = useCommentContext();
+  const { addToTray } = useExportTray();
   const groups: Record<string, AirtableActionItem[]> = {};
   for (const g of DUE_GROUP_ORDER) groups[g] = [];
   for (const item of items) {
@@ -2755,6 +2848,7 @@ function DueDateView({
   }
 
   return (
+    <>
     <div className="flex flex-col gap-4">
       {DUE_GROUP_ORDER.filter((g) => groups[g].length > 0).map((group) => {
         const style = DUE_GROUP_STYLES[group];
@@ -2772,9 +2866,16 @@ function DueDateView({
                   onDragStart={(e) => { e.dataTransfer.effectAllowed = "move"; onDragStart?.(e, item); }}
                   onDragEnd={onDragEnd}
                   onClick={() => onExpand(item)}
+                  onContextMenu={(e) => { e.preventDefault(); setCtxState({ x: e.clientX, y: e.clientY, item }); }}
                   className="rounded-lg bg-[#F4F4F6] px-3 py-2.5 flex flex-col gap-1.5 cursor-grab active:cursor-grabbing hover:shadow-md transition-shadow shrink-0 select-none"
-                  style={{ width: 260, borderLeft: `3px solid ${PRIORITY_ACCENT[item.priority] ?? "#e5e7eb"}` }}
+                  style={{ width: 260, borderLeft: `3px solid ${PRIORITY_ACCENT[item.priority] ?? "#e5e7eb"}`, position: "relative" }}
                 >
+                  {exportMode && (
+                    <button
+                      onClick={(e) => { e.stopPropagation(); toggleItem({ id: `action_item:${item.airtable_id}`, type: "action_item", label: item.task || "Untitled", summary: `${item.status} · ${item.priority}`, content: `Action Item: ${item.task}`, accountName: item.account_name ?? undefined }); }}
+                      style={{ position: "absolute", inset: 0, zIndex: 10, background: isSelected(`action_item:${item.airtable_id}`) ? "rgba(99,102,241,0.15)" : "rgba(99,102,241,0.07)", border: "2px solid " + (isSelected(`action_item:${item.airtable_id}`) ? "#6366f1" : "transparent"), borderRadius: "inherit", cursor: "pointer" }}
+                    />
+                  )}
                   <p className="text-sm font-semibold text-[var(--twilio-navy)] leading-snug line-clamp-2">
                     {item.task || <span className="italic opacity-40">Untitled</span>}
                   </p>
@@ -2803,6 +2904,22 @@ function DueDateView({
         <p className="text-sm text-[var(--twilio-gray-60)] text-center py-12">No items match</p>
       )}
     </div>
+    {ctxState && (
+      <ContextMenu
+        x={ctxState.x}
+        y={ctxState.y}
+        items={[
+          { label: "Open details", onClick: () => onExpand(ctxState.item) },
+          { label: "Mark as Done", onClick: () => void onSave?.(ctxState.item, { status: "Done" }) },
+          { label: "Copy task name", onClick: () => { try { navigator.clipboard.writeText(ctxState.item.task ?? ""); } catch { /* best effort */ } } },
+          { label: "Add comment", onClick: () => openComments({ resourceType: "action_item", resourceId: ctxState.item.id, resourceLabel: ctxState.item.task ?? "", x: ctxState.x, y: ctxState.y }) },
+          { separator: true, label: "", onClick: () => {} },
+          { label: "→ Export tray", icon: <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5"><path d="M1 9v4h12V9"/><path d="M4.5 5.5 7 3l2.5 2.5"/><path d="M7 3v7"/></svg>, onClick: () => addToTray(ctxState.item) },
+        ]}
+        onClose={() => setCtxState(null)}
+      />
+    )}
+    </>
   );
 }
 
@@ -2923,11 +3040,26 @@ function ProjectsView({
 type PageView = "kanban" | "status" | "due" | "projects";
 
 export default function ActionItemsPage() {
+  const { reportError } = useAppError();
   const [allItems, setAllItems] = useState<AirtableActionItem[]>([]);
   const [accounts, setAccounts] = useState<KanbanAccount[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [pageView, setPageView] = useState<PageView>(() => (localStorage.getItem("actionItemsView") as PageView) ?? "kanban");
   const [search, setSearch] = useState("");
+
+  // Focus mode
+  const [focusMode, setFocusMode] = useState(() => localStorage.getItem("actionFocusMode") === "true");
+  const [focusPinnedIds, setFocusPinnedIds] = useState<Set<string>>(() => {
+    try { return new Set(JSON.parse(localStorage.getItem("actionFocusPins") ?? "[]")); } catch { return new Set(); }
+  });
+  function toggleFocusPin(id: string) {
+    setFocusPinnedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      localStorage.setItem("actionFocusPins", JSON.stringify([...next]));
+      return next;
+    });
+  }
 
   // Zone assignment: airtable_id → zone — persisted to localStorage
   const [zones, setZonesRaw] = useState<Record<string, Zone>>(() => {
@@ -2976,25 +3108,6 @@ export default function ActionItemsPage() {
   const [pinnedIds, setPinnedIds] = useState<Set<string>>(() => {
     try { return new Set(JSON.parse(localStorage.getItem("actionItemPinned") ?? "[]")); } catch { return new Set(); }
   });
-
-  // "Completed Today" — items completed on the current calendar day only
-  const todayKey = new Date().toDateString();
-  const [completedTodayIds, setCompletedTodayIds] = useState<Set<string>>(() => {
-    try {
-      const stored = JSON.parse(localStorage.getItem("actionItemCompletedToday") ?? "{}");
-      if (stored.date !== todayKey) return new Set(); // new day — reset
-      return new Set(stored.ids ?? []);
-    } catch { return new Set(); }
-  });
-
-  function recordCompletedToday(airtableId: string) {
-    setCompletedTodayIds((prev) => {
-      const next = new Set(prev);
-      next.add(airtableId);
-      localStorage.setItem("actionItemCompletedToday", JSON.stringify({ date: todayKey, ids: [...next] }));
-      return next;
-    });
-  }
 
   function handlePin(item: AirtableActionItem) {
     setPinnedIds((prev) => {
@@ -3082,6 +3195,8 @@ export default function ActionItemsPage() {
       reminder_id: null,
       reminder_due_at: null,
       reminder_status: null,
+      linked_meeting: null,
+      linked_meeting_name: null,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
       marked_done_at: null,
@@ -3384,11 +3499,6 @@ export default function ActionItemsPage() {
     setDragOverZone(null);
   }
 
-  // Called when a drag from any view ends (drop or cancel) to clean up outer state
-  function handleDragEnd() {
-    setDragId(null);
-    setDragOverZone(null);
-  }
 
 
   async function handleDrop(e: React.DragEvent, targetZoneArg: Zone, accountKey?: string) {
@@ -3662,6 +3772,7 @@ export default function ActionItemsPage() {
       });
       return data;
     } catch {
+      reportError("Failed to save action item");
       return null;
     } finally {
       promotingRef.current.delete(localId);
@@ -3761,7 +3872,7 @@ export default function ActionItemsPage() {
     if (airtableId.startsWith("local-")) return;
     try {
       await airtableApi.updateActionItemFields(airtableId, updated);
-    } catch { /* best effort */ }
+    } catch { reportError("Failed to save action item"); }
   }
 
   // ── Delete action item (log calendar + snapshot → remove from state → API) ───
@@ -4006,6 +4117,12 @@ export default function ActionItemsPage() {
         </div>
         <div className="flex items-center gap-3">
           <button
+            onClick={() => { setFocusMode(v => { const next = !v; localStorage.setItem("actionFocusMode", String(next)); return next; }); }}
+            className="px-3 py-1.5 text-sm font-medium rounded-lg border border-gray-200 bg-white text-[var(--twilio-navy)] hover:bg-gray-50 shadow-blue-sm"
+          >
+            {focusMode ? "Exit Focus" : "Focus"}
+          </button>
+          <button
             onClick={() => setShowLogs((v) => !v)}
             className="px-3 py-1.5 text-sm font-medium rounded-lg border border-gray-200 bg-white text-[var(--twilio-navy)] hover:bg-gray-50 shadow-blue-sm"
           >
@@ -4073,6 +4190,35 @@ export default function ActionItemsPage() {
           </div>
         )}
 
+        {/* Pinned In Progress section — visible only in focus mode */}
+        {focusMode && (
+          <div className="shrink-0 bg-violet-50 rounded-lg border border-violet-200 px-4 py-3">
+            <div className="flex items-center gap-2 mb-2">
+              <span className="text-sm font-semibold text-violet-800">Pinned In Progress</span>
+              <span className="text-xs text-violet-600">{focusPinnedIds.size} pinned</span>
+            </div>
+            {focusPinnedIds.size === 0 && (
+              <p className="text-xs text-violet-500">Pin items from Stage Today to track them here.</p>
+            )}
+            {Array.from(focusPinnedIds).map((id) => {
+              const pinnedItem = allItems.find((i) => i.airtable_id === id);
+              if (!pinnedItem) return null;
+              return (
+                <div key={id} className="flex items-center justify-between gap-2 py-1.5 border-t border-violet-200 first:border-t-0">
+                  <span className="text-sm text-violet-900 truncate">{pinnedItem.task || "Untitled"}</span>
+                  <button
+                    title="Unpin"
+                    onClick={() => toggleFocusPin(id)}
+                    className="shrink-0 text-xs text-violet-600 hover:text-violet-800 px-2 py-0.5 rounded border border-violet-300 hover:bg-violet-100 transition-colors"
+                  >
+                    Unpin
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
         {/* Kanban layout: flex column with two rows */}
         <div className="flex-1 flex flex-col gap-3 px-1 pb-1">
         {/* Row 1: Unstaged | Stage Today | In Progress — horizontally scrollable when viewport is narrow */}
@@ -4117,12 +4263,15 @@ export default function ActionItemsPage() {
           onUpdated={handleItemUpdated}
           className="flex-1"
           style={{ minWidth: "300px", ...(row1Height ? { height: row1Height } : {}) }}
+          focusMode={focusMode}
+          focusPinnedIds={focusPinnedIds}
+          onToggleFocusPin={toggleFocusPin}
         />
 
-        {/* In Progress — min-width so it always has room; grows to fill remaining space */}
+        {/* Currently Tracking — min-width so it always has room; grows to fill remaining space */}
         <DropZone
           zone="active"
-          label="In Progress"
+          label="Currently Tracking"
           description="Drag here to start tracking time"
           items={filteredItemsInZone("active")}
           timers={timers}

@@ -2,7 +2,7 @@
   "name": "agent-pm",
   "private": true,
   "scripts": {
-    "start-agent-pm": "pkill -f 'manage.py runserver' 2>/dev/null; pkill -f daphne 2>/dev/null; pkill -f 'vite' 2>/dev/null; sleep 1 && concurrently --names \"django,react\" --prefix-colors \"cyan,magenta\" \"cd backend && .venv/bin/daphne -b 0.0.0.0 -p 8000 core.asgi:application\" \"sleep 3 && cd frontend && npm run dev\"",
+    "start-agent-pm": "pkill -f 'manage.py runserver' 2>/dev/null; pkill -f daphne 2>/dev/null; pkill -f 'vite' 2>/dev/null; pkill -f 'ngrok' 2>/dev/null; sleep 1 && concurrently --names \"django,react,ngrok\" --prefix-colors \"cyan,magenta,yellow\" \"cd backend && .venv/bin/daphne -b 0.0.0.0 -p 8000 core.asgi:application\" \"sleep 3 && cd frontend && npm run dev\" \"ngrok http --url=untouched-roving-procurer.ngrok-free.dev 8000\"",
     "security-review": "claude --print --dangerously-skip-permissions -p \"$(cat ../.claude/commands/runSecurityReview.md)\""
   },
   "devDependencies": {

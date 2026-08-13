@@ -688,11 +688,11 @@ function AccountCardButton({
 export default function AccountsPage() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [members, setMembers] = useState<TeamMember[]>([]);
-  const [myProfile, setMyProfile] = useState<UserProfile | null>(null);
+  const [, setMyProfile] = useState<UserProfile | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
-  const [total, setTotal] = useState(0);
+  const [, setTotal] = useState(0);
   const navigate = useNavigate();
   const { exportMode, toggleItem, isSelected } = useExport();
   const [modal, setModal] = useState<Partial<Account> | null | "new">(null);
@@ -733,14 +733,7 @@ export default function AccountsPage() {
     teamApi.getMyProfile().then(({ data }) => setMyProfile(data)).catch(() => {});
   }, []);
 
-  // My TeamMember record — matched by user FK id
-  const myMemberId = myProfile
-    ? (members.find((m) => m.user === myProfile.id)?.id ?? null)
-    : null;
-
   const visibleAccounts = accounts;
-
-  const myFirstName = myProfile?.display_name?.split(" ")[0] ?? myProfile?.username ?? null;
 
   function notifyAccountsUpdated() {
     window.dispatchEvent(new StorageEvent("storage", { key: "accountsUpdated", newValue: Date.now().toString() }));

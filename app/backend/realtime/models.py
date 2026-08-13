@@ -31,6 +31,11 @@ class VoiceSession(models.Model):
     duration_seconds = models.PositiveIntegerField(default=0)
     recording_url = models.URLField(blank=True)
     transcript = models.TextField(blank=True)
+    conversation_sid = models.CharField(
+        max_length=34,
+        blank=True,
+        help_text="Twilio Conversations SID (CH…) linked to this call.",
+    )
     started_at = models.DateTimeField(null=True, blank=True)
     ended_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)

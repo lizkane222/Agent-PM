@@ -17,6 +17,18 @@ def vapid_public_key(request):
     return JsonResponse({"vapid_public_key": settings.VAPID_PUBLIC_KEY})
 
 
+def oidc_status(request):
+    """Return whether Okta OIDC is enabled so the frontend can show/hide the SSO button."""
+    return JsonResponse({"okta_enabled": bool(settings.OIDC_RP_CLIENT_ID)})
+
+
+def oidc_logout_fallback(request):
+    """Flush session and redirect to /login when Okta is not configured."""
+    request.session.flush()
+    from django.shortcuts import redirect
+    return redirect("/login")
+
+
 class LoginRateThrottle(AnonRateThrottle):
     """Strict per-IP throttle for the JWT login endpoint to prevent brute-force."""
     scope = "login"
@@ -55,8 +67,12 @@ urlpatterns = [
     # Django Admin (superadmins only — team data management, user assignment, health)
     path("admin/", admin.site.urls),
 
-    # Okta OIDC login/logout/callback
-    path("oidc/", include("mozilla_django_oidc.urls")),
+    # Okta OIDC — only mount mozilla_django_oidc routes when Okta is configured.
+    # When Okta is absent, mount a lightweight logout fallback so the frontend's
+    # window.location.href = "/oidc/logout/" doesn't 404.
+    *([path("oidc/", include("mozilla_django_oidc.urls"))] if os.environ.get("OKTA_CLIENT_ID") else []),
+    *([path("oidc/logout/", oidc_logout_fallback, name="oidc-logout-fallback")] if not os.environ.get("OKTA_CLIENT_ID") else []),
+    path("api/v1/auth/oidc-status/", oidc_status, name="oidc-status"),
 
     # OpenAPI schema + Swagger UI
     path("api/schema/", SpectacularAPIView.as_view(), name="schema"),
@@ -88,6 +104,8 @@ urlpatterns = [
     path("api/v1/comments/", include("comments.urls")),
     path("api/v1/discover/", include("discover.urls")),
     path("api/v1/feedback/", include("feedback.urls")),
+    path("api/v1/account-feed/", include("account_feed.urls")),
+    path("api/v1/sync-review/", include("sync_review.urls")),
 ]
 
 if settings.DEBUG:

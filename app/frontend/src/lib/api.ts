@@ -60,6 +60,8 @@ import type {
   WorkingSession,
   ExportItemSnapshot,
   UserPageNote,
+  AccountFeedConfig,
+  AccountFeedCustomField,
 } from "../types";
 import {
   clearTokens,
@@ -419,6 +421,19 @@ export const accountsApi = {
     apiClient.delete(`/accounts/projects/${id}/`),
 };
 
+export const accountFeedApi = {
+  getFeedConfig: (accountId: number) =>
+    apiClient.get<AccountFeedConfig>(`/account-feed/${accountId}/feed/`),
+  updateFeedConfig: (accountId: number, data: Partial<AccountFeedConfig>) =>
+    apiClient.put<AccountFeedConfig>(`/account-feed/${accountId}/feed/`, data),
+  createCustomField: (accountId: number, data: { name: string; value: string; airtable_field_type?: string }) =>
+    apiClient.post<AccountFeedCustomField>(`/account-feed/${accountId}/feed/custom-fields/`, data),
+  updateCustomField: (accountId: number, fieldId: number, data: Partial<AccountFeedCustomField>) =>
+    apiClient.patch<AccountFeedCustomField>(`/account-feed/${accountId}/feed/custom-fields/${fieldId}/`, data),
+  deleteCustomField: (accountId: number, fieldId: number) =>
+    apiClient.delete(`/account-feed/${accountId}/feed/custom-fields/${fieldId}/`),
+};
+
 export const salesforceApi = {
   status: () =>
     apiClient.get<SalesforceConnectionStatus>("/salesforce/status/"),
@@ -463,6 +478,7 @@ export const airtableApi = {
   categorizeEvent: (data: {
     event_uid: string;
     account_id?: number | null;
+    account_name?: string;
     categorization?: string;
   }) => apiClient.post<EventMatchResult>("/airtable/categorize/", data),
   getEventLink: (event_uid: string) =>
@@ -527,8 +543,8 @@ export const airtableApi = {
 
 export const realtimeApi = {
   getSyncToken: () => apiClient.get<SyncToken>("/realtime/sync-token/"),
-  listActivity: () =>
-    apiClient.get<PaginatedResponse<AgentActivityEvent>>("/realtime/activity/"),
+  listActivity: (params?: { event_type?: string; since?: string }) =>
+    apiClient.get<PaginatedResponse<AgentActivityEvent>>("/realtime/activity/", { params }),
   createActivity: (data: {
     event_type: string;
     title: string;
@@ -714,10 +730,18 @@ export interface GmailMessage {
   body: string;
 }
 
+export interface GmailCalendarSlot {
+  url: string;
+  label: string;
+}
+
 export interface GmailThread {
   id: string;
   subject: string;
   participants: string[];
+  all_participants?: string[];
+  responders?: string[];
+  is_invitation?: boolean;
   message_count: number;
   last_date: string;
   snippet: string;
@@ -726,6 +750,7 @@ export interface GmailThread {
   status: string;
   status_color: "red" | "amber" | "green" | "blue" | "gray";
   next_action: string;
+  calendar_slots?: GmailCalendarSlot[];
 }
 
 export const integrationsApi = {
@@ -733,12 +758,20 @@ export const integrationsApi = {
     apiClient.get<{ connected: OAuthCredential[]; sync_states: unknown[] }>(
       "/integrations/status/"
     ),
+  getScraperStatus: () =>
+    apiClient.get<{ confluence: boolean; jira: boolean; zendesk: boolean; gong: boolean; notion: boolean }>(
+      "/integrations/scraper-status/"
+    ),
   testGmail: () =>
     apiClient.get<{ ok: boolean; email?: string; messages_total?: number; scopes?: string[]; gmail_scope_granted?: boolean; error?: string }>(
       "/integrations/gmail/test/"
     ),
   getGmailThreads: (params: { account_domain?: string; account_name?: string; q?: string }) =>
     apiClient.get<{ threads: GmailThread[] }>("/integrations/gmail/threads/", { params }),
+  // NOTE: no backend route exists yet for this — the caller (ThreadCard, orphaned/unwired)
+  // is not reachable from any current page, so this is a type-level stub only.
+  summarizeThread: (data: { subject: string; messages: GmailMessage[]; all_participants: string[]; is_invitation: boolean }) =>
+    apiClient.post<Pick<GmailThread, "summary" | "status" | "status_color" | "next_action">>("/integrations/gmail/summarize-thread/", data),
   startGoogleConnect: () =>
     apiClient.get<{ authorization_url: string; state: string }>(
       "/integrations/google/connect/"
@@ -775,8 +808,39 @@ export const integrationsApi = {
     apiClient.get<{ authorization_url: string }>("/integrations/microsoft/connect/"),
   startGmailConnect: () =>
     apiClient.get<{ authorization_url: string }>("/integrations/gmail/connect/"),
+  registerGmailWatch: () =>
+    apiClient.post<{ detail: string }>("/integrations/gmail/watch/"),
   notifySlackMention: (slackHandle: string, message: string) =>
     apiClient.post<{ detail: string }>("/integrations/slack/notify-mention/", { slack_handle: slackHandle, message }),
   disconnect: (provider: string) =>
     apiClient.delete(`/integrations/oauth/${provider}/`),
+};
+
+import type { ActionItemStep, StepStatus } from "../types/action_items";
+export type { ActionItemStep, StepStatus };
+
+export const stepsApi = {
+  list: (actionItemId: number) =>
+    apiClient.get<ActionItemStep[]>("/airtable/steps/", { params: { action_item: actionItemId } }),
+  create: (data: { action_item: number; title: string; order: number }) =>
+    apiClient.post<ActionItemStep>("/airtable/steps/", data),
+  update: (id: number, data: Partial<ActionItemStep>) =>
+    apiClient.patch<ActionItemStep>(`/airtable/steps/${id}/`, data),
+  delete: (id: number) =>
+    apiClient.delete(`/airtable/steps/${id}/`),
+};
+
+import type { SyncReviewItem, SyncDeleteRequest } from "../types/sync_review";
+
+export const syncReviewApi = {
+  listItems: (params?: { status?: string }) =>
+    apiClient.get<{ count: number; results: SyncReviewItem[] }>("/sync-review/items/", { params }),
+  acceptItem: (id: number, accountId: number) =>
+    apiClient.patch<SyncReviewItem>(`/sync-review/items/${id}/accept/`, { account_id: accountId }),
+  rejectItem: (id: number) =>
+    apiClient.patch<SyncReviewItem>(`/sync-review/items/${id}/reject/`),
+  listDeleteRequests: (params?: { status?: string }) =>
+    apiClient.get<{ count: number; results: SyncDeleteRequest[] }>("/sync-review/delete-requests/", { params }),
+  resolveDeleteRequest: (id: number, decision: "approved" | "rejected") =>
+    apiClient.patch<SyncDeleteRequest>(`/sync-review/delete-requests/${id}/resolve/`, { decision }),
 };

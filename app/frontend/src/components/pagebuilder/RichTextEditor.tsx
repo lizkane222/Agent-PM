@@ -70,7 +70,7 @@ export default function RichTextEditor({ html, onChange, autoFocus }: Props) {
 
   useEffect(() => {
     if (editor && html !== editor.getHTML()) {
-      editor.commands.setContent(html, false);
+      editor.commands.setContent(html, { emitUpdate: false });
     }
   }, [html]);
 

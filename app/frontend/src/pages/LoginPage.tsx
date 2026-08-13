@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { login } from "../lib/auth";
 
@@ -8,6 +8,14 @@ export default function LoginPage() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [oktaEnabled, setOktaEnabled] = useState(false);
+
+  useEffect(() => {
+    fetch("/api/v1/auth/oidc-status/")
+      .then((r) => r.json())
+      .then((d: { okta_enabled?: boolean }) => { if (d.okta_enabled) setOktaEnabled(true); })
+      .catch(() => {});
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -29,8 +37,9 @@ export default function LoginPage() {
         <h1 className="text-3xl font-semibold text-[var(--twilio-navy)] mb-6">Sign in to Agent PM</h1>
         <form onSubmit={(e) => void handleSubmit(e)} className="space-y-4">
           <div>
-            <label className="block text-sm font-medium text-[var(--twilio-navy)] mb-1">Username or Email</label>
+            <label htmlFor="login-username" className="block text-sm font-medium text-[var(--twilio-navy)] mb-1">Username or Email</label>
             <input
+              id="login-username"
               type="text"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
@@ -41,8 +50,9 @@ export default function LoginPage() {
             />
           </div>
           <div>
-            <label className="block text-sm font-medium text-[var(--twilio-navy)] mb-1">Password</label>
+            <label htmlFor="login-password" className="block text-sm font-medium text-[var(--twilio-navy)] mb-1">Password</label>
             <input
+              id="login-password"
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
@@ -59,6 +69,16 @@ export default function LoginPage() {
             {loading ? "Signing in…" : "Sign in"}
           </button>
         </form>
+        {oktaEnabled && (
+          <div className="mt-4 text-center">
+            <a
+              href="/oidc/authenticate/"
+              className="text-sm text-indigo-600 hover:text-indigo-800 font-medium"
+            >
+              Sign in with Okta SSO
+            </a>
+          </div>
+        )}
       </div>
     </div>
   );

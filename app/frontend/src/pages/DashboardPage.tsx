@@ -43,17 +43,6 @@ function fmtDate(dt: string) {
   return new Date(dt).toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
-function fmtDateTime(dt: string) {
-  const d = new Date(dt);
-  const today = new Date();
-  const isToday = d.toDateString() === today.toDateString();
-  if (isToday) {
-    return d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-  }
-  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" }) + " · " +
-    d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-}
-
 function readZones(): Record<string, string> {
   try { return JSON.parse(localStorage.getItem("actionItemZones") ?? "{}"); } catch { return {}; }
 }
@@ -136,7 +125,6 @@ export default function DashboardPage() {
   const blockedItems = actionItems.filter((i) => i.status === "Blocked");
 
   // Reminders: split today vs overdue
-  const now = new Date();
   const todayMidnight = new Date(); todayMidnight.setHours(0, 0, 0, 0);
   const tomorrowMidnight = new Date(); tomorrowMidnight.setHours(23, 59, 59, 999);
 

@@ -91,99 +91,23 @@ export interface VoiceSession {
 
 // ── Customer Contacts ─────────────────────────────────────────────────────────
 
-export interface CustomerContactNote {
-  id: number;
-  contact: number;
-  author: number | null;
-  author_display: string;
-  content: string;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface CustomerContact {
-  id: number;
-  account: number;
-  name: string;
-  role: string;
-  description: string;
-  email: string;
-  airtable_id: string;
-  notes_count: number;
-  notes: CustomerContactNote[];
-  created_at: string;
-  updated_at: string;
-}
-
-// ── Accounts ─────────────────────────────────────────────────────────────────
-
-export interface AccountTeamMember {
-  id: number;
-  full_name: string;
-  title: string;
-  email: string;
-  avatar_url: string;
-  slack_handle: string;
-}
-
-export interface Account {
-  id: number;
-  company_name: string;
-  airtable_id: string;
-  website: string;
-  industry: string;
-  status: "prospect" | "active" | "inactive" | "churned";
-  arr: string | null;
-  owner: number | null;
-  owner_username: string | null;
-  primary_contact: number | null;
-  primary_contact_name: string | null;
-  team_members: AccountTeamMember[];
-  notes_count: number;
-  created_by: number | null;
-  is_admin_account: boolean;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface AccountNote {
-  id: number;
-  account: number;
-  author: number | null;
-  author_username: string | null;
-  author_display: string;
-  content: string;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface AccountQuickLink {
-  id: number;
-  account: number;
-  name: string;
-  url: string;
-  position: number;
-  created_by: number | null;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface AccountArtifact {
-  id: number;
-  account: number;
-  artifact_type: "link" | "file";
-  name: string;
-  url: string | null;
-  secondary_url: string;
-  icon_key: string;
-  file_url: string | null;
-  mime_type: string;
-  file_size: number | null;
-  uploaded_by: number | null;
-  uploaded_by_username: string | null;
-  created_at: string;
-  updated_at: string;
-}
+// ── Accounts (moved to types/accounts.ts — re-exported here for backwards compat) ────
+export type {
+  CustomerContactNote,
+  CustomerContact,
+  AccountTeamMember,
+  Account,
+  AccountNote,
+  AccountQuickLink,
+  AccountArtifact,
+  AccountProject,
+  GoalResource,
+  SalesforceProjectData,
+  GoalSection,
+  AccountRoleType,
+  AccountRole,
+  PanelItem,
+} from "./accounts";
 
 // ── Salesforce / Cloud Coach ──────────────────────────────────────────────────
 
@@ -249,15 +173,6 @@ export interface SalesforceProject {
   tasks: SalesforceTask[];
 }
 
-export interface AccountProject {
-  id: number;
-  account: number;
-  name: string;
-  description: string;
-  position: number;
-  created_at: string;
-}
-
 export interface LogTimeDayAssignment {
   id: number;
   date: string;
@@ -321,6 +236,7 @@ export interface ActionItemAttachment {
   artifact_type: "link" | "file";
   name: string;
   url: string | null;
+  icon_key?: string;
   file_url: string | null;
   mime_type: string;
   file_size: number | null;
@@ -383,7 +299,7 @@ export interface EventMatchResult {
 
 export interface OAuthCredential {
   id: number;
-  provider: "google" | "slack" | "airtable";
+  provider: "google" | "slack" | "airtable" | "salesforce" | "gong" | "zoom" | "lucidchart" | "github" | "google_drive" | "notion" | "microsoft" | "gmail";
   provider_display: string;
   scopes: string;
   is_active: boolean;
@@ -435,54 +351,17 @@ export interface PaginatedResponse<T> {
 
 // ── Comments ──────────────────────────────────────────────────────────────────
 
-export type CommentResourceType =
-  | "account"
-  | "airtable_account"
-  | "action_item"
-  | "meeting"
-  | "calendar_event"
-  | "reminder"
-  | "task"
-  | "account_note"
-  | "artifact"
-  | "meeting_note"
-  | "claude_skill";
-
-export interface CommentReference {
-  resource_type: CommentResourceType;
-  resource_id: number;
-  label: string;
-  url: string;
-}
-
-export interface CommentMention {
-  user_id: number;
-  username: string;
-  display_name: string;
-}
-
-export interface Comment {
-  id: number;
-  resource_type: CommentResourceType;
-  resource_id: number;
-  resource_label: string;
-  author: number | null;
-  author_username: string | null;
-  author_display: string;
-  content: string;
-  parent: number | null;
-  references: CommentReference[];
-  mentions: CommentMention[];
-  replies: Comment[];
-  created_at: string;
-  updated_at: string;
-}
+// ── Comments (moved to types/comments.ts — re-exported here for backwards compat) ────
+export type { CommentResourceType, CommentReference, CommentMention, Comment } from "./comments";
 
 // ── Feedback (moved to types/feedback.ts — re-exported here for backwards compat) ────
 export type { FeedbackStatus, FeedbackComment, FeedbackItem } from "./feedback";
 
 // ── Discover (moved to types/discover.ts — re-exported here for backwards compat) ────
 export type { DiscoverApplet, AppletCategory, ItemType, UrlStatus } from "./discover";
+
+// ── Action item steps ─────────────────────────────────────────────────────────
+export type { StepStatus, ActionItemStep } from "./action_items";
 
 // ── Page Layouts ──────────────────────────────────────────────────────────────
 
@@ -538,3 +417,21 @@ export interface UserPageNote {
   created_at: string;
   updated_at: string;
 }
+
+// ── Sync Review ───────────────────────────────────────────────────────────────
+export type {
+  SyncReviewSource,
+  SyncReviewContentType,
+  SyncReviewStatus,
+  SyncDeleteRequestStatus,
+  SyncReviewItem,
+  SyncDeleteRequest,
+} from "./sync_review";
+
+// ── Account Feed ──────────────────────────────────────────────────────────────
+export type {
+  AirtableFieldType,
+  AirtableFieldTypeChoice,
+  AccountFeedCustomField,
+  AccountFeedConfig,
+} from "./account_feed";

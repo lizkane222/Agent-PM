@@ -29,6 +29,7 @@ class CalendarEventSerializer(serializers.ModelSerializer):
             "meet_link",
             "calendar_id",
             "is_synced",
+            "event_category",
             "agentpm_airtable_id",
             "created_at",
             "updated_at",

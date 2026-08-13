@@ -19,7 +19,7 @@ import {
   userPageNoteApi, workingSessionApi,
 } from "../lib/api";
 import type {
-  AgentSkill, ClaudeSkill, Account, AccountArtifact, TeamMember,
+  AgentSkill, ClaudeSkill, Account, AccountArtifact,
   ActionItem, Reminder, Comment, PageLayout,
   UserPageNote, WorkingSession, ExportItemSnapshot,
 } from "../types";
@@ -365,6 +365,7 @@ interface MiniNode {
   type: string;
   icon: string;
   label: string;
+  text?: string;
   x: number;
   y: number;
   w: number;
@@ -1535,10 +1536,6 @@ function WorkingSessionsArea({
     const el = document.querySelector("[data-session-adder]") as (HTMLDivElement & { __addRef?: typeof addRef }) | null;
     if (el) el.__addRef = addRef;
   }, [addRef]);
-
-  const currentRefs: AnnotatedRef[] = activeId === "scratch"
-    ? scratchRefs
-    : (activeSession?.record_refs as AnnotatedRef[] ?? []);
 
   return (
     <div style={{

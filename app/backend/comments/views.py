@@ -64,8 +64,10 @@ def _user_can_see_resource(user, resource_type: str, resource_id) -> bool:
                     id=rid, account__airtable_id__in=allowed_airtable_ids,
                 ).exists()
             if resource_type == "meeting":
+                from django.db.models import Q as _Q
                 return AirtableMeeting.objects.filter(
-                    id=rid, account__airtable_id__in=allowed_airtable_ids,
+                    _Q(id=rid, account__isnull=True) |
+                    _Q(id=rid, account__airtable_id__in=allowed_airtable_ids)
                 ).exists()
 
         if resource_type == "calendar_event":
@@ -91,6 +93,32 @@ def _user_can_see_resource(user, resource_type: str, resource_id) -> bool:
     except Exception:
         return False
     return False
+
+
+def _notify_reply_author(replier, parent_comment, reply):
+    """Create an AgentActivityEvent for the parent comment's author when someone replies.
+
+    Idempotent: keyed on client_id=f"reply-{reply.id}" so double calls are safe.
+    Skipped when the replier is replying to their own comment.
+    """
+    if parent_comment.author is None or parent_comment.author == replier:
+        return
+    from realtime.models import AgentActivityEvent
+    client_id = f"reply-{reply.id}"
+    if AgentActivityEvent.objects.filter(client_id=client_id).exists():
+        return
+    AgentActivityEvent.objects.create(
+        user=parent_comment.author,
+        event_type="comment_reply",
+        title=f"{replier.username} replied to your comment on {parent_comment.resource_label}",
+        detail=reply.content[:500],
+        metadata={
+            "resource_type": parent_comment.resource_type,
+            "resource_id": parent_comment.resource_id,
+            "reply_id": reply.id,
+        },
+        client_id=client_id,
+    )
 
 
 class CommentViewSet(viewsets.ModelViewSet):
@@ -124,7 +152,9 @@ class CommentViewSet(viewsets.ModelViewSet):
             raise ValidationError("Reply resource must match parent comment resource.")
         if not _user_can_see_resource(self.request.user, resource_type, resource_id):
             raise PermissionDenied("You cannot comment on this resource.")
-        serializer.save(author=self.request.user)
+        comment = serializer.save(author=self.request.user)
+        if parent:
+            _notify_reply_author(self.request.user, parent, comment)
 
     def perform_update(self, serializer):
         comment = self.get_object()

@@ -1555,3 +1555,512 @@ class SlackNotifyMentionView(APIView):
             logger.exception("SlackNotifyMention: failed to send DM to @%s", slack_handle)
             return Response({"detail": "Slack notification failed — continuing."})
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Atlassian OAuth (Confluence + JIRA — per-user)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ATLASSIAN_TOKEN_URL = "https://auth.atlassian.com/oauth/token"
+_ATLASSIAN_RESOURCES_URL = "https://api.atlassian.com/oauth/token/accessible-resources"
+
+
+def _atlassian_init(request, client_id_setting, redirect_uri_setting, scope, state_salt):
+    """Shared helper for Confluence and JIRA OAuth init."""
+    if not getattr(settings, client_id_setting, ""):
+        return Response(
+            {"detail": f"{client_id_setting} is not configured."},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    from django.core import signing
+    from urllib.parse import urlencode
+
+    state = signing.dumps({"uid": request.user.pk}, salt=state_salt)
+    params = {
+        "audience": "api.atlassian.com",
+        "client_id": getattr(settings, client_id_setting),
+        "scope": scope,
+        "redirect_uri": getattr(settings, redirect_uri_setting),
+        "state": state,
+        "response_type": "code",
+        "prompt": "consent",
+    }
+    auth_url = "https://auth.atlassian.com/authorize?" + urlencode(params)
+    return Response({"authorization_url": auth_url})
+
+
+def _atlassian_callback(request, client_id_setting, client_secret_setting,
+                        redirect_uri_setting, provider, state_salt, config_updater=None):
+    """Shared helper for Confluence and JIRA OAuth callback."""
+    code = request.query_params.get("code")
+    raw_state = request.query_params.get("state", "")
+
+    if not code:
+        return Response({"detail": "Missing code."}, status=status.HTTP_400_BAD_REQUEST)
+
+    from django.core import signing
+    from django.contrib.auth import get_user_model
+    _User = get_user_model()
+
+    try:
+        payload = signing.loads(raw_state, salt=state_salt, max_age=600)
+        user = _User.objects.get(pk=payload["uid"])
+    except Exception as exc:
+        logger.warning("Atlassian OAuth (%s): could not resolve user from state: %s", provider, exc)
+        return Response({"detail": "Invalid state."}, status=status.HTTP_400_BAD_REQUEST)
+
+    resp = requests.post(
+        _ATLASSIAN_TOKEN_URL,
+        json={
+            "grant_type": "authorization_code",
+            "client_id": getattr(settings, client_id_setting),
+            "client_secret": getattr(settings, client_secret_setting),
+            "code": code,
+            "redirect_uri": getattr(settings, redirect_uri_setting),
+        },
+        headers={"Content-Type": "application/json"},
+        timeout=15,
+    )
+    if not resp.ok:
+        logger.error("Atlassian token exchange failed (%s): %s", provider, resp.text[:300])
+        return Response(
+            {"detail": "Atlassian authentication failed."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    data = resp.json()
+    access_token = data.get("access_token", "")
+    refresh_token = data.get("refresh_token", "")
+
+    # Fetch the accessible cloud sites so we know the cloud_id for API calls.
+    sites_resp = requests.get(
+        _ATLASSIAN_RESOURCES_URL,
+        headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+        timeout=10,
+    )
+    cloud_id = ""
+    cloud_name = ""
+    if sites_resp.ok:
+        sites = sites_resp.json()
+        if sites:
+            cloud_id = sites[0].get("id", "")
+            cloud_name = sites[0].get("name", "")
+
+    OAuthCredential.objects.update_or_create(
+        user=user,
+        provider=provider,
+        defaults={
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "scopes": "",
+            "is_active": True,
+        },
+    )
+
+    if config_updater and cloud_id:
+        config_updater(user=user, cloud_id=cloud_id, cloud_name=cloud_name)
+
+    label = "Confluence" if provider == "confluence" else "JIRA"
+    return HttpResponse(
+        f"<h2 style='font-family:sans-serif;color:#4caf50'>{label} connected!</h2>"
+        "<p style='font-family:sans-serif'>You can close this tab and reload the dashboard.</p>"
+        "<script>setTimeout(() => window.close(), 2000)</script>"
+    )
+
+
+class ConfluenceOAuthInitView(APIView):
+    """GET /integrations/confluence/connect/ — return the Atlassian authorization URL."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        return _atlassian_init(
+            request,
+            client_id_setting="CONFLUENCE_CLIENT_ID",
+            redirect_uri_setting="CONFLUENCE_REDIRECT_URI",
+            scope="read:confluence-content.all offline_access",
+            state_salt="confluence-oauth",
+        )
+
+
+class ConfluenceOAuthCallbackView(APIView):
+    """GET /integrations/confluence/callback/ — exchange code, store credential."""
+
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        def _update_config(user, cloud_id, cloud_name):
+            from confluence_sync.models import ConfluenceConfig
+            ConfluenceConfig.objects.update_or_create(
+                user=user, defaults={"cloud_id": cloud_id}
+            )
+
+        return _atlassian_callback(
+            request,
+            client_id_setting="CONFLUENCE_CLIENT_ID",
+            client_secret_setting="CONFLUENCE_CLIENT_SECRET",
+            redirect_uri_setting="CONFLUENCE_REDIRECT_URI",
+            provider="confluence",
+            state_salt="confluence-oauth",
+            config_updater=_update_config,
+        )
+
+
+class JiraOAuthInitView(APIView):
+    """GET /integrations/jira/connect/ — return the Atlassian authorization URL."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        return _atlassian_init(
+            request,
+            client_id_setting="JIRA_CLIENT_ID",
+            redirect_uri_setting="JIRA_REDIRECT_URI",
+            scope="read:jira-work read:jira-user offline_access",
+            state_salt="jira-oauth",
+        )
+
+
+class JiraOAuthCallbackView(APIView):
+    """GET /integrations/jira/callback/ — exchange code, store credential."""
+
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        def _update_config(user, cloud_id, cloud_name):
+            from jira_sync.models import JiraConfig
+            JiraConfig.objects.update_or_create(
+                user=user, defaults={"cloud_id": cloud_id, "cloud_name": cloud_name}
+            )
+
+        return _atlassian_callback(
+            request,
+            client_id_setting="JIRA_CLIENT_ID",
+            client_secret_setting="JIRA_CLIENT_SECRET",
+            redirect_uri_setting="JIRA_REDIRECT_URI",
+            provider="jira",
+            state_salt="jira-oauth",
+            config_updater=_update_config,
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Zendesk per-user OAuth
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ZendeskOAuthInitView(APIView):
+    """GET /integrations/zendesk/connect/ — return the Zendesk authorization URL."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        if not settings.ZENDESK_CLIENT_ID:
+            return Response(
+                {"detail": "ZENDESK_CLIENT_ID is not configured."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        if not settings.ZENDESK_SUBDOMAIN:
+            return Response(
+                {"detail": "ZENDESK_SUBDOMAIN is not configured."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        from django.core import signing
+        from urllib.parse import urlencode
+
+        state = signing.dumps({"uid": request.user.pk}, salt="zendesk-oauth")
+        params = {
+            "response_type": "code",
+            "client_id": settings.ZENDESK_CLIENT_ID,
+            "redirect_uri": settings.ZENDESK_REDIRECT_URI,
+            "scope": "read",
+            "state": state,
+        }
+        auth_url = (
+            f"https://{settings.ZENDESK_SUBDOMAIN}.zendesk.com/oauth/authorizations/new?"
+            + urlencode(params)
+        )
+        return Response({"authorization_url": auth_url})
+
+
+class ZendeskOAuthCallbackView(APIView):
+    """GET /integrations/zendesk/callback/ — exchange code, store per-user credential."""
+
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        code = request.query_params.get("code")
+        raw_state = request.query_params.get("state", "")
+
+        if not code:
+            return Response({"detail": "Missing code."}, status=status.HTTP_400_BAD_REQUEST)
+
+        from django.core import signing
+        from django.contrib.auth import get_user_model
+        _User = get_user_model()
+
+        try:
+            payload = signing.loads(raw_state, salt="zendesk-oauth", max_age=600)
+            user = _User.objects.get(pk=payload["uid"])
+        except Exception as exc:
+            logger.warning("Zendesk per-user OAuth: could not resolve user from state: %s", exc)
+            return Response({"detail": "Invalid or expired state."}, status=status.HTTP_400_BAD_REQUEST)
+
+        resp = requests.post(
+            f"https://{settings.ZENDESK_SUBDOMAIN}.zendesk.com/oauth/tokens",
+            json={
+                "grant_type": "authorization_code",
+                "code": code,
+                "client_id": settings.ZENDESK_CLIENT_ID,
+                "client_secret": settings.ZENDESK_CLIENT_SECRET,
+                "redirect_uri": settings.ZENDESK_REDIRECT_URI,
+                "scope": "read",
+            },
+            headers={"Content-Type": "application/json"},
+            timeout=15,
+        )
+
+        if not resp.ok:
+            logger.error("Zendesk per-user token exchange failed: %s", resp.text[:300])
+            return Response(
+                {"detail": "Zendesk authentication failed."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        data = resp.json()
+        access_token = data.get("access_token", "")
+        if not access_token:
+            return Response(
+                {"detail": "No access_token in Zendesk response."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        OAuthCredential.objects.update_or_create(
+            user=user,
+            provider="zendesk",
+            defaults={
+                "access_token": access_token,
+                "refresh_token": "",
+                "scopes": "read",
+                "is_active": True,
+            },
+        )
+
+        return HttpResponse(
+            "<h2 style='font-family:sans-serif;color:#4caf50'>Zendesk connected!</h2>"
+            "<p style='font-family:sans-serif'>You can close this tab and reload the dashboard.</p>"
+            "<script>setTimeout(() => window.close(), 2000)</script>"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Org-managed scraper views
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ScraperStatusView(APIView):
+    """
+    GET /integrations/scraper-status/
+
+    Returns which org-managed scraper tokens are configured.
+    Confluence and JIRA share an Atlassian API token; Zendesk has its own
+    admin OAuthCredential created by the admin connect flow.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        return Response({
+            "confluence": bool(settings.ATLASSIAN_API_TOKEN),
+            "jira": bool(settings.ATLASSIAN_API_TOKEN),
+            "zendesk": self._has_zendesk_admin_cred(),
+            "gong": bool(settings.GONG_ACCESS_KEY),
+            "notion": bool(settings.NOTION_INTEGRATION_TOKEN),
+        })
+
+    @staticmethod
+    def _has_zendesk_admin_cred():
+        return OAuthCredential.objects.filter(provider="zendesk_admin", is_active=True).exists()
+
+
+class ConfluenceAPITokenConnectView(APIView):
+    """
+    POST /integrations/confluence/connect-token/
+    Body: { email: str, api_token: str }
+
+    Admin-triggered: validates the Atlassian API token against the configured
+    Atlassian instance and stores it as an OAuthCredential for the requesting user.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        import base64
+        email = (request.data.get("email") or "").strip()
+        api_token = (request.data.get("api_token") or "").strip()
+        if not email or not api_token:
+            return Response(
+                {"detail": "email and api_token are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Derive subdomain from ATLASSIAN_BASE_URL, e.g. "twilio-productivity"
+        base_url = settings.ATLASSIAN_BASE_URL.rstrip("/")
+        subdomain = base_url.split("//")[-1].split(".")[0]
+
+        encoded = base64.b64encode(f"{email}:{api_token}".encode()).decode()
+        headers = {"Authorization": f"Basic {encoded}", "Accept": "application/json"}
+        test_url = f"{base_url}/wiki/rest/api/space?limit=1"
+
+        try:
+            resp = requests.get(test_url, headers=headers, timeout=10)
+        except requests.RequestException as exc:
+            logger.error("Confluence token validation request failed: %s", exc)
+            return Response(
+                {"detail": "Could not reach Atlassian instance."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        if not resp.ok:
+            return Response(
+                {"detail": f"Atlassian returned {resp.status_code}. Check email and API token."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        OAuthCredential.objects.update_or_create(
+            user=request.user,
+            provider="confluence",
+            defaults={
+                "access_token": api_token,
+                "refresh_token": "",
+                "scopes": "read",
+                "is_active": True,
+            },
+        )
+
+        from confluence_sync.models import ConfluenceConfig
+        ConfluenceConfig.objects.update_or_create(
+            user=request.user,
+            defaults={
+                "cloud_id": subdomain,
+                "atlassian_email": email,
+            },
+        )
+
+        return Response({"detail": "Confluence connected."})
+
+
+class ZendeskAdminConnectView(APIView):
+    """
+    GET /integrations/zendesk/admin-connect/
+
+    Staff-only. Returns the Zendesk OAuth authorization URL so the admin can
+    start the one-time OAuth flow. Requires ZENDESK_CLIENT_ID and
+    ZENDESK_SUBDOMAIN to be set in .env.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        if not request.user.is_staff:
+            return Response({"detail": "Staff access required."}, status=status.HTTP_403_FORBIDDEN)
+
+        if not settings.ZENDESK_CLIENT_ID:
+            return Response(
+                {"detail": "ZENDESK_CLIENT_ID is not configured."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        from django.core import signing
+        from urllib.parse import urlencode
+
+        state = signing.dumps({"uid": request.user.pk}, salt="zendesk-admin-oauth")
+        params = {
+            "response_type": "code",
+            "client_id": settings.ZENDESK_CLIENT_ID,
+            "redirect_uri": settings.ZENDESK_ADMIN_REDIRECT_URI,
+            "scope": "read",
+            "state": state,
+        }
+        auth_url = (
+            f"https://{settings.ZENDESK_SUBDOMAIN}.zendesk.com/oauth/authorizations/new?"
+            + urlencode(params)
+        )
+        return Response({"authorization_url": auth_url})
+
+
+class ZendeskAdminCallbackView(APIView):
+    """
+    GET /integrations/zendesk/admin-callback/
+
+    Receives the authorization code from Zendesk, exchanges it for an access
+    token, and stores it as an OAuthCredential with provider="zendesk_admin".
+    Only the admin user encoded in the state param can complete this flow.
+    """
+
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        code = request.query_params.get("code")
+        raw_state = request.query_params.get("state", "")
+
+        if not code:
+            return Response({"detail": "Missing code."}, status=status.HTTP_400_BAD_REQUEST)
+
+        from django.core import signing
+        from django.contrib.auth import get_user_model
+        _User = get_user_model()
+
+        try:
+            payload = signing.loads(raw_state, salt="zendesk-admin-oauth", max_age=600)
+            admin_user = _User.objects.get(pk=payload["uid"])
+        except Exception as exc:
+            logger.warning("Zendesk admin OAuth: could not resolve user from state: %s", exc)
+            return Response({"detail": "Invalid or expired state."}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not admin_user.is_staff:
+            return Response({"detail": "Staff access required."}, status=status.HTTP_403_FORBIDDEN)
+
+        resp = requests.post(
+            f"https://{settings.ZENDESK_SUBDOMAIN}.zendesk.com/oauth/tokens",
+            json={
+                "grant_type": "authorization_code",
+                "code": code,
+                "client_id": settings.ZENDESK_CLIENT_ID,
+                "client_secret": settings.ZENDESK_CLIENT_SECRET,
+                "redirect_uri": settings.ZENDESK_ADMIN_REDIRECT_URI,
+                "scope": "read",
+            },
+            headers={"Content-Type": "application/json"},
+            timeout=15,
+        )
+
+        if not resp.ok:
+            logger.error("Zendesk token exchange failed: %s", resp.text[:300])
+            return Response(
+                {"detail": "Zendesk authentication failed."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        data = resp.json()
+        access_token = data.get("access_token", "")
+        if not access_token:
+            return Response(
+                {"detail": "No access_token in Zendesk response."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        OAuthCredential.objects.update_or_create(
+            provider="zendesk_admin",
+            defaults={
+                "user": admin_user,
+                "access_token": access_token,
+                "refresh_token": "",
+                "scopes": "read",
+                "is_active": True,
+            },
+        )
+
+        return HttpResponse(
+            "<h2 style='font-family:sans-serif;color:#4caf50'>Zendesk connected!</h2>"
+            "<p style='font-family:sans-serif'>You can close this tab.</p>"
+            "<script>setTimeout(() => window.close(), 2000)</script>"
+        )
+

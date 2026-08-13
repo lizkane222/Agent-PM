@@ -90,6 +90,7 @@ class AirtableActionItem(models.Model):
         null=True, blank=True,
         related_name="pinned_action_items",
     )
+    status_locally_modified = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     marked_done_at = models.DateTimeField(null=True, blank=True)

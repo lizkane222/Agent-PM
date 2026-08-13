@@ -51,7 +51,7 @@ export default function GlobalSearch({ pageContext = "" }: Props) {
   const chatRef = useRef<HTMLTextAreaElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
   const navigate = useNavigate();
-  const { toggleItem, isSelected: isExportSelected, exportMode, toggleMode, clearItems, items: exportItems } = useExport();
+  const { toggleItem, isSelected: isExportSelected, exportMode, toggleMode } = useExport();
 
   const debouncedQuery = useDebounce(query, 220);
 

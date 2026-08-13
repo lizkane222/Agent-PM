@@ -4,6 +4,9 @@ from django.urls import path
 
 from .views import (
     AirtableConnectView,
+    ConfluenceAPITokenConnectView,
+    ConfluenceOAuthCallbackView,
+    ConfluenceOAuthInitView,
     GitHubOAuthCallbackView,
     GitHubOAuthInitView,
     GmailOAuthCallbackView,
@@ -18,21 +21,42 @@ from .views import (
     GoogleOAuthInitView,
     IntegrationDisconnectView,
     IntegrationStatusView,
+    JiraOAuthCallbackView,
+    JiraOAuthInitView,
     MicrosoftOAuthCallbackView,
     MicrosoftOAuthInitView,
     NotionOAuthCallbackView,
     NotionOAuthInitView,
     SalesforceOAuthCallbackView,
     SalesforceOAuthInitView,
+    ScraperStatusView,
     SlackNotifyMentionView,
     SlackOAuthCallbackView,
     SlackOAuthInitView,
     SlackWebhookView,
     TwilioWebhookView,
+    ZendeskAdminCallbackView,
+    ZendeskAdminConnectView,
+    ZendeskOAuthCallbackView,
+    ZendeskOAuthInitView,
 )
 
 urlpatterns = [
     path("status/", IntegrationStatusView.as_view(), name="integration-status"),
+    path("scraper-status/", ScraperStatusView.as_view(), name="scraper-status"),
+    # Confluence
+    path("confluence/connect/", ConfluenceOAuthInitView.as_view(), name="confluence-oauth-init"),
+    path("confluence/callback/", ConfluenceOAuthCallbackView.as_view(), name="confluence-oauth-callback"),
+    path("confluence/connect-token/", ConfluenceAPITokenConnectView.as_view(), name="confluence-api-token-connect"),
+    # JIRA
+    path("jira/connect/", JiraOAuthInitView.as_view(), name="jira-oauth-init"),
+    path("jira/callback/", JiraOAuthCallbackView.as_view(), name="jira-oauth-callback"),
+    # Zendesk per-user
+    path("zendesk/connect/", ZendeskOAuthInitView.as_view(), name="zendesk-oauth-init"),
+    path("zendesk/callback/", ZendeskOAuthCallbackView.as_view(), name="zendesk-oauth-callback"),
+    # Zendesk org-admin
+    path("zendesk/admin-connect/", ZendeskAdminConnectView.as_view(), name="zendesk-admin-connect"),
+    path("zendesk/admin-callback/", ZendeskAdminCallbackView.as_view(), name="zendesk-admin-callback"),
     path("oauth/<str:provider>/", IntegrationDisconnectView.as_view(), name="integration-disconnect"),
     path("gmail/connect/", GmailOAuthInitView.as_view(), name="gmail-oauth-init"),
     path("gmail/callback/", GmailOAuthCallbackView.as_view(), name="gmail-oauth-callback"),

@@ -406,7 +406,7 @@ export default function PropEditor({ node, onChange }: Props) {
               <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                 <span style={{ fontSize: 12, color: "#374151", flex: 1 }}>{p.accountName as string}</span>
                 <button
-                  onClick={() => set("accountId", 0) || set("accountName", "") || set("meetings", [])}
+                  onClick={() => { set("accountId", 0); set("accountName", ""); set("meetings", []); }}
                   className="text-[10px] text-red-400 hover:text-red-600"
                 >✕</button>
               </div>

@@ -8,7 +8,8 @@ import CalendarIcon from "../assets/icons/Calendar.svg?react";
 import dayGridPlugin from "@fullcalendar/daygrid";
 import timeGridPlugin from "@fullcalendar/timegrid";
 import interactionPlugin from "@fullcalendar/interaction";
-import type { EventClickArg, DateSelectArg, EventInput, DropArg } from "@fullcalendar/core";
+import type { DropArg } from "@fullcalendar/interaction";
+import type { EventClickArg, DateSelectArg, EventInput } from "@fullcalendar/core";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useScheduledOccurrences } from "../hooks/useScheduledOccurrences";
 import { useActionItemFieldOptions } from "../hooks/useActionItemFieldOptions";
@@ -20,16 +21,14 @@ import { useCurrentUser } from "../context/CurrentUserContext";
 import { useCommentContext } from "../components/comments/CommentContext";
 import DayBar from "../components/calendar/DayBar";
 import MeetingDetail from "../components/calendar/MeetingDetail";
+import AccountsSidebar from "../components/calendar/AccountsSidebar";
+import CreateEventModal from "../components/calendar/CreateEventModal";
+import type { SavePayload } from "../components/calendar/CreateEventModal";
 import type { AirtableActionItem, AirtableAccount, CalendarEvent, LogTimeDayAssignment, Reminder, SalesforceProject } from "../types";
+import type { ContentView, NewEventDraft } from "../types/calendar";
 import { getRsvp, dateToLocalISO, toLocalISO, addMsToLocalISO } from "twilio-agent-pm-shared";
 import type { RsvpStatus } from "twilio-agent-pm-shared";
 
-const PRIORITY_ACCENT_CAL: Record<string, string> = {
-  Critical: "#ef4444",
-  High: "#f97316",
-  Medium: "#0ea5e9",
-  Low: "#9ca3af",
-};
 const PRIORITY_COLORS_CAL: Record<string, string> = {
   Critical: "bg-red-50 text-red-700",
   High: "bg-orange-50 text-orange-700",
@@ -162,7 +161,7 @@ function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAcc
       await schedulerApi.createReminder({
         title: newRemTitle.trim().slice(0, 200),
         resource_type: "calendar_event",
-        resource_id: String(event.id),
+        resource_id: event.id,
         due_at: new Date(due_at).toISOString(),
         notify_in_app: true,
       } as Parameters<typeof schedulerApi.createReminder>[0]);
@@ -627,13 +626,6 @@ function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAcc
   );
 }
 
-const PRIORITY_DOT: Record<string, string> = {
-  Critical: "bg-red-500",
-  High: "bg-orange-400",
-  Medium: "bg-sky-400",
-  Low: "bg-gray-300",
-};
-
 
 const CALENDAR_DRAG_KEY = "calendarDragActionItemId";
 const CALENDAR_DRAG_REMINDER_KEY = "calendarDragReminderId";
@@ -757,199 +749,6 @@ function saveScheduledReminder(item: ScheduledReminder): boolean {
     window.dispatchEvent(new StorageEvent("storage", { key: SCHEDULED_REMINDERS_KEY, newValue: JSON.stringify(existing) }));
     return true;
   } catch { return false; }
-}
-
-// ── Accounts sidebar ──────────────────────────────────────────────────────────
-
-function AccountsSidebar({
-  open,
-  onToggle,
-  eventAccountLinks,
-  onLink,
-  selectedAccountName,
-  onSelectAccount,
-  logTimeModeAccount,
-  onLogTimeMode,
-}: {
-  open: boolean;
-  onToggle: () => void;
-  eventAccountLinks: Map<string, { accountName: string; accountId: number }>;
-  onLink: (accountId: number, accountName: string, eventUid?: string) => void;
-  selectedAccountName: string | null;
-  onSelectAccount: (name: string | null) => void;
-  logTimeModeAccount: string | null;
-  onLogTimeMode: (accountName: string | null) => void;
-}) {
-  const [accounts, setAccounts] = useState<AirtableAccount[]>([]);
-  const [dropTargetId, setDropTargetId] = useState<number | null>(null);
-  const [draggingId, setDraggingId] = useState<number | null>(null);
-
-  useEffect(() => {
-    Promise.all([
-      airtableApi.listAccounts(),
-      accountsApi.listAccounts(),
-      accountsApi.getAdminAccount(),
-    ]).then(([atRes, appRes, adminRes]) => {
-      const atAccounts = atRes.data.results as AirtableAccount[];
-      const atNames = new Set(atAccounts.map((a) => a.name?.toLowerCase()));
-      const appOnly = (appRes.data.results as { id: number; company_name: string; is_admin_account?: boolean }[])
-        .filter((a) => !a.is_admin_account && !atNames.has(a.company_name?.toLowerCase()))
-        .map((a) => ({ id: a.id, name: a.company_name } as AirtableAccount));
-      const adminAcct = adminRes.data as { id: number; company_name: string };
-      const adminPill: AirtableAccount = { id: adminAcct.id, name: adminAcct.company_name };
-      const merged = [adminPill, ...atAccounts, ...appOnly].sort((a, b) =>
-        a.name === adminAcct.company_name ? -1 : b.name === adminAcct.company_name ? 1 : a.name.localeCompare(b.name)
-      );
-      setAccounts(merged);
-    }).catch(() => {
-      // Fallback without admin account
-      Promise.all([airtableApi.listAccounts(), accountsApi.listAccounts()]).then(([atRes, appRes]) => {
-        const atAccounts = atRes.data.results as AirtableAccount[];
-        const atNames = new Set(atAccounts.map((a) => a.name?.toLowerCase()));
-        const appOnly = (appRes.data.results as { id: number; company_name: string }[])
-          .filter((a) => !atNames.has(a.company_name?.toLowerCase()))
-          .map((a) => ({ id: a.id, name: a.company_name } as AirtableAccount));
-        setAccounts([...atAccounts, ...appOnly].sort((a, b) => a.name.localeCompare(b.name)));
-      }).catch(() => {});
-    });
-  }, []);
-
-  function handleAccountDragStart(e: React.DragEvent, account: AirtableAccount) {
-    e.dataTransfer.setData("calendarAccountId", String(account.id));
-    e.dataTransfer.setData("calendarAccountName", account.name);
-    e.dataTransfer.effectAllowed = "copy";
-    (window as unknown as Record<string, string>)[CALENDAR_DRAG_ACCOUNT_KEY] = String(account.id);
-    (window as unknown as Record<string, string>)[`${CALENDAR_DRAG_ACCOUNT_KEY}_name`] = account.name;
-
-    // Build a pill as the drag image. Must be in the DOM when setDragImage is called,
-    // then removed immediately after so it never flashes on screen.
-    const pill = document.createElement("div");
-    pill.style.cssText = "position:fixed;top:-200px;left:-200px;background:#4f46e5;color:#fff;padding:5px 14px;border-radius:9999px;font-size:12px;font-weight:600;white-space:nowrap;box-shadow:0 4px 14px rgba(79,70,229,0.45);pointer-events:none";
-    pill.textContent = account.name;
-    document.body.appendChild(pill);
-    e.dataTransfer.setDragImage(pill, 60, 14);
-    // Defer state + DOM cleanup — changing state during dragstart breaks the drag
-    setTimeout(() => { document.body.removeChild(pill); setDraggingId(account.id); }, 0);
-  }
-
-  function handleDropOnAccount(e: React.DragEvent, account: AirtableAccount) {
-    e.preventDefault();
-    setDropTargetId(null);
-    const w = window as unknown as Record<string, string>;
-    // Calendar event dragged onto account chip
-    const eventUid = w[CALENDAR_DRAG_EVENT_KEY];
-    if (eventUid) {
-      delete w[CALENDAR_DRAG_EVENT_KEY];
-      onLink(account.id, account.name, eventUid);
-      return;
-    }
-    // Action item dragged onto account chip — update its account association
-    const airtableId = w[CALENDAR_DRAG_KEY];
-    if (airtableId) {
-      delete w[CALENDAR_DRAG_KEY];
-      delete w[`${CALENDAR_DRAG_KEY}_task`];
-      delete w[`${CALENDAR_DRAG_KEY}_account`];
-      delete w[`${CALENDAR_DRAG_KEY}_est`];
-      airtableApi.updateActionItemFields(airtableId, { account: account.id, account_name: account.name }).catch(() => {});
-      window.dispatchEvent(new StorageEvent("storage", { key: "actionItemsUpdated", newValue: "1" }));
-    }
-  }
-
-  return (
-    <>
-      {/* Toggle button */}
-      <button
-        onClick={onToggle}
-        className={[
-          "absolute top-4 left-4 z-30 flex items-center gap-2 rounded-full px-4 py-2 text-sm font-semibold border shadow-sm transition-colors",
-          open
-            ? "bg-indigo-600 border-indigo-600 text-white shadow-md"
-            : "bg-white border-gray-300 text-[var(--twilio-navy)] hover:bg-gray-50 hover:border-indigo-300",
-        ].join(" ")}
-      >
-        <CorporateIcon className="w-3.5 h-3.5 shrink-0" />
-        Accounts
-      </button>
-
-      {/* Overlay panel */}
-      <div
-        className={[
-          "absolute top-0 left-0 h-full z-20 flex flex-col bg-white border-r border-gray-200 shadow-2xl transition-transform duration-300",
-          "w-[276px]",
-          open ? "translate-x-0" : "-translate-x-full",
-        ].join(" ")}
-      >
-        <div className="h-16 shrink-0" />
-        <p className="px-4 pb-2 text-[11px] text-[var(--twilio-gray-60)]">
-          Drag an account onto a calendar event · or drag an event onto an account
-        </p>
-        <div className="flex-1 overflow-y-auto px-3 pb-3 space-y-2">
-          {accounts.filter((acct) => !!acct.name).map((acct) => {
-            const isSelected = selectedAccountName === acct.name;
-            return (
-              <div
-                key={acct.id ?? acct.name}
-                draggable
-                onClick={() => onSelectAccount(selectedAccountName === acct.name ? null : acct.name)}
-                onDragStart={(e) => handleAccountDragStart(e, acct)}
-                onDragEnd={() => setDraggingId(null)}
-                onDragOver={(e) => { e.preventDefault(); setDropTargetId(acct.id); }}
-                onDragLeave={() => setDropTargetId(null)}
-                onDrop={(e) => handleDropOnAccount(e, acct)}
-                className={[
-                  "rounded-lg p-4 cursor-pointer transition-all select-none border",
-                  draggingId === acct.id
-                    ? "opacity-40 scale-95 bg-indigo-50 border-indigo-300"
-                    : dropTargetId === acct.id
-                    ? "bg-indigo-50 border-indigo-400 border-2 shadow-md"
-                    : isSelected
-                    ? "bg-indigo-600 border-indigo-600 shadow-md"
-                    : "bg-white border-gray-200 shadow-sm hover:shadow-md hover:border-indigo-300",
-                ].join(" ")}
-              >
-                <div className="flex items-center gap-3">
-                  <div className={["h-9 w-9 rounded-full flex items-center justify-center shrink-0", isSelected ? "bg-indigo-500 text-white" : "bg-indigo-50 text-indigo-600"].join(" ")}>
-                    <CorporateIcon className="w-4 h-4" />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className={["text-sm font-semibold truncate", isSelected ? "text-white" : "text-[var(--twilio-navy)]"].join(" ")}>{acct.name}</p>
-                  </div>
-                </div>
-              </div>
-            );
-          })}
-          {accounts.length === 0 && <p className="text-sm text-[var(--twilio-gray-60)] px-1">No accounts found.</p>}
-        </div>
-
-        {/* Log Time footer — always visible at the bottom of the sidebar */}
-        <div className="shrink-0 px-3 py-3 border-t border-gray-100">
-          {!selectedAccountName ? (
-            <p className="text-[11px] text-center text-[var(--twilio-gray-60)] px-1">Select an account above to log time</p>
-          ) : null}
-          <button
-            disabled={!selectedAccountName && !logTimeModeAccount}
-            onClick={() => onLogTimeMode(logTimeModeAccount ? null : selectedAccountName)}
-            className={[
-              "mt-1 w-full flex items-center justify-center gap-2 rounded-xl py-2.5 text-sm font-semibold transition-colors border",
-              logTimeModeAccount
-                ? "bg-emerald-600 border-emerald-600 text-white hover:bg-emerald-700"
-                : selectedAccountName
-                ? "bg-[var(--twilio-navy)] border-[var(--twilio-navy)] text-white hover:opacity-90"
-                : "bg-gray-100 border-gray-200 text-gray-400 cursor-not-allowed",
-            ].join(" ")}
-          >
-            <svg viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4 shrink-0">
-              <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-12a1 1 0 10-2 0v4a1 1 0 00.293.707l2.828 2.829a1 1 0 101.415-1.415L11 9.586V6z" clipRule="evenodd"/>
-            </svg>
-            {logTimeModeAccount ? `Exit Log Time` : "Log Time to Salesforce"}
-          </button>
-          {logTimeModeAccount && (
-            <p className="mt-1.5 text-[10px] text-center text-emerald-700 font-medium">{logTimeModeAccount}</p>
-          )}
-        </div>
-      </div>
-    </>
-  );
 }
 
 type CalCreateForm = {
@@ -1107,7 +906,6 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
     assignee_name: item.assignee_name,
   });
   const cardRef = useRef<HTMLDivElement>(null);
-  const accent = PRIORITY_ACCENT_CAL[editForm.priority] ?? "#9ca3af";
   const hasReminder = !!item.reminder_due_at;
   const [isAccountDropTarget, setIsAccountDropTarget] = useState(false);
 
@@ -1376,7 +1174,7 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
   );
 }
 
-function ActionItemsSidebar({ onDropToast, expandItemId }: { onDropToast?: (msg: string, type: "success" | "warn") => void; expandItemId?: string | null }) {
+function ActionItemsSidebar({ expandItemId }: { onDropToast?: (msg: string, type: "success" | "warn") => void; expandItemId?: string | null }) {
   const currentUser = useCurrentUser();
   const { status: statusOptions } = useActionItemFieldOptions();
   const [items, setItems] = useState<AirtableActionItem[]>([]);
@@ -1570,8 +1368,6 @@ function ActionItemsSidebar({ onDropToast, expandItemId }: { onDropToast?: (msg:
       setSaving(false);
     }
   }
-
-  const reminderItem = reminderItemId ? items.find((i) => i.airtable_id === reminderItemId) ?? null : null;
 
   const [filterTerm, setFilterTerm] = useState("");
   const filteredItems = filterTerm.trim()
@@ -1827,7 +1623,6 @@ function ReminderCard_Cal({ reminder, onDragStart, onDelete, onUpdate }: {
   const [editBody, setEditBody] = useState(reminder.body);
   const [editDueAt, setEditDueAt] = useState(reminder.due_at.slice(0, 16)); // "YYYY-MM-DDTHH:MM"
   const cardRef = useRef<HTMLDivElement>(null);
-  const isPending = reminder.status === "pending";
 
   useEffect(() => {
     if (!expanded) {
@@ -1858,7 +1653,6 @@ function ReminderCard_Cal({ reminder, onDragStart, onDelete, onUpdate }: {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [expanded, editTitle, editBody, editDueAt]);
 
-  const statusColor = isPending ? "#f59e0b" : "#9ca3af";
   const statusLabel = reminder.status.charAt(0).toUpperCase() + reminder.status.slice(1);
   const dueLabel = new Date(reminder.due_at).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 
@@ -1954,7 +1748,7 @@ function ReminderCard_Cal({ reminder, onDragStart, onDelete, onUpdate }: {
 
 // ── Reminders tab content ─────────────────────────────────────────────────────
 
-function RemindersTabContent({ onDropToast }: { onDropToast: (msg: string, type: "success" | "warn") => void }) {
+function RemindersTabContent(_props: { onDropToast: (msg: string, type: "success" | "warn") => void }) {
   const [reminders, setReminders] = useState<Reminder[]>([]);
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
@@ -2742,7 +2536,7 @@ function LogTimePanel({
       .then(({ data }) => data.results)
       .catch((): SalesforceProject[] => []);
     const localPromise = accountsApi.listProjectsByAccount(accountName)
-      .then(({ data }) => data.results.map((p, i) => ({
+      .then(({ data }) => data.results.map((p) => ({
         id: -(p.id + 10000),
         sf_id: `local-${p.id}`,
         name: p.name,
@@ -2847,14 +2641,6 @@ function LogTimePanel({
     if (synced !== undefined && synced > 0) return synced;
     const actual = (i.time_spent ?? 0) + (i.prep_time ?? 0);
     return actual > 0 ? actual : (i.estimated_time ?? 0);
-  }
-
-  function secsForDay(date: string): number {
-    const evSecs = dayCalEvents(date).reduce((s, e) => {
-      const key = `${date}::e::${e.id}`;
-      return s + (timeOverrides[key] !== undefined ? timeOverrides[key] : Math.max(0, (new Date(e.end_datetime).getTime() - new Date(e.start_datetime).getTime()) / 1000));
-    }, 0);
-    return evSecs + dayActionItems(date).reduce((s, i) => s + itemSecs(date, i), 0);
   }
 
   function secsForProject(date: string, assignmentId: number): number {
@@ -3142,13 +2928,11 @@ function LogTimePanel({
   );
 }
 
-type ContentView = "all" | "meetings" | "action-items" | "reminders" | "accounts";
-
 export default function CalendarPage() {
   const [events, setEvents] = useState<CalendarEvent[]>([]);
   const [selectedEvent, setSelectedEvent] = useState<CalendarEvent | null>(null);
   const [meetingPanelCollapsed, setMeetingPanelCollapsed] = useState(false);
-  const [isLoading, setIsLoading] = useState(true);
+  const [, setIsLoading] = useState(true);
   const [isSyncing, setIsSyncing] = useState(false);
   const [showWeekends, setShowWeekends] = useState(false);
   const [userEmail, setUserEmail] = useState<string | null>(null);
@@ -3174,13 +2958,25 @@ export default function CalendarPage() {
     event: CalendarEvent;
   } | null>(null);
   // Drag-to-create modal
-  const [newEventDraft, setNewEventDraft] = useState<{
-    start: string; end: string; title: string; type: "meeting" | "action-item";
-    accountQuery: string;
-    selectedAccount: { id: number; name: string } | null;
-    accountResults: { id: number; name: string }[];
-  } | null>(null);
+  const [newEventDraft, setNewEventDraft] = useState<NewEventDraft | null>(null);
   const [newEventSaving, setNewEventSaving] = useState(false);
+  const [zoomConnected, setZoomConnected] = useState(false);
+
+  useEffect(() => {
+    integrationsApi.getStatus()
+      .then(({ data }) => setZoomConnected(data.connected.some((c) => c.provider === "zoom" && c.is_active)))
+      .catch(() => {});
+  }, []);
+
+  function blankNewEventDraft(overrides: Partial<NewEventDraft>): NewEventDraft {
+    return {
+      start: "", end: "", allDay: false, title: "", type: "meeting", category: "meeting",
+      accountQuery: "", selectedAccount: null, accountResults: [],
+      guests: [], description: "", linkedActionItemIds: [], linkedArtifactIds: [],
+      videoConference: "none", videoConferenceUrl: "", notificationMinutes: null, repeatFrequency: "none",
+      ...overrides,
+    };
+  }
   // Pending reschedule that needs attendee confirmation before committing
   const [pendingReschedule, setPendingReschedule] = useState<{
     ev: CalendarEvent;
@@ -3503,7 +3299,7 @@ export default function CalendarPage() {
     setLastLinkedEventName(evTitle);
     setTimeout(() => setLastLinkedEventName(null), 2500);
     try {
-      await airtableApi.categorizeEvent({ event_uid: uid, account_id: accountId });
+      await airtableApi.categorizeEvent({ event_uid: uid, account_id: accountId, account_name: accountName });
       // Increment trigger so MeetingDetail re-fetches now that the DB is updated
       setMeetingDetailReloadTrigger((n) => n + 1);
       addLog({
@@ -3542,7 +3338,7 @@ export default function CalendarPage() {
   const handleDateSelect = useCallback((info: DateSelectArg) => {
     const start = info.startStr.includes("T") ? info.startStr.slice(0, 19) : `${info.startStr}T09:00:00`;
     const end = info.endStr.includes("T") ? info.endStr.slice(0, 19) : `${info.endStr}T10:00:00`;
-    setNewEventDraft({ start: toLocalISO(start), end: toLocalISO(end), title: "", type: "meeting", accountQuery: "", selectedAccount: null, accountResults: [] });
+    setNewEventDraft(blankNewEventDraft({ start: toLocalISO(start), end: toLocalISO(end) }));
     // Eagerly load accounts the first time the modal opens
     if (allAccountsRef.current.length === 0) {
       Promise.all([airtableApi.listAccounts(), accountsApi.listAccounts()])
@@ -3559,6 +3355,110 @@ export default function CalendarPage() {
   }, []);
 
   const [dropToast, setDropToast] = useState<{ msg: string; type: "success" | "warn" } | null>(null);
+
+  // Recurring events have no backend RRULE support — expand into N separate CalendarEvent
+  // records client-side. Occurrence counts match the labels in CreateEventModal's REPEAT_OPTIONS.
+  function addMonthsLocalISO(localStr: string, months: number): string {
+    const d = new Date(localStr);
+    d.setMonth(d.getMonth() + months);
+    return dateToLocalISO(d);
+  }
+
+  function buildRecurrenceOccurrences(
+    startIso: string,
+    endIso: string,
+    freq: NewEventDraft["repeatFrequency"]
+  ): { start: string; end: string }[] {
+    if (freq === "none") return [{ start: startIso, end: endIso }];
+    const durationMs = new Date(endIso).getTime() - new Date(startIso).getTime();
+    const COUNTS: Record<string, number> = { daily: 30, weekly: 12, biweekly: 12, monthly: 12 };
+    const STEP_DAYS: Record<string, number> = { daily: 1, weekly: 7, biweekly: 14 };
+    const count = COUNTS[freq];
+    const occurrences: { start: string; end: string }[] = [];
+    for (let i = 0; i < count; i++) {
+      const occStart = freq === "monthly"
+        ? addMonthsLocalISO(startIso, i)
+        : addMsToLocalISO(startIso, i * STEP_DAYS[freq] * 24 * 60 * 60 * 1000);
+      occurrences.push({ start: occStart, end: addMsToLocalISO(occStart, durationMs) });
+    }
+    return occurrences;
+  }
+
+  const handleCreateEventSave = useCallback(async (payload: SavePayload) => {
+    const { draft, assembledDescription, attendees, meetLink } = payload;
+    setNewEventSaving(true);
+    try {
+      if (draft.type === "action-item") {
+        // Create a proper AirtableActionItem and schedule it on the calendar
+        const { data: newItem } = await airtableApi.createActionItem({
+          task: draft.title.trim(),
+          task_details: assembledDescription,
+          status: "Open",
+          priority: "Medium",
+          account: draft.selectedAccount?.id ?? null,
+          account_name: draft.selectedAccount?.name ?? null,
+          estimated_time: Math.round((new Date(draft.end).getTime() - new Date(draft.start).getTime()) / 60000),
+        });
+        saveScheduledItem({ airtableId: newItem.airtable_id, task: newItem.task, accountName: newItem.account_name, start: draft.start, end: draft.end });
+        setScheduledItems(readScheduledItems());
+        // Add account link so the tile shows the account name immediately
+        if (draft.selectedAccount) {
+          const scheduledUid = `scheduled-${newItem.airtable_id}__${draft.start.slice(0, 16)}`;
+          setEventAccountLinks((prev) => {
+            const next = new Map(prev);
+            next.set(scheduledUid, { accountId: draft.selectedAccount!.id, accountName: draft.selectedAccount!.name });
+            return next;
+          });
+        }
+        // Signal the sidebar to refresh
+        window.dispatchEvent(new StorageEvent("storage", { key: "actionItemsUpdated", newValue: "1" }));
+        openItemsPanel("action-items");
+      } else {
+        const occurrences = buildRecurrenceOccurrences(draft.start, draft.end, draft.repeatFrequency);
+        for (const occ of occurrences) {
+          const created = await schedulerApi.createEvent({
+            title: draft.title.trim(),
+            start_datetime: occ.start,
+            end_datetime: occ.end,
+            all_day: draft.allDay,
+            calendar_id: "primary",
+            status: "confirmed",
+            description: assembledDescription,
+            attendees,
+            meet_link: meetLink,
+            event_category: draft.category,
+          });
+          setEvents((prev) => [...prev, created.data]);
+          if (draft.selectedAccount) {
+            // Link by google_event_id if available; also by numeric id as fallback
+            // for events that haven't synced to Google yet
+            const uid = created.data.google_event_id || String(created.data.id);
+            void linkEventToAccount(draft.selectedAccount.id, draft.selectedAccount.name, uid);
+          }
+          if (draft.notificationMinutes != null) {
+            const dueAt = addMsToLocalISO(occ.start, -draft.notificationMinutes * 60 * 1000);
+            schedulerApi.createReminder({
+              title: draft.title.trim(),
+              resource_type: "calendar_event",
+              resource_id: created.data.id,
+              resource_label: draft.title.trim(),
+              due_at: dueAt,
+              notify_in_app: true,
+            }).catch(() => {});
+          }
+        }
+      }
+      setNewEventDraft(null);
+      setDropToast({ msg: `Created "${draft.title.trim()}"`, type: "success" });
+      setTimeout(() => setDropToast(null), 3000);
+    } catch {
+      setDropToast({ msg: "Failed to create", type: "warn" });
+      setTimeout(() => setDropToast(null), 3000);
+    } finally {
+      setNewEventSaving(false);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [linkEventToAccount]);
 
   const handleCalendarDrop = useCallback((info: DropArg) => {
     const w = window as unknown as Record<string, string>;
@@ -3624,9 +3524,6 @@ export default function CalendarPage() {
       setDropToast({ msg: "Already scheduled at that time", type: "warn" });
     }
     setTimeout(() => setDropToast(null), 3000);
-
-    // Tell FC not to create its own event (we manage them via scheduledItems state)
-    info.revert?.();
   }, []);
 
   // Parse "scheduled-{airtableId}__{startMin}" → { airtableId, startMin }
@@ -3685,8 +3582,8 @@ export default function CalendarPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const handleEventResize = useCallback((info: { event: { extendedProps: CalendarEvent; startStr: string; endStr: string; start: Date | null; end: Date | null }; revert: () => void }) => {
-    const ev = info.event.extendedProps as CalendarEvent;
+  const handleEventResize = useCallback((info: { event: { extendedProps: Record<string, unknown>; startStr: string; endStr: string; start: Date | null; end: Date | null }; revert: () => void }) => {
+    const ev = info.event.extendedProps as unknown as CalendarEvent;
     const uid = ev.google_event_id ?? "";
     // Normalise to proper RFC3339 with local offset
     const newStart = info.event.start ? dateToLocalISO(info.event.start) : info.event.startStr;
@@ -3713,7 +3610,7 @@ export default function CalendarPage() {
       if (otherAttendees.length > 0) {
         // Revert the visual change and ask for confirmation first
         info.revert();
-        setPendingReschedule({ ev, newStart, newEnd });
+        setPendingReschedule({ ev, newStart, newEnd, revert: info.revert });
         return;
       }
       applyMeetingReschedule(ev, newStart, newEnd, info.revert);
@@ -3741,8 +3638,8 @@ export default function CalendarPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [applyMeetingReschedule, userEmail]);
 
-  const handleEventDrop = useCallback((info: { event: { extendedProps: CalendarEvent; startStr: string; endStr: string; start: Date | null; end: Date | null }; revert: () => void }) => {
-    const ev = info.event.extendedProps as CalendarEvent;
+  const handleEventDrop = useCallback((info: { event: { extendedProps: Record<string, unknown>; startStr: string; endStr: string; start: Date | null; end: Date | null }; revert: () => void }) => {
+    const ev = info.event.extendedProps as unknown as CalendarEvent;
     const uid = ev.google_event_id ?? "";
     const newStart = info.event.start ? dateToLocalISO(info.event.start) : info.event.startStr;
     const newEnd = info.event.end ? dateToLocalISO(info.event.end) : info.event.endStr;
@@ -3768,7 +3665,7 @@ export default function CalendarPage() {
       if (otherAttendees.length > 0) {
         // Revert the visual change and ask for confirmation first
         info.revert();
-        setPendingReschedule({ ev, newStart, newEnd });
+        setPendingReschedule({ ev, newStart, newEnd, revert: info.revert });
         return;
       }
       applyMeetingReschedule(ev, newStart, newEnd, info.revert);
@@ -3901,7 +3798,7 @@ export default function CalendarPage() {
 
   const calendarRef = useRef<FullCalendar>(null);
   const calendarWrapRef = useRef<HTMLDivElement>(null);
-  const [gutterWidth, setGutterWidth] = useState(48);
+  const [, setGutterWidth] = useState(48);
 
   // ── Hover time tooltip ───────────────────────────────────────────────────────
   const [hoverTooltip, setHoverTooltip] = useState<{
@@ -3909,6 +3806,10 @@ export default function CalendarPage() {
     label: string;
   } | null>(null);
   const dragInfoRef = useRef<{ startMs: number } | null>(null);
+  // True while FullCalendar's own event drag is in progress. Gating setHoverTooltip on this
+  // prevents rapid re-renders that feed FC a new events-array reference mid-drag, which would
+  // cause FC to reconcile its event store and abort the drag before eventDrop fires.
+  const fcDragActiveRef = useRef(false);
 
   function msToTimeLabel(ms: number): string {
     const totalMins = Math.round(ms / 60000 / 15) * 15;
@@ -3945,6 +3846,10 @@ export default function CalendarPage() {
     if (!wrap) return;
 
     function onMouseMove(e: MouseEvent) {
+      // Suppress tooltip state updates while FC is dragging an event — re-renders
+      // during drag feed FC a new events-array reference which causes it to reconcile
+      // its store and abort the drag before eventDrop fires.
+      if (fcDragActiveRef.current) return;
       const w = calendarWrapRef.current;
       if (!w) return;
       const ms = getMsFromY(w, e.clientY);
@@ -4098,7 +4003,7 @@ export default function CalendarPage() {
         const view = fcApi?.view;
         if (!view) return;
 
-        const colHeaders = Array.from(wrap.querySelectorAll<HTMLElement>(".fc-col-header-cell[data-date]"));
+        const colHeaders = Array.from(wrap!.querySelectorAll<HTMLElement>(".fc-col-header-cell[data-date]"));
         let dropDate: string | null = null;
         for (const cell of colHeaders) {
           const r = cell.getBoundingClientRect();
@@ -4108,7 +4013,7 @@ export default function CalendarPage() {
 
         // Hit-test each slot row by its viewport rect — immune to scroll position
         let dropHour = 9, dropMinute = 0;
-        const slots = Array.from(wrap.querySelectorAll<HTMLElement>(".fc-timegrid-slot[data-time]"));
+        const slots = Array.from(wrap!.querySelectorAll<HTMLElement>(".fc-timegrid-slot[data-time]"));
         let best: HTMLElement | null = null;
         for (const slot of slots) {
           const r = slot.getBoundingClientRect();
@@ -4152,7 +4057,7 @@ export default function CalendarPage() {
       if (!view) return;
 
       // Determine which date column the drop landed in
-      const colHeaders = Array.from(wrap.querySelectorAll<HTMLElement>(".fc-col-header-cell[data-date]"));
+      const colHeaders = Array.from(wrap!.querySelectorAll<HTMLElement>(".fc-col-header-cell[data-date]"));
       let dropDate: string | null = null;
       for (const cell of colHeaders) {
         const r = cell.getBoundingClientRect();
@@ -4167,7 +4072,7 @@ export default function CalendarPage() {
       // Hit-test each slot row by its viewport rect — immune to scroll position
       let dropHour = 9;
       let dropMinute = 0;
-      const slots = Array.from(wrap.querySelectorAll<HTMLElement>(".fc-timegrid-slot[data-time]"));
+      const slots = Array.from(wrap!.querySelectorAll<HTMLElement>(".fc-timegrid-slot[data-time]"));
       let best: HTMLElement | null = null;
       for (const slot of slots) {
         const r = slot.getBoundingClientRect();
@@ -4376,6 +4281,8 @@ export default function CalendarPage() {
             id: -m.id,
             owner: 0,
             owner_username: accountName,
+            account: accountId,
+            account_name: accountName,
             google_event_id: `airtable-meeting-${m.airtable_id}`,
             title: m.name || "Meeting",
             description: m.expected_topics || "",
@@ -4388,6 +4295,7 @@ export default function CalendarPage() {
             meet_link: m.gong_url || "",
             calendar_id: `account-${accountId}`,
             is_synced: false,
+            agentpm_airtable_id: "",
             created_at: "",
             updated_at: "",
           }));
@@ -4403,6 +4311,8 @@ export default function CalendarPage() {
     id: -(Math.abs((s.uid ?? (s.airtableId + s.start)).split("").reduce((a, c) => a + c.charCodeAt(0), 0))),
     owner: 0,
     owner_username: s.accountName ?? "",
+    account: null,
+    account_name: s.accountName ?? null,
     google_event_id: `scheduled-${s.airtableId}__${s.start.slice(0, 16)}`,
     title: s.task,
     description: "",
@@ -4415,6 +4325,7 @@ export default function CalendarPage() {
     meet_link: "",
     calendar_id: "work_tracking",
     is_synced: false,
+    agentpm_airtable_id: s.airtableId,
     created_at: "",
     updated_at: "",
   }));
@@ -4425,6 +4336,8 @@ export default function CalendarPage() {
     id: -(Math.abs(id.split("").reduce((a, c) => a + c.charCodeAt(0), 0)) + 1),
     owner: 0,
     owner_username: t.accountName ?? "",
+    account: null,
+    account_name: t.accountName ?? null,
     google_event_id: `active-timer-${id}`,
     title: `⏱ ${t.task}`,
     description: "",
@@ -4437,16 +4350,18 @@ export default function CalendarPage() {
     meet_link: "",
     calendar_id: "work_tracking",
     is_synced: false,
+    agentpm_airtable_id: id,
     created_at: "",
     updated_at: "",
   }));
 
   // Synthesize scheduled reminders as calendar events (amber)
-  const REMINDER_COLOR = "#f97316";
   const scheduledReminderCalEvents: CalendarEvent[] = scheduledReminders.map((r) => ({
     id: -(Math.abs((String(r.reminderId) + r.start).split("").reduce((a, c) => a + c.charCodeAt(0), 0)) + 2),
     owner: 0,
     owner_username: "",
+    account: null,
+    account_name: null,
     google_event_id: `scheduled-reminder-${r.reminderId}__${r.start.slice(0, 16)}`,
     title: `🔔 ${r.title}`,
     description: "",
@@ -4459,9 +4374,19 @@ export default function CalendarPage() {
     meet_link: "",
     calendar_id: "work_tracking",
     is_synced: false,
+    agentpm_airtable_id: "",
     created_at: "",
     updated_at: "",
   }));
+
+  // An event with no account-link entry (by google_event_id or numeric id) is "unlinked".
+  function isEventUnlinked(e: CalendarEvent): boolean {
+    const link = (e.google_event_id ? eventAccountLinks.get(e.google_event_id) : undefined)
+      ?? eventAccountLinks.get(String(e.id));
+    return !link;
+  }
+
+  const unlinkedCount = events.filter((e) => e.calendar_id !== "reminders" && isEventUnlinked(e)).length;
 
   // Filter events by content view — in accounts view, further filter to selected account
   const filteredEvents = (() => {
@@ -4471,6 +4396,7 @@ export default function CalendarPage() {
       if (contentView === "meetings") return e.calendar_id !== "work_tracking";
       if (contentView === "action-items") return e.calendar_id === "work_tracking";
       if (contentView === "reminders") return false; // only show scheduled reminders (amber events)
+      if (contentView === "unlinked") return isEventUnlinked(e);
       if (contentView === "accounts") {
         const link = (e.google_event_id ? eventAccountLinks.get(e.google_event_id) : undefined)
           ?? eventAccountLinks.get(String(e.id));
@@ -4557,6 +4483,10 @@ export default function CalendarPage() {
         }}
         logTimeModeAccount={logTimeModeAccount}
         onLogTimeMode={(name) => { setLogTimeModeAccount(name ?? null); if (name) { setSelectedAccountName(name); setContentView("accounts"); } }}
+        overLeftNav={!!logTimeModeAccount}
+        isUnlinkedView={contentView === "unlinked"}
+        onShowUnlinkedView={() => { setSelectedAccountName(null); setContentView("unlinked"); }}
+        unlinkedCount={unlinkedCount}
       />
 
       {/* ── Right button row — mirrors Accounts button on the left ─────────── */}
@@ -4674,7 +4604,7 @@ export default function CalendarPage() {
                   ));
                 }
               } catch {
-                setSelectedActionItem((prev) => prev ? { ...prev, ...Object.fromEntries(Object.keys(patch).map((k) => [k, (selectedActionItem as Record<string,unknown>)[k]])) } : prev);
+                setSelectedActionItem((prev) => prev ? { ...prev, ...Object.fromEntries(Object.keys(patch).map((k) => [k, (selectedActionItem as unknown as Record<string, unknown>)[k]])) } : prev);
               }
             } : undefined}
             onUpdateReminder={async (reminderId, patch) => {
@@ -4731,191 +4661,20 @@ export default function CalendarPage() {
         )}
       </div>
 
-      {/* Right-click context menu for work-tracking events */}
       {newEventDraft && (
-        <div className="fixed inset-0 z-[110] flex items-center justify-center bg-black/30" onClick={() => setNewEventDraft(null)}>
-          <div
-            className="bg-white rounded-2xl shadow-2xl p-6 w-full max-w-sm mx-4"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h2 className="text-base font-semibold text-gray-900 mb-1">New event</h2>
-            <p className="text-xs text-gray-500 mb-4">
-              {new Date(newEventDraft.start).toLocaleString(undefined, { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}
-              {" – "}
-              {new Date(newEventDraft.end).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}
-            </p>
-            <input
-              autoFocus
-              type="text"
-              placeholder="Event title"
-              value={newEventDraft.title}
-              onChange={(e) => setNewEventDraft((d) => d ? { ...d, title: e.target.value } : d)}
-              onKeyDown={(e) => {
-                if (e.key === "Escape") { setNewEventDraft(null); }
-                if (e.key === "Enter" && newEventDraft.title.trim()) {
-                  e.preventDefault();
-                  (document.getElementById("new-event-save-btn") as HTMLButtonElement | null)?.click();
-                }
-              }}
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 mb-3"
-            />
-            <div className="flex gap-2 mb-3">
-              {(["meeting", "action-item"] as const).map((t) => (
-                <button
-                  key={t}
-                  type="button"
-                  onClick={() => setNewEventDraft((d) => d ? { ...d, type: t } : d)}
-                  className={[
-                    "flex-1 py-1.5 rounded-lg text-xs font-medium border transition-colors",
-                    newEventDraft.type === t
-                      ? t === "meeting"
-                        ? "bg-blue-500 border-blue-500 text-white"
-                        : "bg-violet-500 border-violet-500 text-white"
-                      : "bg-white border-gray-200 text-gray-600 hover:border-gray-300",
-                  ].join(" ")}
-                >
-                  {t === "meeting" ? "Meeting" : "Action Item"}
-                </button>
-              ))}
-            </div>
-            {/* Account picker */}
-            <div className="relative mb-5">
-              {newEventDraft.selectedAccount ? (
-                <div className="flex items-center gap-2 border border-indigo-300 bg-indigo-50 rounded-lg px-3 py-2">
-                  <span className="text-sm text-indigo-800 flex-1 truncate">{newEventDraft.selectedAccount.name}</span>
-                  <button
-                    type="button"
-                    onClick={() => setNewEventDraft((d) => d ? { ...d, selectedAccount: null, accountQuery: "" } : d)}
-                    className="text-indigo-400 hover:text-indigo-700 shrink-0"
-                    aria-label="Remove account"
-                  >
-                    <svg viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5"><path d="M4.28 3.22a.75.75 0 0 0-1.06 1.06L6.94 8l-3.72 3.72a.75.75 0 1 0 1.06 1.06L8 9.06l3.72 3.72a.75.75 0 1 0 1.06-1.06L9.06 8l3.72-3.72a.75.75 0 0 0-1.06-1.06L8 6.94 4.28 3.22z"/></svg>
-                  </button>
-                </div>
-              ) : (
-                <>
-                  <input
-                    type="text"
-                    placeholder="Link to account (optional)"
-                    value={newEventDraft.accountQuery}
-                    onFocus={() => {
-                      if (!newEventDraft.accountQuery.trim()) {
-                        const results = allAccountsRef.current.slice(0, 8);
-                        setNewEventDraft((d) => d ? { ...d, accountResults: results } : d);
-                      }
-                    }}
-                    onBlur={() => {
-                      setTimeout(() => setNewEventDraft((d) => d ? { ...d, accountResults: [] } : d), 150);
-                    }}
-                    onChange={(e) => {
-                      const q = e.target.value;
-                      const results = q.trim()
-                        ? allAccountsRef.current.filter((a) => a.name.toLowerCase().includes(q.toLowerCase())).slice(0, 8)
-                        : allAccountsRef.current.slice(0, 8);
-                      setNewEventDraft((d) => d ? { ...d, accountQuery: q, accountResults: results } : d);
-                    }}
-                    onKeyDown={(e) => { if (e.key === "Escape") setNewEventDraft((d) => d ? { ...d, accountQuery: "", accountResults: [] } : d); }}
-                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                  />
-                  {newEventDraft.accountResults.length > 0 && (
-                    <ul className="absolute z-10 left-0 right-0 mt-1 bg-white border border-gray-200 rounded-xl shadow-lg overflow-y-auto max-h-48">
-                      {newEventDraft.accountResults.map((a) => (
-                        <li key={a.id}>
-                          <button
-                            type="button"
-                            className="w-full text-left px-3 py-2 text-sm hover:bg-indigo-50 transition-colors truncate"
-                            onClick={() => setNewEventDraft((d) => d ? { ...d, selectedAccount: a, accountQuery: "", accountResults: [] } : d)}
-                          >
-                            {a.name}
-                          </button>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </>
-              )}
-            </div>
-            <div className="flex gap-2">
-              <button
-                type="button"
-                onClick={() => setNewEventDraft(null)}
-                className="flex-1 py-2 rounded-lg border border-gray-200 text-sm text-gray-600 hover:bg-gray-50 transition-colors"
-              >
-                Cancel
-              </button>
-              <button
-                id="new-event-save-btn"
-                type="button"
-                disabled={!newEventDraft.title.trim() || newEventSaving}
-                onClick={async () => {
-                  if (!newEventDraft.title.trim()) return;
-                  setNewEventSaving(true);
-                  const { selectedAccount, type: draftType, title, start, end } = newEventDraft;
-                  try {
-                    if (draftType === "action-item") {
-                      // Create a proper AirtableActionItem and schedule it on the calendar
-                      const { data: newItem } = await airtableApi.createActionItem({
-                        task: title.trim(),
-                        status: "Open",
-                        priority: "Medium",
-                        account: selectedAccount?.id ?? null,
-                        account_name: selectedAccount?.name ?? null,
-                        estimated_time: Math.round((new Date(end).getTime() - new Date(start).getTime()) / 60000),
-                      });
-                      saveScheduledItem({ airtableId: newItem.airtable_id, task: newItem.task, accountName: newItem.account_name, start, end });
-                      setScheduledItems(readScheduledItems());
-                      // Add account link so the tile shows the account name immediately
-                      if (selectedAccount) {
-                        const scheduledUid = `scheduled-${newItem.airtable_id}__${start.slice(0, 16)}`;
-                        setEventAccountLinks((prev) => {
-                          const next = new Map(prev);
-                          next.set(scheduledUid, { accountId: selectedAccount.id, accountName: selectedAccount.name });
-                          return next;
-                        });
-                      }
-                      // Signal the sidebar to refresh
-                      window.dispatchEvent(new StorageEvent("storage", { key: "actionItemsUpdated", newValue: "1" }));
-                      openItemsPanel("action-items");
-                    } else {
-                      const payload: Partial<CalendarEvent> = {
-                        title: title.trim(),
-                        start_datetime: start,
-                        end_datetime: end,
-                        calendar_id: "primary",
-                        status: "confirmed",
-                        all_day: false,
-                      };
-                      const created = await schedulerApi.createEvent(payload);
-                      setEvents((prev) => [...prev, created.data]);
-                      if (selectedAccount) {
-                        // Link by google_event_id if available; also by numeric id as fallback
-                        // for events that haven't synced to Google yet
-                        const uid = created.data.google_event_id || String(created.data.id);
-                        void linkEventToAccount(selectedAccount.id, selectedAccount.name, uid);
-                      }
-                    }
-                    setNewEventDraft(null);
-                    setDropToast({ msg: `Created "${title.trim()}"`, type: "success" });
-                    setTimeout(() => setDropToast(null), 3000);
-                  } catch {
-                    setDropToast({ msg: "Failed to create", type: "warn" });
-                    setTimeout(() => setDropToast(null), 3000);
-                  } finally {
-                    setNewEventSaving(false);
-                  }
-                }}
-                className="flex-1 py-2 rounded-lg bg-indigo-600 text-white text-sm font-medium hover:bg-indigo-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-              >
-                {newEventSaving ? "Saving…" : "Create"}
-              </button>
-            </div>
-          </div>
-        </div>
+        <CreateEventModal
+          draft={newEventDraft}
+          onChange={(updater) => setNewEventDraft((d) => d ? updater(d) : d)}
+          onSave={handleCreateEventSave}
+          onCancel={() => setNewEventDraft(null)}
+          saving={newEventSaving}
+          zoomConnected={zoomConnected}
+          allAccountsRef={allAccountsRef}
+        />
       )}
 
       {ctxMenu && (() => {
         const ev = ctxMenu.event;
-        const isWorkItem = ctxMenu.type !== "meeting";
         const isRemovable = ctxMenu.type !== "meeting";
         const isMeeting = ctxMenu.type === "meeting";
         const eventDate = ev.start_datetime.slice(0, 10);
@@ -4998,15 +4757,18 @@ export default function CalendarPage() {
                 isMeeting ? "Convert to action item" : "Convert to meeting",
                 isMeeting ? "✅" : "📅",
                 () => {
-                  setNewEventDraft({
+                  setNewEventDraft(blankNewEventDraft({
                     start: ev.start_datetime,
                     end: ev.end_datetime,
                     title: ev.title,
                     type: isMeeting ? "action-item" : "meeting",
+                    category: ev.event_category ?? "meeting",
                     accountQuery: accountName ?? "",
                     selectedAccount: linkedAcct ? { id: linkedAcct.accountId, name: linkedAcct.accountName } : null,
-                    accountResults: [],
-                  });
+                    description: ev.description ?? "",
+                    videoConference: ev.meet_link ? (ev.meet_link.includes("meet.google.com") ? "meet" : "zoom") : "none",
+                    videoConferenceUrl: ev.meet_link && !ev.meet_link.includes("meet.google.com") ? ev.meet_link : "",
+                  }));
                 }
               )}
 
@@ -5020,7 +4782,7 @@ export default function CalendarPage() {
                   body: "",
                   due_at: dueStr,
                   resource_type: "calendar_event",
-                  resource_id: String(ev.id > 0 ? ev.id : ev.google_event_id),
+                  resource_id: ev.id > 0 ? ev.id : null,
                   resource_label: ev.title,
                   notify_in_app: true,
                 }).then(({ data: r }) => {
@@ -5388,19 +5150,21 @@ export default function CalendarPage() {
             eventResize={handleEventResize}
             eventDrop={handleEventDrop}
             eventDragStart={(info) => {
+              fcDragActiveRef.current = true;
               const wrap = calendarWrapRef.current;
               if (!wrap) return;
               const ms = getMsFromY(wrap, (info.jsEvent as MouseEvent).clientY);
               if (ms !== null) dragInfoRef.current = { startMs: Math.round(ms / (15 * 60000)) * 15 * 60000 };
             }}
-            eventDragStop={() => { dragInfoRef.current = null; setHoverTooltip(null); }}
+            eventDragStop={() => { fcDragActiveRef.current = false; dragInfoRef.current = null; setHoverTooltip(null); }}
             eventResizeStart={(info) => {
+              fcDragActiveRef.current = true;
               const wrap = calendarWrapRef.current;
               if (!wrap) return;
               const ms = getMsFromY(wrap, (info.jsEvent as MouseEvent).clientY);
               if (ms !== null) dragInfoRef.current = { startMs: Math.round(ms / (15 * 60000)) * 15 * 60000 };
             }}
-            eventResizeStop={() => { dragInfoRef.current = null; setHoverTooltip(null); }}
+            eventResizeStop={() => { fcDragActiveRef.current = false; dragInfoRef.current = null; setHoverTooltip(null); }}
             slotDuration="00:15:00"
             slotLabelInterval="00:30:00"
             allDaySlot={false}

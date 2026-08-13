@@ -6,7 +6,7 @@
  */
 
 import { SyncClient } from "twilio-sync";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { realtimeApi } from "./api";
 
 // ── Singleton ─────────────────────────────────────────────────────────────────

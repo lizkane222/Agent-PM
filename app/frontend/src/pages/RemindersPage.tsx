@@ -2,7 +2,7 @@ import { useRef, useState } from "react";
 import ScheduleIcon from "../assets/icons/Schedule.svg?react";
 import { useNotificationDefaults } from "../context/NotificationDefaultsContext";
 import type { ReminderResourceType } from "../types";
-import { useExport } from "../context/ExportContext";
+import { useExport, type ExportItem } from "../context/ExportContext";
 import { useRightClickComment } from "../components/comments/CommentContext";
 import { addLog } from "../lib/appLog";
 import ActivityLogSection from "../components/ActivityLogSection";
@@ -141,7 +141,6 @@ export default function RemindersPage() {
       }
       setShowForm(false);
       setEditId(null);
-      load();
     } finally {
       setSaving(false);
     }
@@ -452,7 +451,7 @@ function ReminderRow({
   r: Reminder;
   exportMode: boolean;
   isSelected: (key: string) => boolean;
-  toggleItem: (item: { id: string; type: string; label: string; summary: string; content: string }) => void;
+  toggleItem: (item: ExportItem) => void;
   openEdit: (r: Reminder) => void;
   dismiss: (id: number) => void;
   del: (id: number) => void;

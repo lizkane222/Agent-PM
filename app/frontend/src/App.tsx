@@ -81,6 +81,7 @@ function RequireAuth({ children }: { children: React.ReactNode }) {
     const refresh = getRefreshToken();
     if (!refresh) {
       clearTokens();
+      reset();
       setRedirectToLogin(true);
       return;
     }
@@ -92,6 +93,7 @@ function RequireAuth({ children }: { children: React.ReactNode }) {
       })
       .catch(() => {
         clearTokens();
+      reset();
         setRedirectToLogin(true);
       });
   }, []); // eslint-disable-line react-hooks/exhaustive-deps

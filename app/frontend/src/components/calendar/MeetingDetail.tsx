@@ -21,7 +21,6 @@ import { useCommentContext } from "../comments/CommentContext";
 import InlineCommentThread from "../comments/InlineCommentThread";
 import KanbanCard from "./KanbanCard";
 import LogTimeModal from "./LogTimeModal";
-import ChatterPost from "./ChatterPost";
 import ActivityLogSection from "../ActivityLogSection";
 import { convertActionItemToEvent, convertEventToActionItem, restoreConversion } from "../../hooks/useConvert";
 
@@ -95,7 +94,7 @@ function AttachmentsSection({ item }: { item: AirtableActionItem }) {
         <ul className="space-y-1 mb-2">
           {attachments.map(a => (
             <li key={a.id} className="flex items-center gap-2 text-sm">
-              <a href={a.url} target="_blank" rel="noreferrer" className="flex-1 truncate text-indigo-600 hover:underline text-xs">{a.name || a.url}</a>
+              <a href={a.url ?? undefined} target="_blank" rel="noreferrer" className="flex-1 truncate text-indigo-600 hover:underline text-xs">{a.name || a.url}</a>
               <button
                 type="button"
                 onClick={() => void handleDelete(a.id)}
@@ -216,7 +215,7 @@ function ActionItemEditModal({
       if (form.status !== item.status) patch.status = form.status as AirtableActionItem["status"];
       if (form.priority !== item.priority) patch.priority = form.priority as AirtableActionItem["priority"];
       if ((form.due_date || null) !== item.due_date) patch.due_date = form.due_date || null;
-      if ((form.assignee_name || null) !== item.assignee_name) patch.assignee_name = form.assignee_name || null;
+      if ((form.assignee_name || "") !== item.assignee_name) patch.assignee_name = form.assignee_name || "";
       if (form.estimated_time !== item.estimated_time) patch.estimated_time = form.estimated_time;
       if (form.time_spent !== item.time_spent) patch.time_spent = form.time_spent;
       if (Object.keys(patch).length > 0) {

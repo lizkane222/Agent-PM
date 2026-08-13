@@ -9,7 +9,7 @@
  *
  * The floating panel is rendered in a portal so it works on every page.
  */
-import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useState } from "react";
 import { createPortal } from "react-dom";
 import type { CommentResourceType } from "../../types";
 import CommentPanel from "./CommentPanel";

@@ -4,7 +4,6 @@ import TeamIcon from "../assets/icons/Team.svg?react";
 import { accountsApi } from "../lib/api";
 import type { Account, TeamMember } from "../types";
 import { getTitleRole, ROLE_META, ROLE_ORDER } from "../lib/titleRoles";
-import type { TitleRole } from "../lib/titleRoles";
 import { addLog } from "../lib/appLog";
 import { useLogGlow } from "../hooks/useLogGlow";
 import { useCurrentUser } from "../context/CurrentUserContext";
@@ -96,13 +95,6 @@ function ViewToggle({ value, onChange }: { value: ViewMode; onChange: (v: ViewMo
 }
 
 // ── Draggable account chip (used in the Accounts sidebar) ────────────────────
-
-const ACCOUNT_STATUS_COLORS: Record<Account["status"], string> = {
-  prospect: "bg-yellow-100 text-yellow-700",
-  active: "bg-green-100 text-green-700",
-  inactive: "bg-gray-100 text-[var(--twilio-navy)]",
-  churned: "bg-red-100 text-red-600",
-};
 
 function DraggableAccountChip({
   account,

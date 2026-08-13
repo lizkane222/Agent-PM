@@ -41,7 +41,7 @@ These areas need their own dedicated design effort. Do not migrate, refactor, or
 
 | File | Reason |
 |---|---|
-| `AccountDetailPage.tsx` (~7,230 lines) | ~14 entity types, ~30 inlined sub-components |
+| `AccountDetailPage.tsx` | Migration complete — now 1,268 lines. Only Phase 6 tests remain. |
 | `CalendarPage.tsx` (~5,549 lines) | Real-time WebSocket + Google Calendar OAuth + Salesforce sync |
 | `ActionItemsPage.tsx` — local-draft flow | `local-*` optimistic ID protocol spans render, sync, and Airtable write-back |
 | `MeetingDetail.tsx` — WebSocket code | Real-time collaboration; standalone concern |
@@ -209,3 +209,77 @@ npm run build
 - [ ] No API routes, request shapes, or response shapes were changed
 - [ ] No visible UI or styling changes were introduced
 - [ ] The original app at `/Users/lizkane/Desktop/TWILIO - Agent PM` was not touched
+
+---
+
+## Session Log
+
+### 2026-07-29 — AccountDetailPage migration Phases 3–5
+
+**What changed**
+- `AccountDetailPage.tsx` reduced from 7,230 → 1,268 lines
+- Phase 3 (trivial): extracted `Avatar`, `ReminderBell`, `ReminderSection`, `EmailStatusBadge`, `ArtifactIcon`, `ArtifactViewer`, `NoteActionButton`, `PillInputs`, `EditAccountModal`, `SidebarField`, `ContactNoteRow`, `ThreadCard`, `ActionItemCardOccurrences`
+- Phase 4 (medium): created `src/lib/noteHelpers.tsx` + 15 components in `src/components/account/`
+- Phase 5 (hard): extracted `NewActionItemCard`, `ActionItemModal`, `ActionItemCard`, `AccountTimeline`, `ProjectGoals`, `AccountNoteRow`, `AccountMeetingNotes`
+
+**Key decisions**
+- `noteHelpers` must be `.tsx` not `.ts` — `renderNoteInline` contains JSX
+- `AddArtifactModal` bundled into `ArtifactsPanel.tsx` (exclusively rendered there)
+- `handleKanbanDrop` deps: `[actionItems, setKanbanDragOverCol, setActionItems]`
+
+**Left open**
+- Phase 6: component tests for `ActionItemModal`, `CustomerContactsPanel`, `ProjectGoals`, `AccountNoteRow` + `AccountDetailPage` smoke suite
+
+---
+
+### 2026-08-07 — Action items rich text + steps subsystem
+
+**What changed**
+
+Backend:
+- `ActionItemStep` model in `airtable_sync/models.py` — FK to `AirtableActionItem`, status: Open/Done/Blocked/Archived
+- `ActionItemStepViewSet` at `/api/v1/airtable/steps/`
+- `action_item_step` added to `RESOURCE_TYPE_CHOICES` in `comments/models.py`
+
+Frontend:
+- `StepStatus` / `ActionItemStep` types in `types/action_items.ts`
+- `stepsApi` in `lib/api.ts`, `useActionItemSteps` hook
+- `ActionItemDescriptionEditor.tsx` — TipTap v3 rich text (bold/italic/strike, lists, link, @mention)
+- `StepsPanel.tsx` — step list with status badges, inline editing, inline comments, delete
+
+**Key decisions**
+- `task_details` now stores HTML; `plainToHtml()` handles legacy plain-text on read
+- TipTap Placeholder uses `elementFromPoint` (not in jsdom) — always mock `ActionItemDescriptionEditor` in page tests
+- 242/242 frontend tests; 193/193 backend tests; `tsc --noEmit` clean
+
+---
+
+### 2026-08-07 — Meeting link chip + Done-sort + step handlers
+
+**What changed**
+- `handleConvertStepToActionItem` and `handleAddStepToCalendar` wired in `ActionItemsPage`
+- Done-sort descending on three sorted lists in `ActionItemsPage`
+- Meeting chip (violet pill) on `KanbanCard` and `ActionItemCard`; click navigates to `/accounts/:id?meeting=:linkedMeetingId`
+- `AccountDetailPage`: `useSearchParams` reads `?meeting=<id>` on load, opens meeting panel, scrolls timeline
+- 250/250 frontend tests; 193/193 backend tests; `tsc --noEmit` clean
+
+---
+
+### 2026-08-12 — SettingsPage: Register Gmail watch + sign-out + org data sources
+
+**What changed**
+
+Frontend only:
+- `integrationsApi.getScraperStatus()` — `GET /api/v1/integrations/scraper-status/` in `lib/api.ts`
+- `integrationsApi.registerGmailWatch()` — `POST /api/v1/integrations/gmail/watch/` in `lib/api.ts`
+- `SettingsPage.tsx`: `handleSignOut` (calls `logout()` then navigates to `/oidc/logout/`), Sign-out button in header, "Register Gmail watch" button alongside Gmail `ConnectionCard`, "Organization Data Sources" section (confluence/jira/zendesk/gong/notion with Active/Token-not-configured status)
+- `test/handlers/team.ts`: added `mockUserProfile` export + `GET /api/v1/team/profiles/me/` and `PATCH /api/v1/team/profiles/me/` handlers
+- `pages/__tests__/SettingsPage.test.tsx`: 8 tests (loading state, sign-out button, profile display name, org sources, active org source, sign-out click, register Gmail watch button, register Gmail watch success)
+
+**Key decisions**
+- Test isolation: `beforeEach` resets `window.location` to `{ href: "http://localhost/" }` (absolute URL). Root cause: test 6's `Object.defineProperty(window.location, {href: "/"})` (relative URL) caused axios's `isURLSameOrigin` to throw `Invalid URL` in subsequent tests, silently leaving `credentials = []`
+- 257/257 frontend tests pass (excluding 4 pre-existing untracked failures); `tsc --noEmit` clean; 96/96 tracked backend tests pass
+
+**Left open**
+- Phase 6 AccountDetailPage tests (deferred from 2026-07-29)
+- Pre-existing backend failures in untracked apps (account_feed, accounts/tests, search/tests, sync_review, comments/tests) — reference symbols not yet implemented in tracked source files

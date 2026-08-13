@@ -1,5 +1,29 @@
 import { http, HttpResponse } from "msw";
-import type { TeamMember } from "../../types";
+import type { TeamMember, UserProfile } from "../../types";
+
+export const mockUserProfile: UserProfile = {
+  id: 1,
+  username: "alice",
+  email: "alice@example.com",
+  is_staff: false,
+  display_name: "Alice Smith",
+  avatar_url: "",
+  title: "Account Executive",
+  role: "member",
+  phone_number: "",
+  timezone: "America/New_York",
+  slack_user_id: "",
+  google_account_email: "alice@example.com",
+  airtable_collaborator_id: "",
+  notification_email: true,
+  notification_slack: false,
+  notify_default_in_app: true,
+  notify_default_slack: false,
+  notify_default_push: false,
+  notify_default_sms: false,
+  push_subscription_active: false,
+  staff_view_override: false,
+};
 
 export const mockTeamMembers: TeamMember[] = [
   {
@@ -37,6 +61,13 @@ export const mockTeamMembers: TeamMember[] = [
 ];
 
 export const teamHandlers = [
+  http.get("/api/v1/team/profiles/me/", () =>
+    HttpResponse.json(mockUserProfile)
+  ),
+  http.patch("/api/v1/team/profiles/me/", async ({ request }) => {
+    const body = await request.json() as Partial<UserProfile>;
+    return HttpResponse.json({ ...mockUserProfile, ...body });
+  }),
   http.get("/api/v1/team/members/", () =>
     HttpResponse.json({ results: mockTeamMembers, count: mockTeamMembers.length })
   ),

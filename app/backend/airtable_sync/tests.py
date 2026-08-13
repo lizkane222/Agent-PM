@@ -153,7 +153,7 @@ class GongNotesByPkAPITests(TestCase):
     """PATCH /airtable/meetings/<pk>/gong-notes/ — saves by Django PK."""
 
     def setUp(self):
-        self.user = make_user()
+        self.user = User.objects.create_user("pkuser", password="pass", is_staff=True)
         self.client = APIClient()
         self.client.force_authenticate(user=self.user)
         self.account = make_airtable_account()
@@ -346,7 +346,7 @@ class GongNotesResponseShapeTests(TestCase):
     """Verify the response body contains the expected fields."""
 
     def setUp(self):
-        self.user = make_user("shapeuser")
+        self.user = User.objects.create_user("shapeuser", password="pass", is_staff=True)
         self.client = APIClient()
         self.client.force_authenticate(user=self.user)
 

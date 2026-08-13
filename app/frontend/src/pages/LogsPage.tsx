@@ -33,6 +33,7 @@ const CATEGORY_LABEL: Record<LogCategory, string> = {
   team: "Team",
   action_item: "Action Item",
   calendar: "Calendar",
+  comment_reply: "Comment Reply",
 };
 
 const CATEGORY_COLOR: Record<LogCategory, string> = {
@@ -40,6 +41,7 @@ const CATEGORY_COLOR: Record<LogCategory, string> = {
   team: "bg-sky-50 text-sky-700 ring-1 ring-sky-200",
   action_item: "bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200",
   calendar: "bg-amber-50 text-amber-700 ring-1 ring-amber-200",
+  comment_reply: "bg-violet-50 text-violet-700 ring-1 ring-violet-200",
 };
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
@@ -306,7 +308,7 @@ const FB_STATUS_LABEL: Record<string, string> = {
 };
 
 function FeedbackTab() {
-  const { data: items, loading } = useFeedbackItems();
+  const { data: items, loading, refetch } = useFeedbackItems();
   const [selected, setSelected] = useState<FeedbackItem | null>(null);
 
   if (loading) return <LoadingState />;
@@ -363,11 +365,11 @@ function FeedbackTab() {
           item={selected}
           onClose={() => setSelected(null)}
           onUpdated={updated => {
-            setItems(prev => prev.map(f => f.id === updated.id ? updated : f));
+            void refetch();
             setSelected(updated);
           }}
-          onDeleted={id => {
-            setItems(prev => prev.filter(f => f.id !== id));
+          onDeleted={() => {
+            void refetch();
             setSelected(null);
           }}
         />

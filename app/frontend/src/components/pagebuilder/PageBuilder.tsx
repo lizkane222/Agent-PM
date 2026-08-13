@@ -7,7 +7,6 @@ import {
   useSensor,
   useSensors,
   useDroppable,
-  useDraggable,
 } from "@dnd-kit/core";
 import { useExport, type ExportItem } from "../../context/ExportContext";
 import ComponentPalette from "./ComponentPalette";
@@ -62,34 +61,11 @@ function addChildToTree(root: CanvasNode[], parentId: string, child: CanvasNode)
   });
 }
 
-function updateNodeXYProps(root: CanvasNode[], id: string, props: Record<string, unknown>): CanvasNode[] {
-  return root.map((n) => {
-    if (n.id === id) return { ...n, props: { ...n.props, ...props } };
-    return { ...n, children: updateNodeXYProps(n.children, id, props) };
-  });
-}
-
 function updateNodeXY(root: CanvasNode[], id: string, x: number, y: number): CanvasNode[] {
   return root.map((n) => {
     if (n.id === id) return { ...n, props: { ...n.props, x, y } };
     return { ...n, children: updateNodeXY(n.children, id, x, y) };
   });
-}
-
-// Returns position of pointer relative to a DOM element's top-left, accounting for drag delta.
-function pointerRelativeTo(
-  el: Element,
-  activatorEvent: Event,
-  delta: { x: number; y: number },
-  nodeSize: { w: number; h: number },
-): { x: number; y: number } {
-  const rect = el.getBoundingClientRect();
-  if (activatorEvent instanceof PointerEvent) {
-    const x = Math.max(0, Math.round(activatorEvent.clientX + delta.x - rect.left - nodeSize.w / 2));
-    const y = Math.max(0, Math.round(activatorEvent.clientY + delta.y - rect.top  - nodeSize.h / 2));
-    return { x, y };
-  }
-  return { x: 16, y: 16 };
 }
 
 type Rect = { x: number; y: number; w: number; h: number };
@@ -141,7 +117,7 @@ function computeSnapLines(activeId: string | null, nodes: CanvasNode[]): SnapLin
 
 // Single droppable canvas — one div, no nested wrappers
 function CanvasArea({
-  nodes, selectedId, multiSelectedIds, onSelect, onDelete, onResizeLive, onResizeCommit, onUpdateProps, canvasRef, onDeselect, onMarqueeSelect, onExportItemDrop, onNodeContextMenu, onImportTeamMembers,
+  nodes, selectedId, multiSelectedIds, onSelect, onDelete, onResizeLive, onResizeCommit, onUpdateProps, canvasRef, onDeselect, onMarqueeSelect, onExportItemDrop, onNodeContextMenu, onImportTeamMembers, onFetchTimelineMeetings,
 }: {
   nodes: CanvasNode[];
   selectedId: string | null;
@@ -324,7 +300,7 @@ function CanvasArea({
 
 export default function PageBuilder() {
   const {
-    nodes, commit, live,
+    nodes, commit,
     undo, redo, canUndo, canRedo,
     selectedId, setSelectedId,
     deleteNode,
@@ -372,8 +348,8 @@ export default function PageBuilder() {
     return () => { if (draftTimerRef.current) clearTimeout(draftTimerRef.current); };
   }, [nodes]);
 
-  // Export tray — only need items list for drop logic; display is handled by ExportBar
-  const { items: exportItems } = useExport();
+  // Export tray — display is handled by ExportBar; drop handler receives the full item directly
+  useExport();
 
   const handleShiftSelect = useCallback((id: string) => {
     setMultiSelectedIds((prev) =>

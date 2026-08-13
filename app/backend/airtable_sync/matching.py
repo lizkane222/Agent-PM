@@ -148,11 +148,22 @@ def set_manual_categorization(
     event_uid: str,
     account_id: int | None,
     categorization: str,
+    account_name: str = "",
 ) -> CalendarEventAccountLink:
     """Called when the user manually selects an account or a category (Internal/Admin)."""
     account = None
     if account_id:
-        account = AirtableAccount.objects.filter(pk=account_id).first()
+        candidate = AirtableAccount.objects.filter(pk=account_id).first()
+        if candidate:
+            # Verify name matches to prevent cross-model PK collisions:
+            # accounts.Account PKs and AirtableAccount PKs are separate sequences —
+            # the same integer can map to two different companies.
+            if not account_name or candidate.name.lower() == account_name.lower():
+                account = candidate
+            else:
+                account = AirtableAccount.objects.filter(name__iexact=account_name).first()
+        elif account_name:
+            account = AirtableAccount.objects.filter(name__iexact=account_name).first()
 
     link, _ = CalendarEventAccountLink.objects.update_or_create(
         calendar_event_uid=event_uid,

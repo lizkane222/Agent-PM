@@ -101,14 +101,22 @@ class AirtableAccountViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         # Limit to AirtableAccounts whose airtable_id matches an Account the user
         # is assigned to as a team member. Staff see all (unless they toggled off staff view).
+        from accounts.models import Account
         if _staff_sees_all(self.request.user):
             qs = AirtableAccount.objects.all()
         else:
-            from accounts.models import Account
             allowed_ids = Account.objects.filter(
                 team_members__user=self.request.user
             ).values_list("airtable_id", flat=True)
             qs = AirtableAccount.objects.filter(airtable_id__in=allowed_ids)
+        # Always exclude AirtableAccounts whose name matches the user's personal admin
+        # account. Admin accounts are per-user workspaces (accounts.Account with
+        # is_admin_account=True) and must never appear as shared Airtable entries.
+        user_admin = Account.objects.filter(
+            admin_owner=self.request.user, is_admin_account=True
+        ).values_list("company_name", flat=True).first()
+        if user_admin:
+            qs = qs.exclude(name__iexact=user_admin)
         airtable_id = self.request.query_params.get("airtable_id")
         if airtable_id:
             qs = qs.filter(airtable_id=airtable_id)
@@ -630,6 +638,7 @@ def categorize_event(request):
         event_uid=d["event_uid"],
         account_id=d.get("account_id"),
         categorization=d.get("categorization", ""),
+        account_name=d.get("account_name", ""),
     )
 
     account = link.account

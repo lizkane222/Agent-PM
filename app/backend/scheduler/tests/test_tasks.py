@@ -6,8 +6,8 @@ from django.utils import timezone
 
 from team.models import UserProfile
 
-from .models import Reminder
-from .tasks import _send_sms, deliver_due_reminders
+from ..models import Reminder
+from ..tasks import _send_sms, deliver_due_reminders
 
 
 def _make_user(email="test@example.com", phone="+15551234567"):

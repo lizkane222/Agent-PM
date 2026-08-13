@@ -7,12 +7,30 @@ import json
 import logging
 import urllib.parse
 
+from asgiref.sync import sync_to_async
 from channels.db import database_sync_to_async
 from channels.generic.websocket import AsyncJsonWebsocketConsumer, AsyncWebsocketConsumer
 
 from agents.models import AgentSession
+from . import conversations as conv_api
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Async wrappers for sync Twilio REST calls
+# ---------------------------------------------------------------------------
+
+_create_voice_conversation = sync_to_async(conv_api.create_voice_conversation)
+_add_conversation_message = sync_to_async(conv_api.add_conversation_message)
+_close_voice_conversation = sync_to_async(conv_api.close_voice_conversation)
+
+
+@database_sync_to_async
+def _persist_conversation_sid(call_sid: str, conversation_sid: str) -> None:
+    """Write conversation_sid back to VoiceSession if it exists (best-effort)."""
+    from realtime.models import VoiceSession  # noqa: PLC0415
+    VoiceSession.objects.filter(call_sid=call_sid).update(conversation_sid=conversation_sid)
 
 
 @database_sync_to_async
@@ -233,7 +251,7 @@ class ConversationRelayConsumer(AsyncWebsocketConsumer):
       {"type": "text", "token": "<text chunk>", "last": false}
       {"type": "text", "token": "<final chunk>", "last": true}
 
-    We pipe each transcribed utterance through AgentOrchestrator and stream
+    We pipe each transcribed utterance through Claude via AWS Bedrock and stream
     the text response back as token chunks so Twilio's TTS speaks them as
     they arrive (low latency).
     """
@@ -254,6 +272,7 @@ class ConversationRelayConsumer(AsyncWebsocketConsumer):
         self._history: list[dict] = []
         self._call_sid: str = ""
         self._group: str = ""
+        self._conversation_sid: str = ""
         # Turns that arrive before the browser WS has joined the group are
         # buffered here and flushed on the next group_send so nothing is lost.
         self._pending_turns: list[dict] = []
@@ -262,6 +281,11 @@ class ConversationRelayConsumer(AsyncWebsocketConsumer):
     async def disconnect(self, close_code):
         if self._group:
             await self.channel_layer.group_discard(self._group, self.channel_name)
+        if self._conversation_sid:
+            await _close_voice_conversation(self._conversation_sid)
+            # Persist SID on disconnect — VoiceSession is guaranteed to exist
+            # by this point because the status callback fires before/with hangup.
+            await _persist_conversation_sid(self._call_sid, self._conversation_sid)
         logger.info("ConversationRelay disconnected: call_sid=%s code=%s", self._call_sid, close_code)
 
     async def receive(self, text_data=None, bytes_data=None):
@@ -279,6 +303,16 @@ class ConversationRelayConsumer(AsyncWebsocketConsumer):
             self._group = f"voice_transcript_{self._call_sid}"
             await self.channel_layer.group_add(self._group, self.channel_name)
             logger.info("ConversationRelay setup: call_sid=%s", self._call_sid)
+            # Create a Conversations thread to persist the full voice transcript.
+            try:
+                self._conversation_sid = await _create_voice_conversation(self._call_sid)
+                # Best-effort early save; definitive save happens on disconnect.
+                await _persist_conversation_sid(self._call_sid, self._conversation_sid)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "ConversationRelay: failed to create Conversations thread for %s: %s",
+                    self._call_sid, exc,
+                )
 
         elif event == "prompt":
             utterance = msg.get("voicePrompt", "").strip()
@@ -301,21 +335,20 @@ class ConversationRelayConsumer(AsyncWebsocketConsumer):
         self._pending_turns.clear()
 
     async def _handle_prompt(self, utterance: str) -> None:
-        """Run Claude on the utterance, stream TTS tokens to Twilio, push transcript to browser."""
-        from agents.agent import AgentOrchestrator
+        """Stream a Claude Bedrock response for the utterance, push transcript to browser."""
+        from .llm import bedrock_stream
 
         # Push user utterance to browser immediately.
         await self._push_turn("user", utterance)
 
-        orchestrator = AgentOrchestrator()
+        # Persist customer turn to Conversations.
+        if self._conversation_sid:
+            await _add_conversation_message(self._conversation_sid, "customer", utterance)
+
         full_response = ""
 
         try:
-            async for chunk in orchestrator.run(utterance, conversation_history=self._history):
-                # Skip the terminal {"__token_usage__": ...} sentinel yielded by
-                # AgentOrchestrator.run() — it's a usage accounting frame, not text.
-                if isinstance(chunk, dict):
-                    continue
+            async for chunk in bedrock_stream(utterance, self._history):
                 full_response += chunk
                 await self.send(text_data=json.dumps({
                     "type": "text",
@@ -340,6 +373,10 @@ class ConversationRelayConsumer(AsyncWebsocketConsumer):
 
         # Push completed assistant response to browser.
         await self._push_turn("assistant", full_response)
+
+        # Persist assistant turn to Conversations.
+        if self._conversation_sid and full_response:
+            await _add_conversation_message(self._conversation_sid, "agent-pm", full_response)
 
         self._history.append({"role": "user", "content": utterance})
         self._history.append({"role": "assistant", "content": full_response})
