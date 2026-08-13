@@ -11,3 +11,11 @@ node_modules/
 
 # ── Claude-generated scratch planning docs (not for version control) ─────────
 MIGRATION_PLAN_*.md
+
+# ── One-time migration artifacts (reorg-specific, local absolute paths) ──────
+FILE_MAP.md
+PLAN.md
+migration.md
+Twilio-AgentPM-dataModeledApp-prompts.md
+SMOKE_TESTS.md
+FINAL_CLEANUP.md
