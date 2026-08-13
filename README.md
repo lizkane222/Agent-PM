@@ -5,8 +5,8 @@ A hybrid Django + React application that combines an AI-powered scheduling and p
 ## Architecture
 
 ```
-backend/   Django 5 · DRF · Channels · Celery · Anthropic SDK · Twilio
-frontend/  Vite · React 18 · TypeScript · Tailwind CSS v4 · React Router v7
+app/backend/   Django 5 · DRF · Channels · Celery · Anthropic SDK · Twilio
+app/frontend/  Vite · React 18 · TypeScript · Tailwind CSS v4 · React Router v7
 ```
 
 ## Prerequisites
@@ -21,6 +21,7 @@ frontend/  Vite · React 18 · TypeScript · Tailwind CSS v4 · React Router v7
 ### 1. Clone and configure
 
 ```bash
+cd app
 cp .env.example .env
 # Fill in real values for every key — see Environment Variables section below
 ```
@@ -28,7 +29,7 @@ cp .env.example .env
 ### 2. Backend
 
 ```bash
-cd backend
+cd app/backend
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -40,7 +41,7 @@ python manage.py runserver
 In a second terminal (Celery worker + beat):
 
 ```bash
-cd backend
+cd app/backend
 source .venv/bin/activate
 celery -A core worker --loglevel=info &
 celery -A core beat --loglevel=info
@@ -49,7 +50,7 @@ celery -A core beat --loglevel=info
 ### 3. Frontend
 
 ```bash
-cd frontend
+cd app/frontend
 npm install
 npm run dev
 ```
@@ -117,7 +118,7 @@ Okta/OIDC SSO is supported when `OKTA_CLIENT_ID` is configured — see settings.
 
 ## Agent / MCP
 
-The `AgentOrchestrator` in `backend/agents/agent.py` accepts a user message, calls Claude (`claude-sonnet-4-6`) with tool-use enabled, and dispatches tool calls through `MCPServer` in `backend/agents/mcp_server.py`. Tools cover Google Calendar, Gmail, Airtable, and Slack.
+The `AgentOrchestrator` in `app/backend/agents/agent.py` accepts a user message, calls Claude (`claude-sonnet-4-6`) with tool-use enabled, and dispatches tool calls through `MCPServer` in `app/backend/agents/mcp_server.py`. Tools cover Google Calendar, Gmail, Airtable, and Slack.
 
 ## Airtable Sync
 
