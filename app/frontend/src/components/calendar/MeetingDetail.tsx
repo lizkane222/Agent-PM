@@ -8,6 +8,7 @@ import type {
   AirtableActionItem,
   AirtableMeeting,
   CalendarEvent,
+  CommentReference,
   EventMatchResult,
   MeetingNote,
   Reminder,
@@ -1334,6 +1335,7 @@ function NoteRow({
   const currentUser = useCurrentUser();
   const [editing, setEditing] = useState(false);
   const [editText, setEditText] = useState(note.html);
+  const [noteReferences, setNoteReferences] = useState<CommentReference[]>([]);
 
   // Which tooltip is open: null | "action" | "calendar" | "reminder"
   const [openTooltip, setOpenTooltip] = useState<"action" | "calendar" | "reminder" | null>(null);
@@ -1424,7 +1426,11 @@ function NoteRow({
     setEditing(false);
     const trimmed = editText.trim();
     if (!trimmed || trimmed === note.html) return;
-    schedulerApi.updateMeetingNote(note.id, { html: trimmed, text: htmlToPreviewText(trimmed) })
+    schedulerApi.updateMeetingNote(note.id, {
+      html: trimmed,
+      text: htmlToPreviewText(trimmed),
+      ...(noteReferences.length > 0 && { references: noteReferences }),
+    })
       .then(({ data }) => onSave(data))
       .catch(() => {});
   }
@@ -1508,6 +1514,12 @@ function NoteRow({
               value={editText}
               onChange={setEditText}
               onSubmit={() => commitEdit()}
+              onReferenceInsert={(ref) => {
+                setNoteReferences((prev) => {
+                  const exists = prev.find((r) => r.resource_type === ref.resource_type && r.resource_id === ref.resource_id);
+                  return exists ? prev : [...prev, ref];
+                });
+              }}
               placeholder="Add a note…"
               minHeightClassName="min-h-[32px]"
               autoFocus

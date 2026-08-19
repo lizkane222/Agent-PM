@@ -98,6 +98,14 @@ class UserProfile(models.Model):
     # (DEFAULT_CATEGORY_COLORS in the frontend's lib/eventColors.ts).
     calendar_colors = models.JSONField(default=dict, blank=True)
 
+    # ── Gmail watch configuration ──────────────────────────────────────────────
+    # JSON blob controlling Gmail sync filtering and labeling:
+    #   {"label_name": "Agent PM - Threads",
+    #    "keywords": ["meeting notes", "account-name", ...],
+    #    "block_keywords": ["personal", "spam", ...]}
+    # Validated by UserProfileSerializer. Empty dict means default behavior (watch INBOX, no filters).
+    gmail_watch_config = models.JSONField(default=dict, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

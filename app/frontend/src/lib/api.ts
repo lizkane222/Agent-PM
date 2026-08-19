@@ -480,7 +480,7 @@ export const schedulerApi = {
   },
   createMeetingNote: (data: { event: number; html: string; text: string; due_date?: string | null; position?: number }) =>
     apiClient.post<MeetingNote>("/scheduler/meeting-notes/", data),
-  updateMeetingNote: (id: number, data: Partial<Pick<MeetingNote, "html" | "text" | "due_date" | "position">>) =>
+  updateMeetingNote: (id: number, data: Partial<Pick<MeetingNote, "html" | "text" | "due_date" | "position">> & { references?: CommentReference[] }) =>
     apiClient.patch<MeetingNote>(`/scheduler/meeting-notes/${id}/`, data),
   deleteMeetingNote: (id: number) =>
     apiClient.delete(`/scheduler/meeting-notes/${id}/`),
@@ -702,14 +702,14 @@ export const airtableApi = {
     apiClient.get<{ results: AirtableMeeting[] }>("/airtable/meetings/", { params }),
   getMeeting: (meetingId: number) =>
     apiClient.get<AirtableMeeting>(`/airtable/meetings/${meetingId}/`),
-  updateMeetingGongNotes: (calendarEventId: number, gongNotes: string) =>
-    apiClient.patch<AirtableMeeting>(`/airtable/meetings/by-event/${calendarEventId}/gong-notes/`, { gong_notes: gongNotes }),
-  updateMeetingGongNotesByPk: (meetingId: number, gongNotes: string) =>
-    apiClient.patch<AirtableMeeting>(`/airtable/meetings/${meetingId}/gong-notes/`, { gong_notes: gongNotes }),
-  updateMeetingZoomNotes: (calendarEventId: number, zoomNotes: string) =>
-    apiClient.patch<AirtableMeeting>(`/airtable/meetings/by-event/${calendarEventId}/zoom-notes/`, { zoom_notes: zoomNotes }),
-  updateMeetingZoomNotesByPk: (meetingId: number, zoomNotes: string) =>
-    apiClient.patch<AirtableMeeting>(`/airtable/meetings/${meetingId}/zoom-notes/`, { zoom_notes: zoomNotes }),
+  updateMeetingGongNotes: (calendarEventId: number, gongNotes: string, references?: CommentReference[]) =>
+    apiClient.patch<AirtableMeeting>(`/airtable/meetings/by-event/${calendarEventId}/gong-notes/`, { gong_notes: gongNotes, ...(references && { references }) }),
+  updateMeetingGongNotesByPk: (meetingId: number, gongNotes: string, references?: CommentReference[]) =>
+    apiClient.patch<AirtableMeeting>(`/airtable/meetings/${meetingId}/gong-notes/`, { gong_notes: gongNotes, ...(references && { references }) }),
+  updateMeetingZoomNotes: (calendarEventId: number, zoomNotes: string, references?: CommentReference[]) =>
+    apiClient.patch<AirtableMeeting>(`/airtable/meetings/by-event/${calendarEventId}/zoom-notes/`, { zoom_notes: zoomNotes, ...(references && { references }) }),
+  updateMeetingZoomNotesByPk: (meetingId: number, zoomNotes: string, references?: CommentReference[]) =>
+    apiClient.patch<AirtableMeeting>(`/airtable/meetings/${meetingId}/zoom-notes/`, { zoom_notes: zoomNotes, ...(references && { references }) }),
   createActionItem: (data: Partial<AirtableActionItem>) =>
     apiClient.post<AirtableActionItem>("/airtable/action-items/", data),
   updateActionItem: (id: number, data: Partial<AirtableActionItem>) =>

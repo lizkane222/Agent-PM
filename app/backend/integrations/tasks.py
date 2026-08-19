@@ -44,12 +44,18 @@ def _google_creds_for_user(user):
 
 @shared_task(name="integrations.tasks.register_gmail_watch")
 def register_gmail_watch(user_id: int):
-    """Register (or renew) a Gmail push-notification watch() for a user."""
+    """
+    Register (or renew) a Gmail push-notification watch() for a user.
+    Watches the user's configured Gmail label if set; otherwise watches INBOX.
+    """
     from datetime import datetime, timezone as dt_tz
 
     from django.contrib.auth import get_user_model
     from googleapiclient.discovery import build as g_build
 
+    from integrations.gmail_watch_utils import (
+        get_or_create_gmail_label, get_user_gmail_label
+    )
     from integrations.models import GmailWatchState
 
     User = get_user_model()
@@ -67,9 +73,20 @@ def register_gmail_watch(user_id: int):
     try:
         google_creds = _google_creds_for_user(user)
         gmail = g_build("gmail", "v1", credentials=google_creds, cache_discovery=False)
+
+        # Determine which label(s) to watch
+        label_ids = ["INBOX"]  # default
+        label_name = get_user_gmail_label(user)
+        if label_name:
+            # Get or create the label and watch it instead of INBOX
+            label_id = get_or_create_gmail_label(gmail, label_name)
+            if label_id:
+                label_ids = [label_id]
+                logger.info("Watching label '%s' (id=%s) for %s", label_name, label_id, user.email)
+
         result = gmail.users().watch(
             userId="me",
-            body={"topicName": topic, "labelIds": ["INBOX"]},
+            body={"topicName": topic, "labelIds": label_ids},
         ).execute()
 
         history_id = str(result.get("historyId", ""))
@@ -84,7 +101,7 @@ def register_gmail_watch(user_id: int):
                 "pub_sub_topic": topic,
             },
         )
-        logger.info("Gmail watch registered for %s (expires %s)", user.email, expiration)
+        logger.info("Gmail watch registered for %s on labels %s (expires %s)", user.email, label_ids, expiration)
     except Exception:
         logger.exception("register_gmail_watch failed for user %s", user_id)
 
@@ -154,7 +171,16 @@ def sync_gmail_history_for_user(user_id: int, new_history_id: str = ""):
         logger.exception("sync_gmail_history_for_user: history fetch failed for %s", user.email)
         return
 
+    # Get user's keyword filters
+    from integrations.gmail_watch_utils import (
+        get_user_watch_keywords, get_user_block_keywords, email_matches_keywords
+    )
+
+    keywords = get_user_watch_keywords(user)
+    block_keywords = get_user_block_keywords(user)
+
     created = 0
+    skipped = 0
     for history_entry in history_items:
         for msg_added in history_entry.get("messagesAdded", []):
             msg = msg_added.get("message", {})
@@ -184,6 +210,11 @@ def sync_gmail_history_for_user(user_id: int, new_history_id: str = ""):
                      if h.get("name", "").lower() == "subject"),
                     "(no subject)"
                 )
+
+                # ── Apply keyword filtering ──────────────────────────────────────
+                if not email_matches_keywords(subject, "", keywords, block_keywords):
+                    skipped += 1
+                    continue
 
                 is_internal = _is_internal_only(all_addresses)
                 content_type = "internal_email" if is_internal else "email"
@@ -216,7 +247,10 @@ def sync_gmail_history_for_user(user_id: int, new_history_id: str = ""):
         from sync_review.tasks import run_agent_review
         run_agent_review.delay()
 
-    logger.info("sync_gmail_history_for_user: created/updated %d SyncReviewItems for %s", created, user.email)
+    logger.info(
+        "sync_gmail_history_for_user: created %d, skipped %d (keyword filters) for %s",
+        created, skipped, user.email
+    )
 
 
 @shared_task(name="integrations.tasks.pull_gmail_pubsub_messages")

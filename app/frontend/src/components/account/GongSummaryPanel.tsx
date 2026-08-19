@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from "react";
 import { airtableApi, integrationsApi } from "../../lib/api";
 import type { MeetingNotesSource } from "../../lib/api";
-import type { AirtableActionItem, AirtableMeeting, TeamMember } from "../../types";
+import type { AirtableActionItem, AirtableMeeting, TeamMember, CommentReference } from "../../types";
 import { NoteActionTooltip } from "./NoteActionTooltip";
 import { MeetingSummarySourceToggle, preferredMeetingSource } from "./MeetingSummarySourceToggle";
 
@@ -84,6 +84,7 @@ export function GongSummaryPanel({ eventId, meetingId: meetingIdProp, existingNo
   );
   const [showPaste, setShowPaste] = useState(!initialText.trim());
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [noteReferences] = useState<CommentReference[]>([]);
   // Once the backend creates a stub meeting via by-event, cache its PK for future saves
   const resolvedMeetingId = useRef<number | undefined>(meetingIdProp);
 
@@ -172,14 +173,14 @@ export function GongSummaryPanel({ eventId, meetingId: meetingIdProp, existingNo
         const save = source === "zoom"
           ? airtableApi.updateMeetingZoomNotesByPk
           : airtableApi.updateMeetingGongNotesByPk;
-        const { data } = await save(resolvedMeetingId.current, text.trim());
+        const { data } = await save(resolvedMeetingId.current, text.trim(), noteReferences.length > 0 ? noteReferences : undefined);
         savedMeeting = data;
       } else {
         // by-event will create a stub meeting if none exists; cache its PK
         const save = source === "zoom"
           ? airtableApi.updateMeetingZoomNotes
           : airtableApi.updateMeetingGongNotes;
-        const { data } = await save(eventId, text.trim());
+        const { data } = await save(eventId, text.trim(), noteReferences.length > 0 ? noteReferences : undefined);
         savedMeeting = data;
         resolvedMeetingId.current = savedMeeting.id;
       }

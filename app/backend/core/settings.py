@@ -259,6 +259,16 @@ CELERY_BEAT_SCHEDULE = {
     },
 }
 
+# ── Gmail Watch Keywords (default sync filters) ────────────────────────────────
+GMAIL_DEFAULT_KEYWORDS = [
+    "meeting notes",
+    "meeting assets",
+    "calendar",
+    "invite",
+    "gong",
+    "zoom",
+]
+
 # ── DRF Spectacular (OpenAPI) ─────────────────────────────────────────────────
 SPECTACULAR_SETTINGS = {
     "TITLE": "Agent PM API",

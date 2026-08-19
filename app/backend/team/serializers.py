@@ -103,6 +103,8 @@ class UserProfileSerializer(serializers.ModelSerializer):
             "staff_view_override",
             # Calendar appearance
             "calendar_colors",
+            # Gmail watch configuration
+            "gmail_watch_config",
             "teams",
             "created_at",
             "updated_at",
@@ -164,6 +166,44 @@ class UserProfileSerializer(serializers.ModelSerializer):
                     raise serializers.ValidationError(
                         {key: f"'{name}' must be a hex color like #RRGGBB, got {color!r}."}
                     )
+
+        return value
+
+    def validate_gmail_watch_config(self, value):
+        """Validate the gmail_watch_config blob.
+
+        Shape: {"label_name": "Agent PM - Threads", "keywords": [str], "block_keywords": [str]}
+
+        All fields are optional. Keywords are case-insensitive strings (fuzzy matching happens
+        downstream). Keywords list is capped at 100 to prevent abuse.
+        """
+        if not isinstance(value, dict):
+            raise serializers.ValidationError("Must be an object.")
+
+        unknown = set(value) - {"label_name", "keywords", "block_keywords"}
+        if unknown:
+            raise serializers.ValidationError(
+                f"Unknown key(s): {', '.join(sorted(unknown))}."
+            )
+
+        if "label_name" in value:
+            label = value["label_name"]
+            if not isinstance(label, str):
+                raise serializers.ValidationError({"label_name": "Must be a string."})
+            if not label or len(label) > 100:
+                raise serializers.ValidationError(
+                    {"label_name": "Must be 1-100 characters."}
+                )
+
+        for key in ("keywords", "block_keywords"):
+            if key in value:
+                items = value[key]
+                if not isinstance(items, list):
+                    raise serializers.ValidationError({key: "Must be a list."})
+                if len(items) > 100:
+                    raise serializers.ValidationError({key: "Too many items (max 100)."})
+                if not all(isinstance(s, str) for s in items):
+                    raise serializers.ValidationError({key: "All items must be strings."})
 
         return value
 
