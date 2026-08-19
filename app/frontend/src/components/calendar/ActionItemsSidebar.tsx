@@ -5,8 +5,11 @@ import { useScheduledOccurrences } from "../../hooks/useScheduledOccurrences";
 import { airtableApi, teamApi } from "../../lib/api";
 import { addLog } from "../../lib/appLog";
 import type { AirtableActionItem, AirtableAccount } from "../../types";
-import { ContextMenu, FocusPinBadge, type ContextMenuItem } from "../action-items/ContextMenu";
-import { useCommentContext } from "../comments/CommentContext";
+import { ContextMenu, FocusPinBadge, focusPinMenuItem, type ContextMenuItem } from "../action-items/ContextMenu";
+import StepsPanel from "../action-items/StepsPanel";
+import { useFocusPins } from "../../hooks/useFocusPins";
+import CommentPreviewList from "../comments/CommentPreviewList";
+import { useCommentMenuItem } from "../comments/commentMenuItem";
 import { useExportTray } from "../../hooks/useExportTray";
 import {
   CALENDAR_DRAG_KEY,
@@ -42,7 +45,7 @@ function OccurrencesList({ airtableId }: { airtableId: string }) {
   );
 }
 
-function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onUpdate, onAccountDrop, accounts, teamMembers, forceExpand, isPinned, onTogglePin }: {
+function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onUpdate, onAccountDrop, accounts, teamMembers, forceExpand }: {
   item: AirtableActionItem;
   onDragStart: (e: React.DragEvent) => void;
   onDelete: () => void;
@@ -52,14 +55,17 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
   accounts: AirtableAccount[];
   teamMembers: { id: number; full_name: string }[];
   forceExpand?: boolean;
-  isPinned?: boolean;
-  onTogglePin?: () => void;
 }) {
   const { status: statusOptions } = useActionItemFieldOptions();
   const [expanded, setExpanded] = useState(forceExpand ?? false);
   const [ctxPos, setCtxPos] = useState<{ x: number; y: number } | null>(null);
-  const { openComments } = useCommentContext();
   const { addToTray } = useExportTray();
+  const { isPinned, toggle: toggleFocusPin } = useFocusPins();
+
+  // Never pin a local-* blank — promoteBlankItem discards that id for a real recXXX.
+  const canPin = !item.airtable_id.startsWith("local-");
+  const isPinnedToFocus = canPin && isPinned(item.airtable_id);
+  const commentMenuEntry = useCommentMenuItem("action_item", canPin ? item.id : null, item.task || "", ctxPos);
 
   useEffect(() => {
     if (forceExpand) setExpanded(true);
@@ -245,18 +251,24 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
           </button>
         </div>
 
+
+        {/* Checklist — the same component the modals use, so an action item reads the same
+            wherever it is opened. Real Airtable items only: steps key off the numeric PK. */}
+        {!item.airtable_id.startsWith("local-") && (
+          <div className="pt-2 mt-1 border-t border-violet-100">
+            <StepsPanel actionItemId={item.id} />
+          </div>
+        )}
         <OccurrencesList airtableId={item.airtable_id} />
       </div>
     );
   }
 
   const ctxItems: ContextMenuItem[] = [
-    ...(onTogglePin ? [{
-      label: isPinned ? "Unpin from Focus" : "Pin to Focus",
-      icon: <svg viewBox="0 0 16 16" fill="currentColor" className="w-3 h-3"><path d="M9.828.722a.5.5 0 01.354.146l4.95 4.95a.5.5 0 010 .707c-.48.48-1.072.588-1.503.588-.177 0-.335-.018-.46-.039l-3.134 3.134a5.927 5.927 0 01.16 1.013c.046.702-.032 1.687-.72 2.375a.5.5 0 01-.707 0l-2.829-2.828-3.182 3.182c-.195.195-1.219.902-1.414.707-.195-.195.512-1.22.707-1.414l3.182-3.182-2.828-2.829a.5.5 0 010-.707c.688-.688 1.673-.767 2.375-.72a5.922 5.922 0 011.013.16l3.134-3.133a2.772 2.772 0 01-.04-.461c0-.43.108-1.022.589-1.503a.5.5 0 01.353-.146z"/></svg>,
-      onClick: onTogglePin,
-    } as ContextMenuItem] : []),
-    ...(onTogglePin ? [{ separator: true, label: "", onClick: () => {} } as ContextMenuItem] : []),
+    ...(canPin ? [
+      focusPinMenuItem(isPinnedToFocus, () => toggleFocusPin(item.airtable_id)),
+      { separator: true, label: "", onClick: () => {} } as ContextMenuItem,
+    ] : []),
     {
       label: "Expand",
       icon: <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5"><path d="M9 2H12v3"/><path d="M7 7l5-5"/><path d="M12 9v3H2V2h4"/></svg>,
@@ -274,13 +286,7 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
       icon: <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5"><rect x="5" y="4" width="8" height="9" rx="1"/><path d="M9 4V2H1v9h3"/></svg>,
       onClick: () => { void navigator.clipboard.writeText(item.task || "").catch(() => {}); },
     },
-    {
-      label: "Add comment",
-      icon: <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5"><path d="M12 2H2v8h3l2 2 2-2h3V2z"/></svg>,
-      onClick: () => {
-        if (item.id && ctxPos) openComments({ resourceType: "action_item", resourceId: item.id, resourceLabel: item.task || "", x: ctxPos.x, y: ctxPos.y });
-      },
-    },
+    commentMenuEntry,
     { label: "→ Export tray", icon: <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5"><path d="M1 9v4h12V9"/><path d="M4.5 5.5 7 3l2.5 2.5"/><path d="M7 3v7"/></svg>, onClick: () => addToTray(item) },
     { separator: true, label: "", onClick: () => {} },
     {
@@ -386,7 +392,12 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
       ) : null}
 
       <OccurrencesList airtableId={item.airtable_id} />
-      {isPinned && <FocusPinBadge className="bottom-1.5 right-1.5 z-10" />}
+      <CommentPreviewList
+        resourceType="action_item"
+        resourceId={canPin ? item.id : null}
+        resourceLabel={item.task || ""}
+      />
+      {isPinnedToFocus && <FocusPinBadge />}
     </div>
     {ctxPos && (
       <ContextMenu
@@ -417,18 +428,6 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
       return new Set(Object.entries(zones).filter(([, v]) => v === "today").map(([k]) => k));
     } catch { return new Set(); }
   });
-  const [focusPinnedIds, setFocusPinnedIds] = useState<Set<string>>(() => {
-    try { return new Set(JSON.parse(localStorage.getItem("actionFocusPins") ?? "[]")); } catch { return new Set(); }
-  });
-  function toggleFocusPin(airtableId: string) {
-    setFocusPinnedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(airtableId)) { next.delete(airtableId); } else { next.add(airtableId); }
-      localStorage.setItem("actionFocusPins", JSON.stringify([...next]));
-      return next;
-    });
-  }
-
   // Create form state
   const [creating, setCreating] = useState(false);
   const [form, setForm] = useState({ ...BLANK_FORM });
@@ -446,9 +445,13 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
 
   const fetchItems = () =>
     airtableApi
-      .listActionItems({ status: "Open,In Progress,Blocked,Backlogged,Complete" })
+      // Ask for exactly what the sidebar shows. The old filter listed Blocked/Backlogged
+      // and then discarded them client-side, plus a "Complete" status that does not exist
+      // in the model (Open / In Progress / Done / Blocked / Backlogged) and so matched
+      // nothing. `fresh` because this also runs on an actionItemsUpdated broadcast, which
+      // can originate in another tab and leave this tab's GET cache warm.
+      .listActionItems({ status: "Open,In Progress" }, { fresh: true })
       .then(({ data }) => {
-        // Only show open/in-progress in the sidebar
         const all = data ?? [];
         const liveIds = new Set(all.map((i: AirtableActionItem) => i.airtable_id));
         setItems(all.filter((i: AirtableActionItem) => i.status === "Open" || i.status === "In Progress"));
@@ -675,8 +678,6 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
                   onDragStart={(e) => handleDragStart(e, item)}
                   onDelete={() => handleDelete(item)}
                   onUpdate={(patch) => void handleUpdate(item, patch)}
-                  isPinned={focusPinnedIds.has(item.airtable_id)}
-                  onTogglePin={() => toggleFocusPin(item.airtable_id)}
                   onAccountDrop={(accountId, accountName) => {
                     setItems((prev) => prev.map((i) => i.airtable_id === item.airtable_id ? { ...i, account: accountId, account_name: accountName } : i));
                     airtableApi.updateActionItemFields(item.airtable_id, { account: accountId, account_name: accountName }).catch(() => {
@@ -774,7 +775,7 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
                 value={form.task_details}
                 onChange={(e) => setForm((f) => ({ ...f, task_details: e.target.value }))}
                 rows={2}
-                placeholder="Additional context, steps, or notes…"
+                placeholder="Additional context or notes…"
                 className="w-full rounded-md border border-violet-100 bg-white px-2.5 py-1.5 text-xs text-[var(--twilio-navy)] placeholder:text-[var(--twilio-gray-60)] focus:bg-white focus:border-violet-300 focus:outline-none resize-none leading-relaxed"
               />
 

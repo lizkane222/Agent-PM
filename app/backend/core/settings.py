@@ -271,6 +271,48 @@ SPECTACULAR_SETTINGS = {
 # ── Anthropic ────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
+# Which transport the agent uses to reach Claude.
+#   "bedrock" — AWS Bedrock via the twilio-devex-bedrock SSO profile (needs `aws sso login`)
+#   "gateway" — the corporate LiteLLM proxy, authenticated with ANTHROPIC_API_KEY as a bearer token
+AGENT_BACKEND = os.getenv("AGENT_BACKEND", "bedrock").strip().lower()
+
+# base_url is passed explicitly rather than left to the SDK's ANTHROPIC_BASE_URL fallback:
+# Claude Code's managed settings export that variable, so a bare client would silently
+# inherit it from whatever shell happened to launch Django.
+AGENT_GATEWAY_BASE_URL = os.getenv(
+    "AGENT_GATEWAY_BASE_URL", "https://litellm.ai-services.corp.twilio.com"
+)
+
+# Model ids are backend-specific: Bedrock wants inference-profile ids, the gateway wants
+# whatever LiteLLM publishes on /v1/models. "default" handles the request; the agent may
+# escalate itself to "strong" once per request (see agents.agent.ESCALATE_TOOL).
+AGENT_MODEL_TIERS: dict[str, dict[str, str]] = {
+    "bedrock": {
+        "default": os.getenv("AGENT_MODEL_BEDROCK_DEFAULT", "us.anthropic.claude-sonnet-4-6"),
+        # Opus 4.8, not Opus 5: the BedrockAccess role lists an Opus 5 inference profile
+        # but invoking it 403s ("not authorized to perform the required AWS Marketplace
+        # actions"). Switch this to us.anthropic.claude-opus-5 once that subscription
+        # exists — the generous strong-tier max_tokens below already accounts for it.
+        "strong": os.getenv("AGENT_MODEL_BEDROCK_STRONG", "us.anthropic.claude-opus-4-8"),
+    },
+    "gateway": {
+        # Populate once a LiteLLM virtual key exists and /v1/models has been queried.
+        "default": os.getenv("AGENT_MODEL_GATEWAY_DEFAULT", ""),
+        "strong": os.getenv("AGENT_MODEL_GATEWAY_STRONG", ""),
+    },
+}
+
+# Pin a single model id and suppress escalation entirely (debugging / cost control).
+AGENT_MODEL_OVERRIDE = os.getenv("AGENT_MODEL_OVERRIDE", "").strip()
+
+# max_tokens bounds thinking *and* visible text together. Opus 5 thinks by default, so the
+# strong tier needs materially more headroom than the default tier or replies truncate
+# mid-answer. The non-streaming ceiling stays under the SDK's ~10min HTTP timeout guard.
+AGENT_MAX_TOKENS_DEFAULT = int(os.getenv("AGENT_MAX_TOKENS_DEFAULT", "4096"))
+AGENT_MAX_TOKENS_STRONG = int(os.getenv("AGENT_MAX_TOKENS_STRONG", "16000"))
+AGENT_MAX_TOKENS_STREAM_DEFAULT = int(os.getenv("AGENT_MAX_TOKENS_STREAM_DEFAULT", "8192"))
+AGENT_MAX_TOKENS_STREAM_STRONG = int(os.getenv("AGENT_MAX_TOKENS_STREAM_STRONG", "32000"))
+
 # ── Notification allowlist ───────────────────────────────────────────────────
 # Comma-separated email addresses that may receive reminder notifications.
 # While connectors are being validated, set this to your own email only.

@@ -3,6 +3,8 @@ import type { AccountNote, AirtableActionItem, TeamMember } from "../../types";
 import { accountsApi, airtableApi, schedulerApi, searchApi } from "../../lib/api";
 import { renderNoteInline, handleLinkPaste } from "../../lib/noteHelpers";
 import { useCurrentUser } from "../../context/CurrentUserContext";
+import { useRightClickComment } from "../comments/CommentContext";
+import CommentPreviewList from "../comments/CommentPreviewList";
 
 // ── Account Notes helpers ─────────────────────────────────────────────────────
 
@@ -45,6 +47,9 @@ export function AccountNoteRow({
   onCreatedActionItem?: (item: AirtableActionItem) => void;
 }) {
   const currentUser = useCurrentUser();
+  // `account_note` has been a valid comment resource_type server-side all along; it
+  // just had no UI. Right-click the row to comment on it.
+  const { onContextMenu } = useRightClickComment("account_note", note.id, note.content.slice(0, 120));
   const [editing, setEditing] = useState(false);
   const [editText, setEditText] = useState(note.content);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -231,12 +236,18 @@ export function AccountNoteRow({
 
   return (
     <li
-      className="group relative flex items-start gap-2 px-3 py-2 hover:bg-gray-50 transition-colors"
+      className="group relative flex flex-wrap items-start gap-2 px-3 py-2 hover:bg-gray-50 transition-colors"
       draggable
       onDragStart={(e) => {
         e.dataTransfer.setData("noteText", note.content);
         e.dataTransfer.setData("noteId", String(note.id));
         e.dataTransfer.effectAllowed = "copy";
+      }}
+      /* Bail on the inputs so the native paste/spellcheck menu still works there —
+         the same guard the action item cards use. */
+      onContextMenu={(e) => {
+        if ((e.target as HTMLElement).closest("input, textarea, [contenteditable='true']")) return;
+        onContextMenu(e);
       }}
     >
       <span className="mt-[6px] h-1.5 w-1.5 rounded-full bg-[var(--twilio-navy)] shrink-0 opacity-50 cursor-grab active:cursor-grabbing" />
@@ -459,6 +470,12 @@ export function AccountNoteRow({
           )}
         </div>
       )}
+      <CommentPreviewList
+        resourceType="account_note"
+        resourceId={note.id}
+        resourceLabel={note.content.slice(0, 120)}
+        className="basis-full ml-3.5"
+      />
     </li>
   );
 }

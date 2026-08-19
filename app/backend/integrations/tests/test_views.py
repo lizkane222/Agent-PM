@@ -449,3 +449,196 @@ class ZendeskAdminCallbackViewTest(APITestCase):
         state = signing.dumps({"uid": regular.pk}, salt="zendesk-admin-oauth")
         resp = self.client.get(self.URL, {"code": "authcode", "state": state})
         self.assertEqual(resp.status_code, 403)
+
+
+# ── Google Calendar sync: event category mapping ──────────────────────────────
+
+class GoogleCalendarSyncCategoryTest(APITestCase):
+    """`_sync_google_calendar` maps Google's `eventType` to `event_category`.
+
+    Without this the column stayed at its "meeting" default for every synced
+    event, so out-of-office / focus-time / working-location events all rendered
+    in the meeting color on the calendar.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="gcal_user", password="pass")
+
+    def _run_sync(self, items):
+        """Run the sync with a stubbed Google API returning `items`."""
+        from integrations import views as integrations_views
+
+        service = MagicMock()
+        service.events.return_value.list.return_value.execute.return_value = {
+            "items": items,
+            "nextPageToken": None,
+        }
+        # `build` is imported inside the function, so patching the module attribute
+        # is enough to intercept it.
+        with patch("googleapiclient.discovery.build", return_value=service):
+            integrations_views._sync_google_calendar(self.user, MagicMock())
+
+    def _event(self, event_id, event_type=None, summary="Event"):
+        item = {
+            "id": event_id,
+            "summary": summary,
+            "status": "confirmed",
+            "start": {"dateTime": "2026-08-20T10:00:00+00:00"},
+            "end": {"dateTime": "2026-08-20T11:00:00+00:00"},
+        }
+        if event_type is not None:
+            item["eventType"] = event_type
+        return item
+
+    def _category(self, google_event_id):
+        from scheduler.models import CalendarEvent
+
+        return CalendarEvent.objects.get(
+            owner=self.user, google_event_id=google_event_id
+        ).event_category
+
+    def test_out_of_office_maps_to_out_of_office(self):
+        self._run_sync([self._event("g-ooo", "outOfOffice")])
+        self.assertEqual(self._category("g-ooo"), "out_of_office")
+
+    def test_focus_time_maps_to_focus_time(self):
+        self._run_sync([self._event("g-focus", "focusTime")])
+        self.assertEqual(self._category("g-focus"), "focus_time")
+
+    def test_working_location_maps_to_working_location(self):
+        self._run_sync([self._event("g-loc", "workingLocation")])
+        self.assertEqual(self._category("g-loc"), "working_location")
+
+    def test_default_event_type_stays_a_meeting(self):
+        self._run_sync([self._event("g-default", "default")])
+        self.assertEqual(self._category("g-default"), "meeting")
+
+    def test_missing_event_type_stays_a_meeting(self):
+        self._run_sync([self._event("g-none")])
+        self.assertEqual(self._category("g-none"), "meeting")
+
+    def test_unknown_event_type_stays_a_meeting(self):
+        self._run_sync([self._event("g-birthday", "birthday")])
+        self.assertEqual(self._category("g-birthday"), "meeting")
+
+    def test_resync_does_not_clobber_a_user_chosen_category(self):
+        """A "default" Google event keeps the category the user set in-app."""
+        from scheduler.models import CalendarEvent
+
+        self._run_sync([self._event("g-task", "default")])
+        CalendarEvent.objects.filter(google_event_id="g-task").update(event_category="task")
+
+        self._run_sync([self._event("g-task", "default")])
+        self.assertEqual(self._category("g-task"), "task")
+
+    def test_resync_does_reapply_a_google_owned_category(self):
+        """Google stays authoritative for the types it owns."""
+        from scheduler.models import CalendarEvent
+
+        self._run_sync([self._event("g-ooo2", "outOfOffice")])
+        CalendarEvent.objects.filter(google_event_id="g-ooo2").update(event_category="task")
+
+        self._run_sync([self._event("g-ooo2", "outOfOffice")])
+        self.assertEqual(self._category("g-ooo2"), "out_of_office")
+
+    def test_every_mapped_category_is_a_valid_model_choice(self):
+        from integrations.views import GOOGLE_EVENT_TYPE_TO_CATEGORY
+        from scheduler.models import CalendarEvent
+
+        valid = {value for value, _label in CalendarEvent.EVENT_CATEGORY_CHOICES}
+        self.assertTrue(set(GOOGLE_EVENT_TYPE_TO_CATEGORY.values()).issubset(valid))
+
+
+# ── Meeting notes from email ────────────────────────────────────────────────────
+
+class MeetingNotesFromEmailViewTest(APITestCase):
+    """POST /api/v1/integrations/gmail/meeting-notes/"""
+
+    URL = "/api/v1/integrations/gmail/meeting-notes/"
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="notesuser", password="pass", is_staff=True)
+        self.client.force_authenticate(user=self.user)
+
+    def test_unauthenticated_returns_401(self):
+        self.client.force_authenticate(user=None)
+        resp = self.client.post(self.URL, {}, format="json")
+        self.assertEqual(resp.status_code, 401)
+
+    def test_get_is_not_allowed(self):
+        """The scan mutates meetings, so it is POST-only."""
+        resp = self.client.get(self.URL)
+        self.assertEqual(resp.status_code, 405)
+
+    def test_gmail_not_connected_returns_400(self):
+        resp = self.client.post(self.URL, {}, format="json")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("Gmail", resp.json()["detail"])
+
+    @patch("integrations.meeting_notes.sync_meeting_notes_from_email")
+    def test_returns_the_report_verbatim(self, mock_sync):
+        report = {
+            "days": 30, "account_name": "", "scanned_emails": 4, "scanned_meetings": 2,
+            "updated": [{
+                "meeting_id": 1, "airtable_id": "recA", "meeting_name": "Acme Sync",
+                "date": None, "account_name": "Acme Corp", "sources": ["gong"],
+            }],
+            "skipped": [], "errors": [], "summaries_truncated": False, "max_summaries": 25,
+        }
+        mock_sync.return_value = report
+
+        resp = self.client.post(self.URL, {}, format="json")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), report)
+
+    @patch("integrations.meeting_notes.sync_meeting_notes_from_email")
+    def test_passes_days_and_account_name_through(self, mock_sync):
+        mock_sync.return_value = {
+            "days": 7, "account_name": "Acme Corp", "scanned_emails": 0,
+            "scanned_meetings": 0, "updated": [], "skipped": [], "errors": [],
+            "summaries_truncated": False, "max_summaries": 25,
+        }
+
+        self.client.post(self.URL, {"days": 7, "account_name": "  Acme Corp  "}, format="json")
+
+        kwargs = mock_sync.call_args.kwargs
+        self.assertEqual(kwargs["days"], 7)
+        self.assertEqual(kwargs["account_name"], "Acme Corp")
+
+    @patch("integrations.meeting_notes.sync_meeting_notes_from_email")
+    def test_days_is_clamped_to_the_ceiling(self, mock_sync):
+        mock_sync.return_value = {
+            "days": 180, "account_name": "", "scanned_emails": 0, "scanned_meetings": 0,
+            "updated": [], "skipped": [], "errors": [], "summaries_truncated": False,
+            "max_summaries": 25,
+        }
+
+        self.client.post(self.URL, {"days": 5000}, format="json")
+
+        self.assertEqual(mock_sync.call_args.kwargs["days"], 180)
+
+    @patch("integrations.meeting_notes.sync_meeting_notes_from_email")
+    def test_junk_days_falls_back_to_the_default(self, mock_sync):
+        """A non-numeric param must not 500 — it narrows to the documented default."""
+        mock_sync.return_value = {
+            "days": 30, "account_name": "", "scanned_emails": 0, "scanned_meetings": 0,
+            "updated": [], "skipped": [], "errors": [], "summaries_truncated": False,
+            "max_summaries": 25,
+        }
+
+        resp = self.client.post(self.URL, {"days": "not-a-number"}, format="json")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(mock_sync.call_args.kwargs["days"], 30)
+
+    @patch("integrations.meeting_notes.sync_meeting_notes_from_email")
+    def test_gmail_error_returns_502_not_500(self, mock_sync):
+        mock_sync.side_effect = RuntimeError("gmail exploded")
+
+        resp = self.client.post(self.URL, {}, format="json")
+
+        self.assertEqual(resp.status_code, 502)
+        self.assertIn("detail", resp.json())
+        # The upstream message is not leaked to the client.
+        self.assertNotIn("exploded", resp.json()["detail"])

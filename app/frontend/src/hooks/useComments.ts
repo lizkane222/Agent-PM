@@ -1,5 +1,6 @@
 import { useCallback } from "react";
 import { commentsApi } from "../lib/api";
+import { invalidateCommentSummary } from "../lib/commentSummaryStore";
 import { useResource } from "./useResource";
 import type { Comment, CommentMention, CommentReference, CommentResourceType } from "../types";
 
@@ -14,6 +15,11 @@ export function useComments(
     },
     [resourceType, resourceId],
   );
+
+  /** Keep the card-level rollup in `lib/commentSummaryStore` in step with mutations. */
+  const invalidateSummary = useCallback(() => {
+    if (resourceType && resourceId) invalidateCommentSummary(resourceType, resourceId);
+  }, [resourceType, resourceId]);
 
   const addComment = useCallback(
     async (opts: {
@@ -34,25 +40,28 @@ export function useComments(
         mentions: opts.mentions ?? [],
       });
       refetch();
+      invalidateSummary();
       return data;
     },
-    [resourceType, resourceId, refetch],
+    [resourceType, resourceId, refetch, invalidateSummary],
   );
 
   const editComment = useCallback(
     async (id: number, content: string) => {
       await commentsApi.update(id, content);
       refetch();
+      invalidateSummary();
     },
-    [refetch],
+    [refetch, invalidateSummary],
   );
 
   const deleteComment = useCallback(
     async (id: number) => {
       await commentsApi.delete(id);
       refetch();
+      invalidateSummary();
     },
-    [refetch],
+    [refetch, invalidateSummary],
   );
 
   return { comments, loading, error, addComment, editComment, deleteComment, refetch };

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { agentSkillsApi, skillsApi, commentsApi } from "../lib/api";
+import { agentSkillsApi, skillsApi } from "../lib/api";
 import CodeIcon from "../assets/icons/Code.svg?react";
 import MessagingLogo from "../assets/Product Logos/logo-messagingx-red.svg?react";
 import VoiceLogo from "../assets/Product Logos/logo-programmable-voice-red.svg?react";
@@ -14,6 +14,10 @@ import { useLogGlow } from "../hooks/useLogGlow";
 import type { AgentSkill, AgentSkillStatus, ClaudeSkill, ClaudeSkillStatus } from "../types";
 import { ROLE_OPTIONS } from "../types";
 import { useCommentContext, useRightClickComment } from "../components/comments/CommentContext";
+import CommentIcon from "../components/CommentIcon";
+import CommentCountBadge from "../components/comments/CommentCountBadge";
+import CommentPreviewList from "../components/comments/CommentPreviewList";
+import { useCommentSummary } from "../hooks/useCommentSummary";
 import { useCurrentUser } from "../context/CurrentUserContext";
 
 // ── Static Twilio plugin skill registry ───────────────────────────────────────
@@ -169,21 +173,13 @@ function SkillDetail({
   const [editingRoles, setEditingRoles] = useState(false);
   const [editedRoles, setEditedRoles] = useState<string[]>(skill.roles ?? []);
   const [savingRoles, setSavingRoles] = useState(false);
-  const [commentCount, setCommentCount] = useState(0);
   const { openComments } = useCommentContext();
+  // Was a per-skill commentsApi.list() in an effect — one request per rendered skill,
+  // and its own count formula. The shared rollup batches and stays in step with the
+  // panel's mutations.
+  const commentCount = useCommentSummary("claude_skill", skill.id)?.count ?? 0;
 
   const isCurrentVersion = activeVersionIdx === versions.length - 1;
-
-  // Load comment count for this skill
-  useEffect(() => {
-    commentsApi.list("claude_skill", skill.id).then(({ data }) => {
-      // data.results contains top-level comments; count those + all replies
-      const total = data.results.reduce(
-        (sum, c) => sum + 1 + (c.replies?.length ?? 0), 0
-      );
-      setCommentCount(total);
-    }).catch(() => {});
-  }, [skill.id]);
 
   const handleOpenComments = useCallback((e: React.MouseEvent) => {
     openComments({
@@ -703,9 +699,7 @@ function SkillDetail({
           background: "transparent", color: "var(--text-secondary, #888)",
           border: "1px solid rgba(0,0,0,0.1)", cursor: "pointer", fontFamily: "var(--font-base)",
         }}>
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
-          </svg>
+          <CommentIcon width={13} height={13} />
           Comments{commentCount > 0 ? ` (${commentCount})` : ""}
         </button>
         <button onClick={handleDelete} disabled={deleting} style={{
@@ -727,6 +721,15 @@ function SkillDetail({
           </button>
         )}
       </div>
+
+      {/* Latest comments in place — the Comments button above opens the full thread. */}
+      <CommentPreviewList
+        resourceType="claude_skill"
+        resourceId={skill.id}
+        resourceLabel={skill.name}
+        variant="panel"
+        className="mt-3"
+      />
     </div>
   );
 }
@@ -1275,6 +1278,11 @@ function SkillRow({ skill, selected, onSelect }: {
           </span>
         )}
       </div>
+      <CommentCountBadge
+        resourceType="claude_skill"
+        resourceId={skill.id}
+        className="self-center mr-2 text-[var(--text-secondary,#888)]"
+      />
       {/* Rotated status strip on the right — width must exceed the text length after rotation */}
       <div style={{
         width: "18px", flexShrink: 0,

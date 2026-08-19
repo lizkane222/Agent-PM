@@ -1,15 +1,17 @@
 import React, { useEffect, useRef, useState } from "react";
 import CorporateIcon from "../../assets/icons/Corporate.svg?react";
-import CommentIcon from "../CommentIcon";
-import { airtableApi, accountsApi } from "../../lib/api";
-import type { AccountArtifact, ActionItemAttachment, AirtableActionItem, AirtableMeeting, TeamMember } from "../../types";
+import { airtableApi } from "../../lib/api";
+import type { ActionItemAttachment, AirtableActionItem, AirtableMeeting, TeamMember } from "../../types";
 import { useActionItemFieldOptions } from "../../hooks/useActionItemFieldOptions";
-import { useCommentContext } from "../comments/CommentContext";
+import CommentTrigger from "../comments/CommentTrigger";
+import CommentPreviewList from "../comments/CommentPreviewList";
 import { AccPillSelect, AccPillDate, AccPillNumber, AccPillUrl } from "../shared/PillInputs";
 import { ActionItemCardOccurrences } from "./ActionItemCardOccurrences";
+import StepsPanel from "../action-items/StepsPanel";
 import { convertActionItemToEvent, restoreConversion } from "../../hooks/useConvert";
 import ActivityLogSection from "../ActivityLogSection";
 import { ArtifactIconImg, CATALOG_BY_KEY, getAutoIconKey } from "./ArtifactIcon";
+import ArtifactPicker from "../action-items/ArtifactPicker";
 
 // ── Pill helpers for new action item form ─────────────────────────────────────
 
@@ -66,9 +68,8 @@ export function ActionItemModal({
   const [saveError, setSaveError] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<ActionItemAttachment[]>(item.attachments ?? []);
   const [uploadingAttachment, setUploadingAttachment] = useState(false);
+  const [attachError, setAttachError] = useState<string | null>(null);
   const attachFileRef = useRef<HTMLInputElement>(null);
-  const commentBtnRef = useRef<HTMLButtonElement>(null);
-  const { openComments } = useCommentContext();
   const memberNames = ["Unassigned", ...teamMembers.map((m) => m.full_name)] as string[];
 
   // Link form
@@ -78,28 +79,11 @@ export function ActionItemModal({
   const [savingLink, setSavingLink] = useState(false);
 
   // Artifact dropdown
-  const [artifactMenuOpen, setArtifactMenuOpen] = useState(false);
-  const [accountArtifacts, setAccountArtifacts] = useState<AccountArtifact[]>([]);
-  const artifactMenuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (item.airtable_id.startsWith("local-")) return;
     airtableApi.listAttachments(item.id).then(({ data }) => setAttachments(data)).catch(() => {});
   }, [item.id, item.airtable_id]);
-
-  useEffect(() => {
-    if (!accountId) return;
-    accountsApi.listArtifacts(accountId).then(({ data }) => setAccountArtifacts(data)).catch(() => {});
-  }, [accountId]);
-
-  useEffect(() => {
-    if (!artifactMenuOpen) return;
-    function handler(e: MouseEvent) {
-      if (!artifactMenuRef.current?.contains(e.target as Node)) setArtifactMenuOpen(false);
-    }
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, [artifactMenuOpen]);
 
   const accent = PRIORITY_ACCENT[form.priority ?? item.priority] ?? "#9ca3af";
   const set = (patch: Partial<AirtableActionItem>) => setForm((f) => ({ ...f, ...patch }));
@@ -150,44 +134,62 @@ export function ActionItemModal({
     }
   }
 
+  /** Pull a human-readable message off an axios error, whatever shape the API used. */
+  function attachErrorMessage(err: unknown, fallback: string): string {
+    const data = (err as { response?: { data?: { detail?: string; error?: string } } })?.response?.data;
+    return data?.detail ?? data?.error ?? fallback;
+  }
+
   async function handleAttachFiles(files: FileList | File[]) {
     setUploadingAttachment(true);
+    setAttachError(null);
+    const failed: string[] = [];
+    let lastError: unknown = null;
     for (const f of Array.from(files)) {
       try {
         const { data } = await airtableApi.uploadAttachmentFile(item.id, f);
         setAttachments((prev) => [data, ...prev]);
-      } catch { /* skip */ }
+      } catch (err: unknown) {
+        // Never swallow this: a silent failure here looks exactly like "I picked a file and
+        // nothing happened", which is precisely how this bug went unnoticed.
+        failed.push(f.name);
+        lastError = err;
+      }
+    }
+    if (failed.length) {
+      setAttachError(
+        `${attachErrorMessage(lastError, "Upload failed.")} (${failed.join(", ")})`
+      );
     }
     setUploadingAttachment(false);
   }
 
   async function handleDeleteAttachment(attachId: number) {
-    await airtableApi.deleteAttachment(item.id, attachId);
-    setAttachments((prev) => prev.filter((a) => a.id !== attachId));
+    setAttachError(null);
+    try {
+      await airtableApi.deleteAttachment(item.id, attachId);
+      setAttachments((prev) => prev.filter((a) => a.id !== attachId));
+    } catch (err: unknown) {
+      setAttachError(attachErrorMessage(err, "Could not remove that attachment."));
+    }
   }
 
   async function handleAddLink() {
     const url = linkUrl.trim();
     if (!url) return;
     setSavingLink(true);
+    setAttachError(null);
     try {
       const { data } = await airtableApi.addAttachmentLink(item.id, linkName.trim() || url, url);
       setAttachments((prev) => [data, ...prev]);
       setLinkUrl("");
       setLinkName("");
       setLinkFormOpen(false);
-    } catch { /* skip */ } finally {
+    } catch (err: unknown) {
+      setAttachError(attachErrorMessage(err, "Could not add that link."));
+    } finally {
       setSavingLink(false);
     }
-  }
-
-  async function handleLinkArtifact(a: AccountArtifact) {
-    const url = a.url ?? a.file_url ?? "";
-    setArtifactMenuOpen(false);
-    try {
-      const { data } = await airtableApi.addAttachmentLink(item.id, a.name || url, url);
-      setAttachments((prev) => [data, ...prev]);
-    } catch { /* skip */ }
   }
 
   return (
@@ -212,19 +214,12 @@ export function ActionItemModal({
             style={{ overflow: "hidden", fieldSizing: "content" } as React.CSSProperties}
           />
           <div className="flex items-center gap-1.5 shrink-0">
-            {!item.airtable_id.startsWith("local-") && (
-              <button
-                ref={commentBtnRef}
-                onClick={() => {
-                  const rect = commentBtnRef.current?.getBoundingClientRect();
-                  openComments({ resourceType: "action_item", resourceId: item.id, resourceLabel: item.task ?? "", x: rect ? rect.left : 200, y: rect ? rect.bottom + 4 : 200 });
-                }}
-                className="text-gray-400 hover:text-indigo-600 transition-colors p-1 rounded"
-                title="Comments"
-              >
-                <CommentIcon className="w-4 h-4" />
-              </button>
-            )}
+            <CommentTrigger
+              resourceType="action_item"
+              resourceId={item.id}
+              resourceLabel={item.task ?? ""}
+              disabled={item.airtable_id.startsWith("local-")}
+            />
             <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-xl leading-none transition-colors">×</button>
           </div>
         </div>
@@ -250,14 +245,28 @@ export function ActionItemModal({
             <AccPillDate value={form.due_date} onChange={(v) => set({ due_date: v })} />
           </div>
 
-          {/* Details */}
-          <textarea
-            value={form.task_details ?? ""}
-            onChange={(e) => set({ task_details: e.target.value })}
-            rows={3}
-            placeholder="Additional context, steps, or notes…"
-            className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-[var(--twilio-navy)] placeholder:text-[var(--twilio-gray-60)] focus:bg-white focus:border-indigo-400 focus:outline-none focus:ring-1 focus:ring-indigo-100 transition-colors resize-none"
-          />
+          {/* Description. Steps have their own Checklist section below, so the placeholder
+              no longer invites writing them here as prose. */}
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-wide text-[var(--twilio-gray-60)] mb-1.5">
+              Description
+            </p>
+            <textarea
+              value={form.task_details ?? ""}
+              onChange={(e) => set({ task_details: e.target.value })}
+              rows={3}
+              placeholder="Additional context or notes…"
+              className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-[var(--twilio-navy)] placeholder:text-[var(--twilio-gray-60)] focus:bg-white focus:border-indigo-400 focus:outline-none focus:ring-1 focus:ring-indigo-100 transition-colors resize-none"
+            />
+          </div>
+
+          {/* Checklist — its own field, directly below the description. Real Airtable items
+              only: steps key off the numeric PK, which a local-* draft lacks until promoted. */}
+          {!item.airtable_id.startsWith("local-") && (
+            <div className="pt-3 border-t border-gray-100">
+              <StepsPanel actionItemId={item.id} />
+            </div>
+          )}
 
           {/* Time + Slack */}
           <div className="flex flex-wrap gap-2 items-center">
@@ -328,38 +337,16 @@ export function ActionItemModal({
                     className="text-[11px] px-2 py-0.5 rounded border border-gray-200 text-[var(--twilio-navy)] hover:bg-gray-50 transition-colors"
                   >+ File</button>
                   <button
-                    onClick={() => { setLinkFormOpen((v) => !v); setArtifactMenuOpen(false); }}
+                    onClick={() => { setLinkFormOpen((v) => !v); }}
                     className="text-[11px] px-2 py-0.5 rounded border border-gray-200 text-[var(--twilio-navy)] hover:bg-gray-50 transition-colors"
                   >+ Link</button>
-                  <div className="relative" ref={artifactMenuRef}>
-                    <button
-                      onClick={() => { setArtifactMenuOpen((v) => !v); setLinkFormOpen(false); }}
-                      className="text-[11px] px-2 py-0.5 rounded border border-gray-200 text-[var(--twilio-navy)] hover:bg-gray-50 transition-colors"
-                    >+ Artifact</button>
-                    {artifactMenuOpen && (
-                      <div className="absolute right-0 top-full mt-1 z-20 bg-white shadow-lg rounded-lg border border-gray-200 w-52 py-1 max-h-52 overflow-y-auto">
-                        {accountArtifacts.length === 0 ? (
-                          <p className="text-xs text-gray-400 italic px-3 py-2">No artifacts on this account</p>
-                        ) : (
-                          accountArtifacts.map((a) => {
-                            const iconEntry = CATALOG_BY_KEY[a.icon_key || getAutoIconKey(a.url ?? "")] ?? CATALOG_BY_KEY["link"];
-                            return (
-                              <button
-                                key={a.id}
-                                onClick={() => void handleLinkArtifact(a)}
-                                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs hover:bg-gray-50 text-left truncate"
-                              >
-                                <span className="shrink-0">
-                                  <ArtifactIconImg entry={iconEntry} size={14} />
-                                </span>
-                                <span className="truncate text-[var(--twilio-navy)]">{a.name}</span>
-                              </button>
-                            );
-                          })
-                        )}
-                      </div>
-                    )}
-                  </div>
+                  <ArtifactPicker
+                    actionItemId={item.id}
+                    accountName={item.account_name}
+                    accountId={accountId}
+                    onAttached={(a) => { setAttachments((prev) => [a, ...prev]); setLinkFormOpen(false); }}
+                    onError={setAttachError}
+                  />
                   <input ref={attachFileRef} type="file" multiple className="hidden" onChange={(e) => e.target.files && void handleAttachFiles(e.target.files)} />
                 </div>
               </div>
@@ -402,6 +389,12 @@ export function ActionItemModal({
                 </div>
               )}
 
+              {attachError && (
+                <p role="alert" className="text-xs text-red-600 mb-2 bg-red-50 border border-red-200 rounded px-2 py-1">
+                  {attachError}
+                </p>
+              )}
+
               {attachments.length === 0 ? (
                 <p className="text-xs text-gray-400 italic">No attachments yet.</p>
               ) : (
@@ -433,6 +426,18 @@ export function ActionItemModal({
           )}
 
           <ActionItemCardOccurrences airtableId={item.airtable_id} />
+
+          {/* Comments — the latest few, in place. The panel behind the header icon is
+              still where you read the full thread and reply; this exists so an item
+              with a conversation on it doesn't look identical to one without. */}
+          {!item.airtable_id.startsWith("local-") && (
+            <CommentPreviewList
+              resourceType="action_item"
+              resourceId={item.id}
+              resourceLabel={item.task ?? ""}
+              variant="panel"
+            />
+          )}
 
           {/* Activity log */}
           <div>

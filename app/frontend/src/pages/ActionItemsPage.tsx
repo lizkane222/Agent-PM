@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { fileIcon, fmtBytes, dueDateGroup } from "twilio-agent-pm-shared";
 import { airtableApi, accountsApi, schedulerApi, teamApi, searchApi } from "../lib/api";
 import type { SearchResult } from "../lib/api";
-import { useCommentContext } from "../components/comments/CommentContext";
+import CommentTrigger from "../components/comments/CommentTrigger";
+import CommentPreviewList from "../components/comments/CommentPreviewList";
+import { useCommentMenuItem } from "../components/comments/commentMenuItem";
 import type { ActionItemAttachment, ActionItemDependency, AirtableActionItem, AirtableAccount, CalendarEvent, TeamMember, UserProfile } from "../types";
 import { addLog } from "../lib/appLog";
 import { convertActionItemToEvent, restoreConversion } from "../hooks/useConvert";
@@ -40,8 +42,19 @@ function getLinkFaviconSrc(href: string): string | null {
 import { useExport } from "../context/ExportContext";
 import { useExportTray } from "../hooks/useExportTray";
 import { useAppError } from "../context/AppErrorContext";
-import { ContextMenu, type ContextMenuItem } from "../components/action-items/ContextMenu";
+import { ContextMenu, FocusPinBadge, focusPinMenuItem, type ContextMenuItem } from "../components/action-items/ContextMenu";
+import StepsPanel from "../components/action-items/StepsPanel";
+import ArtifactPicker from "../components/action-items/ArtifactPicker";
+import { useFocusPins } from "../hooks/useFocusPins";
+import {
+  useAccountGroupCollapse,
+  accountGroupKey,
+  NO_ACCOUNT_GROUP_KEY,
+  UNMATCHED_GROUP_KEY,
+} from "../hooks/useAccountGroupCollapse";
+import { useCardCollapse } from "../hooks/useCardCollapse";
 import ActivityLogSection from "../components/ActivityLogSection";
+import RichTextMentionEditor from "../components/shared/RichTextMentionEditor";
 
 // Unified account shape used in the kanban accounts zone.
 // Airtable accounts get prefix "at-", app accounts get prefix "app-".
@@ -76,6 +89,12 @@ const STATUS_COLORS: Record<string, string> = {
   "Backlogged": "bg-slate-100 text-slate-600 ring-1 ring-slate-200",
 };
 
+// Blank cards carry a throwaway `local-N` id that promoteBlankItem replaces with a real
+// recXXX, so a pin recorded against one would be orphaned forever. Never offer to pin them.
+function canPinItem(item: AirtableActionItem): boolean {
+  return !item.airtable_id.startsWith("local-");
+}
+
 function fmtTime(seconds: number): string {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
@@ -88,6 +107,36 @@ function fmtTime(seconds: number): string {
 // ── Zones ─────────────────────────────────────────────────────────────────────
 
 type Zone = "unstaged" | "today" | "active" | "complete" | "accounts" | "done-accounts" | `done-accounts-${string}`;
+
+// Human-readable zone names, used in activity-log messages and the Pinned In Progress
+// section's "where does this card live" pill.
+const ZONE_LABELS: Partial<Record<Zone, string>> = {
+  unstaged: "Unstaged",
+  today: "Staged Today",
+  active: "In Progress",
+  complete: "Completed Today",
+  accounts: "Views",
+};
+
+// Zones that actually render a panel. A stored zone outside this set would orphan the
+// item — see load(), which re-defaults anything unrenderable.
+const RENDERABLE_ZONES: Zone[] = ["unstaged", "today", "active", "accounts"];
+
+// The two zones whose cards the user can hand-order by dragging.
+type ReorderableZone = "today" | "active";
+type ZoneOrderMap = Partial<Record<ReorderableZone, string[]>>;
+const ACTION_ITEM_ORDER_KEY = "actionItemOrder";
+
+function isReorderableZone(zone: Zone): zone is ReorderableZone {
+  return zone === "today" || zone === "active";
+}
+
+/** Where a dragged card should land: above `beforeId`, or at the end when null. */
+interface DropHint { zone: ReorderableZone; beforeId: string | null }
+
+// Standard action-item card width, matching the `w-44` wrappers in the Views grid. Used by
+// the Pinned In Progress row so pinned cards are card-sized rather than container-width.
+const PINNED_CARD_WIDTH = "w-44";
 
 interface TimerState {
   running: boolean;
@@ -268,6 +317,7 @@ function ActionItemFields({
   hideTask = false,
   teamMembers = [],
   accounts = [],
+  afterDetails,
 }: {
   form: Partial<AirtableActionItem>;
   onChange: (updated: Partial<AirtableActionItem>) => void;
@@ -275,6 +325,9 @@ function ActionItemFields({
   hideTask?: boolean;
   teamMembers?: TeamMember[];
   accounts?: KanbanAccount[];
+  /** Rendered as its own section directly below the description. The expanded modal puts
+   *  the checklist here; inline cards leave it empty. */
+  afterDetails?: React.ReactNode;
 }) {
   const { status: statusOptions } = useActionItemFieldOptions();
   const assigneeName = form.assignee_name || (form.assignee_airtable_id ? form.assignee_airtable_id : "");
@@ -293,15 +346,19 @@ function ActionItemFields({
         />
       )}
 
-      {/* Task Details — no label */}
-      <textarea
-        value={form.task_details ?? ""}
-        onChange={(e) => onChange({ task_details: e.target.value })}
-        rows={compact ? 2 : 3}
-        placeholder="Additional context, steps, or notes…"
-        className={`${FIELD_INPUT} resize-none`}
-        onClick={(e) => e.stopPropagation()}
-      />
+      {/* Description — no label. Steps live in their own Checklist section below, so the
+          placeholder no longer invites writing them here as prose. */}
+      <div onClick={(e) => e.stopPropagation()}>
+        <RichTextMentionEditor
+          value={form.task_details ?? ""}
+          onChange={(html) => onChange({ task_details: html })}
+          placeholder="Additional context or notes…"
+          minHeightClassName={compact ? "min-h-[48px]" : "min-h-[72px]"}
+        />
+      </div>
+
+      {/* Its own section, directly below the description */}
+      {afterDetails}
 
       {/* Pill row 1: Status · Priority · Due date */}
       <div className="flex flex-wrap gap-1.5 items-center">
@@ -466,6 +523,7 @@ function AttachmentsSection({ item }: { item: AirtableActionItem }) {
   const [dragOver, setDragOver] = useState(false);
   const [showLinkModal, setShowLinkModal] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Fetch fresh list once on mount (item.attachments may be stale from list endpoint)
@@ -477,11 +535,22 @@ function AttachmentsSection({ item }: { item: AirtableActionItem }) {
 
   async function handleFiles(files: FileList | File[]) {
     setUploading(true);
+    setUploadError(null);
+    const failed: string[] = [];
+    let lastError: unknown = null;
     for (const f of Array.from(files)) {
       try {
         const { data } = await airtableApi.uploadAttachmentFile(item.id, f);
         setAttachments((prev) => [data, ...prev]);
-      } catch { /* skip failed uploads */ }
+      } catch (err: unknown) {
+        // Surface it — a swallowed rejection here reads as "nothing happened".
+        failed.push(f.name);
+        lastError = err;
+      }
+    }
+    if (failed.length) {
+      const data = (lastError as { response?: { data?: { detail?: string; error?: string } } })?.response?.data;
+      setUploadError(`${data?.detail ?? data?.error ?? "Upload failed."} (${failed.join(", ")})`);
     }
     setUploading(false);
   }
@@ -509,6 +578,12 @@ function AttachmentsSection({ item }: { item: AirtableActionItem }) {
             className="text-xs px-2 py-0.5 rounded border border-gray-200 text-[var(--twilio-navy)] hover:bg-gray-50"
             title="Upload file"
           >+ File</button>
+          <ArtifactPicker
+            actionItemId={item.id}
+            accountName={item.account_name}
+            onAttached={(a) => setAttachments((prev) => [a, ...prev])}
+            onError={setUploadError}
+          />
           <input
             ref={fileInputRef}
             type="file"
@@ -518,6 +593,12 @@ function AttachmentsSection({ item }: { item: AirtableActionItem }) {
           />
         </div>
       </div>
+
+      {uploadError && (
+        <p role="alert" className="text-xs text-red-600 mb-2 bg-red-50 border border-red-200 rounded px-2 py-1">
+          {uploadError}
+        </p>
+      )}
 
       {/* Drop zone */}
       <div
@@ -889,8 +970,6 @@ function CardModal({
   const [form, setForm] = useState<Partial<AirtableActionItem>>({ ...item });
   const [saving, setSaving] = useState(false);
   const [converting, setConverting] = useState(false);
-  const commentBtnRef = useRef<HTMLButtonElement>(null);
-  const { openComments } = useCommentContext();
 
   const handleSave = useCallback(async () => {
     if (saving) return;
@@ -936,21 +1015,12 @@ function CardModal({
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-lg font-semibold text-[var(--twilio-navy)]">Edit Action Item</h2>
           <div className="flex items-center gap-2">
-            {!item.airtable_id.startsWith("local-") && (
-              <button
-                ref={commentBtnRef}
-                onClick={() => {
-                  const rect = commentBtnRef.current?.getBoundingClientRect();
-                  openComments({ resourceType: "action_item", resourceId: item.id, resourceLabel: item.task ?? "", x: rect ? rect.left : 200, y: rect ? rect.bottom + 4 : 200 });
-                }}
-                className="text-gray-400 hover:text-indigo-600 transition-colors p-1 rounded"
-                title="Comments"
-              >
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-4 h-4">
-                  <path d="M14 9.5a5 5 0 0 1-5 5H3l-1.5 1.5V5a5 5 0 0 1 5-5h2.5a5 5 0 0 1 5 5v4.5z" strokeLinejoin="round"/>
-                </svg>
-              </button>
-            )}
+            <CommentTrigger
+              resourceType="action_item"
+              resourceId={item.id}
+              resourceLabel={item.task ?? ""}
+              disabled={item.airtable_id.startsWith("local-")}
+            />
             <button onClick={onClose} className="text-[var(--twilio-navy)] hover:text-[var(--twilio-gray-80)] text-xl leading-none">✕</button>
           </div>
         </div>
@@ -962,11 +1032,29 @@ function CardModal({
           </div>
         )}
 
+        {/* Existing comments, in place — the header icon opens the full thread. */}
+        {!item.airtable_id.startsWith("local-") && (
+          <CommentPreviewList
+            resourceType="action_item"
+            resourceId={item.id}
+            resourceLabel={item.task ?? ""}
+            variant="panel"
+            className="mb-3"
+          />
+        )}
+
         <ActionItemFields
           form={form}
           onChange={(patch) => setForm((f) => ({ ...f, ...patch }))}
           teamMembers={teamMembers}
           accounts={accounts}
+          // Its own section immediately below the description. Real Airtable items only —
+          // steps key off the numeric PK, which a local-* draft has not been assigned yet.
+          afterDetails={!item.airtable_id.startsWith("local-") && (
+            <div className="pt-2 border-t border-gray-100">
+              <StepsPanel actionItemId={item.id} />
+            </div>
+          )}
         />
 
         <ModalOccurrences airtableId={item.airtable_id} />
@@ -1428,9 +1516,7 @@ function KanbanCard({
   onTimerEdit,
   teamMembers = [],
   accounts = [],
-  focusMode,
-  focusPinnedIds,
-  onToggleFocusPin,
+  collapsible,
 }: {
   item: AirtableActionItem;
   zone: Zone;
@@ -1445,15 +1531,24 @@ function KanbanCard({
   onTimerEdit?: (seconds: number) => void;
   teamMembers?: TeamMember[];
   accounts?: KanbanAccount[];
-  focusMode?: boolean;
-  focusPinnedIds?: Set<string>;
-  onToggleFocusPin?: (id: string) => void;
+  /** Show a collapse toggle in the top-left corner. Used by Stage Today, Currently
+   *  Tracking and Pinned In Progress; the Views grid leaves its cards always-expanded. */
+  collapsible?: boolean;
 }) {
   const [form, setForm] = useState<Partial<AirtableActionItem>>({ ...item });
   const [saving, setSaving] = useState(false);
-  const { openComments } = useCommentContext();
   const { addToTray } = useExportTray();
+  const { isPinned, toggle: toggleFocusPin } = useFocusPins();
+  const { isCollapsed: isCardCollapsed, toggle: toggleCardCollapse } = useCardCollapse();
   const [ctxPos, setCtxPos] = useState<{ x: number; y: number } | null>(null);
+
+  // Never pin a local-* blank — promoteBlankItem discards that id for a real recXXX.
+  const canPin = !item.airtable_id.startsWith("local-");
+  const isPinnedToFocus = canPin && isPinned(item.airtable_id);
+  const collapsed = !!collapsible && isCardCollapsed(item.airtable_id);
+  // `canPin` is also the "exists server-side" test — a local-* draft has no PK to
+  // hang a comment off, and promoteBlankItem would discard the id anyway.
+  const commentMenuEntry = useCommentMenuItem("action_item", canPin ? item.id : null, item.task ?? "", ctxPos);
 
   // Keep form in sync when item changes from outside (e.g. after a save or promotion),
   // but preserve unsaved user edits when only the account assignment changed (star action).
@@ -1534,6 +1629,80 @@ function KanbanCard({
     onDragStart(e);
   }
 
+  // Right-click menu, shared by all three card layouts below. Defined before the
+  // branch returns so every layout offers the same actions.
+  const kanbanCtxItems: ContextMenuItem[] = [
+    ...(canPin ? [
+      focusPinMenuItem(isPinnedToFocus, () => toggleFocusPin(item.airtable_id)),
+      { separator: true, label: "", onClick: () => {} } as ContextMenuItem,
+    ] : []),
+    { label: "Open details", onClick: () => onExpandClick() },
+    { label: "Mark as Done", onClick: () => void onSave({ status: "Done" }) },
+    { label: "Copy task name", onClick: () => { try { navigator.clipboard.writeText(item.task ?? ""); } catch { /* best effort */ } } },
+    commentMenuEntry,
+    { separator: true, label: "", onClick: () => {} },
+    { label: "→ Export tray", icon: <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5"><path d="M1 9v4h12V9"/><path d="M4.5 5.5 7 3l2.5 2.5"/><path d="M7 3v7"/></svg>, onClick: () => addToTray(item) },
+  ];
+
+  // The compact and unstaged layouts are full of inputs and a rich-text editor. Let the
+  // browser's own menu win there so paste/spellcheck still work.
+  function handleCardContextMenu(e: React.MouseEvent) {
+    if ((e.target as HTMLElement).closest("input, textarea, [contenteditable='true']")) return;
+    e.preventDefault();
+    setCtxPos({ x: e.clientX, y: e.clientY });
+  }
+
+  // ── Collapsed card ───────────────────────────────────────────────────────────
+  // One shared layout for every collapsible section, so a folded card reads the same in
+  // Stage Today, Currently Tracking and Pinned In Progress. Title, status and account stay
+  // visible; everything else is hidden. Still draggable and still right-clickable.
+  if (collapsed) {
+    return (
+      <>
+      <div
+        draggable
+        onDragStart={handleDragStartWithGhost}
+        onContextMenu={handleCardContextMenu}
+        className="rounded-lg shadow-blue-md cursor-grab active:cursor-grabbing select-none hover:shadow-blue-lg transition-all flex items-center gap-2 px-2.5 py-2 overflow-hidden"
+        style={{ position: "relative", background: "#F4F4F6" }}
+      >
+        {isPinnedToFocus && <FocusPinBadge />}
+        <button
+          onClick={(e) => { e.stopPropagation(); toggleCardCollapse(item.airtable_id); }}
+          title="Expand card"
+          className="shrink-0"
+        >
+          <CollapseChevron collapsed />
+        </button>
+        <p className="flex-1 min-w-0 truncate text-xs font-semibold text-[var(--twilio-navy)]">
+          {item.task || <span className="italic opacity-50">Untitled</span>}
+        </p>
+        <span className={`shrink-0 text-[10px] font-semibold uppercase px-1 py-0.5 rounded whitespace-nowrap ${STATUS_COLORS[statusKey] ?? STATUS_COLORS["Open"]}`}>
+          {statusKey}
+        </span>
+        {(item.account_name || form.account_name) && (
+          <span className="shrink-0 inline-flex items-center gap-1 text-[11px] font-semibold text-indigo-700 bg-indigo-50 px-1.5 py-0.5 rounded-full max-w-[110px] truncate">
+            <CorporateIcon width={10} height={10} className="shrink-0 opacity-70" />
+            <span className="truncate">{item.account_name || form.account_name}</span>
+          </span>
+        )}
+        {/* Icon + count only — a collapsed row has no space for a preview, but it
+            should still say whether there is a conversation on the item. */}
+        <CommentTrigger
+          resourceType="action_item"
+          resourceId={item.id}
+          resourceLabel={item.task ?? ""}
+          size="sm"
+          disabled={!canPin}
+        />
+      </div>
+      {ctxPos && (
+        <ContextMenu x={ctxPos.x} y={ctxPos.y} items={kanbanCtxItems} onClose={() => setCtxPos(null)} />
+      )}
+      </>
+    );
+  }
+
   // ── Compact 2-row horizontal card for Stage Today / In Progress ──────────────
   if (isFullForm && !isUnstaged) {
     const assigneeName = form.assignee_name || (form.assignee_airtable_id ? form.assignee_airtable_id : "");
@@ -1548,21 +1717,35 @@ function KanbanCard({
     const actionsCol = isActive ? 4 : 3;
 
     return (
+      <>
       <div
         draggable
         onDragStart={handleDragStartWithGhost}
+        onContextMenu={handleCardContextMenu}
         className="rounded-lg shadow-blue-md cursor-grab active:cursor-grabbing select-none hover:shadow-blue-lg transition-all overflow-hidden"
-        style={{ background: "#F4F4F6", display: "grid", gridTemplateColumns: gridCols, gridTemplateRows: "auto auto auto", padding: "10px 12px", gap: "4px 10px", width: "100%", alignItems: "center" }}
+        style={{ position: "relative", background: "#F4F4F6", display: "grid", gridTemplateColumns: gridCols, gridTemplateRows: "auto auto auto", padding: "10px 12px", gap: "4px 10px", width: "100%", alignItems: "center" }}
       >
+        {isPinnedToFocus && <FocusPinBadge />}
         {/* Row 1 col 1: task name + account badge */}
         <div className="flex flex-col gap-0.5" style={{ gridColumn: 1, gridRow: 1 }}>
-          <input
-            value={form.task ?? ""}
-            onChange={(e) => setForm((f) => ({ ...f, task: e.target.value }))}
-            placeholder="Name or short description"
-            onClick={(e) => e.stopPropagation()}
-            className="flex-1 min-w-0 text-sm font-semibold text-[var(--twilio-navy)] bg-transparent border-b border-gray-200 focus:border-indigo-400 focus:outline-none pb-0.5 placeholder:text-[var(--twilio-gray-60)] placeholder:font-normal"
-          />
+          <div className="flex items-center gap-1.5 min-w-0">
+            {collapsible && (
+              <button
+                onClick={(e) => { e.stopPropagation(); toggleCardCollapse(item.airtable_id); }}
+                title="Collapse card"
+                className="shrink-0"
+              >
+                <CollapseChevron collapsed={false} />
+              </button>
+            )}
+            <input
+              value={form.task ?? ""}
+              onChange={(e) => setForm((f) => ({ ...f, task: e.target.value }))}
+              placeholder="Name or short description"
+              onClick={(e) => e.stopPropagation()}
+              className="flex-1 min-w-0 text-sm font-semibold text-[var(--twilio-navy)] bg-transparent border-b border-gray-200 focus:border-indigo-400 focus:outline-none pb-0.5 placeholder:text-[var(--twilio-gray-60)] placeholder:font-normal"
+            />
+          </div>
           {(item.account_name || form.account_name) && (
             <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-indigo-700 bg-indigo-50 px-1.5 py-0.5 rounded-full w-fit max-w-full truncate">
               <CorporateIcon width={10} height={10} className="shrink-0 opacity-70" />
@@ -1623,14 +1806,18 @@ function KanbanCard({
         </div>
 
         {/* Col 2 spanning both rows: task details */}
-        <textarea
-          value={form.task_details ?? ""}
-          onChange={(e) => setForm((f) => ({ ...f, task_details: e.target.value }))}
-          placeholder="Task details…"
-          onClick={(e) => e.stopPropagation()}
+        <div
           style={{ gridColumn: 2, gridRow: "1 / 3" }}
-          className="resize-none rounded-md border border-gray-200 bg-gray-50 px-2.5 py-1.5 text-xs text-[var(--twilio-navy)] placeholder:text-[var(--twilio-gray-60)] focus:bg-white focus:border-indigo-400 focus:outline-none focus:ring-1 focus:ring-indigo-100 transition-colors leading-relaxed h-full"
-        />
+          className="h-full overflow-y-auto"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <RichTextMentionEditor
+            value={form.task_details ?? ""}
+            onChange={(html) => setForm((f) => ({ ...f, task_details: html }))}
+            placeholder="Task details…"
+            minHeightClassName="min-h-[60px]"
+          />
+        </div>
 
         {/* Col 3 (In Progress only) spanning both rows: timer + track/stop */}
         {isActive && onTimerToggle && (
@@ -1682,40 +1869,37 @@ function KanbanCard({
             <ReminderButton item={item} onUpdated={onUpdated} />
           )}
           {onDelete && <DeleteButton onDelete={onDelete} />}
-          {focusMode && zone === "today" && !focusPinnedIds?.has(item.airtable_id) && (
-            <button
-              title="Pin to Focus"
-              onClick={(e) => { e.stopPropagation(); onToggleFocusPin?.(item.airtable_id); }}
-              className="shrink-0 text-[10px] text-violet-600 hover:text-violet-800 transition-colors"
-            >
-              📌
-            </button>
-          )}
-          {focusMode && zone === "today" && focusPinnedIds?.has(item.airtable_id) && (
-            <span
-              title="Pinned to Focus"
-              className="shrink-0 inline-flex items-center justify-center w-4 h-4 rounded-full bg-violet-500 text-white text-[8px]"
-            >
-              📌
-            </span>
-          )}
         </div>
 
         {/* Row 3: calendar occurrences spanning content columns */}
         <KanbanCardOccurrencesInline airtableId={item.airtable_id} colSpan={isActive ? 2 : 2} />
+
+        <CommentPreviewList
+          resourceType="action_item"
+          resourceId={canPin ? item.id : null}
+          resourceLabel={item.task ?? ""}
+          className="col-span-2"
+        />
       </div>
+      {ctxPos && (
+        <ContextMenu x={ctxPos.x} y={ctxPos.y} items={kanbanCtxItems} onClose={() => setCtxPos(null)} />
+      )}
+      </>
     );
   }
 
   // ── Full tall card for Unstaged ───────────────────────────────────────────────
   if (isUnstaged) {
     return (
+      <>
       <div
         draggable
         onDragStart={handleUnstagedDragStart}
+        onContextMenu={handleCardContextMenu}
         className="rounded-xl shadow-blue-md cursor-grab active:cursor-grabbing select-none hover:shadow-blue-lg transition-all flex flex-col overflow-hidden"
-        style={{ background: "#F4F4F6" }}
+        style={{ position: "relative", background: "#F4F4F6" }}
       >
+        {isPinnedToFocus && <FocusPinBadge />}
         {/* Task title — above badges */}
         <div className="px-4 pt-3 pb-2">
           <input
@@ -1816,17 +2000,12 @@ function KanbanCard({
           </button>
         </div>
       </div>
+      {ctxPos && (
+        <ContextMenu x={ctxPos.x} y={ctxPos.y} items={kanbanCtxItems} onClose={() => setCtxPos(null)} />
+      )}
+      </>
     );
   }
-
-  const kanbanCtxItems: ContextMenuItem[] = [
-    { label: "Open details", onClick: () => onExpandClick() },
-    { label: "Mark as Done", onClick: () => void onSave({ status: "Done" }) },
-    { label: "Copy task name", onClick: () => { try { navigator.clipboard.writeText(item.task ?? ""); } catch { /* best effort */ } } },
-    { label: "Add comment", onClick: () => openComments({ resourceType: "action_item", resourceId: item.id, resourceLabel: item.task ?? "", x: ctxPos?.x ?? 0, y: ctxPos?.y ?? 0 }) },
-    { separator: true, label: "", onClick: () => {} },
-    { label: "→ Export tray", icon: <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5"><path d="M1 9v4h12V9"/><path d="M4.5 5.5 7 3l2.5 2.5"/><path d="M7 3v7"/></svg>, onClick: () => addToTray(item) },
-  ];
 
   return (
     <>
@@ -1836,11 +2015,21 @@ function KanbanCard({
       onClick={(e) => { e.stopPropagation(); onExpandClick(); }}
       onContextMenu={(e) => { e.preventDefault(); setCtxPos({ x: e.clientX, y: e.clientY }); }}
       className="rounded-lg shadow-blue-md cursor-grab active:cursor-grabbing select-none hover:shadow-blue-lg transition-all flex flex-col overflow-hidden"
-      style={{ background: "#F4F4F6" }}
+      style={{ position: "relative", background: "#F4F4F6" }}
     >
+      {isPinnedToFocus && <FocusPinBadge />}
       <div className="px-3 pt-3 pb-2 flex-1 flex flex-col gap-1.5">
         <div className="flex items-start justify-between gap-1">
           <div className="flex items-center gap-1 min-w-0 overflow-hidden">
+            {collapsible && (
+              <button
+                onClick={(e) => { e.stopPropagation(); toggleCardCollapse(item.airtable_id); }}
+                title="Collapse card"
+                className="shrink-0"
+              >
+                <CollapseChevron collapsed={false} />
+              </button>
+            )}
             {form.priority && (
               <span className={`text-[10px] font-semibold uppercase px-1 py-0.5 rounded whitespace-nowrap min-w-0 shrink ${PRIORITY_COLORS[form.priority]}`}>
                 {form.priority}
@@ -1885,6 +2074,11 @@ function KanbanCard({
           </span>
         )}
         <KanbanCardOccurrences airtableId={item.airtable_id} />
+        <CommentPreviewList
+          resourceType="action_item"
+          resourceId={canPin ? item.id : null}
+          resourceLabel={item.task ?? ""}
+        />
       </div>
     </div>
     {ctxPos && (
@@ -1993,6 +2187,45 @@ function CompletedDeckTrigger({
   );
 }
 
+// Chevron for an account group header. Points down when expanded, right when collapsed.
+function CollapseChevron({ collapsed }: { collapsed: boolean }) {
+  return (
+    <svg
+      viewBox="0 0 12 12"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      className={`w-3 h-3 shrink-0 text-[var(--twilio-gray-60)] transition-transform ${collapsed ? "-rotate-90" : ""}`}
+    >
+      <path d="M2 4l4 4 4-4" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+// Open/Done counts shown on an account row header, so a collapsed row still says how much
+// it is hiding.
+function GroupCounts({ items }: { items: AirtableActionItem[] }) {
+  const done = items.filter((i) => i.status === "Done").length;
+  const open = items.length - done;
+  if (items.length === 0) return null;
+  return (
+    <span className="flex items-center gap-1 shrink-0">
+      {open > 0 && (
+        <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-gray-100 text-[var(--twilio-navy)]">{open} open</span>
+      )}
+      {done > 0 && (
+        <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700">{done} done</span>
+      )}
+    </span>
+  );
+}
+
+// Insertion marker shown between cards while dragging inside a hand-ordered zone.
+// Sits in the container's existing gap, so showing it reflows nothing.
+function DropIndicator() {
+  return <div data-testid="drop-indicator" className="h-0.5 -my-1 rounded-full bg-indigo-500 shrink-0" />;
+}
+
 // ── Drop zone ─────────────────────────────────────────────────────────────────
 
 function DropZone({
@@ -2036,8 +2269,11 @@ function DropZone({
   externalDragId,
   onExternalDropWithStatus,
   focusMode,
-  focusPinnedIds,
-  onToggleFocusPin,
+  reorderable,
+  dragId,
+  dropHint,
+  onDropHint,
+  collapsible,
 }: {
   zone: Zone;
   label: string;
@@ -2080,13 +2316,27 @@ function DropZone({
   // The airtable_id being dragged from outside this zone (so status columns can accept external drops)
   externalDragId?: string | null;
   onExternalDropWithStatus?: (airtableId: string, status: AirtableActionItem["status"]) => void;
+  /** Focus mode is on. Pinned items are hoisted into the Pinned In Progress section, so
+   *  the accounts grid shows them as ghosts instead of full cards. */
   focusMode?: boolean;
-  focusPinnedIds?: Set<string>;
-  onToggleFocusPin?: (id: string) => void;
+  // ── Hand-ordering (today / active only) ──────────────────────────────────────
+  /** Cards in this zone can be reordered by dragging. */
+  reorderable?: boolean;
+  /** The airtable_id currently being dragged, used to hide the indicator next to itself. */
+  dragId?: string | null;
+  /** Where the dragged card would land. */
+  dropHint?: DropHint | null;
+  /** Report a candidate insertion point. Cards never handle the drop itself — the event
+   *  bubbles to the zone container so handleDrop stays the single mutation site. */
+  onDropHint?: (zone: ReorderableZone, beforeId: string | null) => void;
+  /** Give each card a collapse toggle in its top-left corner. */
+  collapsible?: boolean;
 }) {
   const isOver = dragOverZone === zone;
   const [accountView, setAccountView] = useState<"mine" | "team">("mine");
   const [openDeckKey, setOpenDeckKey] = useState<string | null>(null);
+  const { pinnedIds: focusPinnedIds } = useFocusPins();
+  const { isCollapsed, toggle: toggleCollapse, setAll: setAllCollapsed, allCollapsed } = useAccountGroupCollapse();
   const { exportMode, toggleItem, isSelected } = useExport();
 
   if (zone === "accounts") {
@@ -2115,6 +2365,21 @@ function DropZone({
     const viewItems = (allRealItems ?? []).filter(matchesSearch);
 
     const currentView = pageView ?? "kanban";
+
+    // Every group key the Collapse all button should act on. The Views grid and the
+    // Projects view share one canonical key space (lowercased account name), so the union
+    // of both lists is correct and lets one button cover whichever view is on screen.
+    const hasUnmatched = (() => {
+      const known = new Set((accounts ?? []).map((a) => a.name.toLowerCase()));
+      return filteredItems.some((i) => i.account_name && !known.has(i.account_name.toLowerCase()));
+    })();
+    const visibleGroupKeys = [...new Set([
+      NO_ACCOUNT_GROUP_KEY,
+      ...(accounts ?? []).map((a) => accountGroupKey(a.name)),
+      ...viewItems.map((i) => accountGroupKey(i.account_name)),
+      ...(hasUnmatched ? [UNMATCHED_GROUP_KEY] : []),
+    ])];
+    const allGroupsCollapsed = allCollapsed(visibleGroupKeys);
 
     return (
       <div className={`flex flex-col bg-white rounded-lg shadow-blue-md ${className ?? ""}`} style={style}>
@@ -2165,6 +2430,17 @@ function DropZone({
                 </button>
               ))}
             </div>
+          )}
+          {/* Collapse all / Expand all — one button covering both grouped views. The label
+              is derived from the store, so it flips to "Expand all" as soon as the last
+              expanded group is collapsed by hand. */}
+          {(currentView === "kanban" || currentView === "projects") && (
+            <button
+              onClick={() => setAllCollapsed(visibleGroupKeys, !allGroupsCollapsed)}
+              className="shrink-0 px-2 py-1 rounded-lg text-[11px] font-semibold uppercase tracking-wide border border-gray-300 bg-gray-50 text-[var(--twilio-gray-80)] hover:bg-gray-100 transition-colors"
+            >
+              {allGroupsCollapsed ? "Expand all" : "Collapse all"}
+            </button>
           )}
           {/* Search — shown in all views */}
           <div className="relative flex-1" style={{ minWidth: 160, maxWidth: 300 }}>
@@ -2229,6 +2505,8 @@ function DropZone({
             const noAccCompleted = (completedItems ?? []).filter((i) => !i.account_name && !(pinnedIds ?? new Set()).has(i.airtable_id));
             const zoneKey = "account-none" as Zone;
             const isAccOver = dragOverZone === zoneKey;
+            const groupKey = NO_ACCOUNT_GROUP_KEY;
+            const rowCollapsed = isCollapsed(groupKey);
             return (
               <div
                 className={`flex flex-col border-b border-gray-100 transition-colors ${isAccOver ? "bg-indigo-50" : "hover:bg-gray-50"}`}
@@ -2238,8 +2516,17 @@ function DropZone({
               >
                 <div className="flex items-stretch">
                   <div className="w-36 shrink-0 px-3 py-2 border-r border-gray-100 flex flex-col justify-center">
-                    <p className="text-sm font-medium text-[var(--twilio-gray-60)] leading-tight italic">No Account</p>
+                    <button
+                      onClick={() => toggleCollapse(groupKey)}
+                      title={rowCollapsed ? "Expand No Account" : "Collapse No Account"}
+                      className="flex items-center gap-1.5 text-left min-w-0"
+                    >
+                      <CollapseChevron collapsed={rowCollapsed} />
+                      <p className="text-sm font-medium text-[var(--twilio-gray-60)] leading-tight italic truncate">No Account</p>
+                    </button>
+                    {rowCollapsed && <div className="mt-1 pl-4"><GroupCounts items={[...noAccItems, ...noAccCompleted]} /></div>}
                   </div>
+                  {!rowCollapsed && <>
                   <div className="flex-1 overflow-x-auto">
                     <div className="flex flex-row gap-2 p-2 min-w-0">
                       {noAccItems.map((item) => (
@@ -2277,9 +2564,10 @@ function DropZone({
                       </div>
                     )}
                   </div>
+                  </>}
                 </div>
                 {/* Expanded completed row */}
-                {openDeckKey === "none" && noAccCompleted.length > 0 && onPin && (
+                {!rowCollapsed && openDeckKey === "none" && noAccCompleted.length > 0 && onPin && (
                   <div
                     className="flex gap-2 px-3 pb-2 overflow-x-auto transition-colors"
                     style={{ borderTop: "1px solid #f0fdf4", background: dragOverZone === "done-accounts-none" ? "#dcfce7" : "#f0fdf4", scrollbarWidth: "thin" }}
@@ -2313,13 +2601,19 @@ function DropZone({
           {(accounts ?? []).map((acc) => {
             const accItems = filteredItems.filter((i) => i.account_name?.toLowerCase() === acc.name.toLowerCase());
             const accCompleted = (completedItems ?? []).filter((i) => i.account_name?.toLowerCase() === acc.name.toLowerCase() && !(pinnedIds ?? new Set()).has(i.airtable_id));
-            // Items staged in today/active that belong to this account — shown as ghosts
+            // Items that belong to this account but are rendered elsewhere — shown as
+            // ghosts so the row never looks emptier than it is. Either staged in
+            // today/active, or hoisted into Pinned In Progress by focus mode.
             const stagedItems = (allRealItems ?? []).filter((i) => {
               const z = itemZones?.[i.airtable_id];
-              return (z === "today" || z === "active") && i.account_name?.toLowerCase() === acc.name.toLowerCase();
+              const pinnedAway = !!focusMode && focusPinnedIds.has(i.airtable_id);
+              return (z === "today" || z === "active" || pinnedAway)
+                && i.account_name?.toLowerCase() === acc.name.toLowerCase();
             });
             const zoneKey = `account-${acc.key}` as Zone;
             const isAccOver = dragOverZone === zoneKey;
+            const groupKey = accountGroupKey(acc.name);
+            const rowCollapsed = isCollapsed(groupKey);
             return (
               <div
                 key={acc.key}
@@ -2329,18 +2623,29 @@ function DropZone({
                 onDrop={(e) => onDrop(e, "accounts", acc.key)}
               >
                 <div className="flex items-stretch">
-                  {/* Account label column */}
+                  {/* Account label column. The star and the collapse toggle are siblings —
+                      nesting one button inside the other would be invalid. */}
                   <div className="w-36 shrink-0 px-3 py-2 border-r border-gray-100 flex flex-col justify-center">
-                    <div className="flex items-center gap-1.5">
+                    <div className="flex items-center gap-1.5 min-w-0">
                       <button title={starredAccountKey === acc.key ? "Remove auto-assign" : "Auto-assign blank cards to this account"} onClick={() => onStarAccount?.(starredAccountKey === acc.key ? null : acc.key)} className="shrink-0 leading-none transition-transform hover:scale-110">
                         <svg viewBox="0 0 20 20" fill={starredAccountKey === acc.key ? "#f59e0b" : "none"} stroke={starredAccountKey === acc.key ? "#f59e0b" : "#9ca3af"} strokeWidth="1.5" className="w-4 h-4">
                           <path strokeLinecap="round" strokeLinejoin="round" d="M9.049 2.927c.3-.921 1.603-.921 1.902 0l1.07 3.292a1 1 0 00.95.69h3.462c.969 0 1.371 1.24.588 1.81l-2.8 2.034a1 1 0 00-.364 1.118l1.07 3.292c.3.921-.755 1.688-1.54 1.118l-2.8-2.034a1 1 0 00-1.175 0l-2.8 2.034c-.784.57-1.838-.197-1.539-1.118l1.07-3.292a1 1 0 00-.364-1.118L2.98 8.72c-.783-.57-.38-1.81.588-1.81h3.461a1 1 0 00.951-.69l1.07-3.292z"/>
                         </svg>
                       </button>
-                      <p className="text-sm font-medium text-[var(--twilio-navy)] leading-tight truncate">{acc.name}</p>
+                      <button
+                        onClick={() => toggleCollapse(groupKey)}
+                        title={rowCollapsed ? `Expand ${acc.name}` : `Collapse ${acc.name}`}
+                        className="flex items-center gap-1 min-w-0 text-left"
+                      >
+                        <CollapseChevron collapsed={rowCollapsed} />
+                        <p className="text-sm font-medium text-[var(--twilio-navy)] leading-tight truncate">{acc.name}</p>
+                      </button>
                     </div>
-                    {acc.source === "airtable" && <span className="text-[10px] text-[var(--twilio-gray-60)] mt-0.5 pl-5">Airtable</span>}
+                    {rowCollapsed
+                      ? <div className="mt-1 pl-5"><GroupCounts items={[...accItems, ...accCompleted]} /></div>
+                      : acc.source === "airtable" && <span className="text-[10px] text-[var(--twilio-gray-60)] mt-0.5 pl-5">Airtable</span>}
                   </div>
+                  {!rowCollapsed && <>
                   {/* Cards scrolling horizontally */}
                   <div className="flex-1 overflow-x-auto">
                     <div className="flex flex-row gap-2 p-2 min-w-0">
@@ -2349,10 +2654,14 @@ function DropZone({
                           <KanbanCard item={item} zone="accounts" onDragStart={(e) => onDragStart(e, item)} onSave={(fields) => onSave(item, fields)} onExpandClick={() => onExpand(item)} onDelete={onDelete ? () => onDelete(item) : undefined} onUpdated={onUpdated} />
                         </div>
                       ))}
-                      {/* Ghost cards for staged items */}
+                      {/* Ghost cards for items rendered in another panel */}
                       {stagedItems.map((item) => {
                         const z = itemZones?.[item.airtable_id];
-                        const label = z === "active" ? "In Progress" : "Stage Today";
+                        const pinnedAway = !!focusMode && focusPinnedIds.has(item.airtable_id);
+                        const label = pinnedAway ? "Pinned to Focus" : z === "active" ? "In Progress" : "Stage Today";
+                        const pillClass = pinnedAway
+                          ? "bg-violet-100 text-violet-700"
+                          : z === "active" ? "bg-yellow-100 text-yellow-700" : "bg-indigo-50 text-indigo-600";
                         return (
                           <div key={item.airtable_id} className="w-44 shrink-0 relative group/ghost">
                             <div className="rounded-lg border border-dashed border-gray-300 bg-white opacity-50 px-3 py-2.5 flex flex-col gap-1 select-none pointer-events-none"
@@ -2360,19 +2669,22 @@ function DropZone({
                               <p className="text-xs font-medium text-[var(--twilio-navy)] italic leading-snug line-clamp-2">
                                 {item.task || "Untitled"}
                               </p>
-                              <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full w-fit ${z === "active" ? "bg-yellow-100 text-yellow-700" : "bg-indigo-50 text-indigo-600"}`}>
+                              <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full w-fit ${pillClass}`}>
                                 {label}
                               </span>
                             </div>
-                            {/* Restore button — visible on hover */}
-                            <button
-                              onClick={() => onRestoreToViews?.(item)}
-                              title={`Remove from ${label} and restore to Views`}
-                              className="absolute top-1.5 right-1.5 opacity-0 group-hover/ghost:opacity-100 transition-opacity flex items-center gap-0.5 text-[10px] font-semibold text-indigo-600 bg-white border border-indigo-200 rounded-full px-1.5 py-0.5 shadow-sm hover:bg-indigo-50 pointer-events-auto"
-                            >
-                              <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.8" className="w-2.5 h-2.5 shrink-0"><path d="M9 3L3 9M3 3l6 6" strokeLinecap="round"/></svg>
-                              Restore
-                            </button>
+                            {/* Restore button — visible on hover. Pinned-away cards are
+                                unpinned from the Pinned In Progress section instead. */}
+                            {!pinnedAway && (
+                              <button
+                                onClick={() => onRestoreToViews?.(item)}
+                                title={`Remove from ${label} and restore to Views`}
+                                className="absolute top-1.5 right-1.5 opacity-0 group-hover/ghost:opacity-100 transition-opacity flex items-center gap-0.5 text-[10px] font-semibold text-indigo-600 bg-white border border-indigo-200 rounded-full px-1.5 py-0.5 shadow-sm hover:bg-indigo-50 pointer-events-auto"
+                              >
+                                <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.8" className="w-2.5 h-2.5 shrink-0"><path d="M9 3L3 9M3 3l6 6" strokeLinecap="round"/></svg>
+                                Restore
+                              </button>
+                            )}
                           </div>
                         );
                       })}
@@ -2409,9 +2721,10 @@ function DropZone({
                       </div>
                     )}
                   </div>
+                  </>}
                 </div>
                 {/* Expanded completed row */}
-                {openDeckKey === acc.key && accCompleted.length > 0 && onPin && (
+                {!rowCollapsed && openDeckKey === acc.key && accCompleted.length > 0 && onPin && (
                   <div
                     className="flex gap-2 px-3 pb-2 overflow-x-auto transition-colors"
                     style={{ borderTop: "1px solid #f0fdf4", background: dragOverZone === `done-accounts-${acc.key}` ? "#dcfce7" : "#f0fdf4", scrollbarWidth: "thin" }}
@@ -2442,6 +2755,49 @@ function DropZone({
               </div>
             );
           })}
+          {/* Unmatched account — catch-all so an item whose account_name matches no known
+              account is never silently rendered nowhere. One row for all of them, so a bad
+              sync can't explode the grid into hundreds of rows. Deliberately not a drop
+              target and with no Done column: filing into an unresolvable bucket has no
+              meaning. Each card shows its own account_name badge. */}
+          {(() => {
+            const known = new Set((accounts ?? []).map((a) => a.name.toLowerCase()));
+            const orphans = filteredItems.filter(
+              (i) => i.account_name && !known.has(i.account_name.toLowerCase())
+            );
+            if (orphans.length === 0) return null;
+            const rowCollapsed = isCollapsed(UNMATCHED_GROUP_KEY);
+            return (
+              <div className="flex flex-col border-b border-gray-100 transition-colors hover:bg-gray-50">
+                <div className="flex items-stretch">
+                  <div className="w-36 shrink-0 px-3 py-2 border-r border-gray-100 flex flex-col justify-center">
+                    <button
+                      onClick={() => toggleCollapse(UNMATCHED_GROUP_KEY)}
+                      title={rowCollapsed ? "Expand unmatched" : "Collapse unmatched"}
+                      className="flex items-center gap-1.5 min-w-0 text-left"
+                    >
+                      <CollapseChevron collapsed={rowCollapsed} />
+                      <p className="text-sm font-medium text-amber-700 leading-tight italic truncate">Unmatched account</p>
+                    </button>
+                    {rowCollapsed
+                      ? <div className="mt-1 pl-4"><GroupCounts items={orphans} /></div>
+                      : <span className="text-[10px] text-amber-600 mt-0.5 pl-4">No matching account</span>}
+                  </div>
+                  {!rowCollapsed && (
+                    <div className="flex-1 overflow-x-auto">
+                      <div className="flex flex-row gap-2 p-2 min-w-0">
+                        {orphans.map((item) => (
+                          <div key={item.airtable_id} className="w-44 shrink-0">
+                            <KanbanCard item={item} zone="accounts" onDragStart={(e) => onDragStart(e, item)} onSave={(fields) => onSave(item, fields)} onExpandClick={() => onExpand(item)} onDelete={onDelete ? () => onDelete(item) : undefined} onUpdated={onUpdated} />
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })()}
         </div>}
       </div>
     );
@@ -2486,14 +2842,30 @@ function DropZone({
       </div>
       <div className={isUnstagedZone ? "p-4" : "flex-1 p-3 overflow-y-auto"}>
         <div className={isUnstagedZone ? "flex flex-row gap-2" : isFullFormZone ? "flex flex-col gap-3" : "flex flex-col gap-2 justify-center h-full"}>
-          {items.map((item) => {
+          {items.map((item, i) => {
             const exportKey = `action_item:${item.airtable_id}`;
             const sel = exportMode && isSelected(exportKey);
+            const showIndicatorBefore = reorderable && !!dragId
+              && dragId !== item.airtable_id
+              && dropHint?.zone === zone && dropHint.beforeId === item.airtable_id;
             return (
+            <Fragment key={item.airtable_id}>
+            {showIndicatorBefore && <DropIndicator />}
             <div
-              key={item.airtable_id}
               className={isUnstagedZone ? "w-80 shrink-0" : undefined}
               style={{ position: "relative" }}
+              onDragOver={reorderable ? (e) => {
+                // Stop the zone container's handler from resetting the hint to "append",
+                // but keep its highlight in sync.
+                e.stopPropagation();
+                onDragOver(e, zone);
+                const r = e.currentTarget.getBoundingClientRect();
+                const dropAbove = e.clientY < r.top + r.height / 2;
+                onDropHint?.(
+                  zone as ReorderableZone,
+                  dropAbove ? item.airtable_id : (items[i + 1]?.airtable_id ?? null),
+                );
+              } : undefined}
             >
               {exportMode && (
                 <button
@@ -2539,13 +2911,15 @@ function DropZone({
                 onTimerEdit={onTimerEdit ? (s) => onTimerEdit(item.airtable_id, s) : undefined}
                 teamMembers={teamMembers}
                 accounts={accounts}
-                focusMode={focusMode}
-                focusPinnedIds={focusPinnedIds}
-                onToggleFocusPin={onToggleFocusPin}
+                collapsible={collapsible}
               />
             </div>
+            </Fragment>
             );
           })}
+          {/* End-of-list insertion point */}
+          {reorderable && !!dragId && dropHint?.zone === zone && dropHint.beforeId === null
+            && items[items.length - 1]?.airtable_id !== dragId && <DropIndicator />}
           {items.length === 0 && (
             <div className={`flex items-center justify-center rounded-lg border-2 border-dashed text-sm h-20 ${isUnstagedZone ? "w-80" : "w-full"} ${isOver ? "border-indigo-400 text-indigo-600" : "border-gray-300 text-[var(--twilio-gray-60)]"}`}>
               Drop here
@@ -2604,9 +2978,17 @@ function StatusBoardView({
   // Optimistic local status overrides so the move feels instant
   const [localStatus, setLocalStatus] = useState<Record<string, AirtableActionItem["status"]>>({});
   const [ctxState, setCtxState] = useState<{ x: number; y: number; item: AirtableActionItem } | null>(null);
+  const { isPinned, toggle: toggleFocusPin } = useFocusPins();
   const { exportMode, toggleItem, isSelected } = useExport();
-  const { openComments } = useCommentContext();
   const { addToTray } = useExportTray();
+  // Menu entry for whichever card was right-clicked. `ctxState` is the same snapshot
+  // the ContextMenu is positioned from, so the panel opens where the menu was.
+  const commentMenuEntry = useCommentMenuItem(
+    "action_item",
+    ctxState && canPinItem(ctxState.item) ? ctxState.item.id : null,
+    ctxState?.item.task ?? "",
+    ctxState,
+  );
 
   function effectiveStatus(item: AirtableActionItem): AirtableActionItem["status"] {
     return localStatus[item.airtable_id] ?? item.status;
@@ -2665,6 +3047,7 @@ function StatusBoardView({
                   className={`group flex items-start gap-2 px-2 py-3 cursor-grab active:cursor-grabbing hover:bg-gray-50 transition-colors border-b border-gray-100 last:border-b-0 select-none ${dragId === item.airtable_id ? "opacity-40" : ""}`}
                   style={{ position: "relative" }}
                 >
+                  {isPinned(item.airtable_id) && <FocusPinBadge />}
                   {exportMode && (
                     <button
                       onClick={(e) => { e.stopPropagation(); toggleItem({ id: `action_item:${item.airtable_id}`, type: "action_item", label: item.task || "Untitled", summary: `${item.status} · ${item.priority}`, content: `Action Item: ${item.task}`, accountName: item.account_name ?? undefined }); }}
@@ -2694,6 +3077,11 @@ function StatusBoardView({
                         </span>
                       )}
                     </div>
+                    <CommentPreviewList
+                      resourceType="action_item"
+                      resourceId={canPinItem(item) ? item.id : null}
+                      resourceLabel={item.task ?? ""}
+                    />
                   </div>
                   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-3 h-3 shrink-0 mt-1 text-gray-300 opacity-0 group-hover:opacity-100 transition-opacity">
                     <path d="M6 4l4 4-4 4" strokeLinecap="round" strokeLinejoin="round"/>
@@ -2743,6 +3131,7 @@ function StatusBoardView({
                     className={`group flex items-start gap-2 px-2 py-3 cursor-grab active:cursor-grabbing hover:bg-gray-50 transition-colors border-b border-gray-100 last:border-b-0 select-none ${dragId === item.airtable_id ? "opacity-40" : ""}`}
                     style={{ position: "relative" }}
                   >
+                    {isPinned(item.airtable_id) && <FocusPinBadge />}
                     {exportMode && (
                       <button
                         onClick={(e) => { e.stopPropagation(); toggleItem({ id: `action_item:${item.airtable_id}`, type: "action_item", label: item.task || "Untitled", summary: `${item.status} · ${item.priority}`, content: `Action Item: ${item.task}`, accountName: item.account_name ?? undefined }); }}
@@ -2766,6 +3155,11 @@ function StatusBoardView({
                           <span className="text-[11px] text-[var(--twilio-gray-60)]">{item.account_name}</span>
                         )}
                       </div>
+                      <CommentPreviewList
+                        resourceType="action_item"
+                        resourceId={canPinItem(item) ? item.id : null}
+                        resourceLabel={item.task ?? ""}
+                      />
                     </div>
                     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-3 h-3 shrink-0 mt-1 text-gray-300 opacity-0 group-hover:opacity-100 transition-opacity">
                       <path d="M6 4l4 4-4 4" strokeLinecap="round" strokeLinejoin="round"/>
@@ -2788,10 +3182,14 @@ function StatusBoardView({
         x={ctxState.x}
         y={ctxState.y}
         items={[
+          ...(canPinItem(ctxState.item) ? [
+            focusPinMenuItem(isPinned(ctxState.item.airtable_id), () => toggleFocusPin(ctxState.item.airtable_id)),
+            { separator: true, label: "", onClick: () => {} } as ContextMenuItem,
+          ] : []),
           { label: "Open details", onClick: () => onExpand(ctxState.item) },
           { label: "Mark as Done", onClick: () => void onSave(ctxState.item, { status: "Done" }) },
           { label: "Copy task name", onClick: () => { try { navigator.clipboard.writeText(ctxState.item.task ?? ""); } catch { /* best effort */ } } },
-          { label: "Add comment", onClick: () => openComments({ resourceType: "action_item", resourceId: ctxState.item.id, resourceLabel: ctxState.item.task ?? "", x: ctxState.x, y: ctxState.y }) },
+          commentMenuEntry,
           { separator: true, label: "", onClick: () => {} },
           { label: "→ Export tray", icon: <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5"><path d="M1 9v4h12V9"/><path d="M4.5 5.5 7 3l2.5 2.5"/><path d="M7 3v7"/></svg>, onClick: () => addToTray(ctxState.item) },
         ]}
@@ -2828,9 +3226,17 @@ function DueDateView({
   onDragEnd?: () => void;
 }) {
   const [ctxState, setCtxState] = useState<{ x: number; y: number; item: AirtableActionItem } | null>(null);
+  const { isPinned, toggle: toggleFocusPin } = useFocusPins();
   const { exportMode, toggleItem, isSelected } = useExport();
-  const { openComments } = useCommentContext();
   const { addToTray } = useExportTray();
+  // Menu entry for whichever card was right-clicked. `ctxState` is the same snapshot
+  // the ContextMenu is positioned from, so the panel opens where the menu was.
+  const commentMenuEntry = useCommentMenuItem(
+    "action_item",
+    ctxState && canPinItem(ctxState.item) ? ctxState.item.id : null,
+    ctxState?.item.task ?? "",
+    ctxState,
+  );
   const groups: Record<string, AirtableActionItem[]> = {};
   for (const g of DUE_GROUP_ORDER) groups[g] = [];
   for (const item of items) {
@@ -2870,6 +3276,7 @@ function DueDateView({
                   className="rounded-lg bg-[#F4F4F6] px-3 py-2.5 flex flex-col gap-1.5 cursor-grab active:cursor-grabbing hover:shadow-md transition-shadow shrink-0 select-none"
                   style={{ width: 260, borderLeft: `3px solid ${PRIORITY_ACCENT[item.priority] ?? "#e5e7eb"}`, position: "relative" }}
                 >
+                  {isPinned(item.airtable_id) && <FocusPinBadge />}
                   {exportMode && (
                     <button
                       onClick={(e) => { e.stopPropagation(); toggleItem({ id: `action_item:${item.airtable_id}`, type: "action_item", label: item.task || "Untitled", summary: `${item.status} · ${item.priority}`, content: `Action Item: ${item.task}`, accountName: item.account_name ?? undefined }); }}
@@ -2894,6 +3301,11 @@ function DueDateView({
                       <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-gray-200 text-[var(--twilio-navy)] truncate max-w-[90px]">{item.assignee_name}</span>
                     )}
                   </div>
+                  <CommentPreviewList
+                    resourceType="action_item"
+                    resourceId={canPinItem(item) ? item.id : null}
+                    resourceLabel={item.task ?? ""}
+                  />
                 </div>
               ))}
             </div>
@@ -2909,10 +3321,14 @@ function DueDateView({
         x={ctxState.x}
         y={ctxState.y}
         items={[
+          ...(canPinItem(ctxState.item) ? [
+            focusPinMenuItem(isPinned(ctxState.item.airtable_id), () => toggleFocusPin(ctxState.item.airtable_id)),
+            { separator: true, label: "", onClick: () => {} } as ContextMenuItem,
+          ] : []),
           { label: "Open details", onClick: () => onExpand(ctxState.item) },
           { label: "Mark as Done", onClick: () => void onSave?.(ctxState.item, { status: "Done" }) },
           { label: "Copy task name", onClick: () => { try { navigator.clipboard.writeText(ctxState.item.task ?? ""); } catch { /* best effort */ } } },
-          { label: "Add comment", onClick: () => openComments({ resourceType: "action_item", resourceId: ctxState.item.id, resourceLabel: ctxState.item.task ?? "", x: ctxState.x, y: ctxState.y }) },
+          commentMenuEntry,
           { separator: true, label: "", onClick: () => {} },
           { label: "→ Export tray", icon: <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5"><path d="M1 9v4h12V9"/><path d="M4.5 5.5 7 3l2.5 2.5"/><path d="M7 3v7"/></svg>, onClick: () => addToTray(ctxState.item) },
         ]}
@@ -2958,16 +3374,9 @@ function ProjectsView({
     return noAcc ? [...named, ["__none__" as string, noAcc] as [string, AirtableActionItem[]]] : named;
   }, [items]);
 
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
-
-  function toggleGroup(key: string) {
-    setCollapsed((prev) => {
-      const next = new Set(prev);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
-  }
+  // Collapse state is shared with the Views grid (and persisted), so the Collapse all
+  // button and the user's per-group choices carry across views and navigation.
+  const { isCollapsed: isGroupCollapsed, toggle: toggleGroup } = useAccountGroupCollapse();
 
   if (items.length === 0) {
     return <p className="text-sm text-[var(--twilio-gray-60)] text-center py-12">No items match</p>;
@@ -2977,14 +3386,15 @@ function ProjectsView({
     <div className="flex flex-col gap-4">
       {accountGroups.map(([key, groupItems]) => {
         const displayName = key === "__none__" ? "No Account" : key;
-        const isCollapsed = collapsed.has(key);
+        const groupKey = key === "__none__" ? NO_ACCOUNT_GROUP_KEY : accountGroupKey(key);
+        const isCollapsed = isGroupCollapsed(groupKey);
         const openCount = groupItems.filter((i) => i.status !== "Done").length;
         const doneCount = groupItems.filter((i) => i.status === "Done").length;
         return (
           <div key={key} className="bg-white rounded-lg shadow-blue-md overflow-hidden">
             {/* Group header */}
             <button
-              onClick={() => toggleGroup(key)}
+              onClick={() => toggleGroup(groupKey)}
               className="w-full flex items-center gap-3 px-4 py-3 border-b border-gray-100 hover:bg-gray-50 transition-colors text-left"
             >
               <svg
@@ -3047,19 +3457,11 @@ export default function ActionItemsPage() {
   const [pageView, setPageView] = useState<PageView>(() => (localStorage.getItem("actionItemsView") as PageView) ?? "kanban");
   const [search, setSearch] = useState("");
 
-  // Focus mode
+  // Focus mode. Pins live in the shared useFocusPins store so cards on the Calendar and
+  // Account Detail pages stay in sync with this page. Only the pinned *set* is needed here
+  // — each card toggles its own pin through the hook, via its right-click menu.
   const [focusMode, setFocusMode] = useState(() => localStorage.getItem("actionFocusMode") === "true");
-  const [focusPinnedIds, setFocusPinnedIds] = useState<Set<string>>(() => {
-    try { return new Set(JSON.parse(localStorage.getItem("actionFocusPins") ?? "[]")); } catch { return new Set(); }
-  });
-  function toggleFocusPin(id: string) {
-    setFocusPinnedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id); else next.add(id);
-      localStorage.setItem("actionFocusPins", JSON.stringify([...next]));
-      return next;
-    });
-  }
+  const { pinnedIds: focusPinnedIds } = useFocusPins();
 
   // Zone assignment: airtable_id → zone — persisted to localStorage
   const [zones, setZonesRaw] = useState<Record<string, Zone>>(() => {
@@ -3069,6 +3471,22 @@ export default function ActionItemsPage() {
     setZonesRaw((prev) => {
       const next = typeof updater === "function" ? updater(prev) : updater;
       localStorage.setItem("actionItemZones", JSON.stringify(next));
+      return next;
+    });
+  }
+
+  // Manual card order within Stage Today / Currently Tracking — persisted to localStorage
+  // alongside actionItemZones. An ordered id array per zone rather than an index map:
+  // inserting into an array is one atomic write, whereas renumbering indices races badly
+  // between tabs. Ids absent from the array sort to the bottom, so an empty map reproduces
+  // the pre-existing (API) order exactly and needs no migration.
+  const [order, setOrderRaw] = useState<ZoneOrderMap>(() => {
+    try { return JSON.parse(localStorage.getItem(ACTION_ITEM_ORDER_KEY) ?? "{}"); } catch { return {}; }
+  });
+  function setOrder(updater: ((prev: ZoneOrderMap) => ZoneOrderMap) | ZoneOrderMap) {
+    setOrderRaw((prev) => {
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      localStorage.setItem(ACTION_ITEM_ORDER_KEY, JSON.stringify(next));
       return next;
     });
   }
@@ -3101,6 +3519,14 @@ export default function ActionItemsPage() {
   const [editItem, setEditItem] = useState<AirtableActionItem | null>(null);
   const [dragId, setDragId] = useState<string | null>(null);
   const [dragOverZone, setDragOverZone] = useState<Zone | null>(null);
+  // Insertion point for a reorder drop. Mirrored into a ref because handleDrop is async
+  // and must read the hint that was current at drop time, not a re-rendered value.
+  const [dropHint, setDropHintState] = useState<DropHint | null>(null);
+  const dropHintRef = useRef<DropHint | null>(null);
+  const setDropHint = useCallback((hint: DropHint | null) => {
+    dropHintRef.current = hint;
+    setDropHintState(hint);
+  }, []);
   const [showLogs, setShowLogs] = useState(false);
   const [autoTrack, setAutoTrack] = useState(false);
 
@@ -3316,8 +3742,11 @@ export default function ActionItemsPage() {
     try {
       const [itemsRes, atAccountsRes, appAccountsRes, profileRes] = await Promise.all([
         airtableApi.listActionItems(),
-        airtableApi.listAccounts(),
-        accountsApi.listAccounts(),
+        // Both account endpoints are paginated (PAGE_SIZE 50). The Views grid renders one
+        // row per fetched account, so a truncated list would hide every item belonging to
+        // account 51+. ClientPageSizePagination makes page_size honoured on both.
+        airtableApi.listAccounts({ page_size: "500" }),
+        accountsApi.listAccounts({ page_size: "500" }),
         teamApi.getMyProfile().catch(() => null),
       ]);
       setAllItems(itemsRes.data);
@@ -3361,10 +3790,12 @@ export default function ActionItemsPage() {
       const currentZones: Record<string, Zone> = { ...stored };
       for (const item of base) {
         const stored_zone = currentZones[item.airtable_id];
-        // Real items must never sit in "unstaged" — that zone is blanks-only.
-        // Only assign a default when there is no prior zone; preserve any explicit
-        // placement ("today", "active", "complete") the user made from any page.
-        if (!stored_zone || stored_zone === "unstaged") {
+        // Assign a default when there is no prior zone, and rescue any item whose stored
+        // zone no longer renders a panel — "unstaged" is blanks-only, and older builds
+        // could leave "complete" / "done-accounts-*" behind, which would strand the item
+        // in no panel at all. Explicit "today" / "active" / "accounts" placements the user
+        // made on any page are preserved.
+        if (!stored_zone || stored_zone === "unstaged" || !RENDERABLE_ZONES.includes(stored_zone)) {
           currentZones[item.airtable_id] = item.account_name ? "accounts" : "today";
         }
       }
@@ -3393,16 +3824,23 @@ export default function ActionItemsPage() {
 
   // Clear drag state whenever any drag ends (cancel or drop) so stale dragId never blocks next drag
   useEffect(() => {
-    const onDragEnd = () => { setDragId(null); setDragOverZone(null); };
+    const onDragEnd = () => { setDragId(null); setDragOverZone(null); setDropHint(null); };
     window.addEventListener("dragend", onDragEnd);
     return () => window.removeEventListener("dragend", onDragEnd);
-  }, []);
+  }, [setDropHint]);
 
   // Pick up zone changes made on the Calendar page (drag-to-stage)
   useEffect(() => {
     function onStorage(e: StorageEvent) {
       if (e.key === "teamUpdated") { void fetchTeamMembers(); return; }
       if (e.key === "accountsUpdated" || e.key === "actionItemsUpdated") { void load(); return; }
+
+      // Manual card order changed in another tab. Adopt it wholesale rather than merging:
+      // an ordering is a total order, so last-write-wins is the only coherent policy.
+      if (e.key === ACTION_ITEM_ORDER_KEY) {
+        try { setOrderRaw(JSON.parse(e.newValue ?? "{}")); } catch { /* ignore */ }
+        return;
+      }
 
       // Calendar removed a work-tracking event — stop timer and subtract that duration
       if (e.key === "actionItemCancelTimer" && e.newValue) {
@@ -3482,6 +3920,16 @@ export default function ActionItemsPage() {
     });
   }
 
+  /** Apply the user's manual order to a zone's cards. Ids with no recorded position sort
+   *  to the bottom, and Array.sort is stable, so they keep their relative API order. */
+  function orderForZone(zone: Zone, items: AirtableActionItem[]): AirtableActionItem[] {
+    if (!isReorderableZone(zone)) return items;
+    const positions = new Map((order[zone] ?? []).map((id, i) => [id, i]));
+    return [...items].sort(
+      (a, b) => (positions.get(a.airtable_id) ?? Infinity) - (positions.get(b.airtable_id) ?? Infinity)
+    );
+  }
+
   // ── Drag handlers ──────────────────────────────────────────────────────────
 
   function handleDragStart(e: React.DragEvent, item: AirtableActionItem) {
@@ -3493,10 +3941,20 @@ export default function ActionItemsPage() {
     e.preventDefault();
     e.dataTransfer.dropEffect = "move";
     setDragOverZone(zone);
+    // Hovering the zone's own padding (not a card) means "append to the end".
+    if (isReorderableZone(zone)) setDropHint({ zone, beforeId: null });
+  }
+
+  /** A card reports where the dragged item would land if dropped now. */
+  function handleDropHint(zone: ReorderableZone, beforeId: string | null) {
+    const prev = dropHintRef.current;
+    if (prev?.zone === zone && prev.beforeId === beforeId) return;
+    setDropHint({ zone, beforeId });
   }
 
   function handleDragLeave() {
     setDragOverZone(null);
+    setDropHint(null);
   }
 
 
@@ -3622,6 +4080,34 @@ export default function ActionItemsPage() {
     const prevZone = prevZoneGlobal;
     setZones((prev) => ({ ...prev, [resolvedId]: targetZone }));
 
+    // Record the manual position. Runs after resolvedId is known so a promoted blank is
+    // stored under its real recXXX and its throwaway local-* id is dropped.
+    const hint = dropHintRef.current;
+    if (isReorderableZone(targetZone)) {
+      // Materialise the full unfiltered order, so reordering while a search is active
+      // cannot drop the hidden cards out of the array.
+      const rendered = orderForZone(targetZone, itemsInZone(targetZone)).map((i) => i.airtable_id);
+      const beforeId = hint?.zone === targetZone ? hint.beforeId : null;
+      setOrder((prev) => {
+        const others = rendered.filter((id) => id !== resolvedId && id !== dragId);
+        const at = beforeId ? others.indexOf(beforeId) : -1;
+        others.splice(at < 0 ? others.length : at, 0, resolvedId);
+        const otherZone: ReorderableZone = targetZone === "today" ? "active" : "today";
+        return {
+          ...prev,
+          [targetZone]: others,
+          [otherZone]: (prev[otherZone] ?? []).filter((id) => id !== resolvedId && id !== dragId),
+        };
+      });
+    } else {
+      // Left the hand-ordered zones entirely — forget its position in both.
+      setOrder((prev) => ({
+        today: (prev.today ?? []).filter((id) => id !== resolvedId && id !== dragId),
+        active: (prev.active ?? []).filter((id) => id !== resolvedId && id !== dragId),
+      }));
+    }
+    setDropHint(null);
+
     // Top up blanks whenever an item leaves Unstaged
     if (prevZone === "unstaged" && targetZone !== "unstaged") {
       setAllItems((prev) => {
@@ -3677,13 +4163,6 @@ export default function ActionItemsPage() {
     }
 
     // Status changes on drop
-    const ZONE_LABELS: Partial<Record<Zone, string>> = {
-      unstaged: "Unstaged",
-      today: "Staged Today",
-      active: "In Progress",
-      complete: "Completed Today",
-      accounts: "Views",
-    };
     const fromLabel = ZONE_LABELS[prevZone as Zone] ?? prevZone;
     const toLabel = ZONE_LABELS[targetZone] ?? targetZone;
 
@@ -3694,7 +4173,9 @@ export default function ActionItemsPage() {
       setAllItems((prev) => prev.map((i) => i.airtable_id === resolvedId ? { ...i, status: "Done" } : i));
     } else if (targetZone === "today") {
       // No status change — just staged for today
-    } else if (targetZone === "active") {
+    } else if (targetZone === "active" && prevZone !== "active") {
+      // Guarded on an actual zone change: a same-zone drop is now a reorder, and must not
+      // re-PATCH the status, restart the timer, or create a second work_tracking event.
       try { await airtableApi.updateActionItemStatus(resolvedId, "In Progress"); } catch { /* best effort */ }
       setAllItems((prev) => prev.map((i) => i.airtable_id === resolvedId ? { ...i, status: "In Progress" } : i));
       // Only auto-start the timer if Auto Track is enabled; otherwise wait for the Track button
@@ -3721,7 +4202,7 @@ export default function ActionItemsPage() {
           liveEventIds.current[resolvedId] = data.id;
         }).catch(() => {});
       }
-    } else if (targetZone === "unstaged") {
+    } else if (targetZone === "unstaged" && prevZone !== "unstaged") {
       try { await airtableApi.updateActionItemStatus(resolvedId, "Open"); } catch { /* best effort */ }
       setAllItems((prev) => prev.map((i) => i.airtable_id === resolvedId ? { ...i, status: "Open" } : i));
     }
@@ -4156,7 +4637,13 @@ export default function ActionItemsPage() {
             }
             return false;
           };
-          const filteredItemsInZone = (zone: Zone) => itemsInZone(zone).filter(kanbanFilter);
+          // In focus mode a pinned card is hoisted into the Pinned In Progress section and
+          // must not also render in its own zone panel — two mounted KanbanCards for one
+          // item would each hold a rival copy of its unsaved form state.
+          const hiddenByFocus = (item: AirtableActionItem) =>
+            focusMode && focusPinnedIds.has(item.airtable_id);
+          const filteredItemsInZone = (zone: Zone) =>
+            orderForZone(zone, itemsInZone(zone).filter(kanbanFilter).filter((i) => !hiddenByFocus(i)));
           return (<>
 
         {/* Time log card */}
@@ -4187,35 +4674,6 @@ export default function ActionItemsPage() {
                 </tbody>
               </table>
             )}
-          </div>
-        )}
-
-        {/* Pinned In Progress section — visible only in focus mode */}
-        {focusMode && (
-          <div className="shrink-0 bg-violet-50 rounded-lg border border-violet-200 px-4 py-3">
-            <div className="flex items-center gap-2 mb-2">
-              <span className="text-sm font-semibold text-violet-800">Pinned In Progress</span>
-              <span className="text-xs text-violet-600">{focusPinnedIds.size} pinned</span>
-            </div>
-            {focusPinnedIds.size === 0 && (
-              <p className="text-xs text-violet-500">Pin items from Stage Today to track them here.</p>
-            )}
-            {Array.from(focusPinnedIds).map((id) => {
-              const pinnedItem = allItems.find((i) => i.airtable_id === id);
-              if (!pinnedItem) return null;
-              return (
-                <div key={id} className="flex items-center justify-between gap-2 py-1.5 border-t border-violet-200 first:border-t-0">
-                  <span className="text-sm text-violet-900 truncate">{pinnedItem.task || "Untitled"}</span>
-                  <button
-                    title="Unpin"
-                    onClick={() => toggleFocusPin(id)}
-                    className="shrink-0 text-xs text-violet-600 hover:text-violet-800 px-2 py-0.5 rounded border border-violet-300 hover:bg-violet-100 transition-colors"
-                  >
-                    Unpin
-                  </button>
-                </div>
-              );
-            })}
           </div>
         )}
 
@@ -4264,8 +4722,11 @@ export default function ActionItemsPage() {
           className="flex-1"
           style={{ minWidth: "300px", ...(row1Height ? { height: row1Height } : {}) }}
           focusMode={focusMode}
-          focusPinnedIds={focusPinnedIds}
-          onToggleFocusPin={toggleFocusPin}
+          reorderable
+          collapsible
+          dragId={dragId}
+          dropHint={dropHint}
+          onDropHint={handleDropHint}
         />
 
         {/* Currently Tracking — min-width so it always has room; grows to fill remaining space */}
@@ -4291,8 +4752,64 @@ export default function ActionItemsPage() {
           onAutoTrackToggle={() => setAutoTrack((v) => !v)}
           className="flex-1"
           style={{ minWidth: "300px", ...(row1Height ? { height: row1Height } : {}) }}
+          focusMode={focusMode}
+          reorderable
+          collapsible
+          dragId={dragId}
+          dropHint={dropHint}
+          onDropHint={handleDropHint}
         />
         </div>{/* end row 1 */}
+
+        {/* Pinned In Progress — visible only in focus mode, and sits below the three
+            staging columns. While focus mode is on a pinned card is rendered ONLY here
+            (its zone panel shows nothing, the Views grid shows a ghost) so there is never
+            a second KanbanCard holding a rival copy of the same unsaved form state.
+            Cards stay draggable: dropping one on Stage Today or Currently Tracking moves
+            its zone via the normal handleDrop path and keeps the pin. */}
+        {focusMode && (
+          <div className="shrink-0 bg-violet-50 rounded-lg border border-violet-200 px-4 py-3">
+            <div className="flex items-center gap-2 mb-2">
+              <span className="text-sm font-semibold text-violet-800">Pinned In Progress</span>
+              <span className="text-xs text-violet-600">{focusPinnedIds.size} pinned</span>
+            </div>
+            {focusPinnedIds.size === 0 ? (
+              <p className="text-xs text-violet-500">Right-click any action item and choose “Pin to Focus” to track it here.</p>
+            ) : (
+              // A wrapping row of normal-width cards, not one full-width card per line.
+              <div className="flex flex-row flex-wrap gap-3 items-start">
+                {Array.from(focusPinnedIds).map((id) => {
+                  const pinnedItem = allItems.find((i) => i.airtable_id === id);
+                  if (!pinnedItem || pinnedItem.airtable_id.startsWith("local-")) return null;
+                  const homeZone: Zone = zones[id] ?? (pinnedItem.account_name ? "accounts" : "today");
+                  return (
+                    // PINNED_CARD_WIDTH matches the Views grid, the app's standard card size.
+                    <div key={id} className={`${PINNED_CARD_WIDTH} shrink-0 flex flex-col gap-1`}>
+                      <span className="inline-flex items-center gap-1 self-start text-[10px] font-semibold uppercase tracking-wide text-violet-700 bg-violet-100 px-1.5 py-0.5 rounded-full">
+                        {ZONE_LABELS[homeZone] ?? homeZone}
+                      </span>
+                      {/* zone="accounts" selects the standard card body — task name, account
+                          badge, status and priority pills — rather than the compact 2-row
+                          grid, which is built to fill a full column. */}
+                      <KanbanCard
+                        item={pinnedItem}
+                        zone="accounts"
+                        onDragStart={(e) => handleDragStart(e, pinnedItem)}
+                        onSave={(fields) => handleInlineSave(pinnedItem, fields)}
+                        onExpandClick={() => setEditItem(pinnedItem)}
+                        onDelete={() => handleDeleteItem(pinnedItem)}
+                        onUpdated={handleItemUpdated}
+                        teamMembers={teamMembers}
+                        accounts={accounts}
+                        collapsible
+                      />
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Row 2: Views (full width) */}
         <div className="flex gap-3 items-start">
@@ -4326,6 +4843,7 @@ export default function ActionItemsPage() {
           allRealItems={allItems.filter((i) => !i.airtable_id.startsWith("local-"))}
           onSaveFieldsOnly={async (item, fields) => { await handleSaveItem(item.airtable_id, fields); }}
           itemZones={zones}
+          focusMode={focusMode}
           onRestoreToViews={(item) => setZones((prev) => ({ ...prev, [item.airtable_id]: "accounts" }))}
           externalDragId={dragId}
           onExternalDropWithStatus={async (airtableId, status) => {

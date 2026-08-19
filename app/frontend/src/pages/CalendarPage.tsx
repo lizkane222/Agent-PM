@@ -19,11 +19,29 @@ import { addLog } from "../lib/appLog";
 import { useLogGlow } from "../hooks/useLogGlow";
 import { useCurrentUser } from "../context/CurrentUserContext";
 import { useCommentContext } from "../components/comments/CommentContext";
+import CommentCountBadge from "../components/comments/CommentCountBadge";
+import CommentIcon from "../components/CommentIcon";
+import { useAppError } from "../context/AppErrorContext";
+import { ContextMenu, FocusPinBadge, focusPinMenuItem } from "../components/action-items/ContextMenu";
+import StepsPanel from "../components/action-items/StepsPanel";
+import { useFocusPins } from "../hooks/useFocusPins";
 import DayBar from "../components/calendar/DayBar";
 import MeetingDetail from "../components/calendar/MeetingDetail";
 import AccountsSidebar from "../components/calendar/AccountsSidebar";
 import CreateEventModal from "../components/calendar/CreateEventModal";
 import type { SavePayload } from "../components/calendar/CreateEventModal";
+import RichTextMentionEditor from "../components/shared/RichTextMentionEditor";
+import EventColorsPopover from "../components/calendar/EventColorsPopover";
+import { useCalendarColors } from "../hooks/useCalendarColors";
+import {
+  EVENT_TYPE_META,
+  IMPORTANT_PALETTE,
+  borderFor,
+  readableTextColor,
+  withAlpha,
+  type ColorableEventType,
+} from "../lib/eventColors";
+import { sanitizeHtml, plainToHtml, htmlToPreviewText } from "../lib/noteHelpers";
 import type { AirtableActionItem, AirtableAccount, CalendarEvent, LogTimeDayAssignment, Reminder, SalesforceProject } from "../types";
 import type { ContentView, NewEventDraft } from "../types/calendar";
 import { getRsvp, dateToLocalISO, toLocalISO, addMsToLocalISO } from "twilio-agent-pm-shared";
@@ -71,6 +89,53 @@ function statusColor(status: CalendarEvent["status"]): string {
 
 const WORK_TRACKING_COLOR = "#a78bfa"; // violet-400 — action items (light purple)
 
+/**
+ * True only when the owner explicitly marked this event "Did not attend".
+ *
+ * `attended` is tri-state: null/undefined means never recorded, which reads as
+ * attended — so this must test `=== false`, not falsiness.
+ */
+function didNotAttend(e: CalendarEvent): boolean {
+  return e.attended === false;
+}
+
+/** Background for a "Did not attend" event: grey at 75% opacity.
+ *
+ *  Deliberately translucent rather than the solid #d1d5db used for cancelled
+ *  events, so "I skipped this" is distinguishable from every other grey on the
+ *  grid at a glance. */
+const DID_NOT_ATTEND_BG = withAlpha("#d1d5db", 0.75);
+const DID_NOT_ATTEND_BORDER = "#9ca3af";
+
+/** The stable id an event is keyed by for "Mark as important!" — same uid the
+ *  right-click handler computes, so both agree for meetings, scheduled action
+ *  items, timers and reminders alike. */
+function eventUid(e: CalendarEvent): string {
+  return e.google_event_id || (e.id ? String(e.id) : "");
+}
+
+/** The subset of useCalendarColors that the color functions need. */
+type ColorResolver = {
+  colorFor: (type: ColorableEventType) => string;
+  importantFor: (uid: string) => string | null;
+};
+
+/**
+ * Base color for an event. Precedence:
+ *   cancelled (gray) → "important" override → the user's color for this type.
+ *
+ * Cancelled wins so a cancelled event still reads as cancelled, and `important`
+ * beats the type color because it is a per-event, deliberate choice.
+ */
+function eventBaseColor(e: CalendarEvent, colors: ColorResolver): string {
+  if (e.status === "cancelled") return statusColor(e.status);
+  const important = colors.importantFor(eventUid(e));
+  if (important) return important;
+  const type: ColorableEventType =
+    e.calendar_id === "work_tracking" ? "action_item" : (e.event_category || "meeting");
+  return colors.colorFor(type);
+}
+
 function fadeColor(hex: string, amount = 0.45): string {
   const n = parseInt(hex.replace("#", ""), 16);
   const r = (n >> 16) & 0xff;
@@ -80,14 +145,18 @@ function fadeColor(hex: string, amount = 0.45): string {
   return `rgb(${mix(r)},${mix(g)},${mix(b)})`;
 }
 
-function toFullCalendarEvent(e: CalendarEvent): EventInput {
+function toFullCalendarEvent(e: CalendarEvent, colors: ColorResolver): EventInput {
   const isWorkSession = e.calendar_id === "work_tracking";
   const isScheduled = e.google_event_id?.startsWith("scheduled-");
   const isScheduledReminder = e.google_event_id?.startsWith("scheduled-reminder-");
   const isDbWorkTracking = isWorkSession && !!e.agentpm_airtable_id && e.is_synced;
-  const backgroundColor = isScheduledReminder ? "#FFFBEB" : isWorkSession ? WORK_TRACKING_COLOR : statusColor(e.status);
-  const borderColor = isScheduledReminder ? "#f59e0b" : isWorkSession ? WORK_TRACKING_COLOR : statusColor(e.status);
-  const textColor = isScheduledReminder ? "#92400e" : "#ffffff";
+  // Work sessions resolve through eventBaseColor too (as the "action_item" type), so
+  // an important override applies to them as well.
+  const resolved = eventBaseColor(e, colors);
+  const backgroundColor = isScheduledReminder ? "#FFFBEB" : resolved;
+  const borderColor = isScheduledReminder ? "#f59e0b" : borderFor(resolved);
+  // Pastel defaults mean white text is often unreadable — pick per background.
+  const textColor = isScheduledReminder ? "#92400e" : readableTextColor(backgroundColor);
   return {
     id: String(e.id),
     title: isScheduled ? e.title : isWorkSession ? `⏱ ${e.title}` : e.title,
@@ -100,6 +169,22 @@ function toFullCalendarEvent(e: CalendarEvent): EventInput {
     editable: isScheduled || isDbWorkTracking || (!isWorkSession && !isScheduledReminder),
     extendedProps: { ...e },
   };
+}
+
+/**
+ * Whether an event on the grid has a real `scheduler.CalendarEvent` row behind it.
+ *
+ * Mirrors the `type === "meeting"` branch of the right-click menu's uid parsing:
+ * active timers and `scheduled-*` overlays are synthetic (their numeric id belongs to
+ * a Reminder or an action item, not a CalendarEvent), and a synced work-tracking block
+ * is handled as its own thing. Commenting on any of those would attach the comment to
+ * the wrong row.
+ */
+function isCommentableEvent(e: CalendarEvent): boolean {
+  const uid = e.google_event_id || String(e.id);
+  if (uid.startsWith("active-timer-") || uid.startsWith("scheduled-")) return false;
+  if (e.calendar_id === "work_tracking" && e.is_synced && !!e.agentpm_airtable_id) return false;
+  return true;
 }
 
 interface EventDetailPanelProps {
@@ -115,9 +200,11 @@ interface EventDetailPanelProps {
   actionItem?: AirtableActionItem | null;
   onUpdateActionItem?: (patch: Partial<AirtableActionItem>) => void;
   onUpdateScheduleTime?: (newStart: string, newEnd: string) => void;
+  /** Resolves the header color from the user's chosen event-type colors. */
+  colors: ColorResolver;
 }
 
-function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAccount, onUnlink, onRemove, onDelete, onUpdateReminder, actionItem, onUpdateActionItem, onUpdateScheduleTime }: EventDetailPanelProps) {
+function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAccount, onUnlink, onRemove, onDelete, onUpdateReminder, actionItem, onUpdateActionItem, onUpdateScheduleTime, colors }: EventDetailPanelProps) {
   const { status: statusOptions } = useActionItemFieldOptions();
   const [dropOver, setDropOver] = useState(false);
   const isWorkSession = event.calendar_id === "work_tracking";
@@ -263,7 +350,7 @@ function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAcc
     '<a target="_blank" rel="noopener noreferrer" '
   );
 
-  const headerColor = isWorkSession ? WORK_TRACKING_COLOR : statusColor(event.status);
+  const headerColor = eventBaseColor(event, colors);
 
   return (
     <div
@@ -417,12 +504,11 @@ function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAcc
                 placeholder="Task name"
                 className="w-full text-sm font-medium text-[var(--twilio-navy)] rounded-md border border-indigo-300 bg-indigo-50 px-3 py-1.5 focus:outline-none focus:border-indigo-500 focus:bg-white transition-colors"
               />
-              <textarea
+              <RichTextMentionEditor
                 value={aiForm.task_details}
-                onChange={(e) => setAiForm((f) => f && ({ ...f, task_details: e.target.value }))}
-                rows={3}
+                onChange={(html) => setAiForm((f) => f && ({ ...f, task_details: html }))}
                 placeholder="Details…"
-                className="w-full text-sm text-[var(--twilio-navy)] rounded-md border border-gray-200 px-3 py-1.5 focus:outline-none focus:border-indigo-300 resize-none leading-relaxed placeholder:text-gray-400"
+                minHeightClassName="min-h-[60px]"
               />
               <div className="flex flex-wrap gap-1.5">
                 <CalPillSelect value={aiForm.status} options={statusOptions as AirtableActionItem["status"][]} colorMap={STATUS_COLORS_CAL} placeholder="Status" onChange={(v) => setAiForm((f) => f && ({ ...f, status: v }))} />
@@ -446,7 +532,10 @@ function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAcc
             <div className="flex flex-col gap-3 cursor-default select-none" onDoubleClick={() => setAiEditing(true)}>
               <p className="text-[var(--twilio-navy)] font-medium leading-snug">{actionItem.task}</p>
               {actionItem.task_details && (
-                <p className="text-[var(--twilio-gray-80)] text-[13px] leading-relaxed">{actionItem.task_details}</p>
+                <div
+                  className="text-[var(--twilio-gray-80)] text-[13px] leading-relaxed prose prose-sm max-w-none"
+                  dangerouslySetInnerHTML={{ __html: sanitizeHtml(plainToHtml(actionItem.task_details)) }}
+                />
               )}
               <div className="flex flex-wrap gap-1.5">
                 <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full ${STATUS_COLORS_CAL[actionItem.status] ?? "bg-gray-100 text-gray-700"}`}>{actionItem.status}</span>
@@ -888,6 +977,12 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
 }) {
   const { status: statusOptions } = useActionItemFieldOptions();
   const [expanded, setExpanded] = useState(forceExpand ?? false);
+  const [ctxPos, setCtxPos] = useState<{ x: number; y: number } | null>(null);
+  const { isPinned, toggle: toggleFocusPin } = useFocusPins();
+
+  // Never pin a local-* blank — promoteBlankItem discards that id for a real recXXX.
+  const canPin = !item.airtable_id.startsWith("local-");
+  const isPinnedToFocus = canPin && isPinned(item.airtable_id);
 
   useEffect(() => {
     if (forceExpand) setExpanded(true);
@@ -986,12 +1081,11 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
         />
 
         {/* Task details */}
-        <textarea
+        <RichTextMentionEditor
           value={editForm.task_details}
-          onChange={(e) => setEditForm((f) => ({ ...f, task_details: e.target.value }))}
-          rows={2}
+          onChange={(html) => setEditForm((f) => ({ ...f, task_details: html }))}
           placeholder="Details…"
-          className="w-full text-[11px] text-[var(--twilio-navy)] bg-white rounded px-2 py-1 border border-gray-200 focus:outline-none focus:border-indigo-300 resize-none leading-relaxed placeholder:text-gray-400"
+          minHeightClassName="min-h-[40px]"
         />
 
         {/* Status + Priority */}
@@ -1073,6 +1167,14 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
           </button>
         </div>
 
+
+        {/* Checklist — the same component the modals use, so an action item reads the same
+            wherever it is opened. Real Airtable items only: steps key off the numeric PK. */}
+        {!item.airtable_id.startsWith("local-") && (
+          <div className="pt-2 mt-1 border-t border-violet-100">
+            <StepsPanel actionItemId={item.id} />
+          </div>
+        )}
         <OccurrencesList airtableId={item.airtable_id} />
       </div>
     );
@@ -1080,11 +1182,18 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
 
   // ── Collapsed view ────────────────────────────────────────────────────────────
   return (
+    <>
     <div
       ref={cardRef}
       draggable
       onDragStart={onDragStart}
       onClick={() => setExpanded(true)}
+      onContextMenu={(e) => {
+        if (!canPin) return;
+        e.preventDefault();
+        e.stopPropagation();
+        setCtxPos({ x: e.clientX, y: e.clientY });
+      }}
       onDragOver={(e) => {
         const w = window as unknown as Record<string, string>;
         if (w[CALENDAR_DRAG_ACCOUNT_KEY]) { e.preventDefault(); setIsAccountDropTarget(true); }
@@ -1104,6 +1213,7 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
       }}
       className="rounded-lg select-none cursor-pointer group"
       style={{
+        position: "relative",
         background: "#F5F3FF",
         borderLeft: "3px solid #a78bfa",
         padding: "8px 10px",
@@ -1115,6 +1225,7 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
         borderRadius: 8,
       }}
     >
+      {isPinnedToFocus && <FocusPinBadge />}
       {/* Row 1: badges + actions */}
       <div className="flex items-center gap-1.5 flex-wrap">
         <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded whitespace-nowrap ${PRIORITY_COLORS_CAL[editForm.priority] ?? "bg-gray-100 text-gray-600"}`}>{editForm.priority}</span>
@@ -1158,7 +1269,7 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
         <div className="flex flex-col gap-0.5">
           {editForm.task_details && (
             <p className="text-[11px] text-[var(--twilio-navy)] opacity-60 leading-snug" style={{ overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" as const }}>
-              {editForm.task_details}
+              {htmlToPreviewText(editForm.task_details)}
             </p>
           )}
           <div className="flex gap-2 flex-wrap">
@@ -1171,6 +1282,15 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
 
       <OccurrencesList airtableId={item.airtable_id} />
     </div>
+    {ctxPos && (
+      <ContextMenu
+        x={ctxPos.x}
+        y={ctxPos.y}
+        items={[focusPinMenuItem(isPinnedToFocus, () => toggleFocusPin(item.airtable_id))]}
+        onClose={() => setCtxPos(null)}
+      />
+    )}
+    </>
   );
 }
 
@@ -1523,12 +1643,11 @@ function ActionItemsSidebar({ expandItemId }: { onDropToast?: (msg: string, type
 
             {/* Body fields */}
             <div className="px-4 py-2 flex flex-col gap-2.5">
-              <textarea
+              <RichTextMentionEditor
                 value={form.task_details}
-                onChange={(e) => setForm((f) => ({ ...f, task_details: e.target.value }))}
-                rows={2}
-                placeholder="Additional context, steps, or notes…"
-                className="w-full rounded-md border border-violet-100 bg-white px-2.5 py-1.5 text-xs text-[var(--twilio-navy)] placeholder:text-[var(--twilio-gray-60)] focus:bg-white focus:border-violet-300 focus:outline-none resize-none leading-relaxed"
+                onChange={(html) => setForm((f) => ({ ...f, task_details: html }))}
+                placeholder="Additional context or notes…"
+                minHeightClassName="min-h-[40px]"
               />
 
               {/* Status · Priority · Due date */}
@@ -2141,7 +2260,7 @@ function LogTimeDayColumn({
   function buildBlankDescription() {
     const lines: string[] = [];
     for (const e of dayCalEvents) lines.push(`${e.title} (${fmtDuration(secsForEvent(e))})`);
-    for (const i of dayItems) lines.push(`${i.task}${i.task_details ? `: ${i.task_details}` : ""} (${fmtDuration(secsForItem(i))})`);
+    for (const i of dayItems) lines.push(`${i.task}${i.task_details ? `: ${htmlToPreviewText(i.task_details)}` : ""} (${fmtDuration(secsForItem(i))})`);
     lines.push(`Total: ${fmtDecimalHours(blankSecs)} hrs`);
     return lines.join("\n");
   }
@@ -2205,7 +2324,7 @@ function LogTimeDayColumn({
         <div className={["rounded-full bg-violet-400 shrink-0 mt-1", compact ? "h-1.5 w-1.5" : "h-2 w-2"].join(" ")} />
         <div className="flex-1 min-w-0">
           <p className={[compact ? "text-[11px] font-medium" : "text-xs font-medium", "truncate", manuallyLogged ? "line-through text-gray-400" : "text-[var(--twilio-navy)]"].join(" ")}>{item.task}</p>
-          {!compact && item.task_details && <p className="text-[10px] text-gray-400 truncate">{item.task_details}</p>}
+          {!compact && item.task_details && <p className="text-[10px] text-gray-400 truncate">{htmlToPreviewText(item.task_details)}</p>}
         </div>
         <TimeInput valueKey={key} defaultSecs={defaultSecs} />
         <button onClick={() => setRemovedItemIds((prev) => new Set([...prev, item.airtable_id]))} className="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-red-400 text-xs leading-none shrink-0 transition-opacity ml-1" title="Remove from log">×</button>
@@ -2309,7 +2428,7 @@ function LogTimeDayColumn({
           function buildProjectDescription() {
             const lines: string[] = [];
             for (const e of projEvents) lines.push(`${e.title} (${fmtDuration(secsForEvent(e))})`);
-            for (const i of projItems) lines.push(`${i.task}${i.task_details ? `: ${i.task_details}` : ""} (${fmtDuration(secsForItem(i))})`);
+            for (const i of projItems) lines.push(`${i.task}${i.task_details ? `: ${htmlToPreviewText(i.task_details)}` : ""} (${fmtDuration(secsForItem(i))})`);
             lines.push(`Total: ${fmtDecimalHours(projSecs)} hrs`);
             return lines.join("\n");
           }
@@ -2987,8 +3106,8 @@ export default function CalendarPage() {
   const allAccountsRef = useRef<{ id: number; name: string }[]>([]);
   const [selectedAccountName, setSelectedAccountName] = useState<string | null>(null);
   const [logTimeModeAccount, setLogTimeModeAccount] = useState<string | null>(null);
-  // Set of google_event_ids the user has marked as "did not attend"
-  const [absentEventIds, setAbsentEventIds] = useState<Set<string>>(new Set());
+  // Attendance is NOT local state — it lives on CalendarEvent.attended so it
+  // survives navigation and refresh. See didNotAttend() below.
   // Visible date range (ISO strings) tracked for daily totals footer
   const [visibleRange, setVisibleRange] = useState<{ start: string; end: string } | null>(null);
   // Extra events synthesized for the accounts view (Airtable meetings)
@@ -3007,6 +3126,19 @@ export default function CalendarPage() {
   // Set to true during optimistic drag/resize updates so fetchEvents doesn't clobber them
   const localMutationRef = useRef(false);
   const { openComments } = useCommentContext();
+  const { reportError } = useAppError();
+  // User-chosen colors per event type, plus per-event "important" overrides
+  const calendarColors = useCalendarColors();
+  // Flattened for child components that want a plain map rather than a resolver
+  const categoryColorMap = useMemo(
+    () => Object.fromEntries(
+      EVENT_TYPE_META.map(({ id }) => [id, calendarColors.colorFor(id)]),
+    ) as Record<ColorableEventType, string>,
+    [calendarColors],
+  );
+  const [colorsPanelOpen, setColorsPanelOpen] = useState(false);
+  // Which context-menu row has its "Mark as important!" swatches expanded
+  const [importantPickerOpen, setImportantPickerOpen] = useState(false);
   useLogGlow(pageRef);
 
   // Scheduled action items dragged onto the calendar (persisted in localStorage)
@@ -3127,6 +3259,9 @@ export default function CalendarPage() {
     const id = setInterval(() => setActiveTimers((prev) => ({ ...prev })), 1000);
     return () => clearInterval(id);
   }, [activeTimers]);
+
+  // The important-color swatches belong to one menu opening, never the next
+  useEffect(() => { setImportantPickerOpen(false); }, [ctxMenu]);
 
   // Close context menu on Escape
   useEffect(() => {
@@ -3323,6 +3458,45 @@ export default function CalendarPage() {
     linkEventToAccountRef.current = (accountId, accountName, eventUid) =>
       void linkEventToAccount(accountId, accountName, eventUid);
   }, [linkEventToAccount]);
+
+  /**
+   * Flip a meeting between Attended and Did not attend, persisting to the server.
+   *
+   * The PK has to be resolved from `eventsRef` rather than read off `ev.id`:
+   * `selectedEvent` comes from FullCalendar's `extendedProps`, and FullCalendar
+   * strips `id` (it owns that prop), so `ev.id` is undefined here. Same lookup the
+   * Comment menu entry does.
+   */
+  const toggleAttendance = useCallback(async (ev: CalendarEvent) => {
+    const uid = ev.google_event_id;
+    const row = eventsRef.current.find(
+      (e) => (uid && e.google_event_id === uid) || (ev.id && e.id === ev.id),
+    );
+    const pk = row?.id ?? ev.id;
+    if (!pk) return;
+
+    // Read the current status off the fetched row, not off `ev`. Callers may hand us a
+    // snapshot taken earlier — the context menu captures its event on right-click — and
+    // toggling from a stale value would flip the wrong way.
+    const current = row?.attended ?? ev.attended;
+    // null/undefined reads as attended, so the first toggle always means "did not attend".
+    const next = current === false ? true : false;
+
+    localMutationRef.current = true;
+    const matches = (e: CalendarEvent) => e.id === pk || (!!uid && e.google_event_id === uid);
+    setEvents((prev) => prev.map((e) => (matches(e) ? { ...e, attended: next } : e)));
+    setSelectedEvent((prev) => (prev && matches(prev) ? { ...prev, attended: next } : prev));
+
+    try {
+      await schedulerApi.setEventAttendance(pk, next);
+    } catch {
+      // Roll back so the pill never claims a status the server didn't accept.
+      const reverted = current ?? null;
+      setEvents((prev) => prev.map((e) => (matches(e) ? { ...e, attended: reverted } : e)));
+      setSelectedEvent((prev) => (prev && matches(prev) ? { ...prev, attended: reverted } : prev));
+      reportError("Could not save attendance. Please try again.");
+    }
+  }, [reportError]);
 
   const unlinkEvent = useCallback(async (eventUid: string) => {
     setEventAccountLinks((prev) => {
@@ -4268,16 +4442,22 @@ export default function CalendarPage() {
     const accountIds = linkedAccountIdsKey ? linkedAccountIdsKey.split(",").map(Number) : [];
     if (accountIds.length === 0) { setAccountMeetingEvents([]); return; }
     let cancelled = false;
-    Promise.all(
-      accountIds.map((id) => airtableApi.listMeetings({ account: String(id) }))
-    ).then((results) => {
+    // Account names come from the links map rather than the response, so the label on a
+    // synthesized event is unchanged from when this fetched one account at a time.
+    const nameByAccountId = new Map(
+      [...eventAccountLinks.values()].map((l) => [l.accountId, l.accountName ?? ""])
+    );
+    // One batched request instead of one per linked account. Each meeting is attributed
+    // by its own `account` field rather than by result index.
+    airtableApi.listMeetings({ account: accountIds.join(","), page_size: "1000" })
+      .then((r) => {
       if (cancelled) return;
-      const synth: CalendarEvent[] = results.flatMap((r, i) => {
-        const accountId = accountIds[i]!;
-        const accountName = [...eventAccountLinks.values()].find((l) => l.accountId === accountId)?.accountName ?? "";
-        return r.data.results
-          .filter((m) => m.date)
-          .map((m): CalendarEvent => ({
+      const synth: CalendarEvent[] = r.data.results
+        .filter((m) => m.date && m.account != null)
+        .map((m): CalendarEvent => {
+          const accountId = m.account as number;
+          const accountName = nameByAccountId.get(accountId) ?? "";
+          return {
             id: -m.id,
             owner: 0,
             owner_username: accountName,
@@ -4298,8 +4478,8 @@ export default function CalendarPage() {
             agentpm_airtable_id: "",
             created_at: "",
             updated_at: "",
-          }));
-      });
+          };
+        });
       setAccountMeetingEvents(synth);
     }).catch(() => {});
     return () => { cancelled = true; };
@@ -4448,7 +4628,7 @@ export default function CalendarPage() {
   for (const day of visibleDays) {
     let secs = 0;
     for (const e of filteredEvents) {
-      if (e.google_event_id && absentEventIds.has(e.google_event_id)) continue;
+      if (didNotAttend(e)) continue;
       const eDay = e.start_datetime.slice(0, 10);
       if (eDay !== day) continue;
       const dur = (new Date(e.end_datetime).getTime() - new Date(e.start_datetime).getTime()) / 1000;
@@ -4485,7 +4665,10 @@ export default function CalendarPage() {
         onLogTimeMode={(name) => { setLogTimeModeAccount(name ?? null); if (name) { setSelectedAccountName(name); setContentView("accounts"); } }}
         overLeftNav={!!logTimeModeAccount}
         isUnlinkedView={contentView === "unlinked"}
-        onShowUnlinkedView={() => { setSelectedAccountName(null); setContentView("unlinked"); }}
+        onShowUnlinkedView={() => {
+          setSelectedAccountName(null);
+          setContentView((v) => (v === "unlinked" ? "all" : "unlinked"));
+        }}
         unlinkedCount={unlinkedCount}
       />
 
@@ -4498,6 +4681,32 @@ export default function CalendarPage() {
         >
           {isSyncing ? "Syncing…" : "Sync Google Calendar"}
         </button>
+        {/* Colors — per-event-type palette picker */}
+        <div className="relative">
+          <button
+            onClick={() => setColorsPanelOpen((v) => !v)}
+            aria-expanded={colorsPanelOpen}
+            className={["flex items-center gap-2 rounded-full px-4 py-2 text-sm font-semibold border shadow-sm transition-colors", colorsPanelOpen ? "bg-indigo-600 border-indigo-600 text-white shadow-md" : "bg-white border-gray-300 text-[var(--twilio-navy)] hover:bg-gray-50 hover:border-indigo-300"].join(" ")}
+          >
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" className="w-3.5 h-3.5 shrink-0">
+              <circle cx="10" cy="10" r="7" />
+              <circle cx="10" cy="6.5" r="1.2" fill="currentColor" stroke="none" />
+              <circle cx="13.2" cy="9.4" r="1.2" fill="currentColor" stroke="none" />
+              <circle cx="7" cy="9" r="1.2" fill="currentColor" stroke="none" />
+              <circle cx="9.6" cy="13" r="1.2" fill="currentColor" stroke="none" />
+            </svg>
+            Colors
+          </button>
+          {colorsPanelOpen && (
+            <EventColorsPopover
+              colorFor={calendarColors.colorFor}
+              onSelect={calendarColors.setCategoryColor}
+              onReset={calendarColors.resetCategoryColors}
+              onClose={() => setColorsPanelOpen(false)}
+              error={calendarColors.error}
+            />
+          )}
+        </div>
         {/* Divider */}
         <div className="w-px h-5 bg-gray-300 mx-2 shrink-0" />
         <button
@@ -4565,6 +4774,7 @@ export default function CalendarPage() {
         {selectedEvent && !meetingPanelCollapsed && (
           <EventDetailPanel
             event={selectedEvent}
+            colors={calendarColors}
             onClose={() => { setSelectedEvent(null); setSelectedActionItem(null); }}
             onCollapse={() => setMeetingPanelCollapsed(true)}
             linkedAccount={
@@ -4663,6 +4873,7 @@ export default function CalendarPage() {
 
       {newEventDraft && (
         <CreateEventModal
+          categoryColors={categoryColorMap}
           draft={newEventDraft}
           onChange={(updater) => setNewEventDraft((d) => d ? updater(d) : d)}
           onSave={handleCreateEventSave}
@@ -4681,6 +4892,13 @@ export default function CalendarPage() {
         const linkedAcct = (ev.google_event_id ? eventAccountLinks.get(ev.google_event_id) : undefined)
           ?? eventAccountLinks.get(String(ev.id));
         const accountName = linkedAcct?.accountName ?? ev.account_name ?? ev.owner_username ?? null;
+        const importantColorForMenu = calendarColors.importantFor(ctxMenu.airtableId || eventUid(ev));
+        // `ctxMenu.event` is a snapshot taken on right-click. Re-resolve against the
+        // live events list so the attendance label reflects the current status rather
+        // than whatever it was when the menu opened.
+        const liveEv = (ev.google_event_id
+          ? events.find((e) => e.google_event_id === ev.google_event_id)
+          : undefined) ?? ev;
 
         // Clamp menu to viewport
         const menuW = 220;
@@ -4688,7 +4906,9 @@ export default function CalendarPage() {
         const x = ctxMenu.x + menuW > window.innerWidth ? ctxMenu.x - menuW : ctxMenu.x;
         const y = ctxMenu.y + menuH > window.innerHeight ? ctxMenu.y - menuH : ctxMenu.y;
 
-        function menuBtn(label: string, icon: string, onClick: () => void, danger = false) {
+        // `icon` is a ReactNode, not a string, so the comment entry can use the same
+        // CommentIcon every other comment affordance in the app uses.
+        function menuBtn(label: string, icon: React.ReactNode, onClick: () => void, danger = false) {
           return (
             <button
               key={label}
@@ -4724,7 +4944,7 @@ export default function CalendarPage() {
               })}
 
               {/* 1b. Comment */}
-              {isMeeting && menuBtn("Comment", "💬", () => {
+              {isMeeting && menuBtn("Comment", <CommentIcon className="w-3.5 h-3.5" />, () => {
                 const cx = ctxMenu.x;
                 const cy = ctxMenu.y;
                 const rlabel = ev.title;
@@ -4739,6 +4959,64 @@ export default function CalendarPage() {
                   openComments({ resourceType: "calendar_event", resourceId: rid, resourceLabel: rlabel, x: cx, y: cy });
                 });
               })}
+
+              {/* 1b-ii. Attendance — the same toggle the meeting panel offers, so the
+                   status can be set without opening the panel first. Meetings only:
+                   scheduled action items and timers have no CalendarEvent row to
+                   record attendance against. */}
+              {isMeeting && menuBtn(
+                didNotAttend(liveEv) ? "Mark as attended" : "Mark as did not attend",
+                didNotAttend(liveEv) ? "✅" : "🚫",
+                () => void toggleAttendance(liveEv),
+              )}
+
+              {/* 1c. Mark as important! — per-event color from the 90s palette.
+                   Expands inline rather than as a submenu; this menu is hand-rolled
+                   and has no submenu support. */}
+              <button
+                className="w-full text-left px-3 py-2 text-[13px] flex items-center gap-2.5 transition-colors rounded-lg text-gray-700 hover:bg-gray-100"
+                onClick={() => setImportantPickerOpen((v) => !v)}
+                aria-expanded={importantPickerOpen}
+              >
+                <span className="text-[15px] leading-none w-4 text-center">❗</span>
+                Mark as important!
+              </button>
+              {importantPickerOpen && (
+                <div className="px-2 pb-1.5">
+                  <div className="flex items-center gap-1.5">
+                    {IMPORTANT_PALETTE.map((swatch) => (
+                      <button
+                        key={swatch}
+                        title={swatch}
+                        aria-label={`Mark as important ${swatch}`}
+                        data-testid={`important-swatch-${swatch}`}
+                        onClick={() => {
+                          calendarColors.setImportant(ctxMenu.airtableId || eventUid(ev), swatch);
+                          setImportantPickerOpen(false);
+                          setCtxMenu(null);
+                        }}
+                        className={[
+                          "h-6 w-6 rounded-md transition-transform hover:scale-110",
+                          importantColorForMenu === swatch ? "ring-2 ring-offset-1 ring-gray-800" : "",
+                        ].join(" ")}
+                        style={{ backgroundColor: swatch, border: `1px solid ${borderFor(swatch)}` }}
+                      />
+                    ))}
+                  </div>
+                  {importantColorForMenu && (
+                    <button
+                      className="mt-1.5 w-full text-left px-1 py-1 text-[12px] text-gray-500 hover:text-red-600 transition-colors"
+                      onClick={() => {
+                        calendarColors.clearImportant(ctxMenu.airtableId || eventUid(ev));
+                        setImportantPickerOpen(false);
+                        setCtxMenu(null);
+                      }}
+                    >
+                      Clear important color
+                    </button>
+                  )}
+                </div>
+              )}
 
               {/* 2. Copy details */}
               {menuBtn("Copy details", "📋", () => {
@@ -5018,9 +5296,14 @@ export default function CalendarPage() {
               right: "viewAll,viewMeetings,viewActionItems,viewReminders,viewAccounts toggleWeekends dayGridMonth,timeGridWeek,timeGridDay",
             }}
             events={filteredEvents.map((e) => {
-              const base = toFullCalendarEvent(e);
-              if (e.google_event_id && absentEventIds.has(e.google_event_id)) {
-                return { ...base, backgroundColor: "#d1d5db", borderColor: "#9ca3af" };
+              const base = toFullCalendarEvent(e, calendarColors);
+              if (didNotAttend(e)) {
+                return {
+                  ...base,
+                  backgroundColor: DID_NOT_ATTEND_BG,
+                  borderColor: DID_NOT_ATTEND_BORDER,
+                  textColor: readableTextColor("#d1d5db"),
+                };
               }
               const date = e.start_datetime.slice(0, 10);
               const linkedAcctName =
@@ -5039,7 +5322,7 @@ export default function CalendarPage() {
               const isWorkSession = e.calendar_id === "work_tracking";
               const rsvp = isWorkSession ? null : getRsvp(e, userEmail);
               const declined = rsvp === "declined";
-              const absent = !!(e.google_event_id && absentEventIds.has(e.google_event_id));
+              const absent = didNotAttend(e);
               const linkedAcctFromMap = (e.google_event_id ? eventAccountLinks.get(e.google_event_id) : undefined)
                 ?? eventAccountLinks.get(String(e.id));
               const linkedAcct = linkedAcctFromMap
@@ -5088,6 +5371,17 @@ export default function CalendarPage() {
                     <span className="text-[10px] italic leading-tight truncate mt-auto pt-0.5 text-right ml-auto block w-full" style={acctStyle}>
                       {linkedAcct.accountName}
                     </span>
+                  )}
+                  {/* Gated exactly like the right-click "Comment" entry: only real
+                      CalendarEvent rows have a PK to hang a comment off. `arg.event.id`
+                      rather than `e.id` because FullCalendar owns (and strips) `id`
+                      from extendedProps. */}
+                  {isCommentableEvent(e) && (
+                    <CommentCountBadge
+                      resourceType="calendar_event"
+                      resourceId={Number(arg.event.id) || null}
+                      className="self-end opacity-80"
+                    />
                   )}
                 </div>
               );
@@ -5282,16 +5576,8 @@ export default function CalendarPage() {
             <MeetingDetail
               event={selectedEvent}
               reloadTrigger={meetingDetailReloadTrigger}
-              attended={!selectedEvent.google_event_id || !absentEventIds.has(selectedEvent.google_event_id)}
-              onToggleAttendance={() => {
-                const uid = selectedEvent.google_event_id;
-                if (!uid) return;
-                setAbsentEventIds((prev) => {
-                  const next = new Set(prev);
-                  if (next.has(uid)) next.delete(uid); else next.add(uid);
-                  return next;
-                });
-              }}
+              attended={!didNotAttend(selectedEvent)}
+              onToggleAttendance={() => void toggleAttendance(selectedEvent)}
             />
           </>
         )}

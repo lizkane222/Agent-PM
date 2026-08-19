@@ -6,6 +6,7 @@ router = DefaultRouter()
 router.register("accounts", views.AirtableAccountViewSet, basename="airtable-accounts")
 router.register("action-items", views.AirtableActionItemViewSet, basename="airtable-action-items")
 router.register("meetings", views.AirtableMeetingViewSet, basename="airtable-meetings")
+router.register("steps", views.ActionItemStepViewSet, basename="airtable-action-item-steps")
 
 urlpatterns = [
     path("action-items/field-options/", views.action_item_field_options, name="airtable-action-item-field-options"),
@@ -18,6 +19,8 @@ urlpatterns = [
     path("action-items/<str:airtable_id>/fields/", views.update_action_item_fields, name="airtable-action-item-fields"),
     path("meetings/by-event/<int:event_id>/gong-notes/", views.update_meeting_gong_notes, name="airtable-meeting-gong-notes"),
     path("meetings/<int:meeting_id>/gong-notes/", views.update_meeting_gong_notes_by_pk, name="airtable-meeting-gong-notes-by-pk"),
+    path("meetings/by-event/<int:event_id>/zoom-notes/", views.update_meeting_zoom_notes, name="airtable-meeting-zoom-notes"),
+    path("meetings/<int:meeting_id>/zoom-notes/", views.update_meeting_zoom_notes_by_pk, name="airtable-meeting-zoom-notes-by-pk"),
     path("time-logs/", views.log_time, name="airtable-time-log"),
     path("sync/", views.trigger_sync, name="airtable-sync"),
 ]

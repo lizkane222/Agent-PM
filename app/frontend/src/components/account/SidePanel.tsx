@@ -44,7 +44,7 @@ export function SidePanel({ panel, onClose, onCreatedActionItem, onMeetingUpdate
             )}
             {panel.item.gong_url && <a href={panel.item.gong_url} target="_blank" rel="noreferrer" className="underline text-xs" style={{ color: "var(--twilio-red, #e22)" }}>Gong recording ↗</a>}
             {panel.item.customer_slack && <a href={panel.item.customer_slack} target="_blank" rel="noreferrer" className="block underline text-xs" style={{ color: "var(--twilio-red, #e22)" }}>Customer Slack ↗</a>}
-            <GongSummaryPanel eventId={0} meetingId={panel.item.id} existingNotes={panel.item.gong_notes} accountName={panel.item.account_name} airtableAccountId={airtableAccountId} onCreatedActionItem={onCreatedActionItem} onSaved={onMeetingUpdated} teamMembers={teamMembers} />
+            <GongSummaryPanel eventId={0} meetingId={panel.item.id} existingNotes={panel.item.gong_notes} existingZoomNotes={panel.item.zoom_notes} accountName={panel.item.account_name} airtableAccountId={airtableAccountId} onCreatedActionItem={onCreatedActionItem} onSaved={onMeetingUpdated} teamMembers={teamMembers} />
           </>
         )}
         {panel.kind === "member" && (
@@ -167,7 +167,7 @@ export function SidePanel({ panel, onClose, onCreatedActionItem, onMeetingUpdate
               {/* Meeting notes — synced with Calendar page */}
               <div style={{ borderTop: "1px solid rgba(0,0,0,0.06)", paddingTop: "10px", marginTop: "4px" }}>
                 <MeetingNotesPanel eventId={ev.id} accountName={ev.account_name} airtableAccountId={airtableAccountId} linkedMeetingId={panel.kind === "calendar" ? panel.linkedMeeting?.id : undefined} onCreatedActionItem={onCreatedActionItem} />
-                <GongSummaryPanel eventId={ev.id} meetingId={panel.kind === "calendar" ? panel.linkedMeeting?.id : undefined} existingNotes={panel.kind === "calendar" ? panel.linkedMeeting?.gong_notes : undefined} accountName={ev.account_name} airtableAccountId={airtableAccountId} onCreatedActionItem={onCreatedActionItem} onSaved={onMeetingUpdated} teamMembers={teamMembers} />
+                <GongSummaryPanel eventId={ev.id} meetingId={panel.kind === "calendar" ? panel.linkedMeeting?.id : undefined} existingNotes={panel.kind === "calendar" ? panel.linkedMeeting?.gong_notes : undefined} existingZoomNotes={panel.kind === "calendar" ? panel.linkedMeeting?.zoom_notes : undefined} accountName={ev.account_name} airtableAccountId={airtableAccountId} onCreatedActionItem={onCreatedActionItem} onSaved={onMeetingUpdated} teamMembers={teamMembers} />
               </div>
             </>
           );

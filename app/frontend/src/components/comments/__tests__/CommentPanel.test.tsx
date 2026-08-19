@@ -111,4 +111,77 @@ describe("CommentPanel", () => {
     );
     expect(screen.getByText(/1 comment/)).toBeInTheDocument();
   });
+
+  it("counts replies in the header total", async () => {
+    // A header reading "1 comment" on a thread with three replies understates it, and
+    // disagrees with the badge on the card, which counts replies server-side.
+    server.use(
+      http.get("/api/v1/comments/comments/", () =>
+        HttpResponse.json({
+          results: [{
+            ...mockComment,
+            replies: [
+              { ...mockComment, id: 2, parent: mockComment.id, content: "r1" },
+              { ...mockComment, id: 3, parent: mockComment.id, content: "r2" },
+            ],
+          }],
+          count: 1,
+        })
+      )
+    );
+    renderPanel();
+
+    await waitFor(() => expect(screen.getByText("3 comments")).toBeInTheDocument());
+  });
+
+  it("keeps the count on one line no matter how long the record label is", async () => {
+    // Regression: the label used to render inline after "Comments" with Tailwind
+    // `truncate`, which is inert on an inline <span>. A long action-item title therefore
+    // ran full width, squeezed the flex sibling to min-content, and rendered
+    // "1 comment" one character per line, vertically.
+    const longLabel =
+      "Liz will follow up later today in Slack with what she thinks needs to be done, " +
+      "including a diagram, and some tasks for Suresh to look at on his side.";
+    renderPanel({ resourceLabel: longLabel });
+    await waitFor(() =>
+      expect(screen.queryByText("Loading…")).not.toBeInTheDocument()
+    );
+
+    const count = screen.getByText("1 comment");
+    expect(count.className).toContain("whitespace-nowrap");
+    // The count and the close button sit in a shrink-0 group, so the label cannot
+    // squeeze them; the label itself lives in a min-w-0 column and clamps.
+    expect(count.parentElement?.className).toContain("shrink-0");
+
+    const label = screen.getByTitle(longLabel);
+    expect(label.tagName).toBe("P");
+    expect(label).toHaveStyle({ overflow: "hidden" });
+    expect(label.parentElement?.className).toContain("min-w-0");
+  });
+
+  it("wraps long unbroken comment content instead of scrolling sideways", async () => {
+    server.use(
+      http.get("/api/v1/comments/comments/", () =>
+        HttpResponse.json({
+          results: [{ ...mockComment, content: "supercalifragilisticexpialidocious".repeat(6) }],
+          count: 1,
+        })
+      )
+    );
+    renderPanel();
+
+    const body = await waitFor(() =>
+      screen.getByText("supercalifragilisticexpialidocious".repeat(6))
+    );
+    expect(body).toHaveStyle({ overflowWrap: "anywhere" });
+  });
+
+  it("does not leave a focus outline on the close button", async () => {
+    renderPanel();
+    await waitFor(() =>
+      expect(screen.queryByText("Loading…")).not.toBeInTheDocument()
+    );
+    const close = screen.getByRole("button", { name: "Close comments" });
+    expect(close.className).toContain("focus-visible:outline-none");
+  });
 });

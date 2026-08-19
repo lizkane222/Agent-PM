@@ -2,6 +2,8 @@ import "@testing-library/jest-dom";
 import { afterEach, beforeAll, afterAll } from "vitest";
 import { cleanup } from "@testing-library/react";
 import { server } from "./msw-server";
+import { resetRequestCache } from "../lib/requestCache";
+import { resetCommentSummaries } from "../lib/commentSummaryStore";
 import { accountHandlers } from "./handlers/accounts";
 import { actionItemHandlers } from "./handlers/action_items";
 import { commentsHandlers } from "./handlers/comments";
@@ -34,5 +36,13 @@ afterEach(() => {
   cleanup();
   server.resetHandlers();
   server.use(...extraHandlers);
+  // apiClient coalesces and briefly caches GETs (lib/requestCache.ts). That cache is
+  // module-level, so it must be cleared alongside the MSW handlers — otherwise a test
+  // that overrides a handler is served the previous test's response body.
+  resetRequestCache();
+  // Same reasoning: the comment-rollup cache in lib/commentSummaryStore.ts is
+  // module-level and shared by every card, so a summary fetched in one test would
+  // otherwise still be cached (and never re-requested) in the next.
+  resetCommentSummaries();
 });
 afterAll(() => server.close());

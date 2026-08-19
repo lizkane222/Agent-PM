@@ -1,5 +1,8 @@
 import { renderHook, act, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi } from "vitest";
+import { http, HttpResponse } from "msw";
+import { server } from "../../test/msw-server";
+import { apiClient } from "../../lib/api";
 import { useResource } from "../useResource";
 
 interface TestItem {
@@ -138,5 +141,64 @@ describe("useResource", () => {
     await waitFor(() => expect(result.current.loading).toBe(false));
     // Should show item2 (result of the second fetch), not item1
     expect(result.current.data).toEqual([item2]);
+  });
+});
+
+describe("useResource — interaction with the GET cache", () => {
+  const PROBE_PATH = "/api/v1/use-resource-probe/";
+
+  it("refetch reaches the network even inside the GET cache TTL", async () => {
+    // apiClient coalesces and briefly caches GETs (lib/requestCache.ts). refetch is an
+    // explicit request for current data, so it must invalidate rather than be answered
+    // from memory — otherwise a post-mutation refetch silently returns the old body.
+    let hits = 0;
+    server.use(
+      http.get(PROBE_PATH, () => {
+        hits += 1;
+        return HttpResponse.json({
+          count: 1, next: null, previous: null,
+          results: [{ id: hits, name: `fetch-${hits}` }],
+        });
+      })
+    );
+
+    const fetcher = () =>
+      apiClient
+        .get<{ results: TestItem[] }>("/use-resource-probe/")
+        .then((r) => r.data.results);
+
+    const { result } = renderHook(() => useResource<TestItem>(fetcher));
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.data).toEqual([{ id: 1, name: "fetch-1" }]);
+    expect(hits).toBe(1);
+
+    act(() => result.current.refetch());
+
+    await waitFor(() => expect(result.current.data).toEqual([{ id: 2, name: "fetch-2" }]));
+    expect(hits).toBe(2);
+  });
+
+  it("two hooks mounting on the same endpoint share one request", async () => {
+    let hits = 0;
+    server.use(
+      http.get(PROBE_PATH, () => {
+        hits += 1;
+        return HttpResponse.json({ count: 0, next: null, previous: null, results: [] });
+      })
+    );
+
+    const fetcher = () =>
+      apiClient
+        .get<{ results: TestItem[] }>("/use-resource-probe/")
+        .then((r) => r.data.results);
+
+    const a = renderHook(() => useResource<TestItem>(fetcher));
+    const b = renderHook(() => useResource<TestItem>(fetcher));
+
+    await waitFor(() => expect(a.result.current.loading).toBe(false));
+    await waitFor(() => expect(b.result.current.loading).toBe(false));
+
+    expect(hits).toBe(1);
   });
 });

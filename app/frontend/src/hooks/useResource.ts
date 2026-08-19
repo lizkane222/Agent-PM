@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { clearGetCache } from "../lib/requestCache";
 
 export interface UseResourceResult<T> {
   data: T[];
@@ -18,7 +19,17 @@ export function useResource<T>(
 
   // Stable refetch — incrementing tick re-runs the effect without requiring
   // the caller to manage a refresh trigger.
-  const refetch = useCallback(() => setTick((n) => n + 1), []);
+  //
+  // Clearing the GET cache first is what makes refetch mean what it says. GETs are
+  // coalesced and briefly cached (lib/requestCache.ts); without this, a refetch inside
+  // the TTL would be answered from memory and the caller would see the same data it
+  // already had. Clearing wholesale rather than by key because the fetcher is an opaque
+  // thunk here — useResource never sees the URL. refetch is a user action or a
+  // post-mutation step, not a hot path, so the bluntness costs nothing.
+  const refetch = useCallback(() => {
+    clearGetCache();
+    setTick((n) => n + 1);
+  }, []);
 
   // Keep a stable ref to the fetcher so the effect only re-runs when deps/tick
   // change, not when the fetcher identity changes on every render.

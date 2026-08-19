@@ -9,6 +9,7 @@ RESOURCE_TYPE_CHOICES = [
     ("account", "Account"),
     ("airtable_account", "Airtable Account"),
     ("action_item", "Airtable Action Item"),
+    ("action_item_step", "Action Item Step"),
     ("meeting", "Airtable Meeting"),
     ("calendar_event", "Calendar Event"),
     ("reminder", "Reminder"),

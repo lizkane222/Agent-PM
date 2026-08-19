@@ -1,7 +1,9 @@
 import React, { useState, useRef, useEffect } from "react";
 import { airtableApi, integrationsApi } from "../../lib/api";
+import type { MeetingNotesSource } from "../../lib/api";
 import type { AirtableActionItem, AirtableMeeting, TeamMember } from "../../types";
 import { NoteActionTooltip } from "./NoteActionTooltip";
+import { MeetingSummarySourceToggle, preferredMeetingSource } from "./MeetingSummarySourceToggle";
 
 // ── Gong / meeting summary paste section ─────────────────────────────────────
 
@@ -63,15 +65,37 @@ export function parseBullets(text: string): GongItem[] {
   return result;
 }
 
-export function GongSummaryPanel({ eventId, meetingId: meetingIdProp, existingNotes, accountName, airtableAccountId, onCreatedActionItem, onSaved, teamMembers = [] }: { eventId: number; meetingId?: number; existingNotes?: string; accountName?: string | null; airtableAccountId?: number | null; onCreatedActionItem?: (item: AirtableActionItem) => void; onSaved?: (updated: AirtableMeeting) => void; teamMembers?: TeamMember[] }) {
-  const [raw, setRaw] = useState(existingNotes ?? "");
-  const [items, setItems] = useState<(GongItem & { mentionedMembers?: TeamMember[] })[]>(() =>
-    existingNotes?.trim() ? parseBullets(existingNotes).map((item) => item) : []
+type NotesBySource = Record<MeetingNotesSource, string>;
+
+export function GongSummaryPanel({ eventId, meetingId: meetingIdProp, existingNotes, existingZoomNotes, accountName, airtableAccountId, onCreatedActionItem, onSaved, teamMembers = [] }: { eventId: number; meetingId?: number; existingNotes?: string; existingZoomNotes?: string; accountName?: string | null; airtableAccountId?: number | null; onCreatedActionItem?: (item: AirtableActionItem) => void; onSaved?: (updated: AirtableMeeting) => void; teamMembers?: TeamMember[] }) {
+  // Both providers' summaries are held at once so switching the toggle doesn't need a
+  // round-trip; `raw` / `items` / `showPaste` are the view of whichever is active.
+  const [notesBySource, setNotesBySource] = useState<NotesBySource>(() => ({
+    gong: existingNotes ?? "",
+    zoom: existingZoomNotes ?? "",
+  }));
+  const [source, setSource] = useState<MeetingNotesSource>(() =>
+    preferredMeetingSource(existingNotes, existingZoomNotes)
   );
-  const [showPaste, setShowPaste] = useState(!existingNotes?.trim());
+  const initialText = notesBySource[source];
+  const [raw, setRaw] = useState(initialText);
+  const [items, setItems] = useState<(GongItem & { mentionedMembers?: TeamMember[] })[]>(() =>
+    initialText.trim() ? parseBullets(initialText).map((item) => item) : []
+  );
+  const [showPaste, setShowPaste] = useState(!initialText.trim());
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   // Once the backend creates a stub meeting via by-event, cache its PK for future saves
   const resolvedMeetingId = useRef<number | undefined>(meetingIdProp);
+
+  // Point raw/items/showPaste at `next`'s text. Unsaved textarea edits are dropped on
+  // switch — the same thing that already happens when the panel's meeting changes.
+  function showSource(next: MeetingNotesSource, store: NotesBySource) {
+    setSource(next);
+    const text = store[next] ?? "";
+    setRaw(text);
+    setItems(text.trim() ? parseBullets(text).map((i) => i) : []);
+    setShowPaste(!text.trim());
+  }
 
   // Re-initialize when the target meeting changes (covers same-notes-text case too)
   const prevMeetingRef = useRef<number | undefined>(meetingIdProp);
@@ -83,15 +107,15 @@ export function GongSummaryPanel({ eventId, meetingId: meetingIdProp, existingNo
       prevMeetingRef.current = meetingIdProp;
       prevEventRef.current = eventId;
       resolvedMeetingId.current = meetingIdProp;
-      setRaw(existingNotes ?? "");
-      setItems(existingNotes?.trim() ? parseBullets(existingNotes).map((i) => i) : []);
-      setShowPaste(!existingNotes?.trim());
+      const store: NotesBySource = { gong: existingNotes ?? "", zoom: existingZoomNotes ?? "" };
+      setNotesBySource(store);
+      showSource(preferredMeetingSource(store.gong, store.zoom), store);
     }
-  }, [meetingIdProp, eventId, existingNotes]);
+  }, [meetingIdProp, eventId, existingNotes, existingZoomNotes]);
 
-  // Always fetch the latest gong_notes from the server when the panel mounts or
-  // the event/meeting changes — this ensures notes saved on the Calendar page are
-  // reflected here without a full page reload.
+  // Always fetch the latest notes from the server when the panel mounts or the
+  // event/meeting changes — this ensures notes saved on the Calendar page, or imported
+  // from a recap email by "GET Meeting Notes", are reflected here without a reload.
   useEffect(() => {
     const fetchMeeting = meetingIdProp
       ? airtableApi.getMeeting(meetingIdProp).then(({ data }) => data)
@@ -104,10 +128,21 @@ export function GongSummaryPanel({ eventId, meetingId: meetingIdProp, existingNo
       .then((m) => {
         if (!m) return;
         resolvedMeetingId.current = m.id;
-        if (m.gong_notes && m.gong_notes !== raw) {
-          setRaw(m.gong_notes);
-          setItems(parseBullets(m.gong_notes).map((i) => i));
-          setShowPaste(false);
+        // Whitespace-only counts as empty: Airtable's richText columns report "\n"
+        // forever once written and cleared, so a truthiness test would render an empty
+        // recap as content and hide the paste box.
+        const store: NotesBySource = {
+          gong: (m.gong_notes ?? "").trim() ? m.gong_notes : "",
+          zoom: (m.zoom_notes ?? "").trim() ? m.zoom_notes : "",
+        };
+        if (!store.gong && !store.zoom) return;
+        setNotesBySource(store);
+        if (store[source] && store[source] !== raw) {
+          showSource(source, store);
+        } else if (!store[source]) {
+          // The active source came back empty but the other one has content — land on
+          // whichever the server actually filled in rather than showing a paste box.
+          showSource(preferredMeetingSource(store.gong, store.zoom), store);
         }
       })
       .catch(() => {});
@@ -124,17 +159,27 @@ export function GongSummaryPanel({ eventId, meetingId: meetingIdProp, existingNo
     setItems(enriched);
     setShowPaste(false);
 
+    // Whichever provider the toggle is on is the one this text belongs to, so the save
+    // targets that column. The other provider's notes are untouched.
+    setNotesBySource((prev) => ({ ...prev, [source]: text }));
+
     const canSave = resolvedMeetingId.current || eventId;
     if (!canSave) return;
     setSaveState("saving");
     try {
       let savedMeeting;
       if (resolvedMeetingId.current) {
-        const { data } = await airtableApi.updateMeetingGongNotesByPk(resolvedMeetingId.current, text.trim());
+        const save = source === "zoom"
+          ? airtableApi.updateMeetingZoomNotesByPk
+          : airtableApi.updateMeetingGongNotesByPk;
+        const { data } = await save(resolvedMeetingId.current, text.trim());
         savedMeeting = data;
       } else {
         // by-event will create a stub meeting if none exists; cache its PK
-        const { data } = await airtableApi.updateMeetingGongNotes(eventId, text.trim());
+        const save = source === "zoom"
+          ? airtableApi.updateMeetingZoomNotes
+          : airtableApi.updateMeetingGongNotes;
+        const { data } = await save(eventId, text.trim());
         savedMeeting = data;
         resolvedMeetingId.current = savedMeeting.id;
       }
@@ -188,6 +233,12 @@ export function GongSummaryPanel({ eventId, meetingId: meetingIdProp, existingNo
           {saveState === "saving" && <span style={{ fontSize: "0.6875rem", color: "#9ca3af" }}>Saving…</span>}
           {saveState === "saved" && <span style={{ fontSize: "0.6875rem", color: "#16a34a" }}>✓ Saved</span>}
           {saveState === "error" && <span style={{ fontSize: "0.6875rem", color: "#dc2626" }}>Save failed</span>}
+          <MeetingSummarySourceToggle
+            value={source}
+            onChange={(next) => showSource(next, notesBySource)}
+            hasGong={!!notesBySource.gong.trim()}
+            hasZoom={!!notesBySource.zoom.trim()}
+          />
           <button onClick={() => setShowPaste((v) => !v)} style={{ fontSize: "0.6875rem", fontWeight: 600, color: "#6366f1", background: "none", border: "none", cursor: "pointer", padding: 0 }}>
             {showPaste ? "Hide" : items.length > 0 ? "Edit paste" : "+ Paste summary"}
           </button>
@@ -201,7 +252,9 @@ export function GongSummaryPanel({ eventId, meetingId: meetingIdProp, existingNo
             onChange={(e) => setRaw(e.target.value)}
             onPaste={handlePaste}
             rows={8}
-            placeholder="Paste your Gong notes, meeting summary, or any bulleted text here…"
+            placeholder={source === "zoom"
+              ? "Paste your Zoom AI Companion summary or any bulleted text here…"
+              : "Paste your Gong notes, meeting summary, or any bulleted text here…"}
             style={{ width: "100%", fontSize: "0.8125rem", border: "1px solid #e5e7eb", borderRadius: "7px", padding: "8px 10px", outline: "none", resize: "vertical", lineHeight: 1.5, boxSizing: "border-box", color: "var(--twilio-navy)" }}
           />
           <button onClick={() => void handleParse()} disabled={!raw.trim()} style={{ marginTop: "5px", width: "100%", padding: "5px 0", fontSize: "0.75rem", fontWeight: 700, background: "#6366f1", color: "#fff", border: "none", borderRadius: "6px", cursor: raw.trim() ? "pointer" : "not-allowed", opacity: raw.trim() ? 1 : 0.4 }}>

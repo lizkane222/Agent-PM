@@ -39,15 +39,20 @@ const BASE_NAV_ITEMS: { to: string; label: string; Icon: SvgIcon }[] = [
 
 function useUserProfile() {
   const [profile, setProfile] = useState<UserProfile | null>(null);
-  const doFetch = () => teamApi.getMyProfile().then(({ data }) => setProfile(data)).catch(() => {});
+  // `fresh` bypasses the short GET cache (lib/requestCache.ts). The mount fetch is
+  // cacheable on purpose — CurrentUserContext and NotificationDefaultsContext request
+  // this same endpoint, and StrictMode doubles each of them. The event-driven refetch
+  // below must see the toggled value, so it opts out.
+  const doFetch = (fresh = false) =>
+    teamApi.getMyProfile({ fresh }).then(({ data }) => setProfile(data)).catch(() => {});
   useEffect(() => { void doFetch(); }, []);
   // Re-fetch when staff_view_override is toggled.
   // StorageEvent fires only in other tabs; the window "accountsUpdated" event fires in the same tab.
   useEffect(() => {
     function onStorage(e: StorageEvent) {
-      if (e.key === "accountsUpdated") void doFetch();
+      if (e.key === "accountsUpdated") void doFetch(true);
     }
-    function onSameTab() { void doFetch(); }
+    function onSameTab() { void doFetch(true); }
     window.addEventListener("storage", onStorage);
     window.addEventListener("accountsUpdated", onSameTab);
     return () => {
@@ -61,11 +66,11 @@ function useUserProfile() {
 function useNavAccounts() {
   const [accounts, setAccounts] = useState<Account[]>([]);
 
-  const fetch = async () => {
+  const fetch = async (fresh = false) => {
     // Run independently so admin account always appears even if listAccounts fails (or vice versa)
     const [listResult, adminResult] = await Promise.allSettled([
-      accountsApi.listAccounts(),
-      accountsApi.getAdminAccount(),
+      accountsApi.listAccounts(undefined, { fresh }),
+      accountsApi.getAdminAccount({ fresh }),
     ]);
 
     const regular: Account[] = listResult.status === "fulfilled"
@@ -87,9 +92,9 @@ function useNavAccounts() {
   useEffect(() => { void fetch(); }, []);
   useEffect(() => {
     function onStorage(e: StorageEvent) {
-      if (e.key === "accountsUpdated") void fetch();
+      if (e.key === "accountsUpdated") void fetch(true);
     }
-    function onSameTab() { void fetch(); }
+    function onSameTab() { void fetch(true); }
     window.addEventListener("storage", onStorage);
     window.addEventListener("accountsUpdated", onSameTab);
     return () => {
@@ -150,10 +155,10 @@ export default function Layout() {
   // response completes (indicated by a storage event set in ChatPage).
   const [lifetimeTokens, setLifetimeTokens] = useState<number>(0);
   useEffect(() => {
-    const load = () => {
+    const load = (fresh = false) => {
       Promise.all([
-        agentApi.getTokenStats().catch(() => null),
-        skillsApi.getTokenStats().catch(() => null),
+        agentApi.getTokenStats({ fresh }).catch(() => null),
+        skillsApi.getTokenStats({ fresh }).catch(() => null),
       ]).then(([agent, skill]) => {
         const agentTotal = agent?.data?.all_time?.total_tokens ?? 0;
         const skillTotal = skill?.data?.all_time?.total_tokens ?? 0;
@@ -162,7 +167,7 @@ export default function Layout() {
     };
     load();
     const onStorage = (e: StorageEvent) => {
-      if (e.key === "agentSessionUpdated" || e.key === "skillTokensUpdated") load();
+      if (e.key === "agentSessionUpdated" || e.key === "skillTokensUpdated") load(true);
     };
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);

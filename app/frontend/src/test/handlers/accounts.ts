@@ -129,6 +129,8 @@ export const mockAirtableMeeting: AirtableMeeting = {
   expected_topics: "",
   gong_notes: "",
   gong_url: "",
+  zoom_notes: "",
+  zoom_url: "",
   customer_slack: "",
   account_team_slack: "",
   last_synced: "2026-01-01T00:00:00Z",
@@ -149,6 +151,13 @@ export const accountHandlers = [
   http.get("/api/v1/accounts/accounts/", () =>
     HttpResponse.json({ count: 1, next: null, previous: null, results: [mockAccount] })
   ),
+  // MUST stay ahead of the ":id" handler below — MSW matches in registration order and
+  // ":id" would otherwise capture "artifacts-batch" as an account ID.
+  http.get("/api/v1/accounts/accounts/artifacts-batch/", ({ request }) => {
+    const ids = new URL(request.url).searchParams.get("ids");
+    if (!ids) return HttpResponse.json([]);
+    return HttpResponse.json([mockArtifact, mockCodeArtifact]);
+  }),
   http.get("/api/v1/accounts/accounts/:id/", () =>
     HttpResponse.json(mockAccount)
   ),
@@ -201,6 +210,28 @@ export const accountHandlers = [
   ),
   http.get("/api/v1/airtable/accounts/", () =>
     HttpResponse.json({ results: [mockAirtableAccount] })
+  ),
+  // Meeting-summary saves. Registered before "meetings/:id/" so the notes sub-paths
+  // aren't captured as a meeting ID; each echoes the field it was given so a test can
+  // assert the panel wrote to the right column.
+  http.patch("/api/v1/airtable/meetings/:id/gong-notes/", async ({ request }) => {
+    const body = await request.json() as { gong_notes?: string };
+    return HttpResponse.json({ ...mockAirtableMeeting, gong_notes: body.gong_notes ?? "" });
+  }),
+  http.patch("/api/v1/airtable/meetings/:id/zoom-notes/", async ({ request }) => {
+    const body = await request.json() as { zoom_notes?: string };
+    return HttpResponse.json({ ...mockAirtableMeeting, zoom_notes: body.zoom_notes ?? "" });
+  }),
+  http.patch("/api/v1/airtable/meetings/by-event/:eventId/gong-notes/", async ({ request }) => {
+    const body = await request.json() as { gong_notes?: string };
+    return HttpResponse.json({ ...mockAirtableMeeting, gong_notes: body.gong_notes ?? "" });
+  }),
+  http.patch("/api/v1/airtable/meetings/by-event/:eventId/zoom-notes/", async ({ request }) => {
+    const body = await request.json() as { zoom_notes?: string };
+    return HttpResponse.json({ ...mockAirtableMeeting, zoom_notes: body.zoom_notes ?? "" });
+  }),
+  http.get("/api/v1/airtable/meetings/:id/", () =>
+    HttpResponse.json(mockAirtableMeeting)
   ),
   // Airtable event linking
   http.post("/api/v1/airtable/categorize/", () =>

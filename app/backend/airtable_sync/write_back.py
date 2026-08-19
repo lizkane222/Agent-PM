@@ -199,7 +199,14 @@ def push_action_item_delete(airtable_id: str) -> bool:
 # ── Meetings ──────────────────────────────────────────────────────────────────
 
 def _meeting_fields(meeting) -> dict:
-    """Map a Django AirtableMeeting instance to Airtable field names."""
+    """Map a Django AirtableMeeting instance to Airtable field names.
+
+    Deliberately omits the Zoom pair. This dict is passed to `table.create` when a
+    local stub is promoted, and Airtable rejects the whole create with
+    UNKNOWN_FIELD_NAME if any key is missing from the base. Zoom Notes / Zoom URL are
+    newer columns that may not exist yet, so they are pushed by a separate, isolated
+    call (`push_meeting_zoom_notes`) where a missing column costs only that write.
+    """
     fields: dict = {}
     if meeting.name:
         fields["Name"] = meeting.name
@@ -212,6 +219,27 @@ def _meeting_fields(meeting) -> dict:
     if meeting.account and meeting.account.airtable_id:
         fields["Account"] = [meeting.account.airtable_id]
     return fields
+
+
+def _promote_stub_meeting(meeting, table) -> str:
+    """Create a real Airtable record for a 'local-' stub and adopt the returned ID.
+
+    Also rewrites any CalendarEvent pointing at the stub ID so the next write
+    resolves straight to the real record. Returns the new Airtable record ID.
+    """
+    fields = _meeting_fields(meeting)
+    if not fields.get("Name"):
+        fields["Name"] = f"Meeting {meeting.pk}"
+    record = _airtable_call(table.create, fields)
+    real_id = record["id"]
+    from scheduler.models import CalendarEvent
+    CalendarEvent.objects.filter(agentpm_airtable_id=meeting.airtable_id).update(
+        agentpm_airtable_id=real_id
+    )
+    meeting.airtable_id = real_id
+    meeting.save(update_fields=["airtable_id"])
+    logger.info("Promoted stub meeting pk=%s to Airtable record %s", meeting.pk, real_id)
+    return real_id
 
 
 def push_meeting_gong_notes(meeting) -> bool:
@@ -228,26 +256,47 @@ def push_meeting_gong_notes(meeting) -> bool:
     try:
         table = get_table(TABLE_MEETINGS)
         if meeting.airtable_id.startswith("local-"):
-            # Create a real Airtable record for this stub meeting
-            fields = _meeting_fields(meeting)
-            if not fields.get("Name"):
-                fields["Name"] = f"Meeting {meeting.pk}"
-            record = _airtable_call(table.create, fields)
-            real_id = record["id"]
-            # Update Django + any CalendarEvent that references the old stub ID
-            from scheduler.models import CalendarEvent
-            CalendarEvent.objects.filter(agentpm_airtable_id=meeting.airtable_id).update(
-                agentpm_airtable_id=real_id
-            )
-            meeting.airtable_id = real_id
-            meeting.save(update_fields=["airtable_id"])
-            logger.info("Promoted stub meeting pk=%s to Airtable record %s", meeting.pk, real_id)
+            # `_meeting_fields` already carries gong_notes, so the create is the push.
+            _promote_stub_meeting(meeting, table)
         else:
             _airtable_call(table.update, meeting.airtable_id, {"Gong Notes": meeting.gong_notes})
             logger.info("Updated Airtable meeting gong_notes for record %s", meeting.airtable_id)
         return True
     except Exception:
         logger.exception("Failed to push Airtable meeting %s gong_notes", meeting.airtable_id)
+        return False
+
+
+def push_meeting_zoom_notes(meeting) -> bool:
+    """
+    Push updated zoom_notes / zoom_url for a meeting to Airtable.
+
+    Runs as its own request rather than joining the Gong payload: "Zoom Notes" and
+    "Zoom URL" are newer columns, and if they are absent from the base Airtable fails
+    the entire update with UNKNOWN_FIELD_NAME. Isolating the call means a base that
+    hasn't grown the columns yet loses only the Zoom mirror — the notes are still saved
+    locally and the Gong push is unaffected. Returns False (and logs) in that case.
+    """
+    if not meeting.airtable_id:
+        logger.warning("push_meeting_zoom_notes called with no airtable_id on meeting %s", meeting.pk)
+        return False
+    try:
+        table = get_table(TABLE_MEETINGS)
+        if meeting.airtable_id.startswith("local-"):
+            _promote_stub_meeting(meeting, table)
+        fields = {"Zoom Notes": meeting.zoom_notes}
+        if meeting.zoom_url:
+            fields["Zoom URL"] = meeting.zoom_url
+        _airtable_call(table.update, meeting.airtable_id, fields)
+        logger.info("Updated Airtable meeting zoom_notes for record %s", meeting.airtable_id)
+        return True
+    except Exception:
+        logger.exception(
+            "Failed to push Airtable meeting %s zoom_notes — if the Airtable Meetings "
+            "table has no 'Zoom Notes' / 'Zoom URL' column, add them to enable the mirror. "
+            "The notes are saved locally either way.",
+            meeting.airtable_id,
+        )
         return False
 
 

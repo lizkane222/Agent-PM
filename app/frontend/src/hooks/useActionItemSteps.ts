@@ -45,5 +45,15 @@ export function useActionItemSteps(actionItemId: number | null) {
     [refetch],
   );
 
-  return { steps, loading, error, refetch, addStep, updateStep, deleteStep, setStatus };
+  /** Persist a new top-to-bottom order in one atomic request. */
+  const reorderSteps = useCallback(
+    async (ids: number[]) => {
+      if (!actionItemId) return;
+      await stepsApi.reorder(actionItemId, ids);
+      refetch();
+    },
+    [actionItemId, refetch],
+  );
+
+  return { steps, loading, error, refetch, addStep, updateStep, deleteStep, setStatus, reorderSteps };
 }

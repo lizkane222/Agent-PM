@@ -2,12 +2,13 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { accountsApi, teamApi } from "../lib/api";
 import CorporateIcon from "../assets/icons/Corporate.svg?react";
-import type { Account, AccountNote, AccountTeamMember, TeamMember, UserProfile } from "../types";
+import type { Account, AccountTeamMember, TeamMember, UserProfile } from "../types";
 import { getTitleRole, ROLE_META } from "../lib/titleRoles";
 import { formatArr } from "twilio-agent-pm-shared";
 import { addLog } from "../lib/appLog";
 import { useExport } from "../context/ExportContext";
 import { useRightClickComment } from "../components/comments/CommentContext";
+import CommentPreviewList from "../components/comments/CommentPreviewList";
 
 type ViewMode = "cards" | "list" | "table";
 
@@ -286,154 +287,6 @@ function AccountModal({
   );
 }
 
-function AccountDetail({
-  account,
-  onEdit,
-  onClose,
-}: {
-  account: Account;
-  onEdit: () => void;
-  onClose: () => void;
-}) {
-  const [notes, setNotes] = useState<AccountNote[]>([]);
-  const [loadingNotes, setLoadingNotes] = useState(true);
-  const [newNote, setNewNote] = useState("");
-  const [posting, setPosting] = useState(false);
-
-  useEffect(() => {
-    setLoadingNotes(true);
-    accountsApi.listNotes(account.id)
-      .then(({ data }) => setNotes(data))
-      .catch(() => setNotes([]))
-      .finally(() => setLoadingNotes(false));
-  }, [account.id]);
-
-  async function submitNote() {
-    if (!newNote.trim()) return;
-    setPosting(true);
-    try {
-      const { data } = await accountsApi.createNote(account.id, newNote.trim());
-      setNotes((n) => [data, ...n]);
-      setNewNote("");
-    } finally {
-      setPosting(false);
-    }
-  }
-
-  async function deleteNote(noteId: number) {
-    await accountsApi.deleteNote(noteId);
-    setNotes((n) => n.filter((x) => x.id !== noteId));
-  }
-
-  return (
-    <div className="fixed inset-0 z-40 flex bg-black/40" onClick={onClose}>
-      <div className="ml-auto h-full w-full max-w-md shadow-xl flex flex-col" style={{ background: "var(--surface, #fff)", fontFamily: "var(--font-base)" }} onClick={(e) => e.stopPropagation()}>
-        <div className="flex items-center justify-between px-6 py-4" style={{ borderBottom: "1px solid var(--border, rgba(0,0,0,0.08))" }}>
-          <h2 className="text-lg font-semibold truncate" style={{ color: "var(--text-primary, #111)" }}>{account.company_name}</h2>
-          <div className="flex gap-2">
-            <button onClick={onEdit} className="text-sm font-medium" style={{ color: "var(--twilio-red, #e22)" }}>Edit</button>
-            <button onClick={onClose} className="text-xl leading-none" style={{ color: "var(--text-secondary, #888)" }}>✕</button>
-          </div>
-        </div>
-
-        <div className="px-6 py-4 space-y-2" style={{ borderBottom: "1px solid var(--border, rgba(0,0,0,0.08))" }}>
-          <div className="flex gap-2 flex-wrap">
-            <span className="rounded-md px-2 py-1 text-sm font-medium" style={STATUS_COLORS[account.status]}>
-              {account.status}
-            </span>
-            {account.industry && <span className="text-sm text-[var(--twilio-navy)]">{account.industry}</span>}
-          </div>
-          <div className="grid grid-cols-2 gap-2 text-sm text-[var(--twilio-navy)]">
-            <div><span className="text-[var(--twilio-navy)]">ARR</span> {formatArr(account.arr)}</div>
-            {account.owner_username && <div><span className="text-[var(--twilio-navy)]">Owner</span> {account.owner_username}</div>}
-            {account.primary_contact_name && <div><span className="text-[var(--twilio-navy)]">Contact</span> {account.primary_contact_name}</div>}
-            {account.website && (
-              <div className="col-span-2 truncate">
-                <span className="text-[var(--twilio-navy)]">Website</span>{" "}
-                <a href={account.website} target="_blank" rel="noreferrer" className="hover:underline" style={{ color: "var(--twilio-red, #e22)" }}>{account.website}</a>
-              </div>
-            )}
-          </div>
-          {account.team_members?.length > 0 && (
-            <div className="mt-3 pt-3" style={{ borderTop: "1px solid var(--border, rgba(0,0,0,0.08))" }}>
-              <p className="text-[11px] font-bold uppercase tracking-widest text-[var(--twilio-gray-60)] mb-2">Team</p>
-              <div className="space-y-2">
-                {account.team_members.map((m) => {
-                  const mc = ROLE_META[getTitleRole(m.title)];
-                  return (
-                  <div key={m.id} className="flex items-center gap-2.5">
-                    {m.avatar_url ? (
-                      <img src={m.avatar_url} alt={m.full_name} className="h-7 w-7 rounded-full object-cover shrink-0" />
-                    ) : (
-                      <div
-                        className="h-7 w-7 rounded-full flex items-center justify-center text-[11px] font-semibold shrink-0"
-                        style={{ backgroundColor: mc.bg, color: mc.text }}
-                      >
-                        {m.full_name.split(" ").map((n) => n[0]).join("").toUpperCase().slice(0, 2)}
-                      </div>
-                    )}
-                    <div className="min-w-0">
-                      <p className="text-sm font-medium text-[var(--twilio-navy)] truncate">{m.full_name}</p>
-                      {m.title && <p className="text-[11px] text-[var(--twilio-gray-60)] truncate">{m.title}</p>}
-                    </div>
-                    {m.slack_handle && (
-                      <span className="ml-auto text-[11px] text-[var(--twilio-gray-60)] shrink-0">@{m.slack_handle}</span>
-                    )}
-                  </div>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-        </div>
-
-        <div className="flex-1 overflow-y-auto px-6 py-4">
-          <h3 className="text-sm font-semibold mb-3 uppercase tracking-wide" style={{ color: "var(--text-secondary, #888)" }}>Activity log</h3>
-
-          <div className="flex gap-2 mb-4">
-            <textarea
-              value={newNote}
-              onChange={(e) => setNewNote(e.target.value)}
-              rows={2}
-              placeholder="Add a note…"
-              className="flex-1 rounded-md px-3 py-2 text-sm resize-none focus:outline-none"
-              style={{ border: "1px solid var(--border, rgba(0,0,0,0.08))", background: "var(--bg, #f5f5f5)", color: "var(--text-primary, #111)" }}
-            />
-            <button
-              onClick={() => void submitNote()}
-              disabled={posting || !newNote.trim()}
-              className="shrink-0 self-end rounded-md px-3 py-2 text-sm font-medium disabled:opacity-50 hover:opacity-90 transition-opacity"
-              style={{ background: "var(--twilio-red, #e22)", color: "#fff", border: "none" }}
-            >
-              {posting ? "…" : "Add"}
-            </button>
-          </div>
-
-          {loadingNotes ? (
-            <p className="text-sm" style={{ color: "var(--text-secondary, #888)" }}>Loading…</p>
-          ) : notes.length === 0 ? (
-            <p className="text-sm" style={{ color: "var(--text-secondary, #888)" }}>No notes yet.</p>
-          ) : (
-            <div className="space-y-3">
-              {notes.map((note) => (
-                <div key={note.id} className="rounded-lg p-3" style={{ background: "var(--bg, #f5f5f5)" }}>
-                  <div className="flex items-start justify-between gap-2">
-                    <p className="text-sm flex-1" style={{ color: "var(--text-primary, #111)" }}>{note.content}</p>
-                    <button onClick={() => void deleteNote(note.id)} className="shrink-0 text-sm hover:text-red-500" style={{ color: "var(--text-secondary, #888)" }}>✕</button>
-                  </div>
-                  <p className="text-xs mt-1" style={{ color: "var(--text-secondary, #888)" }}>
-                    {note.author_display || note.author_username || "Unknown"} · {new Date(note.created_at).toLocaleDateString()}
-                  </p>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
 function ViewToggle({ value, onChange }: { value: ViewMode; onChange: (v: ViewMode) => void }) {
   const opts: { v: ViewMode; icon: React.ReactNode; label: string }[] = [
     {
@@ -680,6 +533,15 @@ function AccountCardButton({
             })}
           </div>
         )}
+        {/* Latest comments in place. `interactive={false}` because the whole row is a
+            <button>; right-click on the row is what opens the full thread. */}
+        <CommentPreviewList
+          resourceType="account"
+          resourceId={acct.id}
+          resourceLabel={acct.company_name}
+          interactive={false}
+          className="mt-3"
+        />
       </div>
     </button>
   );
@@ -696,7 +558,6 @@ export default function AccountsPage() {
   const navigate = useNavigate();
   const { exportMode, toggleItem, isSelected } = useExport();
   const [modal, setModal] = useState<Partial<Account> | null | "new">(null);
-  const [detail, setDetail] = useState<Account | null>(null);
   const [memberPanelOpen, setMemberPanelOpen] = useState(false);
   const [dropTargetId, setDropTargetId] = useState<number | null>(null);
   const [dropTargetSidebarMemberId, setDropTargetSidebarMemberId] = useState<number | null>(null);
@@ -742,7 +603,6 @@ export default function AccountsPage() {
   async function handleSave(form: Partial<Account>) {
     if (modal && modal !== "new" && (modal as Account).id) {
       const { data } = await accountsApi.updateAccount((modal as Account).id, form);
-      setDetail((d) => (d?.id === data.id ? data : d));
       addLog({
         category: "account",
         message: `Account "${data.company_name}" updated`,
@@ -770,7 +630,6 @@ export default function AccountsPage() {
   async function handleDelete(id: number) {
     await accountsApi.deleteAccount(id);
     setModal(null);
-    setDetail(null);
     void fetchAccounts();
     notifyAccountsUpdated();
   }
@@ -799,7 +658,6 @@ export default function AccountsPage() {
       team_member_ids: [...existing, memberId],
     } as Partial<Account>);
     setAccounts((prev) => prev.map((a) => (a.id === data.id ? data : a)));
-    if (detail?.id === data.id) setDetail(data);
   }
 
   return (
@@ -1045,13 +903,6 @@ export default function AccountsPage() {
         />
       )}
 
-      {detail && !modal && (
-        <AccountDetail
-          account={detail}
-          onEdit={() => { setModal(detail); setDetail(null); }}
-          onClose={() => setDetail(null)}
-        />
-      )}
       </div> {/* end max-w-7xl */}
       </div> {/* end main content */}
     </div>

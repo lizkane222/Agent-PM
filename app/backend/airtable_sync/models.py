@@ -34,6 +34,11 @@ class AirtableMeeting(models.Model):
     expected_topics = models.TextField(blank=True, default="")
     gong_notes = models.TextField(blank=True, default="")
     gong_url = models.URLField(blank=True, default="")
+    # Zoom AI Companion recaps live alongside the Gong ones rather than replacing them:
+    # a meeting can be recorded by both, and the UI toggles between the two. Gong is
+    # preferred for display when both are present.
+    zoom_notes = models.TextField(blank=True, default="")
+    zoom_url = models.URLField(blank=True, default="")
     customer_slack = models.URLField(blank=True, default="")
     account_team_slack = models.URLField(blank=True, default="")
     last_synced = models.DateTimeField(auto_now=True)
@@ -101,6 +106,36 @@ class AirtableActionItem(models.Model):
 
     def __str__(self):
         return self.task
+
+
+class ActionItemStep(models.Model):
+    """A single checklist step on an action item.
+
+    Local-only — steps are never pushed to Airtable. Field definitions must stay in sync
+    with migration 0011_actionitemstep, which is already applied; changing them here
+    without a follow-up migration will leave `makemigrations --check` dirty.
+    """
+
+    STATUS_CHOICES = [
+        ("Open", "Open"),
+        ("Done", "Done"),
+        ("Blocked", "Blocked"),
+        ("Archived", "Archived"),
+    ]
+
+    action_item = models.ForeignKey(
+        AirtableActionItem, on_delete=models.CASCADE, related_name="steps"
+    )
+    title = models.CharField(max_length=512)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="Open")
+    order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["order", "created_at"]
+
+    def __str__(self):
+        return f"{self.title} ({self.status})"
 
 
 class ActionItemAttachment(models.Model):

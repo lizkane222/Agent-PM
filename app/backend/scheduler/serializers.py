@@ -30,11 +30,15 @@ class CalendarEventSerializer(serializers.ModelSerializer):
             "calendar_id",
             "is_synced",
             "event_category",
+            "attended",
             "agentpm_airtable_id",
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "owner", "google_event_id", "agentpm_airtable_id", "created_at", "updated_at"]
+        # `attended` is written through the dedicated `attendance` action, which is
+        # owner-scoped and free of the account-membership check that guards this
+        # serializer's normal update path.
+        read_only_fields = ["id", "owner", "google_event_id", "attended", "agentpm_airtable_id", "created_at", "updated_at"]
 
 
 class ActionItemSerializer(serializers.ModelSerializer):

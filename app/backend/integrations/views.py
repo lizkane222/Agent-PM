@@ -13,6 +13,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from core.mixins import TwilioSignatureRequiredMixin  # shared, single canonical copy
 
+from .gmail_utils import build_gmail_service, decode_body, header as gmail_header
 from .models import OAuthCredential, SyncState, WebhookLog
 from .serializers import (
     GoogleOAuthCallbackSerializer,
@@ -64,6 +65,17 @@ def _build_google_flow(scopes=None):
         scopes=scopes or GOOGLE_SCOPES,
         autogenerate_code_verifier=True,
     )
+
+
+# Google's `eventType` → our `CalendarEvent.event_category`. Google owns these
+# three types, so they are authoritative on every sync. "default" is deliberately
+# absent: it means "ordinary event", and mapping it would clobber a category the
+# user picked in-app (Task / Appointment have no Google equivalent).
+GOOGLE_EVENT_TYPE_TO_CATEGORY = {
+    "outOfOffice": "out_of_office",
+    "focusTime": "focus_time",
+    "workingLocation": "working_location",
+}
 
 
 def _sync_google_calendar(user, creds):
@@ -167,6 +179,13 @@ def _sync_google_calendar(user, creds):
                 "calendar_id": resolved_calendar_id,
                 "is_synced": True,
             }
+            # Only set event_category for the Google-owned event types. For an
+            # ordinary ("default") event, leave the column alone so a category the
+            # user set in-app survives the next sync; the model default covers creates.
+            google_category = GOOGLE_EVENT_TYPE_TO_CATEGORY.get(item.get("eventType", ""))
+            if google_category:
+                defaults["event_category"] = google_category
+
             # Only set agentpm_airtable_id when Google carries a value.
             # If it's blank, preserve whatever was stored locally (e.g. a stub
             # created when the user pasted Gong notes for this meeting).
@@ -693,27 +712,9 @@ class GmailThreadsView(APIView):
             return Response({"detail": "account_domain or account_name required."}, status=400)
 
         # ── 1. Build Gmail credentials from stored OAuth token ──────────────
-        cred = (
-            OAuthCredential.objects.filter(user=request.user, provider="gmail", is_active=True).first()
-            or OAuthCredential.objects.filter(user=request.user, provider="google", is_active=True).first()
-        )
-        if not cred:
+        gmail = build_gmail_service(request.user)
+        if gmail is None:
             return Response({"detail": "Gmail not connected. Connect Gmail from Settings."}, status=400)
-
-        from google.oauth2.credentials import Credentials
-        from googleapiclient.discovery import build as g_build
-        import base64, email as email_lib
-
-        google_creds = Credentials(
-            token=cred.access_token,
-            refresh_token=cred.refresh_token,
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=settings.GOOGLE_CLIENT_ID,
-            client_secret=settings.GOOGLE_CLIENT_SECRET,
-            scopes=cred.scopes.split(),
-        )
-
-        gmail = g_build("gmail", "v1", credentials=google_creds, cache_discovery=False)
 
         # ── 2. Build search query ─────────────────────────────────────────────
         query_parts = []
@@ -732,26 +733,9 @@ class GmailThreadsView(APIView):
         raw_threads = resp.get("threads", [])
 
         # ── 4. Fetch each thread's messages ────────────────────────────────────
-        def decode_body(part):
-            data = part.get("body", {}).get("data", "")
-            if not data:
-                for sub in part.get("parts", []):
-                    result = decode_body(sub)
-                    if result:
-                        return result
-            if data:
-                try:
-                    return base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="replace")
-                except Exception:
-                    return ""
-            return ""
-
-        def header(msg, name):
-            return next(
-                (h["value"] for h in msg.get("payload", {}).get("headers", [])
-                 if h["name"].lower() == name.lower()),
-                ""
-            )
+        # decode_body / gmail_header come from .gmail_utils — same logic, one copy,
+        # shared with the meeting-notes scanner.
+        header = gmail_header
 
         threads_data = []
         for t in raw_threads:
@@ -852,6 +836,75 @@ class GmailThreadsView(APIView):
             pass  # messages already included for chat context
 
         return Response({"threads": threads_data})
+
+
+class MeetingNotesFromEmailView(APIView):
+    """
+    Scan the caller's Gmail for Gong / Zoom recap emails and fill in any meeting that
+    is missing an AI summary for that provider.
+
+    POST /api/v1/integrations/gmail/meeting-notes/
+    Body (all optional): {
+      "days": 30,                 # lookback window, capped at 180
+      "account_name": "Acme",     # narrow to one account's meetings
+      "max_emails": 150,
+      "max_summaries": 25
+    }
+    Returns the report from `meeting_notes.sync_meeting_notes_from_email`:
+      { days, account_name, scanned_emails, scanned_meetings,
+        updated: [{meeting_id, meeting_name, date, account_name, sources, email_subjects}],
+        skipped: [{meeting_id, meeting_name, reason}],
+        errors: [...], summaries_truncated: bool, max_summaries: int }
+
+    Existing summaries are never overwritten, so this is safe to run repeatedly.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from .meeting_notes import (
+            DEFAULT_LOOKBACK_DAYS,
+            MAX_EMAILS,
+            MAX_SUMMARIES,
+            GmailNotConnected,
+            sync_meeting_notes_from_email,
+        )
+
+        def _int_param(name: str, default: int, ceiling: int) -> int:
+            raw = request.data.get(name, default)
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                # A junk value narrows to the default rather than 500ing.
+                return default
+            return max(1, min(value, ceiling))
+
+        days = _int_param("days", DEFAULT_LOOKBACK_DAYS, 180)
+        max_emails = _int_param("max_emails", MAX_EMAILS, MAX_EMAILS)
+        max_summaries = _int_param("max_summaries", MAX_SUMMARIES, MAX_SUMMARIES)
+        account_name = (request.data.get("account_name") or "").strip()
+
+        try:
+            report = sync_meeting_notes_from_email(
+                request.user,
+                days=days,
+                account_name=account_name,
+                max_emails=max_emails,
+                max_summaries=max_summaries,
+            )
+        except GmailNotConnected:
+            return Response(
+                {"detail": "Gmail not connected. Connect Gmail from Settings."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except Exception as exc:
+            logger.exception("Meeting-notes email scan failed: %s", exc)
+            return Response(
+                {"detail": "Could not read Gmail. Check the connection in Settings."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        return Response(report)
 
 
 class IntegrationStatusView(APIView):

@@ -5,6 +5,8 @@ import { useActionItemFieldOptions } from "../../hooks/useActionItemFieldOptions
 import { AccPillSelect, AccPillDate, AccPillNumber, AccPillUrl } from "../shared/PillInputs";
 import CorporateIcon from "../../assets/icons/Corporate.svg?react";
 import { ActionItemCardOccurrences } from "./ActionItemCardOccurrences";
+import StepsPanel from "../action-items/StepsPanel";
+import ArtifactPicker from "../action-items/ArtifactPicker";
 
 const PRIORITY_ACCENT: Record<string, string> = {
   Critical: "#ef4444",
@@ -43,6 +45,7 @@ export function ActionItemSidePanelContent({
   const [saved, setSaved] = useState(false);
   const [attachments, setAttachments] = useState<ActionItemAttachment[]>(item.attachments ?? []);
   const [uploadingAttachment, setUploadingAttachment] = useState(false);
+  const [attachError, setAttachError] = useState<string | null>(null);
   const attachFileRef = useRef<HTMLInputElement>(null);
   const memberNames = ["Unassigned", ...teamMembers.map((m) => m.full_name)] as string[];
 
@@ -121,11 +124,22 @@ export function ActionItemSidePanelContent({
 
   async function handleAttachFiles(files: FileList | File[]) {
     setUploadingAttachment(true);
+    setAttachError(null);
+    const failed: string[] = [];
+    let lastError: unknown = null;
     for (const f of Array.from(files)) {
       try {
         const { data } = await airtableApi.uploadAttachmentFile(item.id, f);
         setAttachments((prev) => [data, ...prev]);
-      } catch { /* skip */ }
+      } catch (err: unknown) {
+        // Never swallow this: silence here reads as "I picked a file and nothing happened".
+        failed.push(f.name);
+        lastError = err;
+      }
+    }
+    if (failed.length) {
+      const data = (lastError as { response?: { data?: { detail?: string; error?: string } } })?.response?.data;
+      setAttachError(`${data?.detail ?? data?.error ?? "Upload failed."} (${failed.join(", ")})`);
     }
     setUploadingAttachment(false);
   }
@@ -167,14 +181,27 @@ export function ActionItemSidePanelContent({
         <AccPillDate value={form.due_date} onChange={(v) => set({ due_date: v })} />
       </div>
 
-      {/* Details */}
-      <textarea
-        value={form.task_details ?? ""}
-        onChange={(e) => set({ task_details: e.target.value })}
-        rows={3}
-        placeholder="Additional context, steps, or notes…"
-        className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-[var(--twilio-navy)] placeholder:text-[var(--twilio-gray-60)] focus:bg-white focus:border-indigo-400 focus:outline-none focus:ring-1 focus:ring-indigo-100 transition-colors resize-none"
-      />
+      {/* Description. Steps live in the Checklist section below. */}
+      <div>
+        <p className="text-xs font-semibold uppercase tracking-wide text-[var(--twilio-gray-60)] mb-1.5">
+          Description
+        </p>
+        <textarea
+          value={form.task_details ?? ""}
+          onChange={(e) => set({ task_details: e.target.value })}
+          rows={3}
+          placeholder="Additional context or notes…"
+          className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-[var(--twilio-navy)] placeholder:text-[var(--twilio-gray-60)] focus:bg-white focus:border-indigo-400 focus:outline-none focus:ring-1 focus:ring-indigo-100 transition-colors resize-none"
+        />
+      </div>
+
+      {/* Checklist — its own field, directly below the description. Real Airtable items
+          only: steps key off the numeric PK, which a local-* draft lacks until promoted. */}
+      {!item.airtable_id.startsWith("local-") && (
+        <div className="pt-3 border-t border-gray-100">
+          <StepsPanel actionItemId={item.id} />
+        </div>
+      )}
 
       {/* Time tracking */}
       <div className="rounded-lg border border-gray-200 bg-gray-50 p-3 flex flex-col gap-2.5">
@@ -256,9 +283,20 @@ export function ActionItemSidePanelContent({
                 onClick={() => attachFileRef.current?.click()}
                 className="text-[11px] px-2 py-0.5 rounded border border-gray-200 text-[var(--twilio-navy)] hover:bg-gray-50 transition-colors"
               >+ File</button>
+              <ArtifactPicker
+                actionItemId={item.id}
+                accountName={item.account_name}
+                onAttached={(a) => setAttachments((prev) => [a, ...prev])}
+                onError={setAttachError}
+              />
               <input ref={attachFileRef} type="file" multiple className="hidden" onChange={(e) => e.target.files && void handleAttachFiles(e.target.files)} />
             </div>
           </div>
+          {attachError && (
+            <p role="alert" className="text-xs text-red-600 mb-2 bg-red-50 border border-red-200 rounded px-2 py-1">
+              {attachError}
+            </p>
+          )}
           {attachments.length === 0 ? (
             <p className="text-xs text-gray-400 italic">No attachments yet.</p>
           ) : (

@@ -1,10 +1,16 @@
 """API views for the agents app."""
 
-import asyncio
 import json
 import logging
+import os
+import uuid
 
+import anthropic
+from asgiref.sync import sync_to_async
+from botocore import exceptions as botocore_exceptions
+from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.core.exceptions import ImproperlyConfigured
 from django.db.models import Q, Sum
 from django.http import HttpResponse, StreamingHttpResponse
 from rest_framework import status, viewsets
@@ -24,6 +30,56 @@ from .serializers import (
 
 User = get_user_model()
 logger = logging.getLogger(__name__)
+
+# Credential problems that a user can actually resolve themselves, and which are
+# otherwise indistinguishable from a code bug in the streamed response.
+_BEDROCK_CREDENTIAL_ERRORS = (
+    botocore_exceptions.TokenRetrievalError,
+    botocore_exceptions.UnauthorizedSSOTokenError,
+    botocore_exceptions.SSOTokenLoadError,
+    botocore_exceptions.NoCredentialsError,
+    botocore_exceptions.CredentialRetrievalError,
+    botocore_exceptions.ProfileNotFound,
+)
+
+
+def classify_agent_error(exc: BaseException, ref: str) -> str:
+    """
+    Map an exception to a short, actionable message safe to show in the browser.
+
+    Deliberately coarse: no exception text is interpolated, so nothing sensitive
+    (tokens, ARNs, request bodies) can leak. `ref` correlates with the server log.
+    """
+    if isinstance(exc, _BEDROCK_CREDENTIAL_ERRORS):
+        profile = os.environ.get("AWS_PROFILE", "twilio-devex-bedrock")
+        return (
+            f"[Model credentials expired. Run `aws sso login --profile {profile}` "
+            f"and try again. (ref {ref})]"
+        )
+    if isinstance(exc, ImproperlyConfigured):
+        return f"[Agent is misconfigured — see server logs. (ref {ref})]"
+    if isinstance(exc, (anthropic.AuthenticationError, anthropic.PermissionDeniedError)):
+        return (
+            f"[Model access denied. Check the gateway key or Bedrock role "
+            f"permissions. (ref {ref})]"
+        )
+    if isinstance(exc, anthropic.NotFoundError):
+        return f"[Configured model is unavailable on this backend. (ref {ref})]"
+    if isinstance(exc, anthropic.RateLimitError):
+        return f"[Rate limited by the model endpoint. Try again shortly. (ref {ref})]"
+    if isinstance(
+        exc,
+        (
+            anthropic.APIConnectionError,
+            botocore_exceptions.EndpointConnectionError,
+            botocore_exceptions.SSLError,
+        ),
+    ):
+        return (
+            f"[Cannot reach the model endpoint. Check VPN/Zscaler connectivity. "
+            f"(ref {ref})]"
+        )
+    return f"[Unexpected agent error — check server logs. (ref {ref})]"
 
 
 class AgentSessionViewSet(viewsets.ModelViewSet):
@@ -267,62 +323,54 @@ class AgentSessionViewSet(viewsets.ModelViewSet):
             else:
                 history.append(turn)
 
-        def _generate():
-            import json as _json
+        # An *async* generator is deliberate. Handing StreamingHttpResponse a sync
+        # generator under ASGI makes Django fall back to sync_to_async(list), which
+        # buffers the entire response before sending a single byte.
+        async def _generate():
             orchestrator = AgentOrchestrator()
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            full_response_parts = []
+            full_response_parts: list[str] = []
             token_usage: dict = {"input_tokens": 0, "output_tokens": 0}
-            queue: asyncio.Queue = asyncio.Queue()
-
-            async def _run_into_queue():
-                try:
-                    async for item in orchestrator.run(user_message, history, user=request.user):
-                        await queue.put(item)
-                finally:
-                    await queue.put(None)
-
-            async def _drain():
-                task = asyncio.ensure_future(_run_into_queue())
-                while True:
-                    item = await queue.get()
-                    if item is None:
-                        break
-                    yield item
-                await task
 
             try:
-                gen = _drain()
-                while True:
-                    try:
-                        item = loop.run_until_complete(gen.__anext__())
-                        if isinstance(item, dict) and item.get("__token_usage__"):
-                            token_usage["input_tokens"] = item["input_tokens"]
-                            token_usage["output_tokens"] = item["output_tokens"]
-                            # Send a usage frame the frontend can parse.
-                            payload = _json.dumps({"input_tokens": item["input_tokens"], "output_tokens": item["output_tokens"]})
-                            yield f"\x00TOKEN_USAGE:{payload}\x00".encode()
-                        else:
-                            full_response_parts.append(item)
-                            yield item.encode()
-                    except StopAsyncIteration:
-                        break
-            except Exception:
-                import traceback
-                import sys
-                traceback.print_exc(file=sys.stderr)
-                logger.exception("Error in agent _generate() for session %s", session.pk)
-                yield b"\n[Agent error - check server logs]"
+                async for item in orchestrator.run(user_message, history, user=request.user):
+                    if isinstance(item, dict) and item.get("__token_usage__"):
+                        token_usage["input_tokens"] = item["input_tokens"]
+                        token_usage["output_tokens"] = item["output_tokens"]
+                        # Send a usage frame the frontend can parse. The framing is a
+                        # wire contract shared by several frontend call sites — extra
+                        # keys are safe, changing the delimiters is not.
+                        payload = json.dumps({
+                            "input_tokens": item["input_tokens"],
+                            "output_tokens": item["output_tokens"],
+                            "model": item.get("model", ""),
+                        })
+                        yield f"\x00TOKEN_USAGE:{payload}\x00".encode()
+                    else:
+                        full_response_parts.append(item)
+                        yield item.encode()
+            except Exception as exc:
+                ref = uuid.uuid4().hex[:8]
+                logger.exception(
+                    "Agent stream failed (session=%s ref=%s backend=%s model=%s)",
+                    session.pk, ref, settings.AGENT_BACKEND,
+                    getattr(orchestrator, "model", "?"),
+                )
+                yield f"\n{classify_agent_error(exc, ref)}".encode()
             finally:
                 full_text = "".join(full_response_parts)
                 if full_text:
-                    AgentMessage.objects.create(
-                        session=session, role="assistant", content=full_text,
-                        input_tokens=token_usage["input_tokens"],
-                        output_tokens=token_usage["output_tokens"],
-                    )
-                loop.close()
+                    # We are on the event loop now, so the ORM write must be wrapped.
+                    # Guarded because this also runs during aclose() on client disconnect.
+                    try:
+                        await sync_to_async(AgentMessage.objects.create)(
+                            session=session, role="assistant", content=full_text,
+                            input_tokens=token_usage["input_tokens"],
+                            output_tokens=token_usage["output_tokens"],
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Could not persist assistant message for session %s", session.pk
+                        )
 
         return StreamingHttpResponse(
             _generate(),

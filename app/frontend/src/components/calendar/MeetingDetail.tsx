@@ -17,12 +17,15 @@ import type {
 import { accountsApi, airtableApi, integrationsApi, salesforceApi, schedulerApi, teamApi } from "../../lib/api";
 import { getAccessToken } from "../../lib/auth";
 import { useCurrentUser } from "../../context/CurrentUserContext";
-import { useCommentContext } from "../comments/CommentContext";
+import CommentTrigger from "../comments/CommentTrigger";
+import CommentPreviewList from "../comments/CommentPreviewList";
 import InlineCommentThread from "../comments/InlineCommentThread";
 import KanbanCard from "./KanbanCard";
 import LogTimeModal from "./LogTimeModal";
 import ActivityLogSection from "../ActivityLogSection";
 import { convertActionItemToEvent, convertEventToActionItem, restoreConversion } from "../../hooks/useConvert";
+import RichTextMentionEditor, { type RichTextMentionEditorHandle } from "../shared/RichTextMentionEditor";
+import { sanitizeHtml, plainToHtml, htmlToPreviewText } from "../../lib/noteHelpers";
 
 interface Props {
   event: CalendarEvent;
@@ -191,8 +194,6 @@ function ActionItemEditModal({
   const [saving, setSaving] = useState(false);
   const [converting, setConverting] = useState(false);
   const [deleting, setDeleting] = useState(false);
-  const commentBtnRef = useRef<HTMLButtonElement>(null);
-  const { openComments } = useCommentContext();
 
   async function handleDelete() {
     if (!window.confirm("Delete this action item? This cannot be undone.")) return;
@@ -251,27 +252,26 @@ function ActionItemEditModal({
         <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
           <h2 className="text-sm font-semibold text-[var(--twilio-navy)]">Edit Action Item</h2>
           <div className="flex items-center gap-1.5">
-            {!item.airtable_id.startsWith("local-") && (
-              <button
-                ref={commentBtnRef}
-                onClick={() => {
-                  const rect = commentBtnRef.current?.getBoundingClientRect();
-                  openComments({ resourceType: "action_item", resourceId: item.id, resourceLabel: item.task ?? "", x: rect ? rect.left : 200, y: rect ? rect.bottom + 4 : 200 });
-                }}
-                className="text-gray-400 hover:text-indigo-600 transition-colors p-1 rounded"
-                title="Comments"
-              >
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-4 h-4">
-                  <path d="M14 9.5a5 5 0 0 1-5 5H3l-1.5 1.5V5a5 5 0 0 1 5-5h2.5a5 5 0 0 1 5 5v4.5z" strokeLinejoin="round"/>
-                </svg>
-              </button>
-            )}
+            <CommentTrigger
+              resourceType="action_item"
+              resourceId={item.id}
+              resourceLabel={item.task ?? ""}
+              disabled={item.airtable_id.startsWith("local-")}
+            />
             <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-lg leading-none">✕</button>
           </div>
         </div>
 
         {/* Body */}
         <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
+          {/* Existing comments, in place — the header icon opens the full thread. */}
+          <CommentPreviewList
+            resourceType="action_item"
+            resourceId={item.id}
+            resourceLabel={item.task ?? ""}
+            variant="panel"
+          />
+
           {/* Task name */}
           <div>
             <label className="text-[11px] uppercase tracking-wide text-[var(--twilio-gray-60)] font-semibold mb-1 block">Task</label>
@@ -286,12 +286,11 @@ function ActionItemEditModal({
           {/* Details */}
           <div>
             <label className="text-[11px] uppercase tracking-wide text-[var(--twilio-gray-60)] font-semibold mb-1 block">Details</label>
-            <textarea
+            <RichTextMentionEditor
               value={form.task_details}
-              onChange={(e) => setForm((f) => ({ ...f, task_details: e.target.value }))}
-              rows={3}
+              onChange={(html) => setForm((f) => ({ ...f, task_details: html }))}
               placeholder="Optional notes…"
-              className="w-full text-sm text-[var(--twilio-navy)] rounded-lg border border-gray-200 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-300 resize-none leading-relaxed"
+              minHeightClassName="min-h-[60px]"
             />
           </div>
 
@@ -1263,54 +1262,13 @@ const ADMIN_PROJECT_DESCRIPTIONS: Record<string, string> = {
   "Recruiting / Hiring": "Recruiting, prepping, conducting or submitting notes for interviews",
 };
 
-function stripMentions(text: string) {
-  return text.replace(/@\S+/g, "").replace(/\s{2,}/g, " ").trim();
+function stripMentions(html: string) {
+  return htmlToPreviewText(html).replace(/@\S+/g, "").replace(/\s{2,}/g, " ").trim();
 }
 
-// Render note text: @mentions → indigo, [text](url) → clickable link
-function renderNoteInline(text: string): React.ReactNode[] {
-  const TOKEN = /(\[([^\]]+)\]\((https?:\/\/[^)]+)\))|(@\S+)/g;
-  const parts: React.ReactNode[] = [];
-  let last = 0, match: RegExpExecArray | null;
-  while ((match = TOKEN.exec(text)) !== null) {
-    if (match.index > last) parts.push(text.slice(last, match.index));
-    if (match[1]) {
-      parts.push(<a key={match.index} href={match[3]} target="_blank" rel="noopener noreferrer" className="text-indigo-600 underline underline-offset-2 hover:opacity-75" onClick={(e) => e.stopPropagation()}>{match[2]}</a>);
-    } else {
-      parts.push(<span key={match.index} className="text-indigo-500 font-medium">{match[0]}</span>);
-    }
-    last = match.index + match[0].length;
-  }
-  if (last < text.length) parts.push(text.slice(last));
-  return parts;
-}
-
-// On paste: if text is selected and clipboard is a URL, wrap as [selection](url)
-function handleLinkPaste(
-  e: React.ClipboardEvent<HTMLTextAreaElement>,
-  value: string,
-  setValue: (v: string) => void,
-) {
-  const pasted = e.clipboardData.getData("text").trim();
-  if (!/^https?:\/\/\S+$/.test(pasted)) return;
-  const el = e.currentTarget;
-  const start = el.selectionStart ?? 0;
-  const end = el.selectionEnd ?? 0;
-  if (start === end) return;
-  e.preventDefault();
-  const selected = value.slice(start, end);
-  const replacement = `[${selected}](${pasted})`;
-  const next = value.slice(0, start) + replacement + value.slice(end);
-  setValue(next);
-  requestAnimationFrame(() => {
-    const pos = start + replacement.length;
-    el.setSelectionRange(pos, pos);
-  });
-}
-
-// Extract @mentioned names from text
-function extractMentions(text: string): string[] {
-  return (text.match(/@(\S+)/g) ?? []).map((m) => m.slice(1));
+// Extract @mentioned names from note HTML (or legacy plain text)
+function extractMentions(html: string): string[] {
+  return (htmlToPreviewText(html).match(/@(\S+)/g) ?? []).map((m) => m.slice(1));
 }
 
 // Icon components matching sidebar icons (inline SVG for size control)
@@ -1368,12 +1326,7 @@ function NoteRow({
 }) {
   const currentUser = useCurrentUser();
   const [editing, setEditing] = useState(false);
-  const [editText, setEditText] = useState(note.text);
-  const inputRef = useRef<HTMLTextAreaElement>(null);
-
-  // @mention state
-  const [mentionQuery, setMentionQuery] = useState<string | null>(null);
-  const [mentionIndex, setMentionIndex] = useState(0);
+  const [editText, setEditText] = useState(note.html);
 
   // Which tooltip is open: null | "action" | "calendar" | "reminder"
   const [openTooltip, setOpenTooltip] = useState<"action" | "calendar" | "reminder" | null>(null);
@@ -1385,7 +1338,7 @@ function NoteRow({
   const [tooltipPos, setTooltipPos] = useState<{ top: number; right: number } | null>(null);
 
   // Action Item form state
-  const mentionsInNote = extractMentions(note.text);
+  const mentionsInNote = extractMentions(note.html);
   const preselected = teamMembers.filter((m) =>
     mentionsInNote.some((name) => m.full_name.replace(/\s+/g, "").toLowerCase() === name.toLowerCase())
   );
@@ -1395,7 +1348,7 @@ function NoteRow({
   const [aiSaved, setAiSaved] = useState(false);
 
   // Calendar form state
-  const [calTitle, setCalTitle] = useState(stripMentions(note.text).slice(0, 80) || "Follow-up Meeting");
+  const [calTitle, setCalTitle] = useState(stripMentions(note.html).slice(0, 80) || "Follow-up Meeting");
   const [calStart, setCalStart] = useState("");
   const [calEnd, setCalEnd] = useState("");
   const [calSaved, setCalSaved] = useState(false);
@@ -1450,7 +1403,7 @@ function NoteRow({
       const pad = (n: number) => String(n).padStart(2, "0");
       const fmt = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
       setCalStart(fmt(tomorrow)); setCalEnd(fmt(end));
-      setCalTitle(stripMentions(note.text).slice(0, 80) || "Follow-up Meeting");
+      setCalTitle(stripMentions(note.html).slice(0, 80) || "Follow-up Meeting");
     }
     if (openTooltip === "reminder") {
       const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 1);
@@ -1460,59 +1413,11 @@ function NoteRow({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openTooltip]);
 
-  useEffect(() => {
-    if (editing && inputRef.current) {
-      const el = inputRef.current;
-      el.focus();
-      // Size to content so wrapped lines are fully visible
-      el.style.height = "auto";
-      el.style.height = `${el.scrollHeight}px`;
-    }
-  }, [editing]);
-
-  useEffect(() => {
-    if (!editing || !inputRef.current) return;
-    const el = inputRef.current;
-    el.style.height = "auto";
-    el.style.height = `${el.scrollHeight}px`;
-  }, [editing, editText]);
-
-  function handleChange(val: string) {
-    setEditText(val);
-    // Detect @mention trigger
-    const atIdx = val.lastIndexOf("@");
-    if (atIdx >= 0) {
-      const query = val.slice(atIdx + 1);
-      if (!query.includes(" ")) {
-        setMentionQuery(query.toLowerCase());
-        setMentionIndex(0);
-        return;
-      }
-    }
-    setMentionQuery(null);
-  }
-
-  const mentionMatches = mentionQuery !== null
-    ? teamMembers.filter((m) =>
-        m.full_name.toLowerCase().includes(mentionQuery) ||
-        m.email.toLowerCase().includes(mentionQuery)
-      ).slice(0, 6)
-    : [];
-
-  function acceptMention(member: TeamMember) {
-    const atIdx = editText.lastIndexOf("@");
-    const newText = editText.slice(0, atIdx) + `@${member.full_name.replace(/\s+/g, "")} `;
-    setEditText(newText);
-    setMentionQuery(null);
-    inputRef.current?.focus();
-  }
-
   function commitEdit() {
     setEditing(false);
-    setMentionQuery(null);
     const trimmed = editText.trim();
-    if (!trimmed || trimmed === note.text) return;
-    schedulerApi.updateMeetingNote(note.id, { html: trimmed, text: trimmed })
+    if (!trimmed || trimmed === note.html) return;
+    schedulerApi.updateMeetingNote(note.id, { html: trimmed, text: htmlToPreviewText(trimmed) })
       .then(({ data }) => onSave(data))
       .catch(() => {});
   }
@@ -1525,8 +1430,8 @@ function NoteRow({
     const assigneeName = primary?.full_name || currentUser?.display_name || "";
     const assigneeId = primary ? "" : currentUser?.airtable_collaborator_id || "";
     airtableApi.createActionItem({
-      task: stripMentions(note.text),
-      task_details: note.text,
+      task: stripMentions(note.html),
+      task_details: note.html,
       status: "Open",
       priority: aiPriority,
       due_date: aiDue || null,
@@ -1550,7 +1455,7 @@ function NoteRow({
     }));
     schedulerApi.createEvent({
       title: calTitle,
-      description: `From meeting note: ${note.text}`,
+      description: `From meeting note: ${note.html}`,
       start_datetime: new Date(calStart).toISOString(),
       end_datetime: new Date(calEnd).toISOString(),
       attendees,
@@ -1563,8 +1468,8 @@ function NoteRow({
     if (!remDate) return;
     const due = new Date(`${remDate}T${remTime}:00`);
     schedulerApi.createReminder({
-      title: stripMentions(note.text).slice(0, 200) || "Meeting note reminder",
-      body: note.text,
+      title: stripMentions(note.html).slice(0, 200) || "Meeting note reminder",
+      body: htmlToPreviewText(note.html),
       resource_type: "calendar_event",
       resource_id: eventId,
       resource_label: eventTitle,
@@ -1576,7 +1481,7 @@ function NoteRow({
   }
 
   function handleSendToAgent() {
-    window.dispatchEvent(new CustomEvent("chat-inject", { detail: { text: note.text } }));
+    window.dispatchEvent(new CustomEvent("chat-inject", { detail: { text: htmlToPreviewText(note.html) } }));
   }
 
   return (
@@ -1586,63 +1491,27 @@ function NoteRow({
       {/* Text or edit input — buttons float right so first line shares space, subsequent lines use full width */}
       <div className="flex-1 min-w-0 pb-0.5">
         {editing ? (
-          <div className="relative">
-            <textarea
-              ref={inputRef}
+          <div
+            onBlur={() => commitEdit()}
+            onKeyDownCapture={(e) => {
+              if (e.key === "Escape") { e.preventDefault(); setEditing(false); setEditText(note.html); }
+            }}
+          >
+            <RichTextMentionEditor
               value={editText}
-              rows={1}
-              onChange={(e) => handleChange(e.target.value)}
-              onPaste={(e) => handleLinkPaste(e, editText, setEditText)}
-              onBlur={() => { if (mentionQuery === null) commitEdit(); }}
-              onKeyDown={(e) => {
-                if (mentionQuery !== null && mentionMatches.length > 0) {
-                  if (e.key === "ArrowDown") { e.preventDefault(); setMentionIndex((i) => Math.min(i + 1, mentionMatches.length - 1)); return; }
-                  if (e.key === "ArrowUp") { e.preventDefault(); setMentionIndex((i) => Math.max(i - 1, 0)); return; }
-                  if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); acceptMention(mentionMatches[mentionIndex]); return; }
-                  if (e.key === "Escape") { setMentionQuery(null); return; }
-                }
-                if (e.key === "Enter" && e.shiftKey) { return; } // Shift+Enter → newline (default textarea behaviour)
-                if (e.key === "Enter") { e.preventDefault(); commitEdit(); }
-                if (e.key === "Escape") { setEditing(false); setEditText(note.text); setMentionQuery(null); }
-              }}
-              style={{ overflow: "hidden" }}
-              className="w-full text-sm text-[var(--twilio-navy)] bg-indigo-50 border border-indigo-200 rounded px-2 py-0.5 outline-none focus:ring-1 focus:ring-indigo-400 resize-none leading-relaxed"
+              onChange={setEditText}
+              onSubmit={() => commitEdit()}
+              placeholder="Add a note…"
+              minHeightClassName="min-h-[32px]"
+              autoFocus
             />
-            {/* @mention dropdown */}
-            {mentionQuery !== null && mentionMatches.length > 0 && (
-              <ul className="absolute left-0 top-full mt-1 z-50 bg-white border border-gray-200 rounded-lg shadow-lg w-56 py-1 text-sm">
-                {mentionMatches.map((m, i) => (
-                  <li
-                    key={m.id}
-                    className={`flex items-center gap-2 px-3 py-1.5 cursor-pointer ${i === mentionIndex ? "bg-indigo-50 text-indigo-700" : "text-[var(--twilio-navy)] hover:bg-gray-50"}`}
-                    onMouseDown={(e) => { e.preventDefault(); acceptMention(m); }}
-                  >
-                    <span className="h-5 w-5 rounded-full bg-indigo-100 flex items-center justify-center text-[10px] font-bold text-indigo-600 shrink-0">
-                      {m.full_name[0]}
-                    </span>
-                    <span className="truncate">{m.full_name}</span>
-                    {m.title && <span className="text-[11px] text-[var(--twilio-gray-60)] truncate">{m.title}</span>}
-                  </li>
-                ))}
-              </ul>
-            )}
           </div>
         ) : (
           <div
-            className="text-sm text-[var(--twilio-navy)] leading-relaxed cursor-text"
-            onClick={() => { setEditing(true); setEditText(note.text); }}
-          >
-            {note.text.split("\n").map((line, li) => {
-              const isSub = line.startsWith("- ");
-              const content = isSub ? line.slice(2) : line;
-              return (
-                <div key={li} className={isSub ? "flex items-start gap-1.5 ml-4 mt-0.5" : (li > 0 ? "mt-0.5" : "")}>
-                  {isSub && <span className="shrink-0 mt-[5px] h-1 w-1 rounded-full bg-[var(--twilio-gray-60)] opacity-60" />}
-                  <span>{renderNoteInline(content)}</span>
-                </div>
-              );
-            })}
-          </div>
+            className="text-sm text-[var(--twilio-navy)] leading-relaxed cursor-text prose prose-sm max-w-none"
+            onClick={() => { setEditing(true); setEditText(note.html); }}
+            dangerouslySetInnerHTML={{ __html: sanitizeHtml(plainToHtml(note.html)) }}
+          />
         )}
         {/* Hover action icons — CSS float so text wraps naturally beneath them */}
         {!editing && (
@@ -1699,7 +1568,7 @@ function NoteRow({
           {openTooltip === "action" && tooltipPos && createPortal(
             <div ref={tooltipPanelRef} className="fixed z-[9999] w-72 bg-white border border-gray-200 rounded-xl shadow-lg p-3 space-y-2.5" style={{ top: tooltipPos.top, right: tooltipPos.right }}>
               <p className="text-[11px] font-semibold uppercase tracking-wide text-[var(--twilio-gray-60)]">Create Action Item</p>
-              <div className="text-xs text-[var(--twilio-gray-80)] bg-gray-50 rounded-lg px-2 py-1.5 line-clamp-2">{stripMentions(note.text)}</div>
+              <div className="text-xs text-[var(--twilio-gray-80)] bg-gray-50 rounded-lg px-2 py-1.5 line-clamp-2">{stripMentions(note.html)}</div>
 
               {/* Assignees multi-select */}
               <div>
@@ -1809,7 +1678,7 @@ function NoteRow({
           {openTooltip === "reminder" && tooltipPos && createPortal(
             <div ref={tooltipPanelRef} className="fixed z-[9999] w-64 bg-white border border-gray-200 rounded-xl shadow-lg p-3 space-y-2.5" style={{ top: tooltipPos.top, right: tooltipPos.right }}>
               <p className="text-[11px] font-semibold uppercase tracking-wide text-[var(--twilio-gray-60)]">Set Reminder</p>
-              <div className="text-xs text-[var(--twilio-gray-80)] bg-gray-50 rounded-lg px-2 py-1.5 line-clamp-2">{stripMentions(note.text)}</div>
+              <div className="text-xs text-[var(--twilio-gray-80)] bg-gray-50 rounded-lg px-2 py-1.5 line-clamp-2">{stripMentions(note.html)}</div>
 
               {/* Quick picks */}
               <div className="flex flex-wrap gap-1">
@@ -2326,52 +2195,11 @@ function MeetingNotesSection({
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState(false);
   const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
-
-  // @mention state for the new-note input
-  const [mentionQuery, setMentionQuery] = useState<string | null>(null);
-  const [mentionIndex, setMentionIndex] = useState(0);
-  const draftInputRef = useRef<HTMLTextAreaElement>(null);
+  const draftEditorRef = useRef<RichTextMentionEditorHandle>(null);
 
   useEffect(() => {
     teamApi.listMembers().then(({ data }) => setTeamMembers(data.results ?? [])).catch(() => {});
   }, []);
-
-  useEffect(() => {
-    const el = draftInputRef.current;
-    if (!el) return;
-    el.style.height = "auto";
-    el.style.height = `${el.scrollHeight}px`;
-  }, [draft]);
-
-  function handleDraftChange(val: string) {
-    setDraft(val);
-    if (saveError) setSaveError(false);
-    const atIdx = val.lastIndexOf("@");
-    if (atIdx >= 0) {
-      const query = val.slice(atIdx + 1);
-      if (!query.includes(" ")) {
-        setMentionQuery(query.toLowerCase());
-        setMentionIndex(0);
-        return;
-      }
-    }
-    setMentionQuery(null);
-  }
-
-  const mentionMatches = mentionQuery !== null
-    ? teamMembers.filter((m) =>
-        m.full_name.toLowerCase().includes(mentionQuery) ||
-        m.email.toLowerCase().includes(mentionQuery)
-      ).slice(0, 6)
-    : [];
-
-  function acceptDraftMention(member: TeamMember) {
-    const atIdx = draft.lastIndexOf("@");
-    const newText = draft.slice(0, atIdx) + `@${member.full_name.replace(/\s+/g, "")} `;
-    setDraft(newText);
-    setMentionQuery(null);
-    draftInputRef.current?.focus();
-  }
 
   async function handleAddNote() {
     const text = draft.trim();
@@ -2384,12 +2212,13 @@ function MeetingNotesSection({
       const { data } = await schedulerApi.createMeetingNote({
         event: eventId,
         html: text,
-        text,
+        text: htmlToPreviewText(text),
         position: notes.length,
       });
       locallyCreatedNoteIds.current.add(data.id);
       setNotes((prev) => prev.some((n) => n.id === data.id) ? prev : [...prev, data]);
       setDraft("");
+      draftEditorRef.current?.clear();
     } catch (err) {
       console.error("[MeetingNotes] Failed to save note:", err);
       setSaveError(true);
@@ -2412,27 +2241,16 @@ function MeetingNotesSection({
       {/* New note input */}
       <div className={`relative flex items-start gap-2 px-3 py-2 ${notes.length > 0 ? "border-b border-gray-100" : ""}`}>
         <span className="mt-[7px] h-1.5 w-1.5 rounded-full bg-gray-300 shrink-0" />
-        <textarea
-          ref={draftInputRef}
-          value={draft}
-          rows={1}
-          onChange={(e) => handleDraftChange(e.target.value)}
-          onPaste={(e) => handleLinkPaste(e, draft, setDraft)}
-          onKeyDown={(e) => {
-            if (mentionQuery !== null && mentionMatches.length > 0) {
-              if (e.key === "ArrowDown") { e.preventDefault(); setMentionIndex((i) => Math.min(i + 1, mentionMatches.length - 1)); return; }
-              if (e.key === "ArrowUp") { e.preventDefault(); setMentionIndex((i) => Math.max(i - 1, 0)); return; }
-              if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); acceptDraftMention(mentionMatches[mentionIndex]); return; }
-              if (e.key === "Escape") { setMentionQuery(null); return; }
-            }
-            if (e.key === "Enter" && e.shiftKey) { return; } // Shift+Enter → newline
-            if (e.key === "Enter") { e.preventDefault(); void handleAddNote(); }
-          }}
-          placeholder="Add a note… (Shift+Enter for new line, '- ' for sub-bullet)"
-          style={{ overflow: "hidden" }}
-          className="flex-1 text-sm text-[var(--twilio-navy)] placeholder-gray-400 bg-transparent outline-none py-0.5 resize-none leading-relaxed"
-          disabled={saving}
-        />
+        <div className="flex-1">
+          <RichTextMentionEditor
+            ref={draftEditorRef}
+            value={draft}
+            onChange={(html) => { setDraft(html); if (saveError) setSaveError(false); }}
+            onSubmit={() => void handleAddNote()}
+            placeholder="Add a note…"
+            minHeightClassName="min-h-[32px]"
+          />
+        </div>
         {draft.trim() && (
           <button
             onClick={() => void handleAddNote()}
@@ -2446,24 +2264,6 @@ function MeetingNotesSection({
           <span className="text-[10px] text-red-500 shrink-0 self-start mt-1">
             {eventId <= 0 ? "Sync event to save notes" : "Save failed — try again"}
           </span>
-        )}
-        {/* @mention dropdown for new-note input */}
-        {mentionQuery !== null && mentionMatches.length > 0 && (
-          <ul className="absolute left-6 bottom-full mb-1 z-50 bg-white border border-gray-200 rounded-lg shadow-lg w-56 py-1 text-sm">
-            {mentionMatches.map((m, i) => (
-              <li
-                key={m.id}
-                className={`flex items-center gap-2 px-3 py-1.5 cursor-pointer ${i === mentionIndex ? "bg-indigo-50 text-indigo-700" : "text-[var(--twilio-navy)] hover:bg-gray-50"}`}
-                onMouseDown={(e) => { e.preventDefault(); acceptDraftMention(m); }}
-              >
-                <span className="h-5 w-5 rounded-full bg-indigo-100 flex items-center justify-center text-[10px] font-bold text-indigo-600 shrink-0">
-                  {m.full_name[0]}
-                </span>
-                <span className="truncate">{m.full_name}</span>
-                {m.title && <span className="text-[11px] text-[var(--twilio-gray-60)] truncate">{m.title}</span>}
-              </li>
-            ))}
-          </ul>
         )}
       </div>
       {notes.length > 0 && (

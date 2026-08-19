@@ -1,6 +1,7 @@
 import { useRef, useState } from "react";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { DEFAULT_CATEGORY_COLORS } from "../../../lib/eventColors";
 import CreateEventModal from "../CreateEventModal";
 import type { NewEventDraft } from "../../../types/calendar";
 
@@ -168,7 +169,10 @@ describe("CreateEventModal", () => {
     );
     const focusBtn = screen.getByRole("button", { name: /Focus Time/ });
     fireEvent.click(focusBtn);
-    await waitFor(() => expect(focusBtn.className).toContain("bg-amber-500"));
+    // The active pill takes the user's chosen color for that type (lib/eventColors.ts),
+    // so it matches the event the calendar will draw.
+    await waitFor(() => expect(focusBtn).toHaveAttribute("data-active", "true"));
+    expect(focusBtn).toHaveAttribute("data-color", DEFAULT_CATEGORY_COLORS.focus_time);
   });
 
   it("typing a new email and pressing Enter adds it as a guest", async () => {

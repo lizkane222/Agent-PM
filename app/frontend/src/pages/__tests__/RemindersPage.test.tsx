@@ -29,6 +29,9 @@ vi.mock("../../context/NotificationDefaultsContext", () => ({
 
 vi.mock("../../components/comments/CommentContext", () => ({
   useRightClickComment: () => ({ onContextMenu: vi.fn() }),
+  // RemindersPage renders CommentTrigger / CommentPreviewList, which consume this.
+  // Same stub shape the AccountDetailPage and ActionItemsPage suites use.
+  useCommentContext: () => ({ openComments: vi.fn(), closeComments: vi.fn() }),
 }));
 
 vi.mock("../../lib/appLog", () => ({

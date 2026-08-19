@@ -89,6 +89,15 @@ class UserProfile(models.Model):
         help_text="Staff only: when disabled, restricts data visibility to personally assigned records.",
     )
 
+    # ── Calendar colors ───────────────────────────────────────────────────────
+    # Per-user calendar appearance, validated by UserProfileSerializer:
+    #   {"categories": {"<event_category>|action_item": "#RRGGBB"},
+    #    "important":  {"<event uid>": "#RRGGBB"}}
+    # "categories" is the color per event type; "important" is a per-event override
+    # set from the calendar's right-click menu. Empty dict means "use the defaults"
+    # (DEFAULT_CATEGORY_COLORS in the frontend's lib/eventColors.ts).
+    calendar_colors = models.JSONField(default=dict, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

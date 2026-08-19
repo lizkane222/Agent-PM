@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import type { AirtableActionItem, AirtableMeeting, CalendarEvent } from "../../types";
 import { useRightClickComment } from "../comments/CommentContext";
+import CommentCountBadge from "../comments/CommentCountBadge";
 
 export function fmtDuration(secs: number): string {
   if (!secs) return "—";
@@ -67,6 +68,9 @@ function MeetingTimelineBtn({
       }}
     >
       {m.name || "Meeting"}
+      {/* A badge, not a button — the chip itself is the button, and right-click on it
+          opens the thread. */}
+      <CommentCountBadge resourceType="meeting" resourceId={m.id} className="ml-1 align-middle" />
     </button>
   );
 }
@@ -105,6 +109,7 @@ function CalEventTimelineBtn({
       }}
     >
       {ev.title}
+      <CommentCountBadge resourceType="calendar_event" resourceId={ev.id} className="ml-1 align-middle" />
     </button>
   );
 }

@@ -14,13 +14,10 @@ export const SCHEDULED_REMINDERS_KEY = "scheduledReminders";
 // ── Color maps ────────────────────────────────────────────────────────────────
 export const WORK_TRACKING_COLOR = "#a78bfa";
 
-export const CATEGORY_COLORS: Partial<Record<string, string>> = {
-  task:             "#ec4899", // pink-500
-  out_of_office:   "#f43f5e", // rose-500
-  focus_time:      "#f59e0b", // amber-500
-  working_location: "#10b981", // emerald-500
-  appointment:     "#6366f1", // indigo-500
-};
+// Event-type colors moved to lib/eventColors.ts, where they are user-selectable
+// (DEFAULT_CATEGORY_COLORS + PALETTES). WORK_TRACKING_COLOR above is still the
+// action-item accent used by chips outside the calendar grid.
+
 
 export const PRIORITY_ACCENT_CAL: Record<string, string> = {
   Critical: "#ef4444",

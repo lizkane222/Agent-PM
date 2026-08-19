@@ -47,4 +47,16 @@ export interface UserProfile {
   notify_default_sms: boolean;
   push_subscription_active: boolean;
   staff_view_override: boolean;
+  calendar_colors?: CalendarColorPrefs;
+}
+
+/**
+ * Per-user calendar appearance. `categories` maps a colorable event type to a hex
+ * color; `important` maps a single event's uid to the hex color chosen via the
+ * calendar's "Mark as important!" menu. Both are sparse — anything absent falls back
+ * to DEFAULT_CATEGORY_COLORS in lib/eventColors.ts.
+ */
+export interface CalendarColorPrefs {
+  categories?: Record<string, string>;
+  important?: Record<string, string>;
 }

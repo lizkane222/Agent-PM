@@ -23,6 +23,7 @@ export const mockUserProfile: UserProfile = {
   notify_default_sms: false,
   push_subscription_active: false,
   staff_view_override: false,
+  calendar_colors: {},
 };
 
 export const mockTeamMembers: TeamMember[] = [

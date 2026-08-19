@@ -1,5 +1,6 @@
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { DEFAULT_CATEGORY_COLORS } from "../../../lib/eventColors";
 import { server } from "../../../test/msw-server";
 import { http, HttpResponse } from "msw";
 import EventDetailPanel from "../EventDetailPanel";
@@ -128,8 +129,9 @@ describe("EventDetailPanel — meeting edit mode", () => {
     render(<EventDetailPanel {...defaultProps} onSaveMeeting={vi.fn()} />);
     fireEvent.click(screen.getByRole("button", { name: "Edit meeting" }));
     fireEvent.click(screen.getByRole("button", { name: /Focus Time/ }));
-    // Focus Time button should now be active (amber background per EDIT_CATEGORY_META)
+    // Focus Time is now active, filled with the user's color for that type.
     const focusBtn = screen.getByRole("button", { name: /Focus Time/ });
-    expect(focusBtn.className).toContain("bg-amber-500");
+    expect(focusBtn).toHaveAttribute("data-active", "true");
+    expect(focusBtn).toHaveAttribute("data-color", DEFAULT_CATEGORY_COLORS.focus_time);
   });
 });

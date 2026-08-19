@@ -7,7 +7,8 @@ import imageIconUrl from "../assets/icons/Image.svg";
 import statisticsIconUrl from "../assets/icons/Statistics.svg";
 import cloudUploadIconUrl from "../assets/icons/Cloud Upload.svg";
 import { accountsApi, airtableApi, teamApi, skillsApi, schedulerApi, integrationsApi, searchApi } from "../lib/api";
-import type { GmailThread, SearchResult } from "../lib/api";
+import type { GmailThread, MeetingNotesEmailReport, MeetingNotesSource, SearchResult } from "../lib/api";
+import { MeetingSummarySourceToggle, preferredMeetingSource } from "../components/account/MeetingSummarySourceToggle";
 import type { Account, AccountArtifact, AccountNote, AccountQuickLink, ActionItemAttachment, AirtableAccount, AirtableActionItem, AirtableMeeting, Attendee, CalendarEvent, CustomerContact, CustomerContactNote, MeetingNote, Reminder, TeamMember } from "../types";
 import { ROLE_META, getTitleRole } from "../lib/titleRoles";
 import { useLogGlow } from "../hooks/useLogGlow";
@@ -15,10 +16,21 @@ import { addLog } from "../lib/appLog";
 import { useScheduledOccurrences } from "../hooks/useScheduledOccurrences";
 import { useActionItemFieldOptions } from "../hooks/useActionItemFieldOptions";
 import { useCurrentUser } from "../context/CurrentUserContext";
-import { useRightClickComment, useCommentContext } from "../components/comments/CommentContext";
+import { useRightClickComment } from "../components/comments/CommentContext";
+import CommentTrigger from "../components/comments/CommentTrigger";
+import CommentPreviewList from "../components/comments/CommentPreviewList";
+import CommentCountBadge from "../components/comments/CommentCountBadge";
+import { useCommentMenuItem } from "../components/comments/commentMenuItem";
+import { ContextMenu, FocusPinBadge, focusPinMenuItem } from "../components/action-items/ContextMenu";
+import StepsPanel from "../components/action-items/StepsPanel";
+import { ACTION_ITEMS_UPDATED_KEY } from "../lib/actionItemEvents";
+import ArtifactPicker from "../components/action-items/ArtifactPicker";
+import { useFocusPins } from "../hooks/useFocusPins";
 import InlineCommentThread from "../components/comments/InlineCommentThread";
 import ActivityLogSection from "../components/ActivityLogSection";
 import { convertActionItemToEvent, restoreConversion } from "../hooks/useConvert";
+import RichTextMentionEditor, { type RichTextMentionEditorHandle } from "../components/shared/RichTextMentionEditor";
+import { htmlToPreviewText, sanitizeHtml, plainToHtml } from "../lib/noteHelpers";
 
 // ── Edit Modal ────────────────────────────────────────────────────────────────
 
@@ -399,13 +411,14 @@ function NewActionItemCard({
 
       {/* Fields */}
       <div className="px-4 pb-3 flex-1 flex flex-col gap-2.5" style={{ borderTop: "1px solid rgba(0,0,0,0.06)" }}>
-        <textarea
-          value={form.task_details ?? ""}
-          onChange={(e) => set({ task_details: e.target.value })}
-          rows={2}
-          placeholder="Additional context, steps, or notes…"
-          className="w-full rounded-md border border-gray-200 bg-gray-50 px-2.5 py-1.5 text-xs text-[var(--twilio-navy)] placeholder:text-[var(--twilio-gray-60)] focus:bg-white focus:border-indigo-400 focus:outline-none focus:ring-1 focus:ring-indigo-100 transition-colors resize-none mt-3"
-        />
+        <div className="mt-3">
+          <RichTextMentionEditor
+            value={form.task_details ?? ""}
+            onChange={(html) => set({ task_details: html })}
+            placeholder="Additional context or notes…"
+            minHeightClassName="min-h-[48px]"
+          />
+        </div>
         <div className="flex flex-wrap gap-1.5 items-center">
           <AccPillDate value={form.due_date} onChange={(v) => set({ due_date: v })} />
           <AccPillNumber value={form.estimated_time} label="Est." onChange={(v) => set({ estimated_time: v ?? 0 })} />
@@ -491,9 +504,8 @@ function ActionItemModal({
   const [saveError, setSaveError] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<ActionItemAttachment[]>(item.attachments ?? []);
   const [uploadingAttachment, setUploadingAttachment] = useState(false);
+  const [attachError, setAttachError] = useState<string | null>(null);
   const attachFileRef = useRef<HTMLInputElement>(null);
-  const commentBtnRef = useRef<HTMLButtonElement>(null);
-  const { openComments } = useCommentContext();
   const memberNames = ["Unassigned", ...teamMembers.map((m) => m.full_name)] as string[];
 
   useEffect(() => {
@@ -546,11 +558,22 @@ function ActionItemModal({
 
   async function handleAttachFiles(files: FileList | File[]) {
     setUploadingAttachment(true);
+    setAttachError(null);
+    const failed: string[] = [];
+    let lastError: unknown = null;
     for (const f of Array.from(files)) {
       try {
         const { data } = await airtableApi.uploadAttachmentFile(item.id, f);
         setAttachments((prev) => [data, ...prev]);
-      } catch { /* skip */ }
+      } catch (err: unknown) {
+        // Never swallow this: silence here reads as "I picked a file and nothing happened".
+        failed.push(f.name);
+        lastError = err;
+      }
+    }
+    if (failed.length) {
+      const data = (lastError as { response?: { data?: { detail?: string; error?: string } } })?.response?.data;
+      setAttachError(`${data?.detail ?? data?.error ?? "Upload failed."} (${failed.join(", ")})`);
     }
     setUploadingAttachment(false);
   }
@@ -582,27 +605,28 @@ function ActionItemModal({
             style={{ overflow: "hidden", fieldSizing: "content" } as React.CSSProperties}
           />
           <div className="flex items-center gap-1.5 shrink-0">
-            {!item.airtable_id.startsWith("local-") && (
-              <button
-                ref={commentBtnRef}
-                onClick={() => {
-                  const rect = commentBtnRef.current?.getBoundingClientRect();
-                  openComments({ resourceType: "action_item", resourceId: item.id, resourceLabel: item.task ?? "", x: rect ? rect.left : 200, y: rect ? rect.bottom + 4 : 200 });
-                }}
-                className="text-gray-400 hover:text-indigo-600 transition-colors p-1 rounded"
-                title="Comments"
-              >
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-4 h-4">
-                  <path d="M14 9.5a5 5 0 0 1-5 5H3l-1.5 1.5V5a5 5 0 0 1 5-5h2.5a5 5 0 0 1 5 5v4.5z" strokeLinejoin="round"/>
-                </svg>
-              </button>
-            )}
+            <CommentTrigger
+              resourceType="action_item"
+              resourceId={item.id}
+              resourceLabel={item.task ?? ""}
+              disabled={item.airtable_id.startsWith("local-")}
+            />
             <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-xl leading-none transition-colors">×</button>
           </div>
         </div>
 
         {/* Scrollable body */}
         <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
+          {/* Existing comments, in place — the header icon opens the full thread. */}
+          {!item.airtable_id.startsWith("local-") && (
+            <CommentPreviewList
+              resourceType="action_item"
+              resourceId={item.id}
+              resourceLabel={item.task ?? ""}
+              variant="panel"
+            />
+          )}
+
           {/* Priority + Status pills */}
           <div className="flex items-center gap-2 flex-wrap">
             <AccPillSelect
@@ -622,14 +646,26 @@ function ActionItemModal({
             <AccPillDate value={form.due_date} onChange={(v) => set({ due_date: v })} />
           </div>
 
-          {/* Details */}
-          <textarea
-            value={form.task_details ?? ""}
-            onChange={(e) => set({ task_details: e.target.value })}
-            rows={3}
-            placeholder="Additional context, steps, or notes…"
-            className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-[var(--twilio-navy)] placeholder:text-[var(--twilio-gray-60)] focus:bg-white focus:border-indigo-400 focus:outline-none focus:ring-1 focus:ring-indigo-100 transition-colors resize-none"
-          />
+          {/* Description. Steps live in the Checklist section below. */}
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-wide text-[var(--twilio-gray-60)] mb-1.5">
+              Description
+            </p>
+            <RichTextMentionEditor
+              value={form.task_details ?? ""}
+              onChange={(html) => set({ task_details: html })}
+              placeholder="Additional context or notes…"
+              minHeightClassName="min-h-[64px]"
+            />
+          </div>
+
+          {/* Checklist — its own field, directly below the description. Real Airtable items
+              only: steps key off the numeric PK, which a local-* draft lacks until promoted. */}
+          {!item.airtable_id.startsWith("local-") && (
+            <div className="pt-3 border-t border-gray-100">
+              <StepsPanel actionItemId={item.id} />
+            </div>
+          )}
 
           {/* Time + Slack */}
           <div className="flex flex-wrap gap-2 items-center">
@@ -699,9 +735,20 @@ function ActionItemModal({
                     onClick={() => attachFileRef.current?.click()}
                     className="text-[11px] px-2 py-0.5 rounded border border-gray-200 text-[var(--twilio-navy)] hover:bg-gray-50 transition-colors"
                   >+ File</button>
+                  <ArtifactPicker
+                    actionItemId={item.id}
+                    accountName={item.account_name}
+                    onAttached={(a) => setAttachments((prev) => [a, ...prev])}
+                    onError={setAttachError}
+                  />
                   <input ref={attachFileRef} type="file" multiple className="hidden" onChange={(e) => e.target.files && void handleAttachFiles(e.target.files)} />
                 </div>
               </div>
+              {attachError && (
+                <p role="alert" className="text-xs text-red-600 mb-2 bg-red-50 border border-red-200 rounded px-2 py-1">
+                  {attachError}
+                </p>
+              )}
               {attachments.length === 0 ? (
                 <p className="text-xs text-gray-400 italic">No attachments yet.</p>
               ) : (
@@ -817,7 +864,14 @@ function ActionItemCard({
   onDeleted?: (id: number) => void;
 }) {
   const [modalOpen, setModalOpen] = useState(false);
+  const [ctxPos, setCtxPos] = useState<{ x: number; y: number } | null>(null);
+  const { isPinned, toggle: toggleFocusPin } = useFocusPins();
   const accent = PRIORITY_ACCENT[item.priority] ?? "#9ca3af";
+
+  // Never pin a local-* blank — promoteBlankItem discards that id for a real recXXX.
+  const canPin = !item.airtable_id.startsWith("local-");
+  const isPinnedToFocus = canPin && isPinned(item.airtable_id);
+  const commentItem = useCommentMenuItem("action_item", canPin ? item.id : null, item.task ?? "", ctxPos);
 
   return (
     <>
@@ -825,8 +879,17 @@ function ActionItemCard({
         draggable={!!onDragStart}
         onDragStart={onDragStart}
         onClick={() => setModalOpen(true)}
+        onContextMenu={(e) => {
+          // `canPin` doubles as "this row exists server-side", which is also the
+          // precondition for commenting — a local-* blank has neither menu entry.
+          if (!canPin) return;
+          e.preventDefault();
+          e.stopPropagation();
+          setCtxPos({ x: e.clientX, y: e.clientY });
+        }}
         className="rounded-lg select-none flex flex-col gap-1.5 cursor-pointer hover:shadow-md transition-shadow shrink-0"
         style={{
+          position: "relative",
           background: "#F4F4F6",
           borderLeft: `3px solid ${accent}`,
           padding: "8px 10px",
@@ -835,13 +898,14 @@ function ActionItemCard({
           height: "100%",
         }}
       >
+        {isPinnedToFocus && <FocusPinBadge />}
         <p className="text-sm font-semibold text-[var(--twilio-navy)] leading-snug truncate">
           {item.task || <span className="italic opacity-50">Untitled</span>}
         </p>
         {item.task_details && (
           <p className="text-[11px] text-[var(--twilio-navy)] opacity-60 leading-snug"
             style={{ overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>
-            {item.task_details}
+            {htmlToPreviewText(item.task_details)}
           </p>
         )}
         <div className="flex flex-wrap gap-1">
@@ -863,7 +927,23 @@ function ActionItemCard({
           )}
         </div>
         <ActionItemCardOccurrences airtableId={item.airtable_id} />
+        <CommentPreviewList
+          resourceType="action_item"
+          resourceId={canPin ? item.id : null}
+          resourceLabel={item.task ?? ""}
+        />
       </div>
+      {ctxPos && (
+        <ContextMenu
+          x={ctxPos.x}
+          y={ctxPos.y}
+          items={[
+            focusPinMenuItem(isPinnedToFocus, () => toggleFocusPin(item.airtable_id)),
+            commentItem,
+          ]}
+          onClose={() => setCtxPos(null)}
+        />
+      )}
       {modalOpen && (
         <ActionItemModal
           item={item}
@@ -1042,6 +1122,7 @@ function MeetingNotesPanel({ eventId, accountName, airtableAccountId, onCreatedA
   const [draft, setDraft] = useState("");
   const [saving, setSaving] = useState(false);
   const locallyCreatedIds = useRef<Set<number>>(new Set());
+  const draftEditorRef = useRef<RichTextMentionEditorHandle>(null);
 
   useEffect(() => {
     schedulerApi.listMeetingNotes(eventId)
@@ -1055,10 +1136,11 @@ function MeetingNotesPanel({ eventId, accountName, airtableAccountId, onCreatedA
     if (!text || saving) return;
     setSaving(true);
     try {
-      const { data } = await schedulerApi.createMeetingNote({ event: eventId, html: text, text, position: notes.length });
+      const { data } = await schedulerApi.createMeetingNote({ event: eventId, html: text, text: htmlToPreviewText(text), position: notes.length });
       locallyCreatedIds.current.add(data.id);
       setNotes((prev) => [...prev, data]);
       setDraft("");
+      draftEditorRef.current?.clear();
     } catch { /* best effort */ } finally { setSaving(false); }
   }
 
@@ -1069,7 +1151,7 @@ function MeetingNotesPanel({ eventId, accountName, airtableAccountId, onCreatedA
 
   async function saveNote(updated: MeetingNote) {
     setNotes((prev) => prev.map((n) => n.id === updated.id ? updated : n));
-    try { await schedulerApi.updateMeetingNote(updated.id, { text: updated.text, html: updated.text }); } catch { /* best effort */ }
+    try { await schedulerApi.updateMeetingNote(updated.id, { text: htmlToPreviewText(updated.html), html: updated.html }); } catch { /* best effort */ }
   }
 
   return (
@@ -1078,18 +1160,16 @@ function MeetingNotesPanel({ eventId, accountName, airtableAccountId, onCreatedA
       <div style={{ border: "1px solid rgba(0,0,0,0.08)", borderRadius: "8px", background: "#fff", overflow: "hidden" }}>
         <div style={{ display: "flex", alignItems: "flex-start", gap: "6px", padding: "6px 10px", borderBottom: notes.length > 0 ? "1px solid rgba(0,0,0,0.06)" : undefined }}>
           <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: "#d1d5db", flexShrink: 0, marginTop: "7px" }} />
-          <textarea
-            value={draft}
-            rows={draft.split("\n").length || 1}
-            onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && e.shiftKey) return;
-              if (e.key === "Enter") { e.preventDefault(); void addNote(); }
-            }}
-            placeholder="Add a note… (Shift+Enter for new line)"
-            disabled={saving}
-            style={{ flex: 1, fontSize: "0.8125rem", color: "var(--twilio-navy)", background: "transparent", border: "none", outline: "none", resize: "none", lineHeight: 1.5, padding: "1px 0" }}
-          />
+          <div style={{ flex: 1 }}>
+            <RichTextMentionEditor
+              ref={draftEditorRef}
+              value={draft}
+              onChange={setDraft}
+              onSubmit={() => void addNote()}
+              placeholder="Add a note…"
+              minHeightClassName="min-h-[28px]"
+            />
+          </div>
           {draft.trim() && (
             <button onClick={() => void addNote()} disabled={saving} style={{ fontSize: "0.6875rem", fontWeight: 600, color: "#6366f1", background: "none", border: "none", cursor: "pointer", padding: "2px 0", flexShrink: 0, marginTop: "4px" }}>
               Add
@@ -1121,7 +1201,7 @@ function AccountNoteRowSimple({
   onCreatedActionItem?: (item: AirtableActionItem) => void;
 }) {
   const [editing, setEditing] = useState(false);
-  const [text, setText] = useState(note.text);
+  const [text, setText] = useState(note.html);
   const [openAction, setOpenAction] = useState<"action" | "calendar" | "reminder" | null>(null);
   const [tooltipAnchorY, setTooltipAnchorY] = useState<number | undefined>(undefined);
   const _nlsKey = `note-actions::${note.id}`;
@@ -1146,8 +1226,8 @@ function AccountNoteRowSimple({
   function commit() {
     setEditing(false);
     const trimmed = text.trim();
-    if (!trimmed || trimmed === note.text) return;
-    onSave({ ...note, text: trimmed, html: trimmed });
+    if (!trimmed || trimmed === note.html) return;
+    onSave({ ...note, text: htmlToPreviewText(trimmed), html: trimmed });
   }
 
   return (
@@ -1155,29 +1235,28 @@ function AccountNoteRowSimple({
       <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: "var(--twilio-navy)", opacity: 0.35, flexShrink: 0, marginTop: "7px" }} />
       <div style={{ flex: 1, minWidth: 0 }}>
         {editing ? (
-          <textarea
-            autoFocus
-            value={text}
-            rows={text.split("\n").length || 1}
-            onChange={(e) => setText(e.target.value)}
-            onPaste={(e) => handleLinkPaste(e, text, setText)}
+          <div
             onBlur={commit}
-            onKeyDown={(e) => { if (e.key === "Enter" && e.shiftKey) return; if (e.key === "Enter") { e.preventDefault(); commit(); } if (e.key === "Escape") { setEditing(false); setText(note.text); } }}
-            style={{ width: "100%", fontSize: "0.8125rem", color: "var(--twilio-navy)", background: "#eef2ff", border: "1px solid #a5b4fc", borderRadius: "4px", padding: "2px 6px", outline: "none", resize: "none", lineHeight: 1.5 }}
-          />
-        ) : (
-          <div onClick={() => { setEditing(true); setText(note.text); }} style={{ fontSize: "0.8125rem", color: "var(--twilio-navy)", lineHeight: 1.5, cursor: "text" }}>
-            {note.text.split("\n").map((line, li) => {
-              const isSub = line.startsWith("- ");
-              const content = isSub ? line.slice(2) : line;
-              return (
-                <div key={li} style={isSub ? { display: "flex", alignItems: "flex-start", gap: "5px", marginLeft: "12px", marginTop: li > 0 ? "1px" : undefined } : { marginTop: li > 0 ? "1px" : undefined }}>
-                  {isSub && <span style={{ width: "4px", height: "4px", borderRadius: "50%", background: "#9ca3af", flexShrink: 0, marginTop: "7px" }} />}
-                  <span>{renderNoteInline(content)}</span>
-                </div>
-              );
-            })}
+            onKeyDownCapture={(e) => {
+              if (e.key === "Escape") { e.preventDefault(); setEditing(false); setText(note.html); }
+            }}
+          >
+            <RichTextMentionEditor
+              value={text}
+              onChange={setText}
+              onSubmit={commit}
+              placeholder="Add a note…"
+              minHeightClassName="min-h-[28px]"
+              autoFocus
+            />
           </div>
+        ) : (
+          <div
+            onClick={() => { setEditing(true); setText(note.html); }}
+            style={{ fontSize: "0.8125rem", color: "var(--twilio-navy)", lineHeight: 1.5, cursor: "text" }}
+            className="prose prose-sm max-w-none"
+            dangerouslySetInnerHTML={{ __html: sanitizeHtml(plainToHtml(note.html)) }}
+          />
         )}
       </div>
       {/* Hover actions */}
@@ -1214,7 +1293,7 @@ function AccountNoteRowSimple({
           {openAction && (
             <NoteActionTooltip
               kind={openAction}
-              noteText={note.text}
+              noteText={note.html}
               eventId={eventId}
               accountName={accountName}
               airtableAccountId={airtableAccountId}
@@ -1259,12 +1338,12 @@ function NoteActionTooltip({ kind, noteText, eventId, accountName, airtableAccou
   const [remTime, setRemTime] = useState("09:00");
   const tooltipElRef = useRef<HTMLDivElement>(null);
   const [openUpward] = useState(() => anchorY != null ? anchorY > window.innerHeight - 300 : false);
-  const [calTitle, setCalTitle] = useState(noteText.slice(0, 80));
+  const [calTitle, setCalTitle] = useState(htmlToPreviewText(noteText).slice(0, 80));
   const [calStart, setCalStart] = useState(() => { const d = new Date(); d.setDate(d.getDate() + 1); d.setHours(10,0,0,0); return d.toISOString().slice(0,16); });
   const [calEnd, setCalEnd] = useState(() => { const d = new Date(); d.setDate(d.getDate() + 1); d.setHours(11,0,0,0); return d.toISOString().slice(0,16); });
   const [done, setDone] = useState(false);
 
-  const stripped = noteText.replace(/@\S+/g, "").trim();
+  const stripped = htmlToPreviewText(noteText).replace(/@\S+/g, "").trim();
   // Use first mentioned member as assignee, fall back to current user
   const assignee = mentionedMembers?.[0];
 
@@ -1282,7 +1361,7 @@ function NoteActionTooltip({ kind, noteText, eventId, accountName, airtableAccou
       localStorage.setItem("actionItemsUpdated", String(Date.now()));
       window.dispatchEvent(new StorageEvent("storage", { key: "actionItemsUpdated", newValue: String(Date.now()) }));
     } else if (kind === "reminder") {
-      await schedulerApi.createReminder({ title: stripped.slice(0, 200) || "Note reminder", body: noteText, resource_type: "calendar_event", resource_id: eventId, due_at: new Date(`${remDate}T${remTime}:00`).toISOString(), notify_in_app: true } as Parameters<typeof schedulerApi.createReminder>[0]);
+      await schedulerApi.createReminder({ title: stripped.slice(0, 200) || "Note reminder", body: htmlToPreviewText(noteText), resource_type: "calendar_event", resource_id: eventId, due_at: new Date(`${remDate}T${remTime}:00`).toISOString(), notify_in_app: true } as Parameters<typeof schedulerApi.createReminder>[0]);
     } else {
       await schedulerApi.createEvent({ title: calTitle, description: `From meeting note: ${noteText}`, start_datetime: new Date(calStart).toISOString(), end_datetime: new Date(calEnd).toISOString() } as Parameters<typeof schedulerApi.createEvent>[0]);
     }
@@ -1374,15 +1453,37 @@ function parseBullets(text: string): GongItem[] {
     });
 }
 
-function GongSummaryPanel({ eventId, meetingId: meetingIdProp, existingNotes, accountName, airtableAccountId, onCreatedActionItem, onSaved, teamMembers = [] }: { eventId: number; meetingId?: number; existingNotes?: string; accountName?: string | null; airtableAccountId?: number | null; onCreatedActionItem?: (item: AirtableActionItem) => void; onSaved?: (updated: AirtableMeeting) => void; teamMembers?: TeamMember[] }) {
-  const [raw, setRaw] = useState(existingNotes ?? "");
-  const [items, setItems] = useState<(GongItem & { mentionedMembers?: TeamMember[] })[]>(() =>
-    existingNotes?.trim() ? parseBullets(existingNotes).map((item) => item) : []
+type NotesBySource = Record<MeetingNotesSource, string>;
+
+function GongSummaryPanel({ eventId, meetingId: meetingIdProp, existingNotes, existingZoomNotes, accountName, airtableAccountId, onCreatedActionItem, onSaved, teamMembers = [] }: { eventId: number; meetingId?: number; existingNotes?: string; existingZoomNotes?: string; accountName?: string | null; airtableAccountId?: number | null; onCreatedActionItem?: (item: AirtableActionItem) => void; onSaved?: (updated: AirtableMeeting) => void; teamMembers?: TeamMember[] }) {
+  // Both providers' summaries are held at once so switching the toggle doesn't need a
+  // round-trip; `raw` / `items` / `showPaste` are the view of whichever is active.
+  const [notesBySource, setNotesBySource] = useState<NotesBySource>(() => ({
+    gong: existingNotes ?? "",
+    zoom: existingZoomNotes ?? "",
+  }));
+  const [source, setSource] = useState<MeetingNotesSource>(() =>
+    preferredMeetingSource(existingNotes, existingZoomNotes)
   );
-  const [showPaste, setShowPaste] = useState(!existingNotes?.trim());
+  const initialText = notesBySource[source];
+  const [raw, setRaw] = useState(initialText);
+  const [items, setItems] = useState<(GongItem & { mentionedMembers?: TeamMember[] })[]>(() =>
+    initialText.trim() ? parseBullets(initialText).map((item) => item) : []
+  );
+  const [showPaste, setShowPaste] = useState(!initialText.trim());
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   // Once the backend creates a stub meeting via by-event, cache its PK for future saves
   const resolvedMeetingId = useRef<number | undefined>(meetingIdProp);
+
+  // Point raw/items/showPaste at `next`'s text. Unsaved textarea edits are dropped on
+  // switch — the same thing that already happens when the panel's meeting changes.
+  function showSource(next: MeetingNotesSource, store: NotesBySource) {
+    setSource(next);
+    const text = store[next] ?? "";
+    setRaw(text);
+    setItems(text.trim() ? parseBullets(text).map((i) => i) : []);
+    setShowPaste(!text.trim());
+  }
 
   // Re-initialize when the target meeting changes (covers same-notes-text case too)
   const prevMeetingRef = useRef<number | undefined>(meetingIdProp);
@@ -1394,15 +1495,15 @@ function GongSummaryPanel({ eventId, meetingId: meetingIdProp, existingNotes, ac
       prevMeetingRef.current = meetingIdProp;
       prevEventRef.current = eventId;
       resolvedMeetingId.current = meetingIdProp;
-      setRaw(existingNotes ?? "");
-      setItems(existingNotes?.trim() ? parseBullets(existingNotes).map((i) => i) : []);
-      setShowPaste(!existingNotes?.trim());
+      const store: NotesBySource = { gong: existingNotes ?? "", zoom: existingZoomNotes ?? "" };
+      setNotesBySource(store);
+      showSource(preferredMeetingSource(store.gong, store.zoom), store);
     }
-  }, [meetingIdProp, eventId, existingNotes]);
+  }, [meetingIdProp, eventId, existingNotes, existingZoomNotes]);
 
-  // Always fetch the latest gong_notes from the server when the panel mounts or
-  // the event/meeting changes — this ensures notes saved on the Calendar page are
-  // reflected here without a full page reload.
+  // Always fetch the latest notes from the server when the panel mounts or the
+  // event/meeting changes — this ensures notes saved on the Calendar page, or imported
+  // from a recap email by "GET Meeting Notes", are reflected here without a reload.
   useEffect(() => {
     const fetchMeeting = meetingIdProp
       ? airtableApi.getMeeting(meetingIdProp).then(({ data }) => data)
@@ -1415,10 +1516,21 @@ function GongSummaryPanel({ eventId, meetingId: meetingIdProp, existingNotes, ac
       .then((m) => {
         if (!m) return;
         resolvedMeetingId.current = m.id;
-        if (m.gong_notes && m.gong_notes !== raw) {
-          setRaw(m.gong_notes);
-          setItems(parseBullets(m.gong_notes).map((i) => i));
-          setShowPaste(false);
+        // Whitespace-only counts as empty: Airtable's richText columns report "\n"
+        // forever once written and cleared, so a truthiness test would render an empty
+        // recap as content and hide the paste box.
+        const store: NotesBySource = {
+          gong: (m.gong_notes ?? "").trim() ? m.gong_notes : "",
+          zoom: (m.zoom_notes ?? "").trim() ? m.zoom_notes : "",
+        };
+        if (!store.gong && !store.zoom) return;
+        setNotesBySource(store);
+        if (store[source] && store[source] !== raw) {
+          showSource(source, store);
+        } else if (!store[source]) {
+          // The active source came back empty but the other one has content — land on
+          // whichever the server actually filled in rather than showing a paste box.
+          showSource(preferredMeetingSource(store.gong, store.zoom), store);
         }
       })
       .catch(() => {});
@@ -1435,17 +1547,27 @@ function GongSummaryPanel({ eventId, meetingId: meetingIdProp, existingNotes, ac
     setItems(enriched);
     setShowPaste(false);
 
+    // Whichever provider the toggle is on is the one this text belongs to, so the save
+    // targets that column. The other provider's notes are untouched.
+    setNotesBySource((prev) => ({ ...prev, [source]: text }));
+
     const canSave = resolvedMeetingId.current || eventId;
     if (!canSave) return;
     setSaveState("saving");
     try {
       let savedMeeting;
       if (resolvedMeetingId.current) {
-        const { data } = await airtableApi.updateMeetingGongNotesByPk(resolvedMeetingId.current, text.trim());
+        const save = source === "zoom"
+          ? airtableApi.updateMeetingZoomNotesByPk
+          : airtableApi.updateMeetingGongNotesByPk;
+        const { data } = await save(resolvedMeetingId.current, text.trim());
         savedMeeting = data;
       } else {
         // by-event will create a stub meeting if none exists; cache its PK
-        const { data } = await airtableApi.updateMeetingGongNotes(eventId, text.trim());
+        const save = source === "zoom"
+          ? airtableApi.updateMeetingZoomNotes
+          : airtableApi.updateMeetingGongNotes;
+        const { data } = await save(eventId, text.trim());
         savedMeeting = data;
         resolvedMeetingId.current = savedMeeting.id;
       }
@@ -1499,6 +1621,12 @@ function GongSummaryPanel({ eventId, meetingId: meetingIdProp, existingNotes, ac
           {saveState === "saving" && <span style={{ fontSize: "0.6875rem", color: "#9ca3af" }}>Saving…</span>}
           {saveState === "saved" && <span style={{ fontSize: "0.6875rem", color: "#16a34a" }}>✓ Saved</span>}
           {saveState === "error" && <span style={{ fontSize: "0.6875rem", color: "#dc2626" }}>Save failed</span>}
+          <MeetingSummarySourceToggle
+            value={source}
+            onChange={(next) => showSource(next, notesBySource)}
+            hasGong={!!notesBySource.gong.trim()}
+            hasZoom={!!notesBySource.zoom.trim()}
+          />
           <button onClick={() => setShowPaste((v) => !v)} style={{ fontSize: "0.6875rem", fontWeight: 600, color: "#6366f1", background: "none", border: "none", cursor: "pointer", padding: 0 }}>
             {showPaste ? "Hide" : items.length > 0 ? "Edit paste" : "+ Paste summary"}
           </button>
@@ -1512,7 +1640,9 @@ function GongSummaryPanel({ eventId, meetingId: meetingIdProp, existingNotes, ac
             onChange={(e) => setRaw(e.target.value)}
             onPaste={handlePaste}
             rows={8}
-            placeholder="Paste your Gong notes, meeting summary, or any bulleted text here…"
+            placeholder={source === "zoom"
+              ? "Paste your Zoom AI Companion summary or any bulleted text here…"
+              : "Paste your Gong notes, meeting summary, or any bulleted text here…"}
             style={{ width: "100%", fontSize: "0.8125rem", border: "1px solid #e5e7eb", borderRadius: "7px", padding: "8px 10px", outline: "none", resize: "vertical", lineHeight: 1.5, boxSizing: "border-box", color: "var(--twilio-navy)" }}
           />
           <button onClick={() => void handleParse()} disabled={!raw.trim()} style={{ marginTop: "5px", width: "100%", padding: "5px 0", fontSize: "0.75rem", fontWeight: 700, background: "#6366f1", color: "#fff", border: "none", borderRadius: "6px", cursor: raw.trim() ? "pointer" : "not-allowed", opacity: raw.trim() ? 1 : 0.4 }}>
@@ -1656,17 +1786,15 @@ function ContactNoteRow({
       <li className={`flex items-start gap-${isXs ? "1.5" : "2"} ${isXs ? "text-[11px]" : "text-xs"}`} style={{ color: "var(--twilio-navy)" }}>
         <span className={`${isXs ? "w-1.5 h-1.5" : "w-1.5 h-1.5"} rounded-full bg-gray-300 shrink-0 mt-1.5`} />
         <div className="flex-1 flex flex-col gap-1">
-          <textarea
-            autoFocus
+          <RichTextMentionEditor
             value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); void commit(); }
+            onChange={setDraft}
+            autoFocus
+            minHeightClassName="min-h-[40px]"
+            onSubmit={() => void commit()}
+            onKeyDownCapture={(e) => {
               if (e.key === "Escape") { e.preventDefault(); setEditing(false); setDraft(note.content); }
             }}
-            rows={2}
-            className={`w-full rounded border border-gray-200 bg-white px-2 py-1 ${isXs ? "text-[11px]" : "text-xs"} focus:border-indigo-300 focus:outline-none resize-y`}
-            style={{ color: "var(--twilio-navy)" }}
           />
           <div className="flex gap-1.5">
             <button
@@ -1687,7 +1815,10 @@ function ContactNoteRow({
   return (
     <li className={`group/note flex items-start gap-${isXs ? "1.5" : "2"} ${isXs ? "text-[11px]" : "text-xs"}`} style={{ color: "var(--twilio-navy)" }}>
       <span className="w-1.5 h-1.5 rounded-full bg-gray-300 shrink-0 mt-1.5" />
-      <span className="flex-1 leading-relaxed">{note.content}</span>
+      <span
+        className="flex-1 leading-relaxed prose prose-sm max-w-none"
+        dangerouslySetInnerHTML={{ __html: sanitizeHtml(plainToHtml(note.content)) }}
+      />
       <button
         onClick={() => { setDraft(note.content); setEditing(true); }}
         title="Edit"
@@ -1736,12 +1867,15 @@ function CustomerContactModal({
     }
   }
 
+  const noteDraftEditorRef = useRef<RichTextMentionEditorHandle>(null);
+
   async function handleAddNote() {
     const content = noteDraft.trim();
     if (!content) return;
     const { data } = await accountsApi.addContactNote(contact.id, content);
     setNotes((prev) => [data, ...prev]);
     setNoteDraft("");
+    noteDraftEditorRef.current?.clear();
   }
 
   async function handleUpdateNote(noteId: number, content: string) {
@@ -1839,14 +1973,17 @@ function CustomerContactModal({
           {/* Notes */}
           <div style={{ borderTop: "1px solid rgba(0,0,0,0.07)", paddingTop: "12px" }}>
             <p className="text-xs font-semibold uppercase tracking-wide text-[var(--twilio-gray-60)] mb-2">Notes</p>
-            <div className="flex gap-2 mb-3">
-              <input
-                value={noteDraft}
-                onChange={(e) => setNoteDraft(e.target.value)}
-                onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void handleAddNote(); } }}
-                placeholder="Add a note…"
-                className="flex-1 rounded-lg border border-gray-200 bg-gray-50 px-3 py-1.5 text-xs text-[var(--twilio-navy)] placeholder:text-gray-400 focus:bg-white focus:border-indigo-300 focus:outline-none"
-              />
+            <div className="flex gap-2 mb-3 items-start">
+              <div className="flex-1">
+                <RichTextMentionEditor
+                  ref={noteDraftEditorRef}
+                  value={noteDraft}
+                  onChange={setNoteDraft}
+                  onSubmit={() => void handleAddNote()}
+                  placeholder="Add a note…"
+                  minHeightClassName="min-h-[32px]"
+                />
+              </div>
               {noteDraft.trim() && (
                 <button onClick={() => void handleAddNote()}
                   className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 transition-colors shrink-0">Add</button>
@@ -2106,6 +2243,7 @@ function ActionItemSidePanelContent({
   const [saved, setSaved] = useState(false);
   const [attachments, setAttachments] = useState<ActionItemAttachment[]>(item.attachments ?? []);
   const [uploadingAttachment, setUploadingAttachment] = useState(false);
+  const [attachError, setAttachError] = useState<string | null>(null);
   const attachFileRef = useRef<HTMLInputElement>(null);
   const memberNames = ["Unassigned", ...teamMembers.map((m) => m.full_name)] as string[];
 
@@ -2184,11 +2322,22 @@ function ActionItemSidePanelContent({
 
   async function handleAttachFiles(files: FileList | File[]) {
     setUploadingAttachment(true);
+    setAttachError(null);
+    const failed: string[] = [];
+    let lastError: unknown = null;
     for (const f of Array.from(files)) {
       try {
         const { data } = await airtableApi.uploadAttachmentFile(item.id, f);
         setAttachments((prev) => [data, ...prev]);
-      } catch { /* skip */ }
+      } catch (err: unknown) {
+        // Never swallow this: silence here reads as "I picked a file and nothing happened".
+        failed.push(f.name);
+        lastError = err;
+      }
+    }
+    if (failed.length) {
+      const data = (lastError as { response?: { data?: { detail?: string; error?: string } } })?.response?.data;
+      setAttachError(`${data?.detail ?? data?.error ?? "Upload failed."} (${failed.join(", ")})`);
     }
     setUploadingAttachment(false);
   }
@@ -2230,14 +2379,26 @@ function ActionItemSidePanelContent({
         <AccPillDate value={form.due_date} onChange={(v) => set({ due_date: v })} />
       </div>
 
-      {/* Details */}
-      <textarea
-        value={form.task_details ?? ""}
-        onChange={(e) => set({ task_details: e.target.value })}
-        rows={3}
-        placeholder="Additional context, steps, or notes…"
-        className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-[var(--twilio-navy)] placeholder:text-[var(--twilio-gray-60)] focus:bg-white focus:border-indigo-400 focus:outline-none focus:ring-1 focus:ring-indigo-100 transition-colors resize-none"
-      />
+      {/* Description. Steps live in the Checklist section below. */}
+      <div>
+        <p className="text-xs font-semibold uppercase tracking-wide text-[var(--twilio-gray-60)] mb-1.5">
+          Description
+        </p>
+        <RichTextMentionEditor
+          value={form.task_details ?? ""}
+          onChange={(html) => set({ task_details: html })}
+          placeholder="Additional context or notes…"
+          minHeightClassName="min-h-[64px]"
+        />
+      </div>
+
+      {/* Checklist — its own field, directly below the description. Real Airtable items
+          only: steps key off the numeric PK, which a local-* draft lacks until promoted. */}
+      {!item.airtable_id.startsWith("local-") && (
+        <div className="pt-3 border-t border-gray-100">
+          <StepsPanel actionItemId={item.id} />
+        </div>
+      )}
 
       {/* Time tracking */}
       <div className="rounded-lg border border-gray-200 bg-gray-50 p-3 flex flex-col gap-2.5">
@@ -2319,9 +2480,20 @@ function ActionItemSidePanelContent({
                 onClick={() => attachFileRef.current?.click()}
                 className="text-[11px] px-2 py-0.5 rounded border border-gray-200 text-[var(--twilio-navy)] hover:bg-gray-50 transition-colors"
               >+ File</button>
+              <ArtifactPicker
+                actionItemId={item.id}
+                accountName={item.account_name}
+                onAttached={(a) => setAttachments((prev) => [a, ...prev])}
+                onError={setAttachError}
+              />
               <input ref={attachFileRef} type="file" multiple className="hidden" onChange={(e) => e.target.files && void handleAttachFiles(e.target.files)} />
             </div>
           </div>
+          {attachError && (
+            <p role="alert" className="text-xs text-red-600 mb-2 bg-red-50 border border-red-200 rounded px-2 py-1">
+              {attachError}
+            </p>
+          )}
           {attachments.length === 0 ? (
             <p className="text-xs text-gray-400 italic">No attachments yet.</p>
           ) : (
@@ -2396,12 +2568,15 @@ function ContactSidePanelContent({
     }
   }
 
+  const noteDraftEditorRef = useRef<RichTextMentionEditorHandle>(null);
+
   async function handleAddNote() {
     const content = noteDraft.trim();
     if (!content) return;
     const { data } = await accountsApi.addContactNote(contact.id, content);
     setNotes((prev) => [data, ...prev]);
     setNoteDraft("");
+    noteDraftEditorRef.current?.clear();
   }
 
   async function handleUpdateNote(noteId: number, content: string) {
@@ -2488,15 +2663,17 @@ function ContactSidePanelContent({
       {/* Notes */}
       <div style={{ borderTop: "1px solid rgba(0,0,0,0.07)", paddingTop: "12px" }}>
         <p className="text-[11px] font-semibold uppercase tracking-wide mb-2" style={{ color: "var(--twilio-gray-60)" }}>Notes</p>
-        <div className="flex gap-2 mb-3">
-          <input
-            value={noteDraft}
-            onChange={(e) => setNoteDraft(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void handleAddNote(); } }}
-            placeholder="Add a note…"
-            className="flex-1 rounded-lg border border-gray-200 bg-gray-50 px-3 py-1.5 text-xs placeholder:text-gray-400 focus:bg-white focus:border-indigo-300 focus:outline-none"
-            style={{ color: "var(--twilio-navy)" }}
-          />
+        <div className="flex gap-2 mb-3 items-start">
+          <div className="flex-1">
+            <RichTextMentionEditor
+              ref={noteDraftEditorRef}
+              value={noteDraft}
+              onChange={setNoteDraft}
+              onSubmit={() => void handleAddNote()}
+              placeholder="Add a note…"
+              minHeightClassName="min-h-[32px]"
+            />
+          </div>
           {noteDraft.trim() && (
             <button onClick={() => void handleAddNote()}
               className="px-2.5 py-1.5 text-xs font-semibold rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 transition-colors shrink-0">Add</button>
@@ -2568,7 +2745,7 @@ function SidePanel({ panel, onClose, onCreatedActionItem, onMeetingUpdated, onUp
             )}
             {panel.item.gong_url && <a href={panel.item.gong_url} target="_blank" rel="noreferrer" className="underline text-xs" style={{ color: "var(--twilio-red, #e22)" }}>Gong recording ↗</a>}
             {panel.item.customer_slack && <a href={panel.item.customer_slack} target="_blank" rel="noreferrer" className="block underline text-xs" style={{ color: "var(--twilio-red, #e22)" }}>Customer Slack ↗</a>}
-            <GongSummaryPanel eventId={0} meetingId={panel.item.id} existingNotes={panel.item.gong_notes} accountName={panel.item.account_name} airtableAccountId={airtableAccountId} onCreatedActionItem={onCreatedActionItem} onSaved={onMeetingUpdated} teamMembers={teamMembers} />
+            <GongSummaryPanel eventId={0} meetingId={panel.item.id} existingNotes={panel.item.gong_notes} existingZoomNotes={panel.item.zoom_notes} accountName={panel.item.account_name} airtableAccountId={airtableAccountId} onCreatedActionItem={onCreatedActionItem} onSaved={onMeetingUpdated} teamMembers={teamMembers} />
           </>
         )}
         {panel.kind === "member" && (
@@ -2690,7 +2867,7 @@ function SidePanel({ panel, onClose, onCreatedActionItem, onMeetingUpdated, onUp
               {/* Meeting notes — synced with Calendar page */}
               <div style={{ borderTop: "1px solid rgba(0,0,0,0.06)", paddingTop: "10px", marginTop: "4px" }}>
                 <MeetingNotesPanel eventId={ev.id} accountName={ev.account_name} airtableAccountId={airtableAccountId} onCreatedActionItem={onCreatedActionItem} />
-                <GongSummaryPanel eventId={ev.id} meetingId={panel.kind === "calendar" ? panel.linkedMeeting?.id : undefined} existingNotes={panel.kind === "calendar" ? panel.linkedMeeting?.gong_notes : undefined} accountName={ev.account_name} airtableAccountId={airtableAccountId} onCreatedActionItem={onCreatedActionItem} onSaved={onMeetingUpdated} teamMembers={teamMembers} />
+                <GongSummaryPanel eventId={ev.id} meetingId={panel.kind === "calendar" ? panel.linkedMeeting?.id : undefined} existingNotes={panel.kind === "calendar" ? panel.linkedMeeting?.gong_notes : undefined} existingZoomNotes={panel.kind === "calendar" ? panel.linkedMeeting?.zoom_notes : undefined} accountName={ev.account_name} airtableAccountId={airtableAccountId} onCreatedActionItem={onCreatedActionItem} onSaved={onMeetingUpdated} teamMembers={teamMembers} />
               </div>
             </>
           );
@@ -4382,48 +4559,6 @@ function ArtifactViewer({
 
 // ── Account Notes helpers ─────────────────────────────────────────────────────
 
-// Renders note text: @mentions → indigo, [text](url) → clickable link
-function renderNoteInline(text: string): React.ReactNode[] {
-  const TOKEN = /(\[([^\]]+)\]\((https?:\/\/[^)]+)\))|(@\S+)/g;
-  const parts: React.ReactNode[] = [];
-  let last = 0, match: RegExpExecArray | null;
-  while ((match = TOKEN.exec(text)) !== null) {
-    if (match.index > last) parts.push(text.slice(last, match.index));
-    if (match[1]) {
-      parts.push(<a key={match.index} href={match[3]} target="_blank" rel="noopener noreferrer" className="text-indigo-600 underline underline-offset-2 hover:opacity-75" onClick={(e) => e.stopPropagation()}>{match[2]}</a>);
-    } else {
-      parts.push(<span key={match.index} className="text-indigo-500 font-medium">{match[0]}</span>);
-    }
-    last = match.index + match[0].length;
-  }
-  if (last < text.length) parts.push(text.slice(last));
-  return parts;
-}
-
-// On paste: if text is selected and clipboard looks like a URL, wrap as [selection](url)
-function handleLinkPaste(
-  e: React.ClipboardEvent<HTMLInputElement | HTMLTextAreaElement>,
-  value: string,
-  setValue: (v: string) => void,
-) {
-  const pasted = e.clipboardData.getData("text").trim();
-  if (!/^https?:\/\/\S+$/.test(pasted)) return;
-  const el = e.currentTarget;
-  const start = el.selectionStart ?? 0;
-  const end = el.selectionEnd ?? 0;
-  if (start === end) return; // nothing selected — let normal paste happen
-  e.preventDefault();
-  const selected = value.slice(start, end);
-  const replacement = `[${selected}](${pasted})`;
-  const next = value.slice(0, start) + replacement + value.slice(end);
-  setValue(next);
-  // Restore cursor after the link
-  requestAnimationFrame(() => {
-    const pos = start + replacement.length;
-    el.setSelectionRange(pos, pos);
-  });
-}
-
 const EMOJI_SHORTCODES: Record<string, string> = {
   // Slack standard shortcodes
   link: "🔗", memo: "📝", pencil: "✏️", pencil2: "✏️", page_facing_up: "📄",
@@ -4453,11 +4588,11 @@ function resolveEmojiShortcodes(text: string): string {
   return text.replace(/:([a-z0-9_]+):/gi, (match, code) => EMOJI_SHORTCODES[code.toLowerCase()] ?? match);
 }
 
-function _stripMentions(text: string) {
-  return text.replace(/@\S+/g, "").replace(/\s{2,}/g, " ").trim();
+function _stripMentions(html: string) {
+  return htmlToPreviewText(html).replace(/@\S+/g, "").replace(/\s{2,}/g, " ").trim();
 }
-function _extractMentions(text: string): string[] {
-  return (text.match(/@(\S+)/g) ?? []).map((m) => m.slice(1));
+function _extractMentions(html: string): string[] {
+  return (htmlToPreviewText(html).match(/@(\S+)/g) ?? []).map((m) => m.slice(1));
 }
 function NoteIconChecklist({ className }: { className?: string }) {
   return <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" className={className}><path d="M8 5h9M8 10h9M8 15h9" strokeLinecap="round"/><path d="M3 5l1.5 1.5L7 3M3 10l1.5 1.5L7 8M3 15l1.5 1.5L7 13" strokeLinecap="round" strokeLinejoin="round"/></svg>;
@@ -4494,9 +4629,6 @@ function AccountNoteRow({
   const currentUser = useCurrentUser();
   const [editing, setEditing] = useState(false);
   const [editText, setEditText] = useState(note.content);
-  const inputRef = useRef<HTMLTextAreaElement>(null);
-  const [mentionQuery, setMentionQuery] = useState<string | null>(null);
-  const [mentionIndex, setMentionIndex] = useState(0);
   const [openTooltip, setOpenTooltip] = useState<"action" | "calendar" | "reminder" | null>(null);
   const tooltipRef = useRef<HTMLDivElement>(null);
 
@@ -4550,44 +4682,8 @@ function AccountNoteRow({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openTooltip]);
 
-  useEffect(() => {
-    if (!editing || !inputRef.current) return;
-    const el = inputRef.current;
-    el.focus();
-    el.style.height = "auto";
-    el.style.height = `${el.scrollHeight}px`;
-  }, [editing]);
-
-  useEffect(() => {
-    const el = inputRef.current;
-    if (!editing || !el) return;
-    el.style.height = "auto";
-    el.style.height = `${el.scrollHeight}px`;
-  }, [editing, editText]);
-
-  function handleChange(val: string) {
-    setEditText(val);
-    const atIdx = val.lastIndexOf("@");
-    if (atIdx >= 0) {
-      const query = val.slice(atIdx + 1);
-      if (!query.includes(" ")) { setMentionQuery(query.toLowerCase()); setMentionIndex(0); return; }
-    }
-    setMentionQuery(null);
-  }
-
-  const mentionMatches = mentionQuery !== null
-    ? teamMembers.filter((m) => m.full_name.toLowerCase().includes(mentionQuery) || m.email.toLowerCase().includes(mentionQuery)).slice(0, 6)
-    : [];
-
-  function acceptMention(member: TeamMember) {
-    const atIdx = editText.lastIndexOf("@");
-    setEditText(editText.slice(0, atIdx) + `@${member.full_name.replace(/\s+/g, "")} `);
-    setMentionQuery(null);
-    inputRef.current?.focus();
-  }
-
   function commitEdit() {
-    setEditing(false); setMentionQuery(null);
+    setEditing(false);
     const trimmed = editText.trim();
     if (!trimmed || trimmed === note.content) return;
     accountsApi.updateNote(note.id, trimmed).then(({ data }) => onSave(data)).catch(() => {});
@@ -4637,7 +4733,7 @@ function AccountNoteRow({
     const due = new Date(`${remDate}T${remTime}:00`);
     schedulerApi.createReminder({
       title: _stripMentions(note.content).slice(0, 200) || "Account note reminder",
-      body: note.content,
+      body: htmlToPreviewText(note.content),
       resource_type: "account",
       resource_id: accountId,
       resource_label: accountName,
@@ -4661,54 +4757,27 @@ function AccountNoteRow({
       <span className="mt-[6px] h-1.5 w-1.5 rounded-full bg-[var(--twilio-navy)] shrink-0 opacity-50 cursor-grab active:cursor-grabbing" />
       <div className="flex-1 min-w-0 relative">
         {editing ? (
-          <div className="relative">
-            <textarea
-              ref={inputRef}
+          <div
+            onBlur={() => commitEdit()}
+            onKeyDownCapture={(e) => {
+              if (e.key === "Escape") { e.preventDefault(); setEditing(false); setEditText(note.content); }
+            }}
+          >
+            <RichTextMentionEditor
               value={editText}
-              rows={1}
-              onChange={(e) => handleChange(e.target.value)}
-              onPaste={(e) => handleLinkPaste(e, editText, setEditText)}
-              onBlur={() => { if (mentionQuery === null) commitEdit(); }}
-              onKeyDown={(e) => {
-                if (mentionQuery !== null && mentionMatches.length > 0) {
-                  if (e.key === "ArrowDown") { e.preventDefault(); setMentionIndex((i) => Math.min(i + 1, mentionMatches.length - 1)); return; }
-                  if (e.key === "ArrowUp") { e.preventDefault(); setMentionIndex((i) => Math.max(i - 1, 0)); return; }
-                  if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); acceptMention(mentionMatches[mentionIndex]); return; }
-                  if (e.key === "Escape") { setMentionQuery(null); return; }
-                }
-                if (e.key === "Enter" && e.shiftKey) { return; }
-                if (e.key === "Enter") { e.preventDefault(); commitEdit(); }
-                if (e.key === "Escape") { setEditing(false); setEditText(note.content); setMentionQuery(null); }
-              }}
-              style={{ overflow: "hidden" }}
-              className="w-full text-sm text-[var(--twilio-navy)] bg-indigo-50 border border-indigo-200 rounded px-2 py-0.5 outline-none focus:ring-1 focus:ring-indigo-400 resize-none leading-relaxed"
+              onChange={setEditText}
+              onSubmit={commitEdit}
+              placeholder="Add a note…"
+              minHeightClassName="min-h-[32px]"
+              autoFocus
             />
-            {mentionQuery !== null && mentionMatches.length > 0 && (
-              <ul className="absolute left-0 top-full mt-1 z-50 bg-white border border-gray-200 rounded-lg shadow-lg w-56 py-1 text-sm">
-                {mentionMatches.map((m, i) => (
-                  <li key={m.id} className={`flex items-center gap-2 px-3 py-1.5 cursor-pointer ${i === mentionIndex ? "bg-indigo-50 text-indigo-700" : "text-[var(--twilio-navy)] hover:bg-gray-50"}`}
-                    onMouseDown={(e) => { e.preventDefault(); acceptMention(m); }}>
-                    <span className="h-5 w-5 rounded-full bg-indigo-100 flex items-center justify-center text-[10px] font-bold text-indigo-600 shrink-0">{m.full_name[0]}</span>
-                    <span className="truncate">{m.full_name}</span>
-                  </li>
-                ))}
-              </ul>
-            )}
           </div>
         ) : (
-          <div className="text-sm text-[var(--twilio-navy)] leading-relaxed cursor-text"
-            onClick={() => { setEditing(true); setEditText(note.content); }}>
-            {note.content.split("\n").map((line, li) => {
-              const isSub = line.startsWith("- ");
-              const content = isSub ? line.slice(2) : line;
-              return (
-                <div key={li} style={isSub ? { display: "flex", alignItems: "flex-start", gap: "5px", marginLeft: "12px", marginTop: li > 0 ? "2px" : undefined } : { marginTop: li > 0 ? "2px" : undefined }}>
-                  {isSub && <span style={{ width: "4px", height: "4px", borderRadius: "50%", background: "#9ca3af", flexShrink: 0, marginTop: "8px" }} />}
-                  <span>{renderNoteInline(content)}</span>
-                </div>
-              );
-            })}
-          </div>
+          <div
+            className="text-sm text-[var(--twilio-navy)] leading-relaxed cursor-text prose prose-sm max-w-none"
+            onClick={() => { setEditing(true); setEditText(note.content); }}
+            dangerouslySetInnerHTML={{ __html: sanitizeHtml(plainToHtml(note.content)) }}
+          />
         )}
       </div>
 
@@ -4891,37 +4960,7 @@ function AccountMeetingNotes({
 }) {
   const [draft, setDraft] = useState("");
   const [saving, setSaving] = useState(false);
-  const [mentionQuery, setMentionQuery] = useState<string | null>(null);
-  const [mentionIndex, setMentionIndex] = useState(0);
-  const draftInputRef = useRef<HTMLTextAreaElement>(null);
-
-  useEffect(() => {
-    const el = draftInputRef.current;
-    if (!el) return;
-    el.style.height = "auto";
-    el.style.height = `${el.scrollHeight}px`;
-  }, [draft]);
-
-  function handleDraftChange(val: string) {
-    setDraft(val);
-    const atIdx = val.lastIndexOf("@");
-    if (atIdx >= 0) {
-      const query = val.slice(atIdx + 1);
-      if (!query.includes(" ")) { setMentionQuery(query.toLowerCase()); setMentionIndex(0); return; }
-    }
-    setMentionQuery(null);
-  }
-
-  const mentionMatches = mentionQuery !== null
-    ? teamMembers.filter((m) => m.full_name.toLowerCase().includes(mentionQuery) || m.email.toLowerCase().includes(mentionQuery)).slice(0, 6)
-    : [];
-
-  function acceptDraftMention(member: TeamMember) {
-    const atIdx = draft.lastIndexOf("@");
-    setDraft(draft.slice(0, atIdx) + `@${member.full_name.replace(/\s+/g, "")} `);
-    setMentionQuery(null);
-    draftInputRef.current?.focus();
-  }
+  const draftEditorRef = useRef<RichTextMentionEditorHandle>(null);
 
   async function handleAddNote() {
     const text = draft.trim();
@@ -4931,6 +4970,7 @@ function AccountMeetingNotes({
       const { data } = await accountsApi.createNote(accountId, text);
       onAdd(data);
       setDraft("");
+      draftEditorRef.current?.clear();
     } catch { /* best effort */ } finally {
       setSaving(false);
     }
@@ -4944,43 +4984,21 @@ function AccountMeetingNotes({
     <div className="rounded-xl border border-gray-200 bg-white overflow-hidden">
       <div className={`relative flex items-start gap-2 px-3 py-2 ${notes.length > 0 ? "border-b border-gray-100" : ""}`}>
         <span className="mt-[7px] h-1.5 w-1.5 rounded-full bg-gray-300 shrink-0" />
-        <textarea
-          ref={draftInputRef}
-          value={draft}
-          rows={1}
-          onChange={(e) => handleDraftChange(e.target.value)}
-          onPaste={(e) => handleLinkPaste(e, draft, setDraft)}
-          onKeyDown={(e) => {
-            if (mentionQuery !== null && mentionMatches.length > 0) {
-              if (e.key === "ArrowDown") { e.preventDefault(); setMentionIndex((i) => Math.min(i + 1, mentionMatches.length - 1)); return; }
-              if (e.key === "ArrowUp") { e.preventDefault(); setMentionIndex((i) => Math.max(i - 1, 0)); return; }
-              if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); acceptDraftMention(mentionMatches[mentionIndex]); return; }
-              if (e.key === "Escape") { setMentionQuery(null); return; }
-            }
-            if (e.key === "Enter" && e.shiftKey) { return; }
-            if (e.key === "Enter") { e.preventDefault(); void handleAddNote(); }
-          }}
-          placeholder="Add a note… (type @ to mention, Shift+Enter for new line)"
-          style={{ overflow: "hidden" }}
-          className="flex-1 text-sm text-[var(--twilio-navy)] placeholder-gray-400 bg-transparent outline-none py-0.5 resize-none leading-relaxed"
-          disabled={saving}
-        />
+        <div className="flex-1">
+          <RichTextMentionEditor
+            ref={draftEditorRef}
+            value={draft}
+            onChange={setDraft}
+            onSubmit={() => void handleAddNote()}
+            placeholder="Add a note…"
+            minHeightClassName="min-h-[32px]"
+          />
+        </div>
         {draft.trim() && (
           <button onClick={() => void handleAddNote()} disabled={saving}
             className="text-[11px] font-medium text-indigo-500 hover:text-indigo-700 shrink-0 transition-colors self-start mt-0.5">
             Add
           </button>
-        )}
-        {mentionQuery !== null && mentionMatches.length > 0 && (
-          <ul className="absolute left-6 top-full mt-1 z-50 bg-white border border-gray-200 rounded-lg shadow-lg w-56 py-1 text-sm">
-            {mentionMatches.map((m, i) => (
-              <li key={m.id} className={`flex items-center gap-2 px-3 py-1.5 cursor-pointer ${i === mentionIndex ? "bg-indigo-50 text-indigo-700" : "text-[var(--twilio-navy)] hover:bg-gray-50"}`}
-                onMouseDown={(e) => { e.preventDefault(); acceptDraftMention(m); }}>
-                <span className="h-5 w-5 rounded-full bg-indigo-100 flex items-center justify-center text-[10px] font-bold text-indigo-600 shrink-0">{m.full_name[0]}</span>
-                <span className="truncate">{m.full_name}</span>
-              </li>
-            ))}
-          </ul>
         )}
       </div>
       {notes.length > 0 && (
@@ -5246,6 +5264,15 @@ export default function AccountDetailPage() {
     | { stage: "done"; report: string; durationMs: number }
     | { stage: "error"; message: string }
   >({ stage: "idle" });
+  // "GET Meeting Notes" — scans the user's Gong/Zoom recap emails for meetings that
+  // have no AI summary yet. Scans every meeting the user can see, not just this
+  // account's, so the count in the result may exceed what this page displays.
+  const [meetingNotesState, setMeetingNotesState] = useState<
+    | { stage: "idle" }
+    | { stage: "loading" }
+    | { stage: "done"; report: MeetingNotesEmailReport }
+    | { stage: "error"; message: string }
+  >({ stage: "idle" });
   const [noteDragOverSection, setNoteDragOverSection] = useState<"actions" | "reminders" | "artifacts" | null>(null);
   const [kanbanDragOverCol, setKanbanDragOverCol] = useState<string | null>(null);
   const [kanbanMemberFilter, setKanbanMemberFilter] = useState<Set<string>>(new Set());
@@ -5298,17 +5325,26 @@ export default function AccountDetailPage() {
           })
           .catch(() => setGoalsLoaded(true));
       }
-      // Fetch Airtable data keyed by the account's airtable_id
+      // Fetch Airtable data keyed by the account's airtable_id.
+      //
+      // Not every accounts.Account is linked to an AirtableAccount. Per-user Admin
+      // accounts never are — they are private workspaces, and AirtableAccountViewSet
+      // deliberately hides the shared Airtable "ADMIN" record from the accounts list — yet
+      // their action items and meetings do live under that Airtable account. Without a
+      // name fallback the whole block was skipped and the page showed nothing at all.
       const atId = acctRes.data.airtable_id;
-      if (atId) {
+      const atName = acctRes.data.company_name;
+      if (atId || atName) {
+        const scope: Record<string, string> = atId ? { account: String(atId) } : { account_name: String(atName) };
         return Promise.all([
-          airtableApi.listActionItems({ account: String(atId) }),
-          airtableApi.listMeetings({ account: String(atId) }),
-          airtableApi.listAccounts({ airtable_id: String(atId) }),
+          airtableApi.listActionItems(scope),
+          airtableApi.listMeetings(scope),
+          // Only resolvable by airtable_id; unlinked accounts have no Airtable record to show.
+          atId ? airtableApi.listAccounts({ airtable_id: String(atId) }) : Promise.resolve(null),
         ]).then(([itemsRes, meetingsRes, atAcctRes]) => {
           setActionItems(itemsRes.data);
           setMeetings(meetingsRes.data.results);
-          setAirtableAccount(atAcctRes.data.results[0] ?? null);
+          setAirtableAccount(atAcctRes?.data.results[0] ?? null);
         });
       }
     }).catch(() => {}).finally(() => setLoading(false));
@@ -5364,15 +5400,31 @@ export default function AccountDetailPage() {
     });
   }, [account]);
 
-  // Refresh team list when a new member is added from TeamPage
+  // Refresh team list when a new member is added from TeamPage, and this account's action
+  // items whenever one changes anywhere in the app (or in another tab). Without the second
+  // branch this page only ever saw its own edits — an item created on the Action Items page
+  // or the Calendar never appeared here.
   useEffect(() => {
     function onStorage(e: StorageEvent) {
-      if (e.key !== "teamUpdated") return;
-      teamApi.listMembers().then(({ data }) => setAllMembers(data.results)).catch(() => {});
+      if (e.key === "teamUpdated") {
+        teamApi.listMembers().then(({ data }) => setAllMembers(data.results)).catch(() => {});
+        return;
+      }
+      if (e.key !== ACTION_ITEMS_UPDATED_KEY) return;
+      if (!account) return;
+      // Same account/account_name scoping as the initial fetch. noCache because the
+      // mutation may have happened in another tab, which leaves this tab's GET cache warm.
+      const scope: Record<string, string> = account.airtable_id
+        ? { account: String(account.airtable_id) }
+        : { account_name: account.company_name };
+      airtableApi
+        .listActionItems(scope, { fresh: true })
+        .then(({ data }) => setActionItems(data))
+        .catch(() => {});
     }
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
-  }, []);
+  }, [account]);
 
   async function handleDropActionOnDay(airtableId: string, dateStr: string) {
     const item = actionItems.find((i) => i.airtable_id === airtableId);
@@ -5528,6 +5580,31 @@ export default function AccountDetailPage() {
       notify_in_app: true,
     });
     setAccountReminders((prev) => [...prev, data]);
+  }
+
+  async function handleGetMeetingNotes() {
+    if (!account || meetingNotesState.stage === "loading") return;
+    setMeetingNotesState({ stage: "loading" });
+    try {
+      // No account_name — the scan covers every meeting the user can see, so recaps
+      // land on other accounts' meetings too rather than needing a visit per account.
+      const { data } = await integrationsApi.getMeetingNotesFromEmail();
+      setMeetingNotesState({ stage: "done", report: data });
+
+      // Re-read this account's meetings so any summary just imported shows up without
+      // a reload. Mirrors the initial fetch's account/account_name scoping.
+      const scope: Record<string, string> = account.airtable_id
+        ? { account: String(account.airtable_id) }
+        : { account_name: account.company_name };
+      const refreshed = await airtableApi.listMeetings(scope);
+      setMeetings(refreshed.data.results);
+    } catch (err: unknown) {
+      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+      setMeetingNotesState({
+        stage: "error",
+        message: detail ?? "Could not read Gmail. Check the connection in Settings.",
+      });
+    }
   }
 
   if (loading) return <div className="flex items-center justify-center h-full text-sm text-[var(--twilio-navy)]">Loading…</div>;
@@ -5858,7 +5935,77 @@ export default function AccountDetailPage() {
 
         {/* Combined calendar + action-item timeline */}
         <div className="rounded-lg px-5 py-4" style={{ background: "var(--surface, #fff)", border: "1px solid var(--border, rgba(0,0,0,0.08))", boxShadow: "0 1px 4px rgba(0,0,0,0.04)" }}>
-          <p className="text-xs font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide mb-3">Timeline</p>
+          <div className="flex items-center justify-between gap-2 mb-3 flex-wrap">
+            <p className="text-xs font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide">Timeline</p>
+            <button
+              onClick={() => void handleGetMeetingNotes()}
+              disabled={meetingNotesState.stage === "loading"}
+              title="Check your email for Gong or Zoom meeting summaries and attach them to meetings that don't have notes yet"
+              className="flex items-center gap-1.5 text-xs font-medium disabled:opacity-60 px-3 py-1.5 rounded-md transition-opacity hover:opacity-90"
+              style={{ background: "var(--twilio-red, #e22)", color: "#fff", border: "none" }}
+            >
+              {meetingNotesState.stage === "loading" ? (
+                <>
+                  <svg className="animate-spin w-3 h-3" viewBox="0 0 24 24" fill="none">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"/>
+                  </svg>
+                  Checking email…
+                </>
+              ) : (
+                <>
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-3 h-3">
+                    <rect x="1.5" y="3" width="13" height="10" rx="1.5"/>
+                    <path d="M1.5 4.5L8 9l6.5-4.5" strokeLinecap="round"/>
+                  </svg>
+                  GET Meeting Notes
+                </>
+              )}
+            </button>
+          </div>
+
+          {meetingNotesState.stage === "error" && (
+            <p role="alert" className="text-[11px] mb-3" style={{ color: "var(--twilio-red, #e22)" }}>
+              {meetingNotesState.message}
+            </p>
+          )}
+
+          {meetingNotesState.stage === "done" && (() => {
+            const { report } = meetingNotesState;
+            const updated = report.updated;
+            return (
+              <div
+                role="status"
+                className="mb-3 rounded-md px-3 py-2"
+                style={{ background: "rgba(99,102,241,0.06)", border: "1px solid rgba(99,102,241,0.2)" }}
+              >
+                <p className="text-[11px] font-semibold" style={{ color: "#4f46e5" }}>
+                  {updated.length === 0
+                    ? `No new meeting notes found — scanned ${report.scanned_emails} recap ${report.scanned_emails === 1 ? "email" : "emails"} against ${report.scanned_meetings} ${report.scanned_meetings === 1 ? "meeting" : "meetings"}.`
+                    : `Added notes to ${updated.length} ${updated.length === 1 ? "meeting" : "meetings"}.`}
+                </p>
+                {updated.length > 0 && (
+                  <ul className="mt-1 space-y-0.5">
+                    {updated.map((item) => (
+                      <li key={item.meeting_id} className="text-[11px] text-[var(--twilio-navy)]">
+                        {item.meeting_name || "Untitled meeting"}
+                        {item.date ? ` · ${new Date(item.date).toLocaleDateString(undefined, { month: "short", day: "numeric" })}` : ""}
+                        {" · "}
+                        <span style={{ textTransform: "capitalize" }}>{item.sources.join(" + ")}</span>
+                        {item.account_name && item.account_name !== account.company_name ? ` · ${item.account_name}` : ""}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {report.summaries_truncated && (
+                  <p className="text-[11px] mt-1" style={{ color: "var(--twilio-gray-60)" }}>
+                    Stopped at the per-run limit of {report.max_summaries}. Run it again to pick up the rest.
+                  </p>
+                )}
+              </div>
+            );
+          })()}
+
           <AccountTimeline
             meetings={meetings}
             actionItems={actionItems}
@@ -6974,6 +7121,9 @@ function MeetingTimelineBtn({
       }}
     >
       {m.name || "Meeting"}
+      {/* A badge, not a button — the chip itself is the button, and right-click on it
+          opens the thread. */}
+      <CommentCountBadge resourceType="meeting" resourceId={m.id} className="ml-1 align-middle" />
     </button>
   );
 }
@@ -7012,6 +7162,7 @@ function CalEventTimelineBtn({
       }}
     >
       {ev.title}
+      <CommentCountBadge resourceType="calendar_event" resourceId={ev.id} className="ml-1 align-middle" />
     </button>
   );
 }

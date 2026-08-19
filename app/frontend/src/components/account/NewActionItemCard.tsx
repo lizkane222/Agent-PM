@@ -119,7 +119,7 @@ export function NewActionItemCard({
           value={form.task_details ?? ""}
           onChange={(e) => set({ task_details: e.target.value })}
           rows={2}
-          placeholder="Additional context, steps, or notes…"
+          placeholder="Additional context or notes…"
           className="w-full rounded-md border border-gray-200 bg-gray-50 px-2.5 py-1.5 text-xs text-[var(--twilio-navy)] placeholder:text-[var(--twilio-gray-60)] focus:bg-white focus:border-indigo-400 focus:outline-none focus:ring-1 focus:ring-indigo-100 transition-colors resize-none mt-3"
         />
         <div className="flex flex-wrap gap-1.5 items-center">

@@ -41,7 +41,21 @@ _PRIORITY_AT_TO_SCHEDULER = {
 def _resolve_scheduler_account(air_item: AirtableActionItem):
     if not air_item.account_id:
         return None
-    from accounts.models import Account  # local import to avoid circular deps
+    # local imports to avoid circular deps
+    from accounts.models import (
+        ADMIN_ACCOUNT_NAME,
+        Account,
+        get_or_create_admin_account,
+    )
+
+    # The shared Airtable "Admin" account has no shared Django counterpart — admin
+    # accounts are per-user workspaces. Route each item to its assignee's own Admin.
+    # An unassigned Admin item carries no owner, so it gets no account at all (same
+    # rule AirtableActionItemViewSet applies when deciding Admin item visibility).
+    if (air_item.account.name or "").strip().lower() == ADMIN_ACCOUNT_NAME.lower():
+        assignee = _resolve_scheduler_user(air_item.assignee_airtable_id)
+        return get_or_create_admin_account(assignee) if assignee else None
+
     return Account.objects.filter(airtable_id=air_item.account.airtable_id).first()
 
 
@@ -173,6 +187,8 @@ def sync_meetings() -> int:
             account = AirtableAccount.objects.filter(airtable_id=account_ids[0]).first()
 
         at_gong_notes = _str(f.get("Gong Notes", ""))
+        at_zoom_notes = _str(f.get("Zoom Notes", ""))
+        at_zoom_url = _str(f.get("Zoom URL", ""))
         defaults = {
             "account": account,
             "name": _str(f.get("Name", "")),
@@ -183,10 +199,25 @@ def sync_meetings() -> int:
             "customer_slack": _str(f.get("Customer Slack", "")),
             "account_team_slack": _str(f.get("Account Team Slack", "")),
         }
-        # Only overwrite gong_notes from Airtable when Airtable actually has content —
-        # prevents a sync cycle from blanking locally-saved notes before write-through completes.
-        if at_gong_notes:
+        # Only overwrite notes from Airtable when Airtable actually has content —
+        # prevents a sync cycle from blanking locally-saved notes before write-through
+        # completes.
+        #
+        # The check is `.strip()`, not truthiness: Airtable's richText fields (which is
+        # what both Notes columns are) normalise a cleared value to "\n" rather than "",
+        # and never drop the key again once written. A bare truthiness test therefore
+        # reads an empty Airtable cell as content, overwrites the local notes with "\n",
+        # and — because "\n" is itself truthy — makes the meeting look already-summarised
+        # to the recap-email scanner, which then skips it forever.
+        if at_gong_notes.strip():
             defaults["gong_notes"] = at_gong_notes
+        # Same guard for the Zoom pair. These columns may be absent from a base that
+        # hasn't run `manage.py ensure_airtable_zoom_fields`, in which case `fields`
+        # simply omits them and the local values are preserved.
+        if at_zoom_notes.strip():
+            defaults["zoom_notes"] = at_zoom_notes
+        if at_zoom_url.strip():
+            defaults["zoom_url"] = at_zoom_url
         AirtableMeeting.objects.update_or_create(
             airtable_id=record["id"],
             defaults=defaults,

@@ -23,6 +23,7 @@ def _bedrock_client() -> anthropic.AnthropicBedrock:
     ca = os.environ.get("AWS_CA_BUNDLE")
     http_client = httpx.Client(verify=ca) if ca else httpx.Client()
     return anthropic.AnthropicBedrock(http_client=http_client)
+from django.db.models import Q
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
@@ -615,7 +616,7 @@ _PLATFORM_TOOL_CATALOG = [
     "create_action_item", "update_action_item", "delete_action_item",
     "create_calendar_event", "update_calendar_event", "delete_calendar_event",
     "get_airtable_records", "search_records", "update_meeting", "delete_meeting",
-    "update_account", "add_account_note",
+    "update_account", "add_account_note", "get_meeting_notes_from_email",
 ]
 
 
@@ -729,12 +730,23 @@ class AgentSkillViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        # Staff sees everything. Non-staff only sees skills they created.
+        # Staff sees everything. Non-staff sees skills they created, plus any skill
+        # published to the whole org (public + approved) — without that second clause
+        # a built-in capability shipped by a data migration would be invisible to
+        # everyone but staff, so nobody could pin it to a profile or role page.
         user = self.request.user
         qs = AgentSkill.objects.prefetch_related("pinned_to_users")
         if user.is_staff:
             return qs.all()
-        return qs.filter(created_by=user)
+        return qs.filter(
+            Q(created_by=user) | Q(visibility="public", status="approved")
+        ).distinct()
+
+    # Read-only-to-the-skill actions that any user who can see it may call. pin/unpin
+    # mutate only the caller's own pin state; run/retrieve don't mutate the skill at
+    # all. Everything else (update, destroy, review) stays with the creator, so a
+    # shipped capability can't be rewritten by whoever happens to use it.
+    _SHARED_ACTIONS = ("pin", "unpin", "run", "retrieve")
 
     def check_object_permissions(self, request, obj):
         super().check_object_permissions(request, obj)
@@ -742,10 +754,7 @@ class AgentSkillViewSet(viewsets.ModelViewSet):
         if user.is_staff:
             return
         if obj.created_by_id != getattr(user, "pk", None):
-            # Allow pin/unpin actions to remain callable on any visible skill,
-            # since they only mutate the caller's own pin state. Restrict all
-            # other detail actions to the creator.
-            if getattr(self, "action", None) not in ("pin", "unpin"):
+            if getattr(self, "action", None) not in self._SHARED_ACTIONS:
                 raise PermissionDenied("You do not have permission to act on this skill.")
 
     def get_serializer_context(self):

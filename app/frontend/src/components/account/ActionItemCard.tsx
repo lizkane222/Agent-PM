@@ -3,9 +3,11 @@ import type { AirtableActionItem, AirtableMeeting, TeamMember } from "../../type
 import { airtableApi } from "../../lib/api";
 import { ActionItemCardOccurrences } from "./ActionItemCardOccurrences";
 import { ActionItemModal } from "./ActionItemModal";
-import { ContextMenu, FocusPinBadge, type ContextMenuItem } from "../action-items/ContextMenu";
-import { useCommentContext } from "../comments/CommentContext";
+import { ContextMenu, FocusPinBadge, focusPinMenuItem, type ContextMenuItem } from "../action-items/ContextMenu";
+import CommentPreviewList from "../comments/CommentPreviewList";
+import { useCommentMenuItem } from "../comments/commentMenuItem";
 import { useExportTray } from "../../hooks/useExportTray";
+import { useFocusPins } from "../../hooks/useFocusPins";
 
 const PRIORITY_COLORS: Record<string, string> = {
   Critical: "bg-red-50 text-red-700",
@@ -40,7 +42,6 @@ export function ActionItemCard({
   projectName,
   onMeetingClick,
   contextMenuItems,
-  isPinnedToFocus,
 }: {
   item: AirtableActionItem;
   accountId?: number;
@@ -52,20 +53,29 @@ export function ActionItemCard({
   projectName?: string;
   onMeetingClick?: () => void;
   contextMenuItems?: ContextMenuItem[];
-  isPinnedToFocus?: boolean;
 }) {
   const [modalOpen, setModalOpen] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [dropFlash, setDropFlash] = useState(false);
   const [assignFlash, setAssignFlash] = useState(false);
   const [ctxPos, setCtxPos] = useState<{ x: number; y: number } | null>(null);
-  const { openComments } = useCommentContext();
   const { addToTray } = useExportTray();
+  const { isPinned, toggle: toggleFocusPin } = useFocusPins();
   const accent = PRIORITY_ACCENT[item.priority] ?? "#9ca3af";
+
+  // Never pin a local-* blank: promoteBlankItem discards that id for a real recXXX,
+  // which would orphan the pin permanently.
+  const canPin = !item.airtable_id.startsWith("local-");
+  const isPinnedToFocus = canPin && isPinned(item.airtable_id);
+  const commentMenuEntry = useCommentMenuItem("action_item", canPin ? item.id : null, item.task || "", ctxPos);
 
   const builtInCtxItems: ContextMenuItem[] = [
     ...(contextMenuItems?.length ? [
       ...contextMenuItems,
+      { separator: true, label: "", onClick: () => {} } as ContextMenuItem,
+    ] : []),
+    ...(canPin ? [
+      focusPinMenuItem(isPinnedToFocus, () => toggleFocusPin(item.airtable_id)),
       { separator: true, label: "", onClick: () => {} } as ContextMenuItem,
     ] : []),
     {
@@ -90,13 +100,7 @@ export function ActionItemCard({
       icon: <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5"><rect x="5" y="4" width="8" height="9" rx="1"/><path d="M9 4V2H1v9h3"/></svg>,
       onClick: () => { void navigator.clipboard.writeText(item.task || "").catch(() => {}); },
     },
-    {
-      label: "Add comment",
-      icon: <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5"><path d="M12 2H2v8h3l2 2 2-2h3V2z"/></svg>,
-      onClick: () => {
-        if (item.id && ctxPos) openComments({ resourceType: "action_item", resourceId: item.id, resourceLabel: item.task || "", x: ctxPos.x, y: ctxPos.y });
-      },
-    },
+    commentMenuEntry,
     { separator: true, label: "", onClick: () => {} },
     { label: "→ Export tray", icon: <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5"><path d="M1 9v4h12V9"/><path d="M4.5 5.5 7 3l2.5 2.5"/><path d="M7 3v7"/></svg>, onClick: () => addToTray(item) },
     ...(onDeleted ? [
@@ -219,6 +223,11 @@ export function ActionItemCard({
           </button>
         )}
         <ActionItemCardOccurrences airtableId={item.airtable_id} />
+        <CommentPreviewList
+          resourceType="action_item"
+          resourceId={canPin ? item.id : null}
+          resourceLabel={item.task || ""}
+        />
       </div>
       {modalOpen && (
         <ActionItemModal

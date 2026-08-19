@@ -2,9 +2,13 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { schedulerApi, airtableApi, accountsApi, salesforceApi } from "../../lib/api";
 import type { CalendarEvent, AirtableActionItem, SalesforceProject, LogTimeDayAssignment } from "../../types";
 import type { ScheduledItem, EventAccountLink } from "../../types/calendar";
+import { DEFAULT_CATEGORY_COLORS } from "../../lib/eventColors";
+import type { ColorableEventType } from "../../lib/eventColors";
 
 const CALENDAR_DRAG_KEY = "calendarDragActionItemId";
 const LOGGED_DATES_EVENT = "loggedDatesUpdated";
+
+
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -68,13 +72,19 @@ interface LogTimeDayColumnProps {
   loggedDays: Set<string>;
   manuallyLogged: boolean;
   onMarkManuallyLogged: (date: string) => void;
+  categoryColors: Partial<Record<ColorableEventType, string>>;
 }
 
 function LogTimeDayColumn({
   date, dayCalEvents: allDayCalEvents, dayItems: allDayItems, scheduledItems, syncedItemDurations, projects, assignments,
   timeOverrides, itemAssignments, onOverrideChange, onAddProject, onRemoveProject, onPinItem, onAssignItem, onLogDay, loggedDays,
-  manuallyLogged, onMarkManuallyLogged,
+  manuallyLogged, onMarkManuallyLogged, categoryColors,
 }: LogTimeDayColumnProps) {
+  /** The user's color for an event's type, defaulting when unset or absent. */
+  function categoryColorFor(category: string | undefined): string {
+    const type = (category || "meeting") as ColorableEventType;
+    return categoryColors[type] ?? DEFAULT_CATEGORY_COLORS[type] ?? DEFAULT_CATEGORY_COLORS.meeting;
+  }
   const [isDragOver, setIsDragOver] = useState(false);
   const [isDragOverProject, setIsDragOverProject] = useState<number | null>(null);
   const [loggingKey, setLoggingKey] = useState<string | null>(null);
@@ -222,7 +232,11 @@ function LogTimeDayColumn({
           draggable ? "cursor-grab active:cursor-grabbing" : "",
         ].join(" ")}
       >
-        <div className={["rounded-full shrink-0", compact ? "h-1.5 w-1.5" : "h-2 w-2", e.event_category === "task" ? "bg-pink-400" : e.event_category === "focus_time" ? "bg-amber-400" : e.event_category === "appointment" ? "bg-indigo-400" : e.event_category === "out_of_office" ? "bg-rose-400" : e.event_category === "working_location" ? "bg-emerald-400" : "bg-blue-400"].join(" ")} />
+        {/* Dot takes the user's chosen color for this event type */}
+        <div
+          className={["rounded-full shrink-0", compact ? "h-1.5 w-1.5" : "h-2 w-2"].join(" ")}
+          style={{ backgroundColor: categoryColorFor(e.event_category) }}
+        />
         <p className={[compact ? "text-[11px]" : "text-xs", "text-[var(--twilio-navy)] truncate flex-1", manuallyLogged ? "line-through text-gray-400" : ""].join(" ")}>{e.title}</p>
         <TimeInput valueKey={key} defaultSecs={defaultSecs} />
         <button onClick={() => setRemovedEventIds((prev) => new Set([...prev, e.id]))} className="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-red-400 text-xs leading-none shrink-0 transition-opacity ml-1" title="Remove from log">×</button>
@@ -476,6 +490,8 @@ export interface LogTimePanelProps {
   scheduledItems: ScheduledItem[];
   weekStart: string;
   onExit: () => void;
+  /** The user's chosen color per event type. Default lets this component stand alone. */
+  categoryColors?: Partial<Record<ColorableEventType, string>>;
 }
 
 export default function LogTimePanel({
@@ -486,6 +502,7 @@ export default function LogTimePanel({
   scheduledItems,
   weekStart,
   onExit,
+  categoryColors = DEFAULT_CATEGORY_COLORS,
 }: LogTimePanelProps) {
   const lsKey = (suffix: string) => `logtime::${accountName}::${suffix}`;
   function lsGet<T>(suffix: string, fallback: T): T {
@@ -918,6 +935,7 @@ export default function LogTimePanel({
             onAssignItem={handleAssignItem}
             onLogDay={handleLogDay}
             loggedDays={loggedDays}
+            categoryColors={categoryColors}
             manuallyLogged={manuallyLoggedDays.has(date)}
             onMarkManuallyLogged={(d) => setManuallyLoggedDays((prev) => {
               const next = new Set(prev);

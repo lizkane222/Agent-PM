@@ -65,6 +65,41 @@ class Account(models.Model):
         return self.company_name
 
 
+#: Reserved account name for the per-user personal workspace. Matched
+#: case-insensitively — a shared account may never use it.
+ADMIN_ACCOUNT_NAME = "Admin"
+
+
+def get_or_create_admin_account(user):
+    """Return `user`'s personal Admin account, creating it on first call.
+
+    Admin accounts are per-user workspaces (`is_admin_account=True`,
+    `admin_owner=user`) and are only ever visible to their owner. They are
+    deliberately kept out of Airtable, so `airtable_id` stays blank.
+
+    Also links the user's `TeamMember` row when one exists, so the account is
+    reachable through the standard `team_members` filter as well as via
+    `admin_owner`.
+    """
+    account, _created = Account.objects.get_or_create(
+        admin_owner=user,
+        defaults={
+            "company_name": ADMIN_ACCOUNT_NAME,
+            "is_admin_account": True,
+            "status": "active",
+            "created_by": user,
+        },
+    )
+
+    from team.models import TeamMember  # local import to avoid circular deps
+
+    member = TeamMember.objects.filter(user=user).first()
+    if member and not account.team_members.filter(pk=member.pk).exists():
+        account.team_members.add(member)
+
+    return account
+
+
 class AccountNote(models.Model):
     account = models.ForeignKey(Account, on_delete=models.CASCADE, related_name="notes")
     author = models.ForeignKey(

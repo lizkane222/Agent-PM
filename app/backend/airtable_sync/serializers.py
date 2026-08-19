@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import AirtableAccount, AirtableMeeting, AirtableActionItem, ActionItemAttachment, ActionItemDependency, CalendarEventAccountLink
+from .models import AirtableAccount, AirtableMeeting, AirtableActionItem, ActionItemAttachment, ActionItemDependency, ActionItemStep, CalendarEventAccountLink
 
 
 class AirtableAccountSerializer(serializers.ModelSerializer):
@@ -42,6 +42,15 @@ class ActionItemAttachmentSerializer(serializers.ModelSerializer):
                 return request.build_absolute_uri(obj.file.url)
             return obj.file.url
         return obj.url or None
+
+
+class ActionItemStepSerializer(serializers.ModelSerializer):
+    """A checklist step. Local-only — never written back to Airtable."""
+
+    class Meta:
+        model = ActionItemStep
+        fields = ["id", "action_item", "title", "status", "order", "created_at"]
+        read_only_fields = ["id", "created_at"]
 
 
 class WaitingOnItemSerializer(serializers.ModelSerializer):

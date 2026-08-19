@@ -1972,8 +1972,11 @@ function RolePageInner({ titleRole }: { titleRole: TitleRole }) {
       setActionItems(aiRes.data.results.filter(ai => ai.assigned_to === currentUser.id));
       setReminders(remRes.data.results);
       setComments(comRes.data.results.slice(0, 5));
-      Promise.all(accounts.map(a => accountsApi.listArtifacts(a.id).then(r => r.data).catch(() => [] as AccountArtifact[])))
-        .then(all => setArtifacts(all.flat()));
+      // One batched request rather than one per account — a user on many accounts
+      // used to fan out enough requests here to trip the backend's 200/min throttle.
+      accountsApi.listArtifactsForAccounts(accounts.map(a => a.id))
+        .then(r => setArtifacts(r.data))
+        .catch(() => setArtifacts([] as AccountArtifact[]));
     }).catch(() => {});
   }, [currentUser]);
 

@@ -225,6 +225,10 @@ export interface AirtableMeeting {
   expected_topics: string;
   gong_notes: string;
   gong_url: string;
+  // Zoom AI Companion recaps are stored alongside the Gong ones, not instead of them.
+  // Gong wins when both are present; the meeting-summary panel toggles between them.
+  zoom_notes: string;
+  zoom_url: string;
   customer_slack: string;
   account_team_slack: string;
   last_synced: string;
@@ -352,7 +356,10 @@ export interface PaginatedResponse<T> {
 // ── Comments ──────────────────────────────────────────────────────────────────
 
 // ── Comments (moved to types/comments.ts — re-exported here for backwards compat) ────
-export type { CommentResourceType, CommentReference, CommentMention, Comment } from "./comments";
+export type {
+  CommentResourceType, CommentReference, CommentMention, Comment,
+  CommentPreview, CommentSummary, CommentSummaryResponse,
+} from "./comments";
 
 // ── Feedback (moved to types/feedback.ts — re-exported here for backwards compat) ────
 export type { FeedbackStatus, FeedbackComment, FeedbackItem } from "./feedback";

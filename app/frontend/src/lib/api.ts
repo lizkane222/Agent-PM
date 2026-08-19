@@ -10,6 +10,7 @@
 
 import axios, {
   type AxiosInstance,
+  type AxiosRequestConfig,
   type AxiosResponse,
   type InternalAxiosRequestConfig,
 } from "axios";
@@ -34,6 +35,7 @@ import type {
   CommentMention,
   CommentReference,
   CommentResourceType,
+  CommentSummaryResponse,
   FeedbackItem,
   FeedbackComment as FeedbackCommentType,
   DiscoverApplet,
@@ -70,13 +72,69 @@ import {
   isTokenExpired,
   refreshAccessToken,
 } from "./auth";
+import {
+  MAX_429_RETRIES,
+  requestSemaphore,
+  retryDelayMs,
+  sleep,
+} from "./rateLimit";
+import { clearGetCache, createCachingAdapter } from "./requestCache";
+import { isActionItemMutationUrl, notifyActionItemsChanged } from "./actionItemEvents";
 
 const BASE_URL = import.meta.env["VITE_API_BASE_URL"] ?? "/api/v1";
 
 export const apiClient: AxiosInstance = axios.create({
   baseURL: BASE_URL,
   headers: { "Content-Type": "application/json" },
+  // Coalesce concurrent identical GETs and serve repeats from a short TTL cache.
+  // Applied as an adapter rather than an interceptor so it sits below the retry and
+  // auth layers and covers every existing call site. See lib/requestCache.ts.
+  adapter: createCachingAdapter(axios.getAdapter(axios.defaults.adapter)),
 });
+
+// ── Rate guard — concurrency cap + release ───────────────────────────────────
+// The backend applies a global DRF UserRateThrottle (200/min). Cap in-flight
+// requests so a fan-out queues instead of bursting past it. See lib/rateLimit.ts.
+
+/** Per-request bookkeeping added by the rate guard and the retry interceptors. */
+type GuardedRequestConfig = InternalAxiosRequestConfig & {
+  /** True while this config holds a semaphore slot. Reset on each (re)send. */
+  _slotHeld?: boolean;
+  /** Number of 429 retries already performed for this config. */
+  _429Retry?: number;
+};
+
+/**
+ * Release this request's slot, if it still holds one.
+ *
+ * Idempotent: the flag is cleared on release and set again by the acquire
+ * interceptor when a config is re-sent (by the 401-refresh or 429-retry paths),
+ * so a retried request acquires a fresh slot and never double-releases.
+ */
+function releaseSlot(config: GuardedRequestConfig | undefined): void {
+  if (config?._slotHeld) {
+    config._slotHeld = false;
+    requestSemaphore.release();
+  }
+}
+
+// Registered FIRST so it runs before the analytics, 401, and 429 handlers below.
+// Axios runs response interceptors in registration order, and the 401/429 handlers
+// re-issue the request through apiClient — which acquires a new slot. If the
+// original slot were still held, MAX_CONCURRENT_REQUESTS concurrent retries would
+// deadlock the queue permanently.
+apiClient.interceptors.response.use(
+  (response: AxiosResponse) => {
+    releaseSlot(response.config as GuardedRequestConfig);
+    return response;
+  },
+  (error: unknown) => {
+    if (axios.isAxiosError(error)) {
+      releaseSlot(error.config as GuardedRequestConfig | undefined);
+    }
+    return Promise.reject(error);
+  },
+);
 
 // ── Request interceptor — attach JWT (proactive refresh if expired) ──────────
 
@@ -95,6 +153,12 @@ apiClient.interceptors.request.use(async (config: InternalAxiosRequestConfig) =>
   if (token) {
     config.headers["Authorization"] = `Bearer ${token}`;
   }
+
+  // Take a concurrency slot last, immediately before the request goes out, so a
+  // slot is never held while waiting on the token refresh above. Safe from
+  // deadlock because refreshAccessToken() uses raw axios, not apiClient.
+  await requestSemaphore.acquire();
+  (config as GuardedRequestConfig)._slotHeld = true;
   return config;
 });
 
@@ -180,6 +244,8 @@ apiClient.interceptors.response.use(
 
       if (!getRefreshToken()) {
         clearTokens();
+        // Drop cached GETs so the next session can't read this user's data.
+        clearGetCache();
         window.location.href = "/login";
         return Promise.reject(error);
       }
@@ -202,6 +268,7 @@ apiClient.interceptors.response.use(
           .catch(() => {
             _retryQueue = [];
             clearTokens();
+            clearGetCache();
             window.location.href = "/login";
             reject(error);
           });
@@ -211,6 +278,79 @@ apiClient.interceptors.response.use(
     return Promise.reject(error);
   }
 );
+
+// ── Response interceptor — retry with backoff on 429 ─────────────────────────
+// Registered last so it runs after the 401 handler. The slot for this request was
+// already released by the guard interceptor at the top of this file, so sleeping
+// here doesn't occupy the queue; the re-sent request acquires a fresh slot.
+
+apiClient.interceptors.response.use(
+  (response: AxiosResponse) => response,
+  async (error: unknown) => {
+    if (!axios.isAxiosError(error)) return Promise.reject(error);
+    if (error.response?.status !== 429) return Promise.reject(error);
+
+    const config = error.config as GuardedRequestConfig | undefined;
+    if (!config) return Promise.reject(error);
+
+    const attempt = (config._429Retry ?? 0) + 1;
+    if (attempt > MAX_429_RETRIES) {
+      // Out of retries — reject so existing .catch() handlers still run.
+      return Promise.reject(error);
+    }
+    config._429Retry = attempt;
+
+    const retryAfter = error.response.headers?.["retry-after"] as string | undefined;
+    await sleep(retryDelayMs(attempt, retryAfter));
+    return apiClient(config);
+  }
+);
+
+// ── Action item change broadcast ─────────────────────────────────────────────
+// Every page that shows action items keeps its own copy in state and refreshes on a
+// `storage` event. Firing that from here — rather than at each mutation site — is what
+// makes "create anywhere, fresh everywhere" hold: three creation paths used to forget,
+// so an item made on Account Detail never reached the Calendar sidebar.
+apiClient.interceptors.response.use((response: AxiosResponse) => {
+  const method = (response.config?.method ?? "get").toLowerCase();
+  const url = response.config?.url ?? "";
+  if (method !== "get" && isActionItemMutationUrl(url)) notifyActionItemsChanged();
+  return response;
+});
+
+// ── Cache opt-out helper ──────────────────────────────────────────────────────
+// GETs are coalesced and briefly cached (lib/requestCache.ts). A refetch triggered by
+// an event — a setting toggled, an agent response finishing — wants the current server
+// state, so it opts out. The mount-time fetch of the same endpoint stays cacheable.
+
+function freshConfig(opts?: { fresh?: boolean }): AxiosRequestConfig {
+  return opts?.fresh ? { noCache: true } : {};
+}
+
+// ── Empty-result helpers for batch endpoints ──────────────────────────────────
+// A batch helper called with zero IDs has a knowable answer, so it resolves a
+// synthetic response instead of sending a request with an empty filter (which the
+// backend would read as "no valid IDs" and answer with an empty list anyway — this
+// just saves the round trip, and the request budget).
+
+function syntheticResponse<T>(data: T): AxiosResponse<T> {
+  return {
+    data,
+    status: 200,
+    statusText: "OK",
+    headers: {},
+    config: {} as InternalAxiosRequestConfig,
+  };
+}
+
+function emptyPage<T>(): AxiosResponse<PaginatedResponse<T>> {
+  return syntheticResponse<PaginatedResponse<T>>({
+    count: 0,
+    next: null,
+    previous: null,
+    results: [],
+  });
+}
 
 // ── Typed API helpers ─────────────────────────────────────────────────────────
 
@@ -246,8 +386,8 @@ export const agentApi = {
     }),
   listUsers: () =>
     apiClient.get<SessionParticipant[]>("/agents/users/"),
-  getTokenStats: () =>
-    apiClient.get<TokenStats>("/agents/sessions/token-stats/"),
+  getTokenStats: (opts?: { fresh?: boolean }) =>
+    apiClient.get<TokenStats>("/agents/sessions/token-stats/", freshConfig(opts)),
 };
 
 export const schedulerApi = {
@@ -258,6 +398,11 @@ export const schedulerApi = {
   updateEvent: (id: number, data: Partial<CalendarEvent>) =>
     apiClient.patch<CalendarEvent>(`/scheduler/events/${id}/`, data),
   deleteEvent: (id: number) => apiClient.delete(`/scheduler/events/${id}/`),
+  /** Record whether the owner attended. `null` clears the record.
+   *  Separate from updateEvent: `attended` is read-only on the serializer and is
+   *  written by an owner-scoped action that skips the account-membership check. */
+  setEventAttendance: (id: number, attended: boolean | null) =>
+    apiClient.patch<CalendarEvent>(`/scheduler/events/${id}/attendance/`, { attended }),
 
   listActionItems: (params?: Record<string, string>) =>
     apiClient.get<PaginatedResponse<ActionItem>>("/scheduler/action-items/", { params }),
@@ -290,6 +435,17 @@ export const schedulerApi = {
 
   listMeetingNotes: (eventId: number) =>
     apiClient.get<PaginatedResponse<MeetingNote>>("/scheduler/meeting-notes/", { params: { event: eventId, page_size: 200 } }),
+  /**
+   * Batched counterpart to listMeetingNotes — fetches notes for many events in one
+   * request. Callers group the flat result by `note.event`. Returns an empty envelope
+   * without hitting the network when there are no IDs to ask about.
+   */
+  listMeetingNotesForEvents: (eventIds: number[]) => {
+    if (eventIds.length === 0) return Promise.resolve(emptyPage<MeetingNote>());
+    return apiClient.get<PaginatedResponse<MeetingNote>>("/scheduler/meeting-notes/", {
+      params: { event: eventIds.join(","), page_size: 1000 },
+    });
+  },
   createMeetingNote: (data: { event: number; html: string; text: string; due_date?: string | null; position?: number }) =>
     apiClient.post<MeetingNote>("/scheduler/meeting-notes/", data),
   updateMeetingNote: (id: number, data: Partial<Pick<MeetingNote, "html" | "text" | "due_date" | "position">>) =>
@@ -299,7 +455,14 @@ export const schedulerApi = {
 };
 
 export const teamApi = {
-  getMyProfile: () => apiClient.get<UserProfile>("/team/profiles/me/"),
+  /**
+   * Pass `{ fresh: true }` from an event-driven refetch (e.g. after a
+   * staff_view_override toggle) so it bypasses the short GET cache in
+   * lib/requestCache.ts. Plain mount fetches should stay cacheable — three shell
+   * components request this endpoint and StrictMode doubles each one.
+   */
+  getMyProfile: (opts?: { fresh?: boolean }) =>
+    apiClient.get<UserProfile>("/team/profiles/me/", freshConfig(opts)),
   updateMyProfile: (data: Partial<UserProfile>) =>
     apiClient.patch<UserProfile>("/team/profiles/me/", data),
   savePushSubscription: (subscription: PushSubscriptionJSON) =>
@@ -334,8 +497,8 @@ export const discoverApi = {
 };
 
 export const accountsApi = {
-  listAccounts: (params?: Record<string, string>) =>
-    apiClient.get<PaginatedResponse<Account>>("/accounts/accounts/", { params }),
+  listAccounts: (params?: Record<string, string>, opts?: { fresh?: boolean }) =>
+    apiClient.get<PaginatedResponse<Account>>("/accounts/accounts/", { params, ...freshConfig(opts) }),
   getAccount: (id: number) => apiClient.get<Account>(`/accounts/accounts/${id}/`),
   createAccount: (data: Partial<Account>) =>
     apiClient.post<Account>("/accounts/accounts/", data),
@@ -367,6 +530,18 @@ export const accountsApi = {
     apiClient.post<Account>(`/accounts/accounts/${accountId}/team-members/remove/`, { member_id: memberId }),
   listArtifacts: (accountId: number) =>
     apiClient.get<AccountArtifact[]>(`/accounts/accounts/${accountId}/artifacts/`),
+  /**
+   * Batched counterpart to listArtifacts — one request covering many accounts.
+   * Returns a flat list (same element shape as listArtifacts); each artifact carries
+   * its own `account`, so callers can group locally if they need to. Accounts the
+   * caller can't see are omitted rather than erroring.
+   */
+  listArtifactsForAccounts: (accountIds: number[]) => {
+    if (accountIds.length === 0) return Promise.resolve(syntheticResponse<AccountArtifact[]>([]));
+    return apiClient.get<AccountArtifact[]>("/accounts/accounts/artifacts-batch/", {
+      params: { ids: accountIds.join(",") },
+    });
+  },
   addArtifactLink: (accountId: number, name: string, url: string, iconKey?: string, secondaryUrl?: string) =>
     apiClient.post<AccountArtifact>(`/accounts/accounts/${accountId}/artifacts/`, { artifact_type: "link", name, url, icon_key: iconKey ?? "", secondary_url: secondaryUrl ?? "" }),
   uploadArtifactFile: (accountId: number, file: File) => {
@@ -409,8 +584,8 @@ export const accountsApi = {
     apiClient.patch<CustomerContactNote>(`/accounts/contact-notes/${noteId}/`, { content }),
   deleteContactNote: (noteId: number) =>
     apiClient.delete(`/accounts/contact-notes/${noteId}/`),
-  getAdminAccount: () =>
-    apiClient.get<Account>("/accounts/admin-account/"),
+  getAdminAccount: (opts?: { fresh?: boolean }) =>
+    apiClient.get<Account>("/accounts/admin-account/", freshConfig(opts)),
   listProjectsByAccount: (accountName: string) =>
     apiClient.get<PaginatedResponse<AccountProject>>("/accounts/projects/", { params: { account_name: accountName } }),
   createProject: (data: { account: number; name: string; description?: string; position?: number }) =>
@@ -489,8 +664,8 @@ export const airtableApi = {
     apiClient.post<Record<string, { linked: boolean; airtable_account_id?: number; airtable_id?: string; account_name?: string }>>(
       "/airtable/event-links/batch/", { event_uids }
     ),
-  listActionItems: (params?: Record<string, string>) =>
-    apiClient.get<AirtableActionItem[]>("/airtable/action-items/", { params }),
+  listActionItems: (params?: Record<string, string>, opts?: { fresh?: boolean }) =>
+    apiClient.get<AirtableActionItem[]>("/airtable/action-items/", { params, ...freshConfig(opts) }),
   listMeetings: (params?: Record<string, string>) =>
     apiClient.get<{ results: AirtableMeeting[] }>("/airtable/meetings/", { params }),
   getMeeting: (meetingId: number) =>
@@ -499,6 +674,10 @@ export const airtableApi = {
     apiClient.patch<AirtableMeeting>(`/airtable/meetings/by-event/${calendarEventId}/gong-notes/`, { gong_notes: gongNotes }),
   updateMeetingGongNotesByPk: (meetingId: number, gongNotes: string) =>
     apiClient.patch<AirtableMeeting>(`/airtable/meetings/${meetingId}/gong-notes/`, { gong_notes: gongNotes }),
+  updateMeetingZoomNotes: (calendarEventId: number, zoomNotes: string) =>
+    apiClient.patch<AirtableMeeting>(`/airtable/meetings/by-event/${calendarEventId}/zoom-notes/`, { zoom_notes: zoomNotes }),
+  updateMeetingZoomNotesByPk: (meetingId: number, zoomNotes: string) =>
+    apiClient.patch<AirtableMeeting>(`/airtable/meetings/${meetingId}/zoom-notes/`, { zoom_notes: zoomNotes }),
   createActionItem: (data: Partial<AirtableActionItem>) =>
     apiClient.post<AirtableActionItem>("/airtable/action-items/", data),
   updateActionItem: (id: number, data: Partial<AirtableActionItem>) =>
@@ -591,8 +770,8 @@ export const skillsApi = {
     apiClient.post<ClaudeSkill>(`/skills/skills/${id}/fix-and-review/`),
   invoke: (id: number, arguments_: Record<string, unknown>) =>
     apiClient.post<{ result: unknown; duration_ms: number }>(`/skills/skills/${id}/invoke/`, { arguments: arguments_ }),
-  getTokenStats: () =>
-    apiClient.get<SkillTokenStats>("/skills/skills/token-stats/"),
+  getTokenStats: (opts?: { fresh?: boolean }) =>
+    apiClient.get<SkillTokenStats>("/skills/skills/token-stats/", freshConfig(opts)),
 };
 
 export const agentSkillsApi = {
@@ -683,6 +862,22 @@ export const commentsApi = {
     apiClient.get<PaginatedResponse<Comment>>("/comments/comments/", {
       params: { resource_type: resourceType, resource_id: resourceId },
     }),
+  /**
+   * Comment count + a short preview for many records of one type, in a single request.
+   *
+   * Record cards across the app show a comment badge and inline preview, so the
+   * un-batched alternative is one request per visible card — which bursts past the
+   * `user` throttle. Returns an empty envelope without hitting the network when
+   * there are no IDs to ask about (same contract as listMeetingNotesForEvents).
+   */
+  summary: (resourceType: CommentResourceType, resourceIds: number[]) => {
+    if (resourceIds.length === 0) {
+      return Promise.resolve(syntheticResponse<CommentSummaryResponse>({ results: {} }));
+    }
+    return apiClient.get<CommentSummaryResponse>("/comments/comments/summary/", {
+      params: { resource_type: resourceType, resource_ids: resourceIds.join(",") },
+    });
+  },
   create: (data: {
     resource_type: CommentResourceType;
     resource_id: number;
@@ -735,6 +930,38 @@ export interface GmailCalendarSlot {
   label: string;
 }
 
+/** Which provider a stored meeting summary came from. Gong is preferred for display. */
+export type MeetingNotesSource = "gong" | "zoom";
+
+export interface MeetingNotesUpdate {
+  meeting_id: number;
+  airtable_id: string;
+  meeting_name: string;
+  date: string | null;
+  account_name: string | null;
+  sources: MeetingNotesSource[];
+  email_subjects?: Partial<Record<MeetingNotesSource, string>>;
+}
+
+export interface MeetingNotesSkip {
+  meeting_id: number;
+  meeting_name: string;
+  reason: "already_summarized" | "no_matching_email" | "summary_limit_reached";
+}
+
+/** Report returned by POST /integrations/gmail/meeting-notes/. */
+export interface MeetingNotesEmailReport {
+  days: number;
+  account_name: string;
+  scanned_emails: number;
+  scanned_meetings: number;
+  updated: MeetingNotesUpdate[];
+  skipped: MeetingNotesSkip[];
+  errors: Array<{ meeting_id: number; meeting_name: string; source?: string; detail: string }>;
+  summaries_truncated: boolean;
+  max_summaries: number;
+}
+
 export interface GmailThread {
   id: string;
   subject: string;
@@ -768,6 +995,10 @@ export const integrationsApi = {
     ),
   getGmailThreads: (params: { account_domain?: string; account_name?: string; q?: string }) =>
     apiClient.get<{ threads: GmailThread[] }>("/integrations/gmail/threads/", { params }),
+  // Scans Gong / Zoom recap emails and fills in meetings that have no AI summary yet.
+  // Never overwrites existing notes, so it is safe to call repeatedly.
+  getMeetingNotesFromEmail: (body?: { days?: number; account_name?: string }) =>
+    apiClient.post<MeetingNotesEmailReport>("/integrations/gmail/meeting-notes/", body ?? {}),
   // NOTE: no backend route exists yet for this — the caller (ThreadCard, orphaned/unwired)
   // is not reachable from any current page, so this is a type-level stub only.
   summarizeThread: (data: { subject: string; messages: GmailMessage[]; all_participants: string[]; is_invitation: boolean }) =>
@@ -828,6 +1059,9 @@ export const stepsApi = {
     apiClient.patch<ActionItemStep>(`/airtable/steps/${id}/`, data),
   delete: (id: number) =>
     apiClient.delete(`/airtable/steps/${id}/`),
+  /** Set the whole checklist order atomically. `ids` is the new top-to-bottom sequence. */
+  reorder: (actionItemId: number, ids: number[]) =>
+    apiClient.post<ActionItemStep[]>("/airtable/steps/reorder/", { action_item: actionItemId, ids }),
 };
 
 import type { SyncReviewItem, SyncDeleteRequest } from "../types/sync_review";

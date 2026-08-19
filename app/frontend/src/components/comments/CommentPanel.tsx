@@ -21,6 +21,14 @@ interface Props {
   onClose: () => void;
 }
 
+/**
+ * Panel box. Exported because `CommentContext` clamps the panel into the viewport and
+ * previously used its own slightly different numbers (370 × 520), so a panel opened
+ * near the right edge could still be clipped by the 10px it didn't know about.
+ */
+export const COMMENT_PANEL_WIDTH = 380;
+export const COMMENT_PANEL_HEIGHT = 520;
+
 function timeAgo(dateStr: string): string {
   const diff = (Date.now() - new Date(dateStr).getTime()) / 1000;
   if (diff < 60) return "just now";
@@ -113,7 +121,12 @@ function CommentRow({
             </div>
           </div>
         ) : (
-          <div className="text-sm text-gray-700 whitespace-pre-wrap leading-relaxed">
+          // `overflowWrap: anywhere` so a pasted URL or a long unbroken token wraps
+          // instead of forcing the panel to scroll sideways.
+          <div
+            className="text-sm text-gray-700 whitespace-pre-wrap leading-relaxed min-w-0"
+            style={{ overflowWrap: "anywhere" }}
+          >
             {renderContent(comment.content, comment.references, navigate)}
           </div>
         )}
@@ -210,23 +223,53 @@ export default function CommentPanel({ resourceType, resourceId, resourceLabel, 
     }
   }, [comments.length]);
 
+  // Replies are part of the conversation, so a header reading "1 comment" on a thread
+  // with five replies understates it. Matches the count the card badge shows, which
+  // comes from the server-side rollup in `commentSummaryStore`.
+  const totalCount = comments.reduce((n, c) => n + 1 + (c.replies?.length ?? 0), 0);
+
   return (
     <div
       ref={panelRef}
       className="flex flex-col rounded-2xl shadow-2xl border border-gray-200 bg-white overflow-hidden"
-      style={{ width: 360, maxHeight: 520, zIndex: 9999 }}
+      style={{ width: COMMENT_PANEL_WIDTH, maxHeight: COMMENT_PANEL_HEIGHT, zIndex: 9999 }}
     >
-      {/* Header */}
-      <div className="flex items-center justify-between px-4 py-2.5 border-b border-gray-100 bg-gray-50">
-        <div>
+      {/*
+        Header. The record label goes on its own line, clamped to two lines.
+        It used to sit inline after "Comments" with `truncate`, which does nothing on
+        an inline <span> — a long action-item title therefore ran full width, squeezed
+        the flex sibling to min-content and rendered "1 comment" one character per
+        line, vertically. `min-w-0` + `shrink-0` + `whitespace-nowrap` keep that from
+        coming back regardless of label length.
+      */}
+      <div className="flex items-start justify-between gap-2 px-4 py-2.5 border-b border-gray-100 bg-gray-50">
+        <div className="min-w-0 flex-1">
           <span className="text-xs font-semibold text-gray-700">Comments</span>
           {resourceLabel && (
-            <span className="ml-2 text-[10px] text-gray-400 truncate max-w-[180px]">{resourceLabel}</span>
+            <p
+              className="text-[10px] text-gray-400 leading-snug mt-0.5"
+              title={resourceLabel}
+              style={{
+                overflow: "hidden",
+                display: "-webkit-box",
+                WebkitLineClamp: 2,
+                WebkitBoxOrient: "vertical",
+                overflowWrap: "anywhere",
+              }}
+            >
+              {resourceLabel}
+            </p>
           )}
         </div>
-        <div className="flex items-center gap-2">
-          <span className="text-[10px] text-gray-400">{comments.length} comment{comments.length !== 1 ? "s" : ""}</span>
-          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 rounded p-0.5">
+        <div className="flex items-center gap-2 shrink-0">
+          <span className="text-[10px] text-gray-400 whitespace-nowrap">
+            {totalCount} comment{totalCount !== 1 ? "s" : ""}
+          </span>
+          <button
+            onClick={onClose}
+            aria-label="Close comments"
+            className="text-gray-400 hover:text-gray-600 rounded p-0.5 outline-none focus:outline-none focus-visible:outline-none"
+          >
             <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2" className="w-3 h-3">
               <path d="M1 1l10 10M11 1L1 11" strokeLinecap="round" />
             </svg>

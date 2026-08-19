@@ -12,7 +12,7 @@
 import { createContext, useCallback, useContext, useState } from "react";
 import { createPortal } from "react-dom";
 import type { CommentResourceType } from "../../types";
-import CommentPanel from "./CommentPanel";
+import CommentPanel, { COMMENT_PANEL_HEIGHT, COMMENT_PANEL_WIDTH } from "./CommentPanel";
 
 interface CommentTarget {
   resourceType: CommentResourceType;
@@ -60,8 +60,9 @@ export function useRightClickComment<T extends HTMLElement>(
   return { onContextMenu };
 }
 
-const PANEL_WIDTH = 370;
-const PANEL_HEIGHT = 520;
+// Sourced from CommentPanel so the clamp maths can't drift from the real panel box.
+const PANEL_WIDTH = COMMENT_PANEL_WIDTH;
+const PANEL_HEIGHT = COMMENT_PANEL_HEIGHT;
 
 export function CommentProvider({ children }: { children: React.ReactNode }) {
   const [target, setTarget] = useState<CommentTarget | null>(null);

@@ -54,6 +54,13 @@ class CalendarEvent(models.Model):
     event_category = models.CharField(
         max_length=30, choices=EVENT_CATEGORY_CHOICES, blank=True, default="meeting"
     )
+    # Whether the owner actually attended. Tri-state on purpose:
+    #   None  → never recorded (the UI shows "Attended", the optimistic default)
+    #   True  → explicitly marked Attended
+    #   False → explicitly marked Did not attend; excluded from daily time totals
+    # Set only through the `attendance` action, and deliberately absent from the
+    # Google sync's update_or_create defaults so a re-sync never overwrites it.
+    attended = models.BooleanField(null=True, blank=True, default=None)
     # For events pushed from AgentPM (action items), stores the originating Airtable record ID
     agentpm_airtable_id = models.CharField(max_length=255, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)

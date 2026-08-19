@@ -3,6 +3,7 @@
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from rest_framework.test import APITestCase
 
 from realtime.models import VoiceSession
@@ -106,6 +107,12 @@ class VoiceTwiMLViewTests(APITestCase):
     """
     VoiceTwiMLView — returns ConversationRelay TwiML pointing to /ws/voice-relay/.
     """
+
+    def setUp(self):
+        # This endpoint is unauthenticated, so it draws on DRF's anon throttle bucket
+        # (20/min) which is shared process-wide via LocMemCache. In a full-suite run
+        # earlier tests exhaust it and these assertions see a 429 body instead of TwiML.
+        cache.clear()
 
     def _post(self, **kwargs):
         """POST to /api/v1/realtime/voice/twiml/ with Twilio signature bypassed."""

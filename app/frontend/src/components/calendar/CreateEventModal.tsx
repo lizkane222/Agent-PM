@@ -12,6 +12,7 @@ import { airtableApi, accountsApi, teamApi } from "../../lib/api";
 import type { NewEventDraft, EventCategory, GuestEntry } from "../../types/calendar";
 import type { AirtableActionItem } from "../../types/airtable";
 import type { AccountArtifact } from "../../types/accounts";
+import { DEFAULT_CATEGORY_COLORS, borderFor, readableTextColor } from "../../lib/eventColors";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -33,17 +34,21 @@ interface Props {
   zoomConnected: boolean;
   /** Ref to the eagerly-loaded accounts list — read at call time, not render time. */
   allAccountsRef: MutableRefObject<{ id: number; name: string }[]>;
+  /** The user's chosen color per event type. Defaults let this component stand alone. */
+  categoryColors?: Partial<Record<EventCategory, string>>;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-const CATEGORY_META: { id: EventCategory; label: string; icon: string; color: string }[] = [
-  { id: "meeting",          label: "Meeting",          icon: "🗓", color: "bg-blue-500 border-blue-500 text-white" },
-  { id: "task",             label: "Task",             icon: "✓",  color: "bg-violet-500 border-violet-500 text-white" },
-  { id: "out_of_office",   label: "Out of Office",    icon: "🚫", color: "bg-rose-500 border-rose-500 text-white" },
-  { id: "focus_time",      label: "Focus Time",       icon: "🎯", color: "bg-amber-500 border-amber-500 text-white" },
-  { id: "working_location", label: "Working Location", icon: "📍", color: "bg-emerald-500 border-emerald-500 text-white" },
-  { id: "appointment",     label: "Appointment",      icon: "📅", color: "bg-indigo-500 border-indigo-500 text-white" },
+// Labels and icons only — the active pill's color comes from the user's chosen
+// event-type colors (lib/eventColors.ts) so the pill matches the resulting event.
+const CATEGORY_META: { id: EventCategory; label: string; icon: string }[] = [
+  { id: "meeting",          label: "Meeting",          icon: "🗓" },
+  { id: "task",             label: "Task",             icon: "✓" },
+  { id: "out_of_office",   label: "Out of Office",    icon: "🚫" },
+  { id: "focus_time",      label: "Focus Time",       icon: "🎯" },
+  { id: "working_location", label: "Working Location", icon: "📍" },
+  { id: "appointment",     label: "Appointment",      icon: "📅" },
 ];
 
 const NOTIFICATION_OPTIONS: { value: number | null; label: string }[] = [
@@ -88,7 +93,7 @@ function fromDatetimeLocal(val: string): string {
 
 // ── Component ────────────────────────────────────────────────────────────────
 
-export default function CreateEventModal({ draft, onChange, onSave, onCancel, saving, zoomConnected, allAccountsRef }: Props) {
+export default function CreateEventModal({ draft, onChange, onSave, onCancel, saving, zoomConnected, allAccountsRef, categoryColors = DEFAULT_CATEGORY_COLORS }: Props) {
   const titleRef = useRef<HTMLInputElement>(null);
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
@@ -361,21 +366,26 @@ export default function CreateEventModal({ draft, onChange, onSave, onCancel, sa
           {/* Type row: calendar event categories + Action Item tab */}
           <div className="mb-4">
             <div className="flex flex-wrap gap-1.5 mb-1.5">
-              {CATEGORY_META.map((c) => (
-                <button
-                  key={c.id}
-                  type="button"
-                  onClick={() => onChange((d) => ({ ...d, type: "meeting", category: c.id }))}
-                  className={[
-                    "px-2.5 py-1 rounded-full text-xs font-medium border transition-colors",
-                    !isActionItem && draft.category === c.id
-                      ? c.color
-                      : "bg-white border-gray-200 text-gray-600 hover:border-gray-300",
-                  ].join(" ")}
-                >
-                  {c.icon} {c.label}
-                </button>
-              ))}
+              {CATEGORY_META.map((c) => {
+                const active = !isActionItem && draft.category === c.id;
+                const fill = categoryColors[c.id] ?? DEFAULT_CATEGORY_COLORS[c.id];
+                return (
+                  <button
+                    key={c.id}
+                    type="button"
+                    data-active={active ? "true" : "false"}
+                    data-color={active ? fill : undefined}
+                    onClick={() => onChange((d) => ({ ...d, type: "meeting", category: c.id }))}
+                    className={[
+                      "px-2.5 py-1 rounded-full text-xs font-medium border transition-colors",
+                      active ? "" : "bg-white border-gray-200 text-gray-600 hover:border-gray-300",
+                    ].join(" ")}
+                    style={active ? { backgroundColor: fill, borderColor: borderFor(fill), color: readableTextColor(fill) } : undefined}
+                  >
+                    {c.icon} {c.label}
+                  </button>
+                );
+              })}
               <button
                 type="button"
                 onClick={() => onChange((d) => ({ ...d, type: "action-item" }))}

@@ -50,6 +50,14 @@ export interface CalendarEvent {
   calendar_id: string;
   is_synced: boolean;
   event_category?: EventCategory;
+  /**
+   * Whether the owner attended. Tri-state, mirroring the Django column:
+   *   null/undefined → never recorded (treated as attended)
+   *   true           → explicitly Attended
+   *   false          → explicitly Did not attend
+   * Written through schedulerApi.setEventAttendance, never a plain updateEvent.
+   */
+  attended?: boolean | null;
   agentpm_airtable_id: string;
   created_at: string;
   updated_at: string;

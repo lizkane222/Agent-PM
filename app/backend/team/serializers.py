@@ -1,5 +1,7 @@
 """DRF serializers for the team app."""
 
+import re
+
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
@@ -44,6 +46,10 @@ ROLE_RANK = {"admin": 4, "manager": 3, "member": 2, "viewer": 1}
 
 
 class UserProfileSerializer(serializers.ModelSerializer):
+    #: Guards against the per-event "important" map growing without bound.
+    IMPORTANT_COLOR_LIMIT = 500
+    HEX_COLOR_RE = re.compile(r"#[0-9A-Fa-f]{6}")
+
     email = serializers.EmailField(source="user.email", read_only=True)
     username = serializers.CharField(source="user.username", read_only=True)
     is_staff = serializers.BooleanField(source="user.is_staff", read_only=True)
@@ -95,6 +101,8 @@ class UserProfileSerializer(serializers.ModelSerializer):
             "push_subscription_active",
             # Staff view mode
             "staff_view_override",
+            # Calendar appearance
+            "calendar_colors",
             "teams",
             "created_at",
             "updated_at",
@@ -108,6 +116,52 @@ class UserProfileSerializer(serializers.ModelSerializer):
 
     def get_push_subscription_active(self, obj) -> bool:
         return bool(obj.push_subscription)
+
+    def validate_calendar_colors(self, value):
+        """Validate the calendar_colors blob.
+
+        Shape: {"categories": {<type>: "#RRGGBB"}, "important": {<uid>: "#RRGGBB"}}
+
+        Colors are validated by *format*, not by membership in a specific palette, so
+        offering a new palette in the UI needs no backend change. Category keys are
+        checked, because a typo there would silently never apply.
+        """
+        if not isinstance(value, dict):
+            raise serializers.ValidationError("Must be an object.")
+
+        unknown = set(value) - {"categories", "important"}
+        if unknown:
+            raise serializers.ValidationError(
+                f"Unknown key(s): {', '.join(sorted(unknown))}. Expected 'categories' and/or 'important'."
+            )
+
+        from scheduler.models import CalendarEvent
+
+        # Action items are not an event_category — they are identified by
+        # calendar_id="work_tracking" — but they are still a colorable type.
+        valid_types = {v for v, _label in CalendarEvent.EVENT_CATEGORY_CHOICES} | {"action_item"}
+
+        for key, cap in (("categories", None), ("important", self.IMPORTANT_COLOR_LIMIT)):
+            section = value.get(key)
+            if section is None:
+                continue
+            if not isinstance(section, dict):
+                raise serializers.ValidationError({key: "Must be an object."})
+            if cap is not None and len(section) > cap:
+                raise serializers.ValidationError(
+                    {key: f"Too many entries (max {cap})."}
+                )
+            for name, color in section.items():
+                if key == "categories" and name not in valid_types:
+                    raise serializers.ValidationError(
+                        {key: f"Unknown event type '{name}'. Expected one of: {', '.join(sorted(valid_types))}."}
+                    )
+                if not isinstance(color, str) or not self.HEX_COLOR_RE.fullmatch(color):
+                    raise serializers.ValidationError(
+                        {key: f"'{name}' must be a hex color like #RRGGBB, got {color!r}."}
+                    )
+
+        return value
 
 
 class TeamMemberSerializer(serializers.ModelSerializer):

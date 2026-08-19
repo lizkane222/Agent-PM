@@ -94,7 +94,12 @@ function CommentRow({
             </div>
           </div>
         ) : (
-          <div className="text-sm text-gray-700 whitespace-pre-wrap leading-relaxed">
+          // `overflowWrap: anywhere` so a pasted URL or a long unbroken token wraps
+          // instead of forcing the panel to scroll sideways.
+          <div
+            className="text-sm text-gray-700 whitespace-pre-wrap leading-relaxed min-w-0"
+            style={{ overflowWrap: "anywhere" }}
+          >
             {renderContent(comment.content)}
           </div>
         )}

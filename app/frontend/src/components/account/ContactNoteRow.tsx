@@ -39,7 +39,7 @@ export function ContactNoteRow({
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); void commit(); }
+              if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void commit(); }
               if (e.key === "Escape") { e.preventDefault(); setEditing(false); setDraft(note.content); }
             }}
             rows={2}

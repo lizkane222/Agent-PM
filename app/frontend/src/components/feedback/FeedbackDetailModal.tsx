@@ -247,7 +247,7 @@ export default function FeedbackDetailModal({ item, onClose, onUpdated, onDelete
                           background: "var(--surface, #fff)", outline: "none",
                         }}
                         onKeyDown={e => {
-                          if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) void saveEditComment(c.id);
+                          if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void saveEditComment(c.id); }
                           if (e.key === "Escape") setEditingCommentId(null);
                         }}
                       />
@@ -283,7 +283,9 @@ export default function FeedbackDetailModal({ item, onClose, onUpdated, onDelete
                   fontSize: "0.875rem", fontFamily: "var(--font-base)", color: "var(--twilio-navy)",
                   background: "var(--surface, #fff)", outline: "none",
                 }}
-                onKeyDown={e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) postComment(); }}
+                onKeyDown={e => {
+                  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); postComment(); }
+                }}
               />
               <button
                 onClick={postComment}

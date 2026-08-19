@@ -239,6 +239,45 @@ button:not(.card-btn) {
   outline-offset: 2px;
 }
 
+/* ── …except on fields you type into ────────────────────────────────────────
+   Clicking an input used to paint blue from three independent sources:
+     1. the *:focus-visible outline above (2px, offset 2px),
+     2. Tailwind `focus:ring-*` — a box-shadow halo, ~130 call sites,
+     3. Tailwind `focus:border-indigo-*` — the 1px border turning blue.
+   Text fields already signal focus with the caret, so all three are dropped
+   for them here rather than editing every call site. Buttons, links,
+   checkboxes and radios keep the full focus ring — they have no caret, so
+   removing theirs would leave keyboard users with no indicator at all.
+   ─────────────────────────────────────────────────────────────────────── */
+
+/* "Anything you type or pick a value in" — excludes button-like inputs. */
+input:not([type="checkbox"]):not([type="radio"]):not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="file"]):not([type="range"]):not([type="color"]):is(:focus, :focus-visible),
+textarea:is(:focus, :focus-visible),
+select:is(:focus, :focus-visible),
+[contenteditable="true"]:is(:focus, :focus-visible),
+[contenteditable=""]:is(:focus, :focus-visible),
+.ProseMirror:is(:focus, :focus-visible),
+.ProseMirror-focused {
+  outline: none !important;
+  /* Kills focus:ring-* without disturbing a resting shadow, since every
+     ring in this app is focus-only. --tw-ring-shadow is reset too so a
+     later `box-shadow` composition can't reintroduce it. */
+  box-shadow: none !important;
+  --tw-ring-shadow: 0 0 #0000 !important;
+  --tw-ring-offset-shadow: 0 0 #0000 !important;
+  --tw-ring-color: transparent !important;
+}
+
+/* Hold the resting grey border through focus, cancelling focus:border-*.
+   Matched on the resting class so the ~10 fields that rest on indigo
+   (border-indigo-200/300) are left blue as designed. Dark mode needs no
+   entry: its `[data-theme="dark"] input` border-color rule already
+   outranks the focus utilities. */
+:is(input, textarea, select).border-gray-200:focus  { border-color: #e5e7eb !important; }
+:is(input, textarea, select).border-gray-300:focus  { border-color: #d1d5db !important; }
+:is(input, textarea, select).border-gray-100:focus  { border-color: #f3f4f6 !important; }
+:is(input, textarea, select).border-transparent:focus { border-color: transparent !important; }
+
 /* ── Blue-gray shadow utilities (all-sides, cool tint) ──────────────────────*/
 
 .shadow-blue-sm  { box-shadow:  0 0  6px 1px rgba(30, 58, 100, 0.10); }

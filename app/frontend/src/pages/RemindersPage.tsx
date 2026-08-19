@@ -4,6 +4,8 @@ import { useNotificationDefaults } from "../context/NotificationDefaultsContext"
 import type { ReminderResourceType } from "../types";
 import { useExport, type ExportItem } from "../context/ExportContext";
 import { useRightClickComment } from "../components/comments/CommentContext";
+import CommentTrigger from "../components/comments/CommentTrigger";
+import CommentPreviewList from "../components/comments/CommentPreviewList";
 import { addLog } from "../lib/appLog";
 import ActivityLogSection from "../components/ActivityLogSection";
 import { useReminders } from "../hooks/useReminders";
@@ -511,7 +513,8 @@ function ReminderRow({
                     </span>
                   </div>
                 </div>
-                <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                <div style={{ display: "flex", gap: 6, flexShrink: 0, alignItems: "center" }}>
+                  <CommentTrigger resourceType="reminder" resourceId={r.id} resourceLabel={r.title} size="sm" />
                   {r.status !== "dismissed" && (
                     <>
                       <button className="card-btn" onClick={() => openEdit(r)} style={iconBtn} title="Edit">✏️</button>
@@ -521,6 +524,13 @@ function ReminderRow({
                   <button className="card-btn" onClick={() => del(r.id)} style={{ ...iconBtn, color: "#e22" }} title="Delete">🗑</button>
                 </div>
               </div>
+              <CommentPreviewList
+                resourceType="reminder"
+                resourceId={r.id}
+                resourceLabel={r.title}
+                variant="panel"
+                className="mt-3"
+              />
               <div style={{ marginTop: 12, paddingTop: 10, borderTop: "1px solid var(--border, rgba(0,0,0,0.06))" }}>
                 <p style={{ fontSize: "0.6875rem", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em", color: "var(--text-secondary, #888)", marginBottom: 6 }}>
                   Activity Log

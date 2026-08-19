@@ -84,4 +84,40 @@ describe("useActionItemSteps", () => {
     await waitFor(() => expect(result.current.loading).toBe(false));
     expect(result.current.steps.length).toBeGreaterThan(0);
   });
+  it("reorderSteps POSTs the new sequence and triggers refetch", async () => {
+    let body: { action_item?: number; ids?: number[] } | null = null;
+    server.use(
+      http.post("/api/v1/airtable/steps/reorder/", async ({ request }) => {
+        body = (await request.json()) as { action_item: number; ids: number[] };
+        return HttpResponse.json([]);
+      })
+    );
+    const { result } = renderHook(() => useActionItemSteps(ACTION_ITEM_ID));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    await act(async () => {
+      await result.current.reorderSteps([3, 1, 2]);
+    });
+
+    // One atomic call, not a PATCH per row.
+    expect(body).toEqual({ action_item: ACTION_ITEM_ID, ids: [3, 1, 2] });
+    await waitFor(() => expect(result.current.loading).toBe(false));
+  });
+
+  it("reorderSteps is a no-op without an action item", async () => {
+    let called = false;
+    server.use(
+      http.post("/api/v1/airtable/steps/reorder/", () => {
+        called = true;
+        return HttpResponse.json([]);
+      })
+    );
+    const { result } = renderHook(() => useActionItemSteps(null));
+
+    await act(async () => {
+      await result.current.reorderSteps([1, 2]);
+    });
+
+    expect(called).toBe(false);
+  });
 });

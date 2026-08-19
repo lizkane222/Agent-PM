@@ -1,5 +1,20 @@
 import { http, HttpResponse } from "msw";
 
+import type { MeetingNotesEmailReport } from "../../lib/api";
+
+/** Default: a scan that found nothing. Tests override with server.use() for hits. */
+export const mockMeetingNotesReport: MeetingNotesEmailReport = {
+  days: 30,
+  account_name: "",
+  scanned_emails: 0,
+  scanned_meetings: 0,
+  updated: [],
+  skipped: [],
+  errors: [],
+  summaries_truncated: false,
+  max_summaries: 25,
+};
+
 export const mockGmailCredential = {
   id: 1,
   provider: "gmail" as const,
@@ -20,5 +35,8 @@ export const integrationsHandlers = [
   ),
   http.post("/api/v1/integrations/gmail/watch/", () =>
     HttpResponse.json({ detail: "Gmail watch registration enqueued." })
+  ),
+  http.post("/api/v1/integrations/gmail/meeting-notes/", () =>
+    HttpResponse.json(mockMeetingNotesReport)
   ),
 ];

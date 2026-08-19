@@ -1061,6 +1061,67 @@ async def add_account_note(account_name: str, content: str) -> dict:
         return {"status": "error", "error": str(exc)}
 
 
+# ── Meeting notes from email ──────────────────────────────────────────────────
+
+@mcp_server.tool(schema={"input_schema": {
+    "type": "object",
+    "properties": {
+        "days": {
+            "type": "integer",
+            "default": 30,
+            "description": "How many days back to scan for recap emails (max 180).",
+        },
+        "account_name": {
+            "type": "string",
+            "description": "Optional — restrict to one account's meetings.",
+        },
+    },
+}})
+async def get_meeting_notes_from_email(days: int = 30, account_name: str = "") -> dict:
+    """Scan the user's Gmail for Gong or Zoom recap emails and attach any missing AI meeting summary to the matching meeting. Call this when the user asks to fetch, pull, refresh, or back-fill meeting notes or call recaps, or says a meeting is missing its summary. Matches emails to meetings by name and date, prefers Gong over Zoom, stores both, and never overwrites an existing summary."""
+    from integrations.meeting_notes import GmailNotConnected, sync_meeting_notes_from_email
+
+    user = _current_user.get()
+    if not user:
+        return {"status": "error", "message": "Not authorized for this record"}
+
+    loop = asyncio.get_running_loop()
+
+    def _run():
+        return sync_meeting_notes_from_email(user, days=days, account_name=account_name or "")
+
+    try:
+        report = await loop.run_in_executor(None, _run)
+    except GmailNotConnected:
+        return {
+            "status": "error",
+            "message": "Gmail is not connected. Connect Gmail from the Settings page first.",
+        }
+    except Exception as exc:
+        logger.exception("get_meeting_notes_from_email failed: %s", exc)
+        return {"status": "error", "error": str(exc)}
+
+    # Keep the tool result compact — Claude only needs what changed, and the raw
+    # `skipped` list on a busy account can run to hundreds of entries.
+    return {
+        "status": "ok",
+        "scanned_emails": report["scanned_emails"],
+        "scanned_meetings": report["scanned_meetings"],
+        "updated_count": len(report["updated"]),
+        "updated": [
+            {
+                "meeting_name": item["meeting_name"],
+                "date": item["date"],
+                "account_name": item["account_name"],
+                "sources": item["sources"],
+            }
+            for item in report["updated"]
+        ],
+        "skipped_count": len(report["skipped"]),
+        "summaries_truncated": report["summaries_truncated"],
+    }
+
+
 # ── Slack ─────────────────────────────────────────────────────────────────────
 
 @mcp_server.tool(schema={"input_schema": {

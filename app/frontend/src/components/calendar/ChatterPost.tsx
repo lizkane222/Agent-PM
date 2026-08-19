@@ -13,8 +13,8 @@ export default function ChatterPost({ recordId, recordName }: Props) {
   const [success, setSuccess] = useState(false);
   const [error, setError] = useState("");
 
-  async function handlePost(e: React.FormEvent) {
-    e.preventDefault();
+  async function handlePost(e?: React.FormEvent) {
+    e?.preventDefault();
     if (!body.trim()) return;
     setSubmitting(true);
     setError("");
@@ -62,6 +62,11 @@ export default function ChatterPost({ recordId, recordName }: Props) {
           <textarea
             value={body}
             onChange={(e) => setBody(e.target.value)}
+            onKeyDown={(e) => {
+              // A bare Enter inside a <textarea> never submits the enclosing
+              // form, so the submit path has to be triggered by hand.
+              if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void handlePost(); }
+            }}
             rows={3}
             placeholder="Write an update…"
             className="w-full border border-blue-200 rounded-lg px-3 py-2 text-sm resize-none bg-white focus:outline-none focus:ring-2 focus:ring-blue-300"

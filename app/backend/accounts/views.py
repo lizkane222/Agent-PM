@@ -11,6 +11,8 @@ from rest_framework.views import APIView
 
 
 from core.mixins import _staff_sees_all
+from core.pagination import ClientPageSizePagination
+from core.query_params import csv_int_params
 from realtime.sync import publish_activity_event
 
 from scheduler.models import Reminder
@@ -25,6 +27,7 @@ logger = logging.getLogger(__name__)
 class AccountViewSet(viewsets.ModelViewSet):
     serializer_class = AccountSerializer
     permission_classes = [IsAuthenticated]
+    pagination_class = ClientPageSizePagination
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ["company_name", "industry", "website"]
     ordering_fields = ["company_name", "arr", "status", "created_at"]
@@ -46,6 +49,14 @@ class AccountViewSet(viewsets.ModelViewSet):
             qs = qs.filter(
                 Q(is_admin_account=False) | Q(admin_owner=user)
             ).distinct()
+        # "Admin" is a reserved per-user workspace name (matched case-insensitively,
+        # the same way AirtableAccountViewSet reserves it). A row carrying that name
+        # without is_admin_account=True is a stale shared mirror — never list it, or
+        # it shows up as a second Admin alongside the caller's own.
+        from .models import ADMIN_ACCOUNT_NAME
+        qs = qs.exclude(
+            Q(company_name__iexact=ADMIN_ACCOUNT_NAME) & Q(is_admin_account=False)
+        )
         status_filter = self.request.query_params.get("status")
         if status_filter:
             qs = qs.filter(status=status_filter)
@@ -291,6 +302,32 @@ class AccountViewSet(viewsets.ModelViewSet):
 
         artifacts = account.artifacts.select_related("uploaded_by").all()
         return Response(AccountArtifactSerializer(artifacts, many=True, context={"request": request}).data)
+
+    @action(detail=False, methods=["get"], url_path="artifacts-batch")
+    def artifacts_batch(self, request):
+        """GET /accounts/accounts/artifacts-batch/?ids=1,2,3 — artifacts across many accounts.
+
+        The batched counterpart to the per-account `artifacts` GET above. Callers that
+        render a list of accounts used to hit the detail route once per account, which
+        burst past the DRF user throttle; this returns the same flat element shape for
+        every requested account in a single request.
+
+        Scoping goes through `self.get_queryset()`, so it inherits exactly the visibility
+        `get_object()` gives the detail route — IDs the caller can't see are silently
+        omitted rather than raising, since a batch is best-effort by nature.
+        """
+        account_ids = csv_int_params(request.query_params.get("ids"))
+        if not account_ids:
+            return Response([])
+        visible = self.get_queryset().filter(pk__in=account_ids)
+        artifacts = (
+            AccountArtifact.objects.filter(account__in=visible)
+            .select_related("uploaded_by", "account")
+            .order_by("account_id", "id")
+        )
+        return Response(
+            AccountArtifactSerializer(artifacts, many=True, context={"request": request}).data
+        )
 
     @action(detail=True, methods=["get", "post"], url_path="action-items")
     def action_items(self, request, pk=None):
@@ -631,30 +668,9 @@ class AdminAccountView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        user = request.user
+        from .models import get_or_create_admin_account
 
-        # Find the user's linked TeamMember row (may not exist for service accounts)
-        from team.models import TeamMember
-        try:
-            member = TeamMember.objects.get(user=user)
-        except TeamMember.DoesNotExist:
-            member = None
-
-        account, created = Account.objects.get_or_create(
-            admin_owner=user,
-            defaults={
-                "company_name": "Admin",
-                "is_admin_account": True,
-                "status": "active",
-                "created_by": user,
-            },
-        )
-
-        # Ensure the user's TeamMember record is linked so action items can be
-        # assigned and the account appears via the standard team_members filter too.
-        if member and not account.team_members.filter(pk=member.pk).exists():
-            account.team_members.add(member)
-
+        account = get_or_create_admin_account(request.user)
         return Response(AccountSerializer(account, context={"request": request}).data)
 
 

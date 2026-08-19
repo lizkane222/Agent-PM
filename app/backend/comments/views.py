@@ -1,10 +1,20 @@
 """DRF views for the comments app."""
 
 from rest_framework import permissions, viewsets
+from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.response import Response
 
-from .models import Comment
-from .serializers import CommentSerializer
+from core.query_params import csv_int_params
+
+from .models import RESOURCE_TYPE_CHOICES, Comment
+from .serializers import CommentPreviewSerializer, CommentSerializer
+
+#: How many recent comments the batched ``/summary/`` route previews per record.
+SUMMARY_PREVIEW_LIMIT = 3
+
+#: Upper bound on ``?resource_ids=`` so one request can't scan the whole table.
+SUMMARY_MAX_IDS = 500
 
 
 def _user_can_see_resource(user, resource_type: str, resource_id) -> bool:
@@ -141,6 +151,65 @@ class CommentViewSet(viewsets.ModelViewSet):
         if not _user_can_see_resource(self.request.user, resource_type, resource_id):
             return qs.none()
         return qs.filter(resource_type=resource_type, resource_id=resource_id)
+
+    @action(detail=False, methods=["get"], url_path="summary")
+    def summary(self, request):
+        """Comment count + newest-``SUMMARY_PREVIEW_LIMIT`` preview for many records at once.
+
+        ``GET /comments/comments/summary/?resource_type=action_item&resource_ids=1,2,3``
+
+        Record cards across the app show a comment badge and an inline preview, so
+        the alternative is one request per visible card — which bursts past the
+        ``user`` throttle (see the batching notes in ``core/query_params.py``).
+
+        Records with no comments are omitted from ``results`` entirely; the client
+        treats a missing key as zero. Visibility is checked with the same
+        ``_user_can_see_resource`` gate the list route uses, but only for ids that
+        actually have comments, so the per-id query cost tracks comment volume
+        rather than page size.
+        """
+        resource_type = request.query_params.get("resource_type")
+        if not resource_type:
+            raise ValidationError("resource_type is required.")
+        if resource_type not in dict(RESOURCE_TYPE_CHOICES):
+            raise ValidationError(f"Unknown resource_type '{resource_type}'.")
+
+        ids = csv_int_params(request.query_params.get("resource_ids"))
+        if not ids:
+            return Response({"results": {}})
+        if len(ids) > SUMMARY_MAX_IDS:
+            raise ValidationError(f"At most {SUMMARY_MAX_IDS} resource_ids per request.")
+
+        scoped = Comment.objects.filter(resource_type=resource_type, resource_id__in=set(ids))
+        present = set(scoped.values_list("resource_id", flat=True).distinct())
+        visible = {
+            rid for rid in present
+            if _user_can_see_resource(request.user, resource_type, rid)
+        }
+        if not visible:
+            return Response({"results": {}})
+
+        rows = (
+            scoped.filter(resource_id__in=visible)
+            .select_related("author", "author__profile")
+            .order_by("resource_id", "-created_at", "-id")
+        )
+
+        results: dict[str, dict] = {}
+        for comment in rows:
+            entry = results.setdefault(str(comment.resource_id), {"count": 0, "comments": []})
+            # ``count`` covers replies too — a badge reading "1" on a record with
+            # one parent and five replies would understate the conversation.
+            entry["count"] += 1
+            if comment.parent_id is None and len(entry["comments"]) < SUMMARY_PREVIEW_LIMIT:
+                entry["comments"].append(CommentPreviewSerializer(comment).data)
+
+        # Newest-first while collecting (so the limit keeps the *latest* three),
+        # oldest-first for display so the preview reads like a conversation.
+        for entry in results.values():
+            entry["comments"].reverse()
+
+        return Response({"results": results})
 
     def perform_create(self, serializer):
         resource_type = serializer.validated_data.get("resource_type")

@@ -136,3 +136,116 @@ class TeamMemberWriteTest(APITestCase):
         resp = self.client.delete(member_detail_url(self.member.id))
         self.assertEqual(resp.status_code, 204)
         self.assertFalse(TeamMember.objects.filter(pk=self.member.id).exists())
+
+
+# ── Calendar color preferences ────────────────────────────────────────────────
+
+PROFILE_ME_URL = "/api/v1/team/profiles/me/"
+
+
+class CalendarColorsTest(APITestCase):
+    """`UserProfile.calendar_colors` — per-user calendar appearance.
+
+    Holds both the color chosen per event type and the per-event "important"
+    overrides set from the calendar's right-click menu. Colors are validated by
+    format rather than against a fixed palette, so the UI can offer new palettes
+    without a backend change; event *type* names are validated, because a typo
+    there would silently never apply.
+    """
+
+    def setUp(self):
+        self.user = _make_user("colors_user")
+        self.client.force_authenticate(user=self.user)
+
+    def _patch(self, colors):
+        return self.client.patch(PROFILE_ME_URL, {"calendar_colors": colors}, format="json")
+
+    def test_requires_auth(self):
+        self.client.force_authenticate(user=None)
+        self.assertEqual(self.client.get(PROFILE_ME_URL).status_code, 401)
+
+    def test_defaults_to_empty_dict(self):
+        resp = self.client.get(PROFILE_ME_URL)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["calendar_colors"], {})
+
+    def test_patch_stores_category_colors(self):
+        resp = self._patch({"categories": {"meeting": "#C3D3E0", "task": "#F2A2BD"}})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            resp.data["calendar_colors"]["categories"],
+            {"meeting": "#C3D3E0", "task": "#F2A2BD"},
+        )
+
+    def test_patch_round_trips_on_get(self):
+        self._patch({"categories": {"focus_time": "#82BFB7"}})
+        resp = self.client.get(PROFILE_ME_URL)
+        self.assertEqual(resp.data["calendar_colors"], {"categories": {"focus_time": "#82BFB7"}})
+
+    def test_action_item_is_a_valid_type(self):
+        """Action items are not an event_category but are still colorable."""
+        self.assertEqual(self._patch({"categories": {"action_item": "#CFC1D8"}}).status_code, 200)
+
+    def test_patch_stores_important_overrides(self):
+        resp = self._patch({"important": {"gcal-event-123": "#842D78"}})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["calendar_colors"]["important"], {"gcal-event-123": "#842D78"})
+
+    def test_both_sections_together(self):
+        resp = self._patch({
+            "categories": {"meeting": "#C3D3E0"},
+            "important": {"scheduled-recABC": "#E5A836"},
+        })
+        self.assertEqual(resp.status_code, 200)
+
+    def test_rejects_unknown_top_level_key(self):
+        resp = self._patch({"categories": {}, "themes": {"a": "#000000"}})
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("themes", str(resp.data))
+
+    def test_rejects_unknown_event_type(self):
+        resp = self._patch({"categories": {"brunch": "#F2A2BD"}})
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("brunch", str(resp.data))
+
+    def test_rejects_malformed_hex(self):
+        for bad in ["F2A2BD", "#F2A2B", "#GGGGGG", "red", "#f2a2bd88"]:
+            with self.subTest(color=bad):
+                self.assertEqual(self._patch({"categories": {"task": bad}}).status_code, 400)
+
+    def test_accepts_lowercase_hex(self):
+        self.assertEqual(self._patch({"categories": {"task": "#f2a2bd"}}).status_code, 200)
+
+    def test_rejects_non_string_color(self):
+        self.assertEqual(self._patch({"categories": {"task": 123}}).status_code, 400)
+
+    def test_rejects_non_dict_payload(self):
+        self.assertEqual(self._patch(["#F2A2BD"]).status_code, 400)
+
+    def test_rejects_non_dict_section(self):
+        self.assertEqual(self._patch({"categories": "#F2A2BD"}).status_code, 400)
+
+    def test_rejects_oversized_important_map(self):
+        from team.serializers import UserProfileSerializer
+
+        over = {f"uid-{i}": "#842D78" for i in range(UserProfileSerializer.IMPORTANT_COLOR_LIMIT + 1)}
+        self.assertEqual(self._patch({"important": over}).status_code, 400)
+
+    def test_accepts_important_map_at_the_limit(self):
+        from team.serializers import UserProfileSerializer
+
+        at_limit = {f"uid-{i}": "#842D78" for i in range(UserProfileSerializer.IMPORTANT_COLOR_LIMIT)}
+        self.assertEqual(self._patch({"important": at_limit}).status_code, 200)
+
+    def test_does_not_leak_to_other_users(self):
+        self._patch({"categories": {"meeting": "#842D78"}})
+        other = _make_user("colors_other")
+        self.client.force_authenticate(user=other)
+        self.assertEqual(self.client.get(PROFILE_ME_URL).data["calendar_colors"], {})
+
+    def test_patching_colors_leaves_other_profile_fields_alone(self):
+        self.client.patch(PROFILE_ME_URL, {"display_name": "Liz"}, format="json")
+        self._patch({"categories": {"meeting": "#C3D3E0"}})
+        resp = self.client.get(PROFILE_ME_URL)
+        self.assertEqual(resp.data["display_name"], "Liz")
+        self.assertEqual(resp.data["calendar_colors"]["categories"]["meeting"], "#C3D3E0")

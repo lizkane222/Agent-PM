@@ -5,6 +5,8 @@ from pathlib import Path
 
 
 from core.mixins import _staff_sees_all
+from core.pagination import ClientPageSizePagination
+from core.query_params import csv_int_params, csv_params
 from django.db import transaction
 from django.db.models import F, Q
 from rest_framework import viewsets, status
@@ -12,11 +14,12 @@ from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated, IsAdminUser
 from rest_framework.response import Response
 
-from .models import AirtableAccount, AirtableActionItem, AirtableMeeting, ActionItemAttachment, ActionItemDependency, CalendarEventAccountLink
+from .models import AirtableAccount, AirtableActionItem, AirtableMeeting, ActionItemAttachment, ActionItemDependency, ActionItemStep, CalendarEventAccountLink
 from .serializers import (
     AirtableAccountSerializer,
     AirtableActionItemSerializer,
     ActionItemAttachmentSerializer,
+    ActionItemStepSerializer,
     AirtableMeetingSerializer,
     CalendarEventMatchSerializer,
     ManualCategorizationSerializer,
@@ -41,6 +44,56 @@ def _can_reach(source_pk: int, target_pk: int, visited: set | None = None) -> bo
         if dep_pk == target_pk or _can_reach(dep_pk, target_pk, visited):
             return True
     return False
+
+
+ACTION_ITEM_WRITE_DENIED = "You can only modify action items assigned to you."
+
+
+def _exclude_private_admin_items(qs, user):
+    """Drop action items under an "Admin" account that belong to somebody else.
+
+    Items under any account named "Admin" (case-insensitive) are private to their assignee.
+    Items with a BLANK assignee have no owner, so they are shared and stay visible — the
+    earlier three-way Q(...)|Q(...)|Q(...) form failed every branch for those and hid them
+    from everyone, staff included.
+
+    Deliberately NO _staff_sees_all bypass: staff must not see another user's private Admin
+    items. Do not "fix" this by adding one.
+
+    Shared by AirtableActionItemViewSet and ActionItemStepViewSet so step visibility can
+    never drift from item visibility.
+    """
+    admin_account_ids = list(
+        AirtableAccount.objects.filter(name__iexact="admin").values_list("id", flat=True)
+    )
+    if not admin_account_ids:
+        return qs
+    # assignee_airtable_id is a non-nullable CharField(default=""), so =="" is a complete
+    # blank test.
+    private_admin = Q(account_id__in=admin_account_ids) & ~Q(assignee_airtable_id="")
+    user_collab_id = getattr(getattr(user, "profile", None), "airtable_collaborator_id", None)
+    if user_collab_id:
+        return qs.exclude(private_admin & ~Q(assignee_airtable_id=user_collab_id))
+    return qs.exclude(private_admin)
+
+
+def _can_write_action_item(user, item) -> bool:
+    """True if `user` may modify `item` — including its steps and attachments.
+
+    Single source of truth for the action item write rule. It previously lived inline in
+    AirtableActionItemViewSet.check_object_permissions and, separately and differently, in
+    update_action_item_fields; the divergence is what made file uploads 403 on unassigned
+    items while field edits on the very same item succeeded.
+
+    Allowed when the caller is staff (with staff data visibility), when the item has no
+    assignee at all — nobody owns it — or when the caller *is* the assignee.
+    """
+    if _staff_sees_all(user):
+        return True
+    if not item.assignee_airtable_id:
+        return True
+    user_collab_id = getattr(getattr(user, "profile", None), "airtable_collaborator_id", None)
+    return bool(user_collab_id) and item.assignee_airtable_id == user_collab_id
 
 
 def _action_items_for_account(account, user):
@@ -96,6 +149,7 @@ def _resolve_this_meeting(event_uid: str):
 class AirtableAccountViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     serializer_class = AirtableAccountSerializer
+    pagination_class = ClientPageSizePagination
     http_method_names = ["get", "patch", "head", "options"]
 
     def get_queryset(self):
@@ -133,39 +187,171 @@ class AirtableAccountViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
 
+class ActionItemStepViewSet(viewsets.ModelViewSet):
+    """Checklist steps on an action item. Local-only; never synced to Airtable.
+
+    Scoped through the parent action item: you can only see steps on items you can see
+    (so the Admin privacy rule applies transitively), and only write steps on items you
+    could write yourself.
+    """
+
+    permission_classes = [IsAuthenticated]
+    serializer_class = ActionItemStepSerializer
+    pagination_class = None  # A checklist is short and the UI renders all of it at once.
+
+    def get_queryset(self):
+        visible_items = _exclude_private_admin_items(AirtableActionItem.objects.all(), self.request.user)
+        qs = ActionItemStep.objects.filter(action_item__in=visible_items)
+        action_item_param = self.request.query_params.get("action_item")
+        if action_item_param and action_item_param.isdigit():
+            qs = qs.filter(action_item_id=action_item_param)
+        return qs.select_related("action_item")
+
+    def _require_writable_parent(self, item):
+        if not _can_write_action_item(self.request.user, item):
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied(ACTION_ITEM_WRITE_DENIED)
+
+    def perform_create(self, serializer):
+        self._require_writable_parent(serializer.validated_data["action_item"])
+        serializer.save()
+
+    def perform_update(self, serializer):
+        # Guard both the current parent and any reparenting attempt.
+        self._require_writable_parent(serializer.instance.action_item)
+        target = serializer.validated_data.get("action_item")
+        if target is not None and target.pk != serializer.instance.action_item_id:
+            self._require_writable_parent(target)
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        self._require_writable_parent(instance.action_item)
+        instance.delete()
+
+    @action(detail=False, methods=["post"], url_path="reorder")
+    def reorder(self, request):
+        """POST /airtable/steps/reorder/ — set the checklist order in one shot.
+
+        Body: {"action_item": <pk>, "ids": [<step id>, ...]} in the desired order.
+
+        One atomic call rather than a PATCH per row: a checklist reorder touches most of
+        the list, and N sequential PATCHes would be chatty, non-atomic, and could leave
+        duplicate `order` values visible if one failed midway.
+
+        Ids not listed (e.g. a step another tab added since the page loaded) keep their
+        relative order and are appended, so a concurrent insert degrades gracefully instead
+        of 400ing the whole reorder.
+        """
+        action_item_id = request.data.get("action_item")
+        ids = request.data.get("ids")
+
+        if not isinstance(ids, list) or not all(isinstance(i, int) for i in ids):
+            return Response({"error": "`ids` must be a list of step ids."}, status=status.HTTP_400_BAD_REQUEST)
+        if len(set(ids)) != len(ids):
+            return Response({"error": "`ids` contains duplicates."}, status=status.HTTP_400_BAD_REQUEST)
+
+        item = AirtableActionItem.objects.filter(pk=action_item_id).first()
+        if not item:
+            return Response({"error": "Unknown action item."}, status=status.HTTP_404_NOT_FOUND)
+        # Visible to this caller? Reuse the queryset scoping rather than restating it.
+        if not _exclude_private_admin_items(
+            AirtableActionItem.objects.filter(pk=item.pk), request.user
+        ).exists():
+            return Response({"error": "Unknown action item."}, status=status.HTTP_404_NOT_FOUND)
+        self._require_writable_parent(item)
+
+        steps = list(ActionItemStep.objects.filter(action_item=item))
+        by_id = {s.pk: s for s in steps}
+        unknown = [i for i in ids if i not in by_id]
+        if unknown:
+            return Response(
+                {"error": f"Steps {unknown} do not belong to this action item."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        ordered = [by_id[i] for i in ids]
+        ordered += [s for s in steps if s.pk not in set(ids)]
+        for index, step in enumerate(ordered):
+            step.order = index
+        with transaction.atomic():
+            ActionItemStep.objects.bulk_update(ordered, ["order"])
+
+        return Response(ActionItemStepSerializer(ordered, many=True).data)
+
+
 class AirtableMeetingViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated]
     serializer_class = AirtableMeetingSerializer
+    # Batched ?account=/?calendar_event_id= requests cover many accounts or events at once
+    # and would be silently truncated by the project-default PAGE_SIZE of 50. Response
+    # shape is unchanged — still the DRF envelope.
+    pagination_class = ClientPageSizePagination
 
     def get_queryset(self):
         qs = AirtableMeeting.objects.select_related("account").order_by("-date")
+        # ?account= accepts a single value or a comma-separated batch, and mixes PKs with
+        # Airtable string IDs ("12" / "recXXX" / "12,recXXX"). Batching lets a caller
+        # showing many accounts fetch their meetings in one request instead of one each.
         account_param = self.request.query_params.get("account")
         if account_param:
-            if account_param.isdigit():
-                qs = qs.filter(account_id=account_param)
-            else:
-                # Airtable string ID (e.g. "recXXX") — resolve to AirtableAccount PK
-                at_acct = AirtableAccount.objects.filter(airtable_id=account_param).first()
-                qs = qs.filter(account=at_acct) if at_acct else qs.none()
-        # Resolve a CalendarEvent PK to its linked AirtableMeeting via agentpm_airtable_id
+            tokens = csv_params(account_param)
+            pks = {int(t) for t in tokens if t.isdigit()}
+            at_ids = [t for t in tokens if not t.isdigit()]
+            if at_ids:
+                # Airtable string IDs (e.g. "recXXX") — resolve to AirtableAccount PKs
+                pks.update(
+                    AirtableAccount.objects.filter(airtable_id__in=at_ids)
+                    .values_list("pk", flat=True)
+                )
+            # Nothing resolved — narrow to empty rather than returning every meeting.
+            qs = qs.filter(account_id__in=pks) if pks else qs.none()
+        # Name fallback, mirroring AirtableActionItemViewSet. Needed for accounts.Account
+        # rows with no airtable_id yet — notably per-user Admin accounts, which are never
+        # linked to the shared Airtable "ADMIN" record.
+        account_name_param = self.request.query_params.get("account_name")
+        if account_name_param:
+            qs = qs.filter(account__name__iexact=account_name_param)
+        # Resolve CalendarEvent PKs to their linked AirtableMeetings via agentpm_airtable_id.
+        # Accepts a single PK or a comma-separated batch ("5" or "5,6,7"). Callers map each
+        # meeting back to its event by matching airtable_id against the event's
+        # agentpm_airtable_id, which is already exposed by CalendarEventSerializer.
         cal_event_param = self.request.query_params.get("calendar_event_id")
-        if cal_event_param and cal_event_param.isdigit():
+        if cal_event_param:
             from scheduler.models import CalendarEvent
-            event = CalendarEvent.objects.filter(pk=cal_event_param).first()
-            if event and event.agentpm_airtable_id:
-                qs = qs.filter(airtable_id=event.agentpm_airtable_id)
-            else:
-                qs = qs.none()
+            event_ids = csv_int_params(cal_event_param)
+            at_ids = [
+                at_id
+                for at_id in CalendarEvent.objects.filter(pk__in=event_ids)
+                .values_list("agentpm_airtable_id", flat=True)
+                if at_id
+            ]
+            # No event resolved to a linked Airtable record — return nothing, as before.
+            qs = qs.filter(airtable_id__in=at_ids) if at_ids else qs.none()
         return qs
 
 
-@api_view(["PATCH"])
-@permission_classes([IsAuthenticated])
-def update_meeting_gong_notes_by_pk(request, meeting_id: int):
-    """PATCH /airtable/meetings/<meeting_id>/gong-notes/  — saves by Django PK."""
-    from .write_back import push_meeting_gong_notes
+# Meeting summaries come from two providers. Both are stored, and the UI toggles
+# between them, so the save path is identical apart from which column it writes and
+# which write-back helper mirrors it to Airtable.
+_MEETING_NOTES_SOURCES = {
+    "gong": ("gong_notes", "push_meeting_gong_notes"),
+    "zoom": ("zoom_notes", "push_meeting_zoom_notes"),
+}
 
-    gong_notes = request.data.get("gong_notes", "")
+
+def _save_meeting_notes(meeting, source: str, notes: str):
+    """Write `notes` to the column for `source` and mirror it to Airtable."""
+    from . import write_back
+
+    field, pusher = _MEETING_NOTES_SOURCES[source]
+    setattr(meeting, field, notes)
+    meeting.save(update_fields=[field])
+    getattr(write_back, pusher)(meeting)
+
+
+def _meeting_notes_by_pk(request, meeting_id: int, source: str):
+    """Shared body for the by-PK notes endpoints."""
+    notes = request.data.get(f"{source}_notes", "")
 
     try:
         meeting = AirtableMeeting.objects.select_related("account").get(pk=meeting_id)
@@ -184,28 +370,16 @@ def update_meeting_gong_notes_by_pk(request, meeting_id: int):
         if not allowed:
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
 
-    meeting.gong_notes = gong_notes
-    meeting.save(update_fields=["gong_notes"])
-    push_meeting_gong_notes(meeting)
-
+    _save_meeting_notes(meeting, source, notes)
     return Response(AirtableMeetingSerializer(meeting).data)
 
 
-@api_view(["PATCH"])
-@permission_classes([IsAuthenticated])
-def update_meeting_gong_notes(request, event_id: int):
-    """
-    PATCH /airtable/meetings/by-event/<event_id>/gong-notes/
-    Body: { "gong_notes": "..." }
-
-    Looks up the CalendarEvent by PK, finds (or creates) a linked AirtableMeeting,
-    saves the new gong_notes to Django, and pushes to Airtable.
-    """
+def _meeting_notes_by_event(request, event_id: int, source: str):
+    """Shared body for the by-event notes endpoints (creates a stub meeting if needed)."""
     import uuid
     from scheduler.models import CalendarEvent
-    from .write_back import push_meeting_gong_notes
 
-    gong_notes = request.data.get("gong_notes", "")
+    notes = request.data.get(f"{source}_notes", "")
 
     try:
         event = CalendarEvent.objects.get(pk=event_id)
@@ -214,7 +388,7 @@ def update_meeting_gong_notes(request, event_id: int):
 
     # Ownership check: staff bypass; otherwise the caller must own the event
     # OR be a team member on the linked account. Return 404 (not 403) to avoid
-    # leaking event existence — mirrors update_meeting_gong_notes_by_pk.
+    # leaking event existence — mirrors the by-PK path.
     if not _staff_sees_all(request.user):
         allowed = event.owner_id == request.user.id
         if not allowed and event.account_id:
@@ -253,11 +427,48 @@ def update_meeting_gong_notes(request, event_id: int):
         event.agentpm_airtable_id = stub_id
         event.save(update_fields=["agentpm_airtable_id"])
 
-    meeting.gong_notes = gong_notes
-    meeting.save(update_fields=["gong_notes"])
-    push_meeting_gong_notes(meeting)
-
+    _save_meeting_notes(meeting, source, notes)
     return Response(AirtableMeetingSerializer(meeting).data)
+
+
+@api_view(["PATCH"])
+@permission_classes([IsAuthenticated])
+def update_meeting_gong_notes_by_pk(request, meeting_id: int):
+    """PATCH /airtable/meetings/<meeting_id>/gong-notes/  — saves by Django PK."""
+    return _meeting_notes_by_pk(request, meeting_id, "gong")
+
+
+@api_view(["PATCH"])
+@permission_classes([IsAuthenticated])
+def update_meeting_gong_notes(request, event_id: int):
+    """
+    PATCH /airtable/meetings/by-event/<event_id>/gong-notes/
+    Body: { "gong_notes": "..." }
+
+    Looks up the CalendarEvent by PK, finds (or creates) a linked AirtableMeeting,
+    saves the new gong_notes to Django, and pushes to Airtable.
+    """
+    return _meeting_notes_by_event(request, event_id, "gong")
+
+
+@api_view(["PATCH"])
+@permission_classes([IsAuthenticated])
+def update_meeting_zoom_notes_by_pk(request, meeting_id: int):
+    """PATCH /airtable/meetings/<meeting_id>/zoom-notes/  — saves by Django PK."""
+    return _meeting_notes_by_pk(request, meeting_id, "zoom")
+
+
+@api_view(["PATCH"])
+@permission_classes([IsAuthenticated])
+def update_meeting_zoom_notes(request, event_id: int):
+    """
+    PATCH /airtable/meetings/by-event/<event_id>/zoom-notes/
+    Body: { "zoom_notes": "..." }
+
+    Zoom counterpart of update_meeting_gong_notes — same scoping and stub-creation
+    behaviour, writing the Zoom column instead.
+    """
+    return _meeting_notes_by_event(request, event_id, "zoom")
 
 
 class AirtableActionItemViewSet(viewsets.ModelViewSet):
@@ -282,34 +493,16 @@ class AirtableActionItemViewSet(viewsets.ModelViewSet):
         status_filter = self.request.query_params.get("status")
         if status_filter:
             qs = qs.filter(status__in=status_filter.split(","))
-        # Items under any account named "Admin" (case-insensitive) are private —
-        # only the assigned user can see them. Users without a collaborator ID see none.
-        user_collab_id = getattr(getattr(self.request.user, "profile", None), "airtable_collaborator_id", None)
-        admin_account_ids = list(AirtableAccount.objects.filter(name__iexact="admin").values_list("id", flat=True))
-        if admin_account_ids:
-            # Keep: non-Admin items OR Admin items assigned to this user
-            if user_collab_id:
-                qs = qs.filter(
-                    Q(account_id__isnull=True) |
-                    ~Q(account_id__in=admin_account_ids) |
-                    Q(account_id__in=admin_account_ids, assignee_airtable_id=user_collab_id)
-                )
-            else:
-                qs = qs.exclude(account_id__in=admin_account_ids)
-        return qs
+        return _exclude_private_admin_items(qs, self.request.user)
 
     def check_object_permissions(self, request, obj):
-        """Non-safe methods require staff or the caller being the item's assignee."""
+        """Non-safe methods require staff, the caller being the assignee, or no assignee."""
         super().check_object_permissions(request, obj)
         if request.method in ("GET", "HEAD", "OPTIONS"):
             return
-        if _staff_sees_all(request.user):
-            return
-        user_collab_id = getattr(getattr(request.user, "profile", None), "airtable_collaborator_id", None)
-        if user_collab_id and obj.assignee_airtable_id == user_collab_id:
-            return
-        from rest_framework.exceptions import PermissionDenied
-        raise PermissionDenied("You can only modify action items assigned to you.")
+        if not _can_write_action_item(request.user, obj):
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied(ACTION_ITEM_WRITE_DENIED)
 
     def _require_account_membership(self, target_account):
         """Raise PermissionDenied unless the caller can attach action items to this account.

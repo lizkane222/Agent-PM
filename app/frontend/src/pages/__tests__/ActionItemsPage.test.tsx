@@ -12,13 +12,16 @@ global.ResizeObserver = class ResizeObserver {
 };
 
 // TipTap's Placeholder extension calls elementFromPoint which jsdom lacks
-vi.mock("../../components/action-items/ActionItemDescriptionEditor", () => ({
-  default: ({ value, onChange, placeholder }: { value: string; onChange: (v: string) => void; placeholder?: string }) => (
+vi.mock("../../components/shared/RichTextMentionEditor", () => ({
+  default: ({ value, onChange, placeholder, onSubmit }: { value: string; onChange: (v: string) => void; placeholder?: string; onSubmit?: () => void }) => (
     <textarea
       data-testid="description-editor"
       value={value}
       onChange={(e) => onChange(e.target.value)}
       placeholder={placeholder}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" && !e.shiftKey && onSubmit) { e.preventDefault(); onSubmit(); }
+      }}
     />
   ),
   plainToHtml: (text: string) => text,
@@ -167,6 +170,54 @@ async function renderPageStableWithErrors() {
     </MemoryRouter>
   );
   vi.useRealTimers();
+}
+
+/** The card root (the draggable wrapper) for the card whose name input holds `taskName`. */
+function cardFor(taskName: string): HTMLElement {
+  const input = screen.getByDisplayValue(taskName);
+  const card = input.closest("[draggable='true']");
+  if (!card) throw new Error(`no draggable card wrapping "${taskName}"`);
+  return card as HTMLElement;
+}
+
+/**
+ * The panel element for a zone, found by walking up from its header text.
+ *
+ * Matches only the `<p>` header: the same label also appears as a `<span>` pill on the
+ * Views grid's ghost cards ("this item is staged elsewhere"), which would otherwise make
+ * the lookup ambiguous.
+ */
+function zonePanel(label: string): HTMLElement {
+  const header = screen.getAllByText(label).find((el) => el.tagName === "P");
+  if (!header) throw new Error(`no zone header found for "${label}"`);
+  // Walk up to the DropZone root, which is the drop target carrying the rounded card bg.
+  let el: HTMLElement | null = header;
+  while (el && !el.className.includes("shadow-blue-md")) el = el.parentElement;
+  if (!el) throw new Error(`no panel found for zone "${label}"`);
+  return el;
+}
+
+const stageTodayPanel = () => zonePanel("Stage Today");
+
+/** The Pinned In Progress container. */
+function pinnedSection(): HTMLElement {
+  let el: HTMLElement | null = screen.getByText("Pinned In Progress");
+  while (el && !el.className.includes("bg-violet-50")) el = el.parentElement;
+  if (!el) throw new Error("Pinned In Progress section not found");
+  return el;
+}
+
+/**
+ * The card root inside the Pinned In Progress section for `taskName`.
+ *
+ * Pinned cards use the standard card body, which renders the task as text rather than an
+ * editable input, so `cardFor` (which searches by display value) cannot find them.
+ */
+function pinnedCardFor(taskName: string): HTMLElement {
+  const label = within(pinnedSection()).getByText(taskName);
+  const card = label.closest("[draggable='true']");
+  if (!card) throw new Error(`no pinned card wrapping "${taskName}"`);
+  return card as HTMLElement;
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -426,6 +477,20 @@ describe("ActionItemsPage", () => {
     expect(screen.getByRole("button", { name: /exit focus/i })).toBeInTheDocument();
   });
 
+  it("Pinned In Progress sits below the Unstaged / Stage Today / Currently Tracking row", async () => {
+    await renderPage();
+    await waitFor(() => expect(screen.getByText("Stage Today")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: /^Focus$/i }));
+
+    const section = screen.getByText("Pinned In Progress");
+    for (const zoneLabel of ["Unstaged", "Stage Today", "Currently Tracking"]) {
+      const zone = screen.getByText(zoneLabel);
+      // DOCUMENT_POSITION_PRECEDING on the section means the zone comes first in the DOM.
+      expect(section.compareDocumentPosition(zone) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy();
+    }
+  });
+
   it("clicking Exit Focus hides the Pinned In Progress section", async () => {
     await renderPage();
     await waitFor(() => expect(screen.getByText("Stage Today")).toBeInTheDocument());
@@ -437,8 +502,8 @@ describe("ActionItemsPage", () => {
     expect(screen.queryByText("Pinned In Progress")).not.toBeInTheDocument();
   });
 
-  it("pin button on Stage Today card pins item to Pinned In Progress", async () => {
-    // Item with no account defaults to "today" zone where pin buttons appear
+  it("right-click Pin to Focus hoists the card into Pinned In Progress", async () => {
+    // Item with no account defaults to the "today" zone (compact card layout)
     server.use(
       http.get("/api/v1/airtable/action-items/", () =>
         HttpResponse.json([{ ...mockItem, account: null, account_name: null }])
@@ -447,24 +512,67 @@ describe("ActionItemsPage", () => {
     await renderPageStable();
     await waitFor(() => expect(screen.getByText("Stage Today")).toBeInTheDocument());
 
-    // Enter focus mode to reveal pin buttons
     fireEvent.click(screen.getByRole("button", { name: /^Focus$/i }));
-    expect(screen.getByText("Pinned In Progress")).toBeInTheDocument();
+    const stagePanel = stageTodayPanel();
+    expect(within(stagePanel).getByDisplayValue("Fix billing issue")).toBeInTheDocument();
 
-    // Pin buttons are in the DOM (opacity controlled by CSS hover, still accessible)
-    const pinButton = screen.getByTitle("Pin to Focus");
-    fireEvent.click(pinButton);
+    fireEvent.contextMenu(cardFor("Fix billing issue"));
+    fireEvent.click(screen.getByText("Pin to Focus"));
 
-    // Pinned count label should update
     await waitFor(() => expect(screen.getByText("1 pinned")).toBeInTheDocument());
 
-    // Unpin button visible on the pinned card
-    expect(screen.getByTitle("Unpin")).toBeInTheDocument();
-    // Pin badge now shows permanently on the original card
+    // Single-mount: the card now lives in the Pinned section and nowhere else, so its
+    // unsaved form state can't be duplicated across two mounted cards.
+    expect(within(pinnedSection()).getByText("Fix billing issue")).toBeInTheDocument();
+    expect(within(stageTodayPanel()).queryByDisplayValue("Fix billing issue")).not.toBeInTheDocument();
     expect(screen.getByTitle("Pinned to Focus")).toBeInTheDocument();
   });
 
-  it("unpinning from Pinned In Progress removes item from section", async () => {
+  it("pinned cards are card-width and laid out in a wrapping row", async () => {
+    server.use(
+      http.get("/api/v1/airtable/action-items/", () => HttpResponse.json([ITEM_A, ITEM_B]))
+    );
+    await renderPageStable();
+    await waitFor(() => expect(screen.getByText("Stage Today")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: /^Focus$/i }));
+
+    for (const task of ["Alpha task", "Beta task"]) {
+      fireEvent.contextMenu(cardFor(task));
+      fireEvent.click(screen.getByText("Pin to Focus"));
+    }
+    await waitFor(() => expect(screen.getByText("2 pinned")).toBeInTheDocument());
+
+    // A wrapping row, not one full-width card per line.
+    const row = pinnedCardFor("Alpha task").parentElement!.parentElement!;
+    expect(row.className).toContain("flex-wrap");
+    expect(row.className).not.toContain("flex-col");
+
+    // Each card is constrained to the app's standard card width rather than the
+    // container's width.
+    for (const task of ["Alpha task", "Beta task"]) {
+      expect(pinnedCardFor(task).parentElement!.className).toContain("w-44");
+    }
+  });
+
+  it("the pinned card shows name, account and status in the standard card body", async () => {
+    await renderPageStable();
+    await waitFor(() => expect(screen.getByText("Stage Today")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: /^Focus$/i }));
+    // mockItem has an account, so it lives in the Views zone and renders the standard card.
+    fireEvent.contextMenu(screen.getByText("Fix billing issue"));
+    fireEvent.click(screen.getByText("Pin to Focus"));
+    await waitFor(() => expect(screen.getByText("1 pinned")).toBeInTheDocument());
+
+    const pinned = pinnedSection();
+    expect(within(pinned).getByText("Fix billing issue")).toBeInTheDocument();
+    expect(within(pinned).getByText("Acme Corp")).toBeInTheDocument();
+    expect(within(pinned).getByText("Open")).toBeInTheDocument();
+    // Plus the pill saying which zone it actually lives in.
+    expect(within(pinned).getByText("Views")).toBeInTheDocument();
+  });
+
+  it("right-click Unpin from Focus returns the card to its zone", async () => {
     server.use(
       http.get("/api/v1/airtable/action-items/", () =>
         HttpResponse.json([{ ...mockItem, account: null, account_name: null }])
@@ -474,13 +582,61 @@ describe("ActionItemsPage", () => {
     await waitFor(() => expect(screen.getByText("Stage Today")).toBeInTheDocument());
 
     fireEvent.click(screen.getByRole("button", { name: /^Focus$/i }));
-    fireEvent.click(screen.getByTitle("Pin to Focus"));
+    fireEvent.contextMenu(cardFor("Fix billing issue"));
+    fireEvent.click(screen.getByText("Pin to Focus"));
     await waitFor(() => expect(screen.getByText("1 pinned")).toBeInTheDocument());
 
-    // Unpin via the Pinned section's unpin button
-    fireEvent.click(screen.getByTitle("Unpin"));
+    // Unpin from the card itself — the menu label has flipped.
+    fireEvent.contextMenu(pinnedCardFor("Fix billing issue"));
+    fireEvent.click(screen.getByText("Unpin from Focus"));
+
     await waitFor(() => expect(screen.queryByText("1 pinned")).not.toBeInTheDocument());
-    expect(screen.queryByTitle("Unpin")).not.toBeInTheDocument();
+    expect(within(stageTodayPanel()).getByDisplayValue("Fix billing issue")).toBeInTheDocument();
+    expect(screen.queryByTitle("Pinned to Focus")).not.toBeInTheDocument();
+  });
+
+  it("pins are written to the shared actionFocusPins key", async () => {
+    server.use(
+      http.get("/api/v1/airtable/action-items/", () =>
+        HttpResponse.json([{ ...mockItem, account: null, account_name: null }])
+      )
+    );
+    await renderPageStable();
+    await waitFor(() => expect(screen.getByText("Stage Today")).toBeInTheDocument());
+
+    fireEvent.contextMenu(cardFor("Fix billing issue"));
+    fireEvent.click(screen.getByText("Pin to Focus"));
+
+    await waitFor(() =>
+      expect(JSON.parse(localStorage.getItem("actionFocusPins") ?? "[]")).toEqual(["recAAA001"])
+    );
+  });
+
+  it("does not offer Pin to Focus on an unstaged blank card", async () => {
+    await renderPageStable();
+    await waitFor(() => expect(screen.getByText("Unstaged")).toBeInTheDocument());
+
+    // Blank cards carry throwaway local-* ids that promoteBlankItem replaces, so pinning
+    // one would orphan the pin forever.
+    const blank = screen.getByPlaceholderText("Name or short description");
+    const card = blank.closest("[draggable='true']") as HTMLElement;
+    fireEvent.contextMenu(card);
+
+    expect(screen.getByText("Open details")).toBeInTheDocument();
+    expect(screen.queryByText("Pin to Focus")).not.toBeInTheDocument();
+  });
+
+  it("the old inline pin emoji is gone from every card", async () => {
+    server.use(
+      http.get("/api/v1/airtable/action-items/", () =>
+        HttpResponse.json([{ ...mockItem, account: null, account_name: null }])
+      )
+    );
+    await renderPageStable();
+    await waitFor(() => expect(screen.getByText("Stage Today")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: /^Focus$/i }));
+    expect(document.body.textContent).not.toContain("📌");
   });
 
   // ── Right-click context menus ─────────────────────────────────────────────────
@@ -522,6 +678,7 @@ describe("ActionItemsPage", () => {
     expect(screen.getByText("Mark as Done")).toBeInTheDocument();
     expect(screen.getByText("Copy task name")).toBeInTheDocument();
     expect(screen.getByText("Add comment")).toBeInTheDocument();
+    expect(screen.getByText("Pin to Focus")).toBeInTheDocument();
   });
 
   it("right-clicking a DueDate card shows the context menu", async () => {
@@ -536,5 +693,432 @@ describe("ActionItemsPage", () => {
     expect(screen.getByText("Mark as Done")).toBeInTheDocument();
     expect(screen.getByText("Copy task name")).toBeInTheDocument();
     expect(screen.getByText("Add comment")).toBeInTheDocument();
+    expect(screen.getByText("Pin to Focus")).toBeInTheDocument();
+  });
+
+  // ── Checklist in the expanded card modal ──────────────────────────────────────
+
+  it("the expanded card modal shows the checklist", async () => {
+    server.use(
+      http.get("/api/v1/airtable/steps/", () =>
+        HttpResponse.json([
+          { id: 1, action_item: 1, title: "Step one", status: "Done", order: 0, created_at: "2026-08-18T00:00:00Z" },
+          { id: 2, action_item: 1, title: "Step two", status: "Open", order: 1, created_at: "2026-08-18T00:00:00Z" },
+        ])
+      )
+    );
+    await renderPageStable();
+    await waitFor(() => expect(screen.getByText("Fix billing issue")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByText("Fix billing issue"));
+    await waitFor(() => expect(screen.getByText("Edit Action Item")).toBeInTheDocument());
+
+    expect(screen.getByText("Checklist")).toBeInTheDocument();
+    expect(screen.getByText("Step one")).toBeInTheDocument();
+    expect(screen.getByText("1/2")).toBeInTheDocument();
+    expect(screen.getByText("50%")).toBeInTheDocument();
+  });
+
+  it("puts the checklist in its own section right below the description", async () => {
+    server.use(http.get("/api/v1/airtable/steps/", () => HttpResponse.json([])));
+    await renderPageStable();
+    await waitFor(() => expect(screen.getByText("Fix billing issue")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByText("Fix billing issue"));
+    await waitFor(() => expect(screen.getByText("Edit Action Item")).toBeInTheDocument());
+
+    const modal = screen.getByText("Edit Action Item").closest("div.bg-white") as HTMLElement;
+    const description = within(modal).getAllByTestId("description-editor")[0];
+    const checklist = within(modal).getByText("Checklist");
+
+    // Checklist follows the description, and sits above the status/priority pill row.
+    expect(description.compareDocumentPosition(checklist) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(description.contains(checklist)).toBe(false);
+  });
+
+  it("the description placeholder no longer mentions steps", async () => {
+    await renderPageStable();
+    await waitFor(() => expect(screen.getByText("Stage Today")).toBeInTheDocument());
+
+    expect(screen.queryByPlaceholderText(/steps/i)).not.toBeInTheDocument();
+  });
+
+  // ── Per-card collapse ─────────────────────────────────────────────────────────
+
+  it("collapsing a Stage Today card keeps title, status and account visible", async () => {
+    server.use(
+      http.get("/api/v1/airtable/action-items/", () =>
+        HttpResponse.json([{ ...mockItem, account: null, account_name: null }])
+      )
+    );
+    await renderPageStable();
+    await waitFor(() => expect(screen.getByText("Stage Today")).toBeInTheDocument());
+
+    const panel = stageTodayPanel();
+    // Expanded: the editor and the Save button are present.
+    expect(within(panel).getByTestId("description-editor")).toBeInTheDocument();
+
+    fireEvent.click(within(panel).getByTitle("Collapse card"));
+
+    const collapsed = stageTodayPanel();
+    expect(within(collapsed).getByText("Fix billing issue")).toBeInTheDocument();
+    expect(within(collapsed).getByText("Open")).toBeInTheDocument();
+    expect(within(collapsed).queryByTestId("description-editor")).not.toBeInTheDocument();
+    expect(within(collapsed).queryByRole("button", { name: "Save" })).not.toBeInTheDocument();
+    expect(within(collapsed).getByTitle("Expand card")).toBeInTheDocument();
+  });
+
+  it("a collapsed card still shows its account", async () => {
+    // mockItem has an account but lives in the Views zone, so stage it first. That also
+    // puts a "Stage Today" ghost pill in the Views grid, hence the more specific anchor.
+    localStorage.setItem("actionItemZones", JSON.stringify({ recAAA001: "today" }));
+    await renderPageStable();
+    await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
+
+    const panel = stageTodayPanel();
+    fireEvent.click(within(panel).getByTitle("Collapse card"));
+
+    const collapsed = stageTodayPanel();
+    expect(within(collapsed).getByText("Fix billing issue")).toBeInTheDocument();
+    expect(within(collapsed).getByText("Acme Corp")).toBeInTheDocument();
+    expect(within(collapsed).getByText("Open")).toBeInTheDocument();
+  });
+
+  it("expanding a collapsed card restores the full body", async () => {
+    server.use(
+      http.get("/api/v1/airtable/action-items/", () =>
+        HttpResponse.json([{ ...mockItem, account: null, account_name: null }])
+      )
+    );
+    await renderPageStable();
+    await waitFor(() => expect(screen.getByText("Stage Today")).toBeInTheDocument());
+
+    fireEvent.click(within(stageTodayPanel()).getByTitle("Collapse card"));
+    expect(within(stageTodayPanel()).queryByTestId("description-editor")).not.toBeInTheDocument();
+
+    fireEvent.click(within(stageTodayPanel()).getByTitle("Expand card"));
+    expect(within(stageTodayPanel()).getByTestId("description-editor")).toBeInTheDocument();
+  });
+
+  it("card collapse persists so it survives navigation", async () => {
+    server.use(
+      http.get("/api/v1/airtable/action-items/", () =>
+        HttpResponse.json([{ ...mockItem, account: null, account_name: null }])
+      )
+    );
+    await renderPageStable();
+    await waitFor(() => expect(screen.getByText("Stage Today")).toBeInTheDocument());
+
+    fireEvent.click(within(stageTodayPanel()).getByTitle("Collapse card"));
+
+    await waitFor(() =>
+      expect(JSON.parse(localStorage.getItem("actionItemCardCollapsed-v1") ?? "[]"))
+        .toEqual(["recAAA001"])
+    );
+  });
+
+  it("a collapsed card is still draggable and still right-clickable", async () => {
+    server.use(
+      http.get("/api/v1/airtable/action-items/", () =>
+        HttpResponse.json([{ ...mockItem, account: null, account_name: null }])
+      )
+    );
+    await renderPageStable();
+    await waitFor(() => expect(screen.getByText("Stage Today")).toBeInTheDocument());
+
+    fireEvent.click(within(stageTodayPanel()).getByTitle("Collapse card"));
+
+    const card = within(stageTodayPanel()).getByText("Fix billing issue")
+      .closest("[draggable='true']") as HTMLElement;
+    expect(card).toBeTruthy();
+
+    fireEvent.contextMenu(card);
+    expect(screen.getByText("Pin to Focus")).toBeInTheDocument();
+    expect(screen.getByText("Open details")).toBeInTheDocument();
+  });
+
+  it("Currently Tracking cards are collapsible too", async () => {
+    localStorage.setItem("actionItemZones", JSON.stringify({ recAAA001: "active" }));
+    await renderPageStable();
+    await waitFor(() => expect(screen.getByText("Currently Tracking")).toBeInTheDocument());
+
+    const panel = zonePanel("Currently Tracking");
+    fireEvent.click(within(panel).getByTitle("Collapse card"));
+
+    const collapsed = zonePanel("Currently Tracking");
+    expect(within(collapsed).getByText("Fix billing issue")).toBeInTheDocument();
+    expect(within(collapsed).getByTitle("Expand card")).toBeInTheDocument();
+  });
+
+  it("Pinned In Progress cards are collapsible too", async () => {
+    await renderPageStable();
+    await waitFor(() => expect(screen.getByText("Stage Today")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: /^Focus$/i }));
+    fireEvent.contextMenu(screen.getByText("Fix billing issue"));
+    fireEvent.click(screen.getByText("Pin to Focus"));
+    await waitFor(() => expect(screen.getByText("1 pinned")).toBeInTheDocument());
+
+    fireEvent.click(within(pinnedSection()).getByTitle("Collapse card"));
+
+    const pinned = pinnedSection();
+    expect(within(pinned).getByText("Fix billing issue")).toBeInTheDocument();
+    expect(within(pinned).getByText("Acme Corp")).toBeInTheDocument();
+    expect(within(pinned).getByText("Open")).toBeInTheDocument();
+    expect(within(pinned).getByTitle("Expand card")).toBeInTheDocument();
+  });
+
+  it("Views grid cards have no collapse toggle", async () => {
+    await renderPageStable();
+    await waitFor(() => expect(screen.getByText("Fix billing issue")).toBeInTheDocument());
+
+    // Per-card collapse is scoped to the staging columns and the pinned row; the Views grid
+    // collapses by account row instead.
+    const viewsPanel = zonePanel("Views");
+    expect(within(viewsPanel).queryByTitle("Collapse card")).not.toBeInTheDocument();
+  });
+
+  // ── Collapse all ──────────────────────────────────────────────────────────────
+
+  // The account name appears both in the row header and on each card's account badge, so
+  // these tests key off the header's collapse toggle rather than the bare text.
+  const acmeToggle = () => screen.getByTitle(/(Collapse|Expand) Acme Corp/i);
+
+  it("Collapse all hides every account row body and flips its own label", async () => {
+    await renderPageStable();
+    await waitFor(() => expect(acmeToggle()).toBeInTheDocument());
+
+    // Expanded: the account's card is on screen.
+    expect(screen.getByText("Fix billing issue")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /collapse all/i }));
+
+    // Headers stay, bodies go.
+    expect(screen.getByTitle(/Expand Acme Corp/i)).toBeInTheDocument();
+    expect(screen.getByTitle(/Expand No Account/i)).toBeInTheDocument();
+    expect(screen.queryByText("Fix billing issue")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /expand all/i })).toBeInTheDocument();
+  });
+
+  it("Collapse all persists the canonical group keys", async () => {
+    await renderPageStable();
+    await waitFor(() => expect(acmeToggle()).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: /collapse all/i }));
+
+    const stored: string[] = JSON.parse(localStorage.getItem("actionItemsCollapsedAccounts-v1") ?? "[]");
+    // Lowercased account name, so the Views grid and Projects view agree on one key.
+    expect(stored).toContain("acme corp");
+    expect(stored).toContain("__none__");
+  });
+
+  it("Expand all re-expands the rows", async () => {
+    await renderPageStable();
+    await waitFor(() => expect(acmeToggle()).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: /collapse all/i }));
+    expect(screen.queryByText("Fix billing issue")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /expand all/i }));
+    expect(screen.getByText("Fix billing issue")).toBeInTheDocument();
+  });
+
+  it("collapsing a single row shows its open count and keeps the bulk button on Collapse all", async () => {
+    await renderPageStable();
+    await waitFor(() => expect(acmeToggle()).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTitle(/Collapse Acme Corp/i));
+
+    expect(screen.queryByText("Fix billing issue")).not.toBeInTheDocument();
+    expect(screen.getByText("1 open")).toBeInTheDocument();
+    // The No Account row is untouched, so the bulk button still offers "Collapse all".
+    expect(screen.getByRole("button", { name: /collapse all/i })).toBeInTheDocument();
+  });
+
+  it("collapse state survives a switch to Projects view and back", async () => {
+    await renderPageStable();
+    await waitFor(() => expect(acmeToggle()).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTitle(/Collapse Acme Corp/i));
+    expect(screen.queryByText("Fix billing issue")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Projects" }));
+    // Same shared store keyed on the canonical name, so the group is collapsed here too.
+    await waitFor(() => expect(screen.getByText("1 open")).toBeInTheDocument());
+    expect(screen.queryByText("Fix billing issue")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Accounts" }));
+    await waitFor(() => expect(acmeToggle()).toBeInTheDocument());
+    expect(screen.queryByText("Fix billing issue")).not.toBeInTheDocument();
+  });
+
+  // ── Drag to reorder within Stage Today ────────────────────────────────────────
+
+  const ITEM_A = { ...mockItem, id: 1, airtable_id: "recAAA", task: "Alpha task", account: null, account_name: null };
+  const ITEM_B = { ...mockItem, id: 2, airtable_id: "recBBB", task: "Beta task", account: null, account_name: null };
+
+  /** jsdom's getBoundingClientRect returns all zeros, so every hover would read as
+   *  "drop above". Give each card wrapper a real 100px-tall box. */
+  function stubCardRects() {
+    return vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue({
+      top: 0, bottom: 100, height: 100, left: 0, right: 200, width: 200, x: 0, y: 0,
+      toJSON: () => ({}),
+    } as DOMRect);
+  }
+
+  const DT = () => ({ setDragImage: vi.fn(), setData: vi.fn(), getData: vi.fn(() => ""), effectAllowed: "", dropEffect: "", types: [] });
+
+  /**
+   * Dispatch a dragover carrying real pointer coordinates.
+   *
+   * fireEvent.dragOver cannot be used here: jsdom does not implement DragEvent, so RTL
+   * falls back to a plain Event and silently drops clientY — the handler would then read
+   * `undefined` and always resolve to "insert below". A MouseEvent named "dragover" is
+   * picked up by React's root listener and keeps its coordinates.
+   */
+  function dragOverAt(target: HTMLElement, clientY: number) {
+    const ev = new MouseEvent("dragover", { bubbles: true, cancelable: true, clientY });
+    Object.defineProperty(ev, "dataTransfer", { value: DT() });
+    fireEvent(target, ev);
+  }
+
+  function stagedTaskOrder(): string[] {
+    return within(stageTodayPanel())
+      .getAllByPlaceholderText("Name or short description")
+      .map((el) => (el as HTMLInputElement).value);
+  }
+
+  it("dropping a card above another reorders Stage Today and persists the order", async () => {
+    server.use(
+      http.get("/api/v1/airtable/action-items/", () => HttpResponse.json([ITEM_A, ITEM_B]))
+    );
+    await renderPageStable();
+    await waitFor(() => expect(screen.getByDisplayValue("Alpha task")).toBeInTheDocument());
+
+    expect(stagedTaskOrder()).toEqual(["Alpha task", "Beta task"]);
+
+    const rects = stubCardRects();
+    try {
+      const beta = cardFor("Beta task");
+      fireEvent.dragStart(beta, { dataTransfer: DT() });
+      // Hover the top half of Alpha's wrapper → "insert above Alpha".
+      dragOverAt(cardFor("Alpha task").parentElement!, 10);
+      fireEvent.drop(stageTodayPanel(), { dataTransfer: DT() });
+
+      await waitFor(() => expect(stagedTaskOrder()).toEqual(["Beta task", "Alpha task"]));
+      expect(JSON.parse(localStorage.getItem("actionItemOrder") ?? "{}").today)
+        .toEqual(["recBBB", "recAAA"]);
+    } finally {
+      rects.mockRestore();
+    }
+  });
+
+  it("an item with no recorded order sorts below ordered ones", async () => {
+    localStorage.setItem("actionItemOrder", JSON.stringify({ today: ["recBBB"] }));
+    server.use(
+      http.get("/api/v1/airtable/action-items/", () => HttpResponse.json([ITEM_A, ITEM_B]))
+    );
+    await renderPageStable();
+    await waitFor(() => expect(screen.getByDisplayValue("Alpha task")).toBeInTheDocument());
+
+    expect(stagedTaskOrder()).toEqual(["Beta task", "Alpha task"]);
+  });
+
+  it("adopts a new order from another tab via a storage event", async () => {
+    server.use(
+      http.get("/api/v1/airtable/action-items/", () => HttpResponse.json([ITEM_A, ITEM_B]))
+    );
+    await renderPageStable();
+    await waitFor(() => expect(screen.getByDisplayValue("Alpha task")).toBeInTheDocument());
+    expect(stagedTaskOrder()).toEqual(["Alpha task", "Beta task"]);
+
+    fireEvent(window, new StorageEvent("storage", {
+      key: "actionItemOrder",
+      newValue: JSON.stringify({ today: ["recBBB", "recAAA"] }),
+    }));
+
+    await waitFor(() => expect(stagedTaskOrder()).toEqual(["Beta task", "Alpha task"]));
+  });
+
+  it("reordering within Currently Tracking fires no status PATCH and no calendar event", async () => {
+    // Both items already in the active zone.
+    localStorage.setItem("actionItemZones", JSON.stringify({ recAAA: "active", recBBB: "active" }));
+    const statusCalls: string[] = [];
+    const eventCalls: string[] = [];
+    server.use(
+      http.get("/api/v1/airtable/action-items/", () => HttpResponse.json([ITEM_A, ITEM_B])),
+      http.patch("/api/v1/airtable/action-items/:airtableId/status/", ({ params }) => {
+        statusCalls.push(String(params.airtableId));
+        return HttpResponse.json(ITEM_A);
+      }),
+      http.post("/api/v1/scheduler/events/", async ({ request }) => {
+        eventCalls.push(String(request.url));
+        return HttpResponse.json({ id: 99 });
+      })
+    );
+    await renderPageStable();
+    await waitFor(() => expect(screen.getByDisplayValue("Alpha task")).toBeInTheDocument());
+
+    const rects = stubCardRects();
+    try {
+      fireEvent.dragStart(cardFor("Beta task"), { dataTransfer: DT() });
+      dragOverAt(cardFor("Alpha task").parentElement!, 10);
+      fireEvent.drop(zonePanel("Currently Tracking"), { dataTransfer: DT() });
+
+      await waitFor(() =>
+        expect(JSON.parse(localStorage.getItem("actionItemOrder") ?? "{}").active)
+          .toEqual(["recBBB", "recAAA"])
+      );
+      // A same-zone drop is a reorder, not a re-entry into "In Progress".
+      expect(statusCalls).toEqual([]);
+      expect(eventCalls).toEqual([]);
+    } finally {
+      rects.mockRestore();
+    }
+  });
+
+  // ── Display completeness ──────────────────────────────────────────────────────
+
+  it("rescues an item stranded in a zone that no longer renders", async () => {
+    // Older builds could leave "complete" behind; no panel renders it.
+    localStorage.setItem("actionItemZones", JSON.stringify({ recAAA001: "complete" }));
+    await renderPageStable();
+
+    await waitFor(() => expect(screen.getByText("Fix billing issue")).toBeInTheDocument());
+    expect(JSON.parse(localStorage.getItem("actionItemZones") ?? "{}").recAAA001).toBe("accounts");
+  });
+
+  it("shows items whose account matches no known account under an Unmatched row", async () => {
+    server.use(
+      http.get("/api/v1/airtable/action-items/", () =>
+        HttpResponse.json([{ ...mockItem, account: 99, account_name: "Ghost Industries" }])
+      )
+    );
+    await renderPageStable();
+    await waitFor(() => expect(screen.getByText("Unmatched account")).toBeInTheDocument());
+
+    // Without the catch-all row this card would render nowhere at all.
+    expect(screen.getByText("Fix billing issue")).toBeInTheDocument();
+  });
+
+  it("requests both account lists with a widened page_size", async () => {
+    const requested: string[] = [];
+    server.use(
+      http.get("/api/v1/airtable/accounts/", ({ request }) => {
+        requested.push(request.url);
+        return HttpResponse.json({ results: [{ id: 1, airtable_id: "recACCT1", name: "Acme Corp" }], count: 1 });
+      }),
+      http.get("/api/v1/accounts/accounts/", ({ request }) => {
+        requested.push(request.url);
+        return HttpResponse.json({ results: [], count: 0 });
+      })
+    );
+    await renderPageStable();
+    await waitFor(() => expect(screen.getByTitle(/Collapse Acme Corp/i)).toBeInTheDocument());
+
+    // Both endpoints are paginated at 50 by default; the grid needs every account or it
+    // silently hides the items belonging to the ones it didn't fetch.
+    expect(requested).toHaveLength(2);
+    for (const url of requested) expect(url).toContain("page_size=500");
   });
 });

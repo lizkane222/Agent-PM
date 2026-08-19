@@ -8,7 +8,6 @@ import type { EventCategory } from "../../types/calendar";
 import CorporateIcon from "../../assets/icons/Corporate.svg?react";
 import {
   WORK_TRACKING_COLOR,
-  CATEGORY_COLORS,
   PRIORITY_COLORS_CAL,
   STATUS_COLORS_CAL,
   CalPillSelect,
@@ -18,14 +17,17 @@ import {
   CALENDAR_DRAG_ACCOUNT_KEY,
 } from "./calendarHelpers";
 import type { CalCreateForm } from "./calendarHelpers";
+import { DEFAULT_CATEGORY_COLORS, borderFor, readableTextColor } from "../../lib/eventColors";
 
-const EDIT_CATEGORY_META: { id: EventCategory; label: string; icon: string; activeClass: string }[] = [
-  { id: "meeting",          label: "Meeting",          icon: "🗓", activeClass: "bg-blue-500  border-blue-500  text-white" },
-  { id: "task",             label: "Task",             icon: "✓",  activeClass: "bg-pink-500  border-pink-500  text-white" },
-  { id: "out_of_office",   label: "Out of Office",    icon: "🚫", activeClass: "bg-rose-500  border-rose-500  text-white" },
-  { id: "focus_time",      label: "Focus Time",       icon: "🎯", activeClass: "bg-amber-500 border-amber-500 text-white" },
-  { id: "working_location", label: "Working Location", icon: "📍", activeClass: "bg-emerald-500 border-emerald-500 text-white" },
-  { id: "appointment",     label: "Appointment",      icon: "📅", activeClass: "bg-indigo-500 border-indigo-500 text-white" },
+// Labels and icons only — the active pill takes the user's chosen color for that
+// event type (lib/eventColors.ts) so it matches the event on the calendar.
+const EDIT_CATEGORY_META: { id: EventCategory; label: string; icon: string }[] = [
+  { id: "meeting",          label: "Meeting",          icon: "🗓" },
+  { id: "task",             label: "Task",             icon: "✓" },
+  { id: "out_of_office",   label: "Out of Office",    icon: "🚫" },
+  { id: "focus_time",      label: "Focus Time",       icon: "🎯" },
+  { id: "working_location", label: "Working Location", icon: "📍" },
+  { id: "appointment",     label: "Appointment",      icon: "📅" },
 ];
 
 function toDatetimeLocal(iso: string): string {
@@ -44,6 +46,8 @@ function statusColor(status: CalendarEvent["status"]): string {
 
 export interface EventDetailPanelProps {
   event: CalendarEvent;
+  /** The user's chosen color per event type. Defaults let this component stand alone. */
+  categoryColors?: Partial<Record<EventCategory, string>>;
   onClose: () => void;
   onCollapse: () => void;
   linkedAccount?: { accountName: string; accountId: number } | null;
@@ -58,7 +62,7 @@ export interface EventDetailPanelProps {
   onSaveMeeting?: (updated: CalendarEvent) => void;
 }
 
-export default function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAccount, onUnlink, onRemove, onDelete, onUpdateReminder, actionItem, onUpdateActionItem, onUpdateScheduleTime, onSaveMeeting }: EventDetailPanelProps) {
+export default function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAccount, onUnlink, onRemove, onDelete, onUpdateReminder, actionItem, onUpdateActionItem, onUpdateScheduleTime, onSaveMeeting, categoryColors = DEFAULT_CATEGORY_COLORS }: EventDetailPanelProps) {
   const { status: statusOptions } = useActionItemFieldOptions();
   const [dropOver, setDropOver] = useState(false);
   const isWorkSession = event.calendar_id === "work_tracking";
@@ -257,7 +261,7 @@ export default function EventDetailPanel({ event, onClose, onCollapse, linkedAcc
     ? WORK_TRACKING_COLOR
     : isScheduledReminder
     ? "#f59e0b"
-    : (CATEGORY_COLORS[event.event_category ?? "meeting"] ?? statusColor(event.status));
+    : (categoryColors[event.event_category || "meeting"] ?? DEFAULT_CATEGORY_COLORS[event.event_category || "meeting"] ?? statusColor(event.status));
 
   return (
     <div
@@ -548,22 +552,27 @@ export default function EventDetailPanel({ event, onClose, onCollapse, linkedAcc
           <div>
             <p className="text-[11px] text-[var(--twilio-gray-60)] uppercase tracking-wide font-semibold mb-1">Type</p>
             <div className="flex flex-wrap gap-1.5">
-              {EDIT_CATEGORY_META.map((cat) => (
-                <button
-                  key={cat.id}
-                  type="button"
-                  onClick={() => setMeetingCategory(cat.id)}
-                  className={[
-                    "inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-semibold rounded-full border transition-colors",
-                    meetingCategory === cat.id
-                      ? cat.activeClass
-                      : "bg-white border-gray-200 text-[var(--twilio-gray-60)] hover:border-gray-400 hover:text-gray-700",
-                  ].join(" ")}
-                >
-                  <span>{cat.icon}</span>
-                  {cat.label}
-                </button>
-              ))}
+              {EDIT_CATEGORY_META.map((cat) => {
+                const active = meetingCategory === cat.id;
+                const fill = categoryColors[cat.id] ?? DEFAULT_CATEGORY_COLORS[cat.id];
+                return (
+                  <button
+                    key={cat.id}
+                    type="button"
+                    data-active={active ? "true" : "false"}
+                    data-color={active ? fill : undefined}
+                    onClick={() => setMeetingCategory(cat.id)}
+                    className={[
+                      "inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-semibold rounded-full border transition-colors",
+                      active ? "" : "bg-white border-gray-200 text-[var(--twilio-gray-60)] hover:border-gray-400 hover:text-gray-700",
+                    ].join(" ")}
+                    style={active ? { backgroundColor: fill, borderColor: borderFor(fill), color: readableTextColor(fill) } : undefined}
+                  >
+                    <span>{cat.icon}</span>
+                    {cat.label}
+                  </button>
+                );
+              })}
             </div>
           </div>
           <div>

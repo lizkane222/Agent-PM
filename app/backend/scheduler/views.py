@@ -10,6 +10,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from core.mixins import RequireAccountMembershipMixin, RequireCalendarEventOwnershipMixin
+from core.pagination import ClientPageSizePagination
+from core.query_params import csv_int_params
 from realtime.sync import publish_activity_event
 
 from .models import ActionItem, CalendarEvent, MeetingNote, Reminder, Task
@@ -49,6 +51,35 @@ class CalendarEventViewSet(RequireAccountMembershipMixin, viewsets.ModelViewSet)
         if agentpm_airtable_id:
             qs = qs.filter(agentpm_airtable_id=agentpm_airtable_id)
         return qs
+
+    @action(detail=True, methods=["patch"], url_path="attendance")
+    def attendance(self, request, pk=None):
+        """PATCH /scheduler/events/<pk>/attendance/ — record whether the owner attended.
+
+        Body: {"attended": true | false | null}. Tri-state: null clears the record.
+
+        A dedicated action rather than the generic PATCH because attendance is the
+        owner's private annotation of their own event. The generic update path runs
+        RequireAccountMembershipMixin, which would 403 a user marking their own
+        meeting when that meeting is linked to an account they aren't a member of.
+        `get_object()` is already scoped to `owner=request.user`, so another user's
+        event 404s here.
+        """
+        event = self.get_object()
+
+        if "attended" not in request.data:
+            return Response({"attended": "This field is required."}, status=400)
+        value = request.data["attended"]
+        # isinstance, not `in (True, False, None)` — Python treats 1 == True and
+        # 0 == False, so a membership test would silently accept integers.
+        if not (value is None or isinstance(value, bool)):
+            return Response(
+                {"attended": "Must be true, false, or null."}, status=400
+            )
+
+        event.attended = value
+        event.save(update_fields=["attended", "updated_at"])
+        return Response(CalendarEventSerializer(event, context={"request": request}).data)
 
     def perform_create(self, serializer):
         # RequireAccountMembershipMixin.perform_create would run this too, but this
@@ -530,6 +561,10 @@ class MeetingNoteViewSet(RequireCalendarEventOwnershipMixin, viewsets.ModelViewS
     serializer_class = MeetingNoteSerializer
     permission_classes = [IsAuthenticated]
     event_field_name = "event"
+    # Batched ?event=1,2,3 requests cover many events at once and would be silently
+    # truncated by the project-default PAGE_SIZE of 50. This also makes the ?page_size=
+    # that callers already send take effect. Response shape is unchanged.
+    pagination_class = ClientPageSizePagination
 
     def get_queryset(self):
         # Notes are scoped to the calendar event's owner (mirroring CalendarEventViewSet).
@@ -539,9 +574,15 @@ class MeetingNoteViewSet(RequireCalendarEventOwnershipMixin, viewsets.ModelViewS
         user = self.request.user
         if not (getattr(user, "is_staff", False)):
             qs = qs.filter(event__owner=user)
-        event_id = self.request.query_params.get("event")
-        if event_id:
-            qs = qs.filter(event_id=event_id)
+        # ?event= accepts a single PK or a comma-separated batch ("5" or "5,6,7") so a
+        # caller rendering many events fetches their notes in one request instead of
+        # one per event. The owner scoping above still applies to every ID in the batch.
+        event_param = self.request.query_params.get("event")
+        if event_param:
+            event_ids = csv_int_params(event_param)
+            # A present-but-unparseable filter narrows to nothing rather than falling
+            # through and returning every note the caller can see.
+            qs = qs.filter(event_id__in=event_ids) if event_ids else qs.none()
         return qs
 
     def check_object_permissions(self, request, obj):

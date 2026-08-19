@@ -4,7 +4,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { http, HttpResponse } from "msw";
 import { server } from "../../test/msw-server";
-import { mockAccount, mockAirtableAccount } from "../../test/handlers/accounts";
+import { mockAccount, mockAccountNote, mockAirtableAccount } from "../../test/handlers/accounts";
 import type { Account } from "../../types";
 import { mockTeamMembers } from "../../test/handlers/team";
 
@@ -35,9 +35,44 @@ vi.mock("../../components/comments/CommentContext", () => ({
 
 vi.mock("../../assets/icons/Corporate.svg?react", () => ({ default: () => null }));
 
+// TipTap's Placeholder extension calls elementFromPoint which jsdom lacks.
+// The stub mirrors the real editor's Enter contract (bare Enter → onSubmit,
+// Shift+Enter → newline) so page tests exercise the same keyboard path the
+// real component does. The real implementation is covered directly in
+// components/shared/__tests__/RichTextMentionEditor.test.tsx.
+vi.mock("../../components/shared/RichTextMentionEditor", () => ({
+  default: React.forwardRef(({ value, onChange, placeholder, onSubmit, onKeyDownCapture }: { value: string; onChange: (v: string) => void; placeholder?: string; onSubmit?: () => void; onKeyDownCapture?: (e: React.KeyboardEvent) => void }, ref: React.Ref<{ clear: () => void }>) => {
+    React.useImperativeHandle(ref, () => ({ clear: () => onChange("") }));
+    return (
+      <textarea
+        data-testid="description-editor"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        onKeyDown={(e) => {
+          onKeyDownCapture?.(e);
+          if (e.key === "Enter" && !e.shiftKey && onSubmit) { e.preventDefault(); onSubmit(); }
+        }}
+      />
+    );
+  }),
+  plainToHtml: (text: string) => text,
+}));
+
 // ── Mock data ─────────────────────────────────────────────────────────────────
 
-const FUTURE_MEETING_DATE = "2026-08-15";
+/**
+ * Always genuinely in the future, and always after `itemBeforeMeeting.due_date` but before
+ * `itemAfterMeeting.due_date`. Previously hardcoded to a fixed calendar day, which silently
+ * turned the "Before Next Meeting" button off — and these tests red — once that day passed.
+ */
+function daysFromNow(days: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+const FUTURE_MEETING_DATE = daysFromNow(10);
 
 const mockMeetingFuture = {
   id: 1,
@@ -50,6 +85,8 @@ const mockMeetingFuture = {
   expected_topics: "",
   gong_notes: "",
   gong_url: "",
+  zoom_notes: "",
+  zoom_url: "",
   customer_slack: "",
   account_team_slack: "",
   last_synced: "2026-01-01T00:00:00Z",
@@ -105,8 +142,8 @@ const itemBob   = makeItem({ airtable_id: "recBBB002", id: 2, task: "Bob task", 
 const itemNone  = makeItem({ airtable_id: "recCCC003", id: 3, task: "Unassigned task", assignee_name: "" });
 
 // Items with due_dates for the Before Next Meeting test.
-const itemBeforeMeeting = makeItem({ airtable_id: "recD001", id: 4, task: "Before task", assignee_name: "Alice Smith", due_date: "2026-08-10" });
-const itemAfterMeeting  = makeItem({ airtable_id: "recE002", id: 5, task: "After task",  assignee_name: "Bob Jones",   due_date: "2026-08-20" });
+const itemBeforeMeeting = makeItem({ airtable_id: "recD001", id: 4, task: "Before task", assignee_name: "Alice Smith", due_date: daysFromNow(5) });
+const itemAfterMeeting  = makeItem({ airtable_id: "recE002", id: 5, task: "After task",  assignee_name: "Bob Jones",   due_date: daysFromNow(20) });
 
 function registerHandlers(items = [itemAlice, itemBob, itemNone]) {
   server.use(
@@ -284,5 +321,367 @@ describe("AccountDetailPage — kanban views", () => {
     const section = await getSection();
     await waitFor(() => within(section).getByText("New"));
     expect(within(section).getByText("New")).toBeInTheDocument();
+  });
+
+  // ── Accounts not linked to an Airtable record ────────────────────────────────
+  //
+  // Per-user Admin accounts have a blank airtable_id and are never linked to the shared
+  // Airtable "ADMIN" record, but their action items and meetings do live under it. The page
+  // used to skip the Airtable fetch entirely for such accounts and render nothing.
+  describe("account with no airtable_id", () => {
+    const unlinkedAccount: Account = { ...mockAccountWithMembers, airtable_id: "", company_name: "Admin" };
+
+    it("scopes action items and meetings by account_name instead", async () => {
+      const scopes: Record<string, string | null> = {};
+      server.use(
+        http.get("/api/v1/accounts/accounts/:id/", () => HttpResponse.json(unlinkedAccount)),
+        http.get("/api/v1/airtable/action-items/", ({ request }) => {
+          const url = new URL(request.url);
+          scopes.itemsName = url.searchParams.get("account_name");
+          scopes.itemsId = url.searchParams.get("account");
+          return HttpResponse.json([itemAlice, itemBob]);
+        }),
+        http.get("/api/v1/airtable/meetings/", ({ request }) => {
+          scopes.meetingsName = new URL(request.url).searchParams.get("account_name");
+          return HttpResponse.json({ results: [mockMeetingFuture] });
+        }),
+      );
+
+      await renderPage();
+      const section = await getSection();
+
+      // The items actually render — this is the reported symptom.
+      await waitFor(() => expect(within(section).getByText("Alice task")).toBeInTheDocument());
+      expect(within(section).getByText("Bob task")).toBeInTheDocument();
+
+      // Scoped by name, with no bogus `?account=` on the request.
+      expect(scopes.itemsName).toBe("Admin");
+      expect(scopes.itemsId).toBeNull();
+      expect(scopes.meetingsName).toBe("Admin");
+    });
+
+    it("does not request the Airtable account record when there is nothing to look up", async () => {
+      let airtableAccountsCalled = false;
+      server.use(
+        http.get("/api/v1/accounts/accounts/:id/", () => HttpResponse.json(unlinkedAccount)),
+        http.get("/api/v1/airtable/accounts/", () => {
+          airtableAccountsCalled = true;
+          return HttpResponse.json({ results: [] });
+        }),
+      );
+
+      await renderPage();
+      const section = await getSection();
+      await waitFor(() => within(section).getByRole("button", { name: "All" }));
+
+      expect(airtableAccountsCalled).toBe(false);
+    });
+
+    it("still scopes by airtable_id when the account is linked", async () => {
+      // The page issues more than one action-items request (ArtifactsPanel makes its own,
+      // scoped by the numeric AirtableAccount PK), so collect them all rather than
+      // recording only the last.
+      const calls: { id: string | null; name: string | null }[] = [];
+      server.use(
+        http.get("/api/v1/airtable/action-items/", ({ request }) => {
+          const url = new URL(request.url);
+          calls.push({ id: url.searchParams.get("account"), name: url.searchParams.get("account_name") });
+          return HttpResponse.json([itemAlice]);
+        }),
+      );
+
+      await renderPage();
+      const section = await getSection();
+      await waitFor(() => expect(within(section).getByText("Alice task")).toBeInTheDocument());
+
+      expect(calls.some((c) => c.id === "recACME001")).toBe(true);
+      // A linked account never falls back to the name scope.
+      expect(calls.every((c) => c.name === null)).toBe(true);
+    });
+  });
+});
+
+// ── GET Meeting Notes ─────────────────────────────────────────────────────────
+
+/**
+ * The button scans the user's Gong/Zoom recap emails for meetings that have no AI
+ * summary yet. It deliberately scans *every* meeting the user can see, not just this
+ * account's, so the request must carry no account filter — and it re-reads this
+ * account's meetings afterwards so an imported summary appears without a reload.
+ */
+describe("AccountDetailPage — GET Meeting Notes", () => {
+  const SCAN_PATH = "/api/v1/integrations/gmail/meeting-notes/";
+
+  const emptyReport = {
+    days: 30,
+    account_name: "",
+    scanned_emails: 3,
+    scanned_meetings: 2,
+    updated: [],
+    skipped: [],
+    errors: [],
+    summaries_truncated: false,
+    max_summaries: 25,
+  };
+
+  beforeEach(() => {
+    // vi.resetModules() is not optional here. The kanban block above calls it, which
+    // detaches the module instance that test/setup.ts holds a reference to — so its
+    // resetRequestCache() then clears a stale copy and the page's live GET cache
+    // (lib/requestCache.ts, 10s TTL) survives into the next test. A fresh module graph
+    // per test gives each one an empty cache, so the meetings re-read below is really
+    // observed at the network layer.
+    vi.resetModules();
+    localStorage.clear();
+    registerHandlers();
+  });
+
+  async function clickButton() {
+    const button = await screen.findByRole("button", { name: /GET Meeting Notes/i });
+    fireEvent.click(button);
+    return button;
+  }
+
+  /** Find a result row by its combined text — the provider name is its own <span>. */
+  function rowMatching(pattern: RegExp): HTMLElement | undefined {
+    return within(screen.getByRole("status"))
+      .getAllByRole("listitem")
+      .find((li) => pattern.test(li.textContent ?? ""));
+  }
+
+  it("renders the button in the Timeline header", async () => {
+    await renderPage();
+    expect(await screen.findByRole("button", { name: /GET Meeting Notes/i })).toBeInTheDocument();
+  });
+
+  it("posts to the scan endpoint with no account filter", async () => {
+    let body: unknown = "not called";
+    server.use(
+      http.post(SCAN_PATH, async ({ request }) => {
+        body = await request.json();
+        return HttpResponse.json(emptyReport);
+      })
+    );
+
+    await renderPage();
+    await clickButton();
+
+    await waitFor(() => expect(body).not.toBe("not called"));
+    expect(body).toEqual({});
+  });
+
+  it("reports the scan counts when nothing was found", async () => {
+    server.use(http.post(SCAN_PATH, () => HttpResponse.json(emptyReport)));
+
+    await renderPage();
+    await clickButton();
+
+    expect(await screen.findByText(/No new meeting notes found/i)).toBeInTheDocument();
+    expect(screen.getByText(/3 recap emails against 2 meetings/i)).toBeInTheDocument();
+  });
+
+  it("lists each updated meeting with its provider", async () => {
+    server.use(
+      http.post(SCAN_PATH, () => HttpResponse.json({
+        ...emptyReport,
+        updated: [{
+          meeting_id: 1, airtable_id: "recMTG001", meeting_name: "Q3 Review",
+          date: "2026-08-10T10:00:00Z", account_name: "Acme Corp", sources: ["gong"],
+        }],
+      }))
+    );
+
+    await renderPage();
+    await clickButton();
+
+    expect(await screen.findByText(/Added notes to 1 meeting/i)).toBeInTheDocument();
+    // The provider sits in its own <span> for capitalisation, so match on the row's
+    // full text rather than a single text node.
+    expect(rowMatching(/Q3 Review.*gong/i)).toBeTruthy();
+  });
+
+  it("names the other account when a recap landed outside this page", async () => {
+    server.use(
+      http.post(SCAN_PATH, () => HttpResponse.json({
+        ...emptyReport,
+        updated: [{
+          meeting_id: 9, airtable_id: "recMTG009", meeting_name: "Beta Kickoff",
+          date: null, account_name: "Beta Corp", sources: ["zoom"],
+        }],
+      }))
+    );
+
+    await renderPage();
+    await clickButton();
+
+    await screen.findByText(/Added notes to 1 meeting/i);
+    expect(rowMatching(/Beta Kickoff.*zoom.*Beta Corp/i)).toBeTruthy();
+  });
+
+  it("says when the per-run summary limit was reached", async () => {
+    server.use(
+      http.post(SCAN_PATH, () => HttpResponse.json({
+        ...emptyReport, summaries_truncated: true, max_summaries: 25,
+      }))
+    );
+
+    await renderPage();
+    await clickButton();
+
+    expect(await screen.findByText(/Stopped at the per-run limit of 25/i)).toBeInTheDocument();
+  });
+
+  it("re-reads this account's meetings so an imported summary shows up", async () => {
+    let meetingFetches = 0;
+    server.use(
+      http.get("/api/v1/airtable/meetings/", () => {
+        meetingFetches += 1;
+        return HttpResponse.json({ results: [mockMeetingFuture] });
+      }),
+      http.post(SCAN_PATH, () => HttpResponse.json(emptyReport)),
+    );
+
+    await renderPage();
+    // Wait for the button (proves the account loaded) before counting: the initial
+    // meetings fetch is chained after it and can outlast waitFor's 1s default.
+    await screen.findByRole("button", { name: /GET Meeting Notes/i });
+    await waitFor(() => expect(meetingFetches).toBeGreaterThan(0), { timeout: 3000 });
+    const before = meetingFetches;
+
+    await clickButton();
+
+    // The scan is a POST, which clears the client's GET cache (lib/requestCache.ts),
+    // so this really does hit the network rather than replaying the pre-scan response.
+    await waitFor(() => expect(meetingFetches).toBeGreaterThan(before), { timeout: 3000 });
+  });
+
+  it("shows the backend's message when Gmail is not connected", async () => {
+    server.use(
+      http.post(SCAN_PATH, () =>
+        HttpResponse.json({ detail: "Gmail not connected. Connect Gmail from Settings." }, { status: 400 })
+      )
+    );
+
+    await renderPage();
+    await clickButton();
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/Gmail not connected/i);
+  });
+
+  it("falls back to a generic message when the error has no detail", async () => {
+    server.use(http.post(SCAN_PATH, () => new HttpResponse(null, { status: 500 })));
+
+    await renderPage();
+    await clickButton();
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/Could not read Gmail/i);
+  });
+
+  it("disables the button while the scan is in flight", async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    server.use(
+      http.post(SCAN_PATH, async () => {
+        await gate;
+        return HttpResponse.json(emptyReport);
+      })
+    );
+
+    await renderPage();
+    const button = await clickButton();
+
+    await waitFor(() => expect(button).toBeDisabled());
+    expect(screen.getByText(/Checking email…/i)).toBeInTheDocument();
+
+    release?.();
+    await waitFor(() => expect(button).not.toBeDisabled());
+  });
+});
+
+// ── Enter-to-add on note composers ────────────────────────────────────────────
+
+describe("AccountDetailPage — Enter adds a note", () => {
+  const NOTES_PATH = "/api/v1/accounts/accounts/:id/notes/";
+
+  beforeEach(() => {
+    vi.resetModules();
+    localStorage.clear();
+    registerHandlers();
+  });
+
+  /** The account-notes draft composer (the only one mounted on page load). */
+  async function getComposer() {
+    const boxes = await screen.findAllByPlaceholderText(/Add a note/);
+    return boxes[0];
+  }
+
+  it("renders a note composer", async () => {
+    await renderPage();
+    expect(await getComposer()).toBeInTheDocument();
+  });
+
+  it("POSTs the note when Enter is pressed — no Add click needed", async () => {
+    let body: unknown = "not called";
+    server.use(
+      http.post(NOTES_PATH, async ({ request }) => {
+        body = await request.json();
+        return HttpResponse.json({
+          id: 99, account: 1, author: 1, author_username: "alice", author_display: "Alice",
+          content: "Typed with the keyboard", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
+        });
+      })
+    );
+
+    await renderPage();
+    const composer = await getComposer();
+    fireEvent.change(composer, { target: { value: "Typed with the keyboard" } });
+    fireEvent.keyDown(composer, { key: "Enter" });
+
+    await waitFor(() => expect(body).not.toBe("not called"));
+    expect(body).toEqual({ content: "Typed with the keyboard" });
+  });
+
+  it("does NOT post on Shift+Enter — that inserts a newline", async () => {
+    let calls = 0;
+    server.use(http.post(NOTES_PATH, () => { calls += 1; return HttpResponse.json(mockAccountNote); }));
+
+    await renderPage();
+    const composer = await getComposer();
+    fireEvent.change(composer, { target: { value: "Line one" } });
+    fireEvent.keyDown(composer, { key: "Enter", shiftKey: true });
+
+    await new Promise((r) => setTimeout(r, 30));
+    expect(calls).toBe(0);
+  });
+
+  it("does not post an empty note on Enter", async () => {
+    let calls = 0;
+    server.use(http.post(NOTES_PATH, () => { calls += 1; return HttpResponse.json(mockAccountNote); }));
+
+    await renderPage();
+    const composer = await getComposer();
+    fireEvent.keyDown(composer, { key: "Enter" });
+
+    await new Promise((r) => setTimeout(r, 30));
+    expect(calls).toBe(0);
+  });
+
+  it("posts exactly once per Enter press", async () => {
+    let calls = 0;
+    server.use(
+      http.post(NOTES_PATH, () => {
+        calls += 1;
+        return HttpResponse.json({ ...mockAccountNote, id: 100 + calls, content: "Once" });
+      })
+    );
+
+    await renderPage();
+    const composer = await getComposer();
+    fireEvent.change(composer, { target: { value: "Once" } });
+    fireEvent.keyDown(composer, { key: "Enter" });
+
+    await waitFor(() => expect(calls).toBe(1));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(calls).toBe(1);
   });
 });

@@ -41,3 +41,26 @@ export interface Comment {
   created_at: string;
   updated_at: string;
 }
+
+/** Trimmed comment shape returned by the batched `/comments/comments/summary/` route. */
+export interface CommentPreview {
+  id: number;
+  resource_id: number;
+  author: number | null;
+  author_display: string;
+  content: string;
+  created_at: string;
+}
+
+/** Per-record comment rollup: total count (replies included) + newest few top-level. */
+export interface CommentSummary {
+  /** Every comment on the record, replies included. */
+  count: number;
+  /** Oldest-first, capped server-side (currently 3). */
+  comments: CommentPreview[];
+}
+
+/** `results` is keyed by `String(resource_id)`; records with no comments are omitted. */
+export interface CommentSummaryResponse {
+  results: Record<string, CommentSummary>;
+}

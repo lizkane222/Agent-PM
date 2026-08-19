@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { schedulerApi, airtableApi } from "../../lib/api";
 import { AccountNoteRowSimple } from "./AccountNoteRowSimple";
 import { parseBullets, GongBulletRow, _strHash } from "./GongSummaryPanel";
@@ -107,6 +107,12 @@ export function AccountMeetingNotesFeed({
     return calendarEvents.map((ev) => ev.id).sort((a, b) => a - b).join(",");
   }, [calendarEvents]);
 
+  // The effect needs each event's agentpm_airtable_id to map batched meetings back to
+  // events, but must keep re-firing only on the ID set (not on every new array
+  // reference). Read the full objects through a ref so they stay out of the deps.
+  const calendarEventsRef = useRef(calendarEvents);
+  calendarEventsRef.current = calendarEvents;
+
   useEffect(() => {
     if (!allEventIdStr) {
       setFetched(true);
@@ -114,24 +120,33 @@ export function AccountMeetingNotesFeed({
     }
     setLoading(true);
     const ids = allEventIdStr.split(",").map(Number).filter(Boolean);
-    Promise.all(
-      ids.map((id) =>
-        Promise.all([
-          schedulerApi.listMeetingNotes(id)
-            .then((r) => ({ eventId: id, notes: r.data.results as MeetingNote[] }))
-            .catch(() => ({ eventId: id, notes: [] as MeetingNote[] })),
-          airtableApi.listMeetings({ calendar_event_id: String(id) })
-            .then((r) => ({ eventId: id, meeting: r.data.results[0] as AirtableMeeting | undefined }))
-            .catch(() => ({ eventId: id, meeting: undefined as AirtableMeeting | undefined })),
-        ])
-      )
-    ).then((pairs) => {
+    // Two requests total, regardless of event count. This used to be two per event,
+    // which blew the backend's 200/min throttle on any account with many meetings.
+    Promise.all([
+      schedulerApi.listMeetingNotesForEvents(ids)
+        .then((r) => r.data.results as MeetingNote[])
+        .catch(() => [] as MeetingNote[]),
+      airtableApi.listMeetings({ calendar_event_id: ids.join(",") })
+        .then((r) => r.data.results as AirtableMeeting[])
+        .catch(() => [] as AirtableMeeting[]),
+    ]).then(([notes, batchedMeetings]) => {
+      // Every requested event gets an entry — dateGroups indexes this map directly.
       const notesMap: Record<number, MeetingNote[]> = {};
+      for (const id of ids) notesMap[id] = [];
+      for (const note of notes) {
+        (notesMap[note.event] ??= []).push(note);
+      }
+
+      // Join meetings back to events on airtable_id === event.agentpm_airtable_id,
+      // the same linkage the backend used to resolve one calendar_event_id at a time.
+      const meetingByAirtableId = new Map(batchedMeetings.map((m) => [m.airtable_id, m]));
       const meetingsMap: Record<number, AirtableMeeting> = {};
-      pairs.forEach(([{ eventId, notes }, { meeting }]) => {
-        notesMap[eventId] = notes;
-        if (meeting) meetingsMap[eventId] = meeting;
-      });
+      for (const ev of calendarEventsRef.current) {
+        if (!ev.agentpm_airtable_id) continue;
+        const meeting = meetingByAirtableId.get(ev.agentpm_airtable_id);
+        if (meeting) meetingsMap[ev.id] = meeting;
+      }
+
       setNotesByEvent(notesMap);
       setMeetingByEvent(meetingsMap);
     }).finally(() => { setLoading(false); setFetched(true); });
