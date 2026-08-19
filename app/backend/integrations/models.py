@@ -77,6 +77,27 @@ class WebhookLog(models.Model):
         return f"{self.source} webhook — {self.event_type} ({self.created_at:%Y-%m-%d %H:%M})"
 
 
+class GmailWatchState(models.Model):
+    """
+    Tracks the active Gmail push-notification watch() for a user.
+    Populated by integrations.tasks.register_gmail_watch; historyId is the
+    cursor sync_gmail_history_for_user resumes from.
+    """
+
+    user = models.OneToOneField(
+        User,
+        on_delete=models.CASCADE,
+        related_name="gmail_watch_state",
+    )
+    history_id = models.CharField(max_length=64, blank=True, default="")
+    expiration = models.DateTimeField(null=True, blank=True)
+    pub_sub_topic = models.CharField(max_length=256, blank=True, default="")
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self) -> str:
+        return f"{self.user.email} — Gmail watch (expires {self.expiration})"
+
+
 class SyncState(models.Model):
     """Tracks the last-synced cursor/token for incremental sync operations."""
 

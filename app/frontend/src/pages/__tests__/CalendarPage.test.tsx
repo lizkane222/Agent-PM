@@ -4,14 +4,17 @@ import { http, HttpResponse } from "msw";
 import { server } from "../../test/msw-server";
 import { AppErrorProvider } from "../../context/AppErrorContext";
 import { mockCalendarEvents } from "../../test/handlers/scheduler";
+import { mockActionItem } from "../../test/handlers/action_items";
 import { mockUserProfile } from "../../test/handlers/team";
 import {
   DARK_TEXT,
   DEFAULT_CATEGORY_COLORS,
+  EVENT_CATEGORY_META,
   EVENT_TYPE_META,
   IMPORTANT_PALETTE,
   borderFor,
   readableTextColor,
+  tint,
   withAlpha,
 } from "../../lib/eventColors";
 import CalendarPage from "../CalendarPage";
@@ -28,12 +31,14 @@ vi.mock("@fullcalendar/react", async () => {
     props: Record<string, unknown>,
     _ref: unknown,
   ) {
-    const { datesSet, events, eventDidMount, select, eventClick } = props as {
+    const { datesSet, events, eventDidMount, select, eventClick, customButtons, headerToolbar } = props as {
       datesSet?: (info: {
         startStr: string;
         endStr: string;
         view: { type: string };
       }) => void;
+      customButtons?: Record<string, { text: string; click: () => void }>;
+      headerToolbar?: { left?: string; center?: string; right?: string };
       events?: Array<{
         id: string;
         title: string;
@@ -57,9 +62,36 @@ vi.mock("@fullcalendar/react", async () => {
       });
     }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+    // The real toolbar's `right` slot, rendered in order so placement is assertable.
+    // Space-separated groups, comma-separated buttons within a group; a name that is
+    // not a customButton is an FC built-in (prev, today, dayGridMonth, …) and gets a
+    // placeholder so its position still counts.
+    const toolbarButtons = (headerToolbar?.right ?? "")
+      .split(/\s+/)
+      .filter(Boolean)
+      .flatMap((group) => group.split(","))
+      .filter(Boolean)
+      .map((name) =>
+        React.createElement(
+          "button",
+          {
+            key: name,
+            className: `fc-${name}-button`,
+            "data-fc-button": name,
+            onClick: customButtons?.[name]?.click,
+          },
+          customButtons?.[name]?.text ?? name,
+        ),
+      );
+
     return React.createElement(
       "div",
       { "data-testid": "fullcalendar" },
+      React.createElement(
+        "div",
+        { className: "fc-header-toolbar", "data-testid": "fc-toolbar-right" },
+        toolbarButtons,
+      ),
       // Test-only trigger for FullCalendar's `select` prop (drag-to-create on the grid).
       React.createElement("button", {
         "data-testid": "trigger-date-select",
@@ -843,6 +875,34 @@ describe("CalendarPage", () => {
       expect(patched).toEqual({ calendar_colors: { categories: { task: "#18363E" } } });
     });
 
+    it("sits in the calendar toolbar, immediately after the month/week/day group", () => {
+      renderPage();
+      const order = Array.from(
+        document.querySelectorAll<HTMLElement>("[data-fc-button]"),
+      ).map((el) => el.dataset.fcButton);
+      expect(order.slice(-4)).toEqual([
+        "dayGridMonth",
+        "timeGridWeek",
+        "timeGridDay",
+        "colorsButton",
+      ]);
+    });
+
+    it("stays dismissable by its own trigger despite the outside-click listener", async () => {
+      // The trigger is a FullCalendar custom button, so it is not a DOM ancestor of
+      // the panel: the panel's mousedown-outside handler would close the panel and
+      // the click that follows would reopen it. `ignoreSelector` is what prevents it.
+      renderPage();
+      const button = screen.getByRole("button", { name: /Colors/ });
+      fireEvent.click(button);
+      expect(await screen.findByRole("dialog", { name: "Event colors" })).toBeInTheDocument();
+
+      fireEvent.mouseDown(button);
+      expect(screen.getByRole("dialog", { name: "Event colors" })).toBeInTheDocument();
+      fireEvent.click(button);
+      expect(screen.queryByRole("dialog", { name: "Event colors" })).not.toBeInTheDocument();
+    });
+
     it("closes when the header button is clicked again", async () => {
       renderPage();
       const button = screen.getByRole("button", { name: /Colors/ });
@@ -976,5 +1036,440 @@ describe("CalendarPage", () => {
     await waitFor(() =>
       expect(screen.getByText(/Google Calendar sync failed/)).toBeInTheDocument(),
     );
+  });
+
+  describe("sidebar colors follow the user's preferences", () => {
+    const ACTION_COLOR = "#842D78"; // 90s purple
+    const REMINDER_COLOR = "#174DB1"; // 90s blue
+
+    function withColors(categories: Record<string, string>) {
+      server.use(
+        http.get("/api/v1/team/profiles/me/", () =>
+          HttpResponse.json({ ...mockUserProfile, calendar_colors: { categories } }),
+        ),
+      );
+    }
+
+    /** The one mounted sidebar card. Only one tab is mounted at a time. */
+    const card = () => document.querySelector<HTMLElement>("[data-accent]");
+
+    it("paints action-item cards in the configured action-item color", async () => {
+      withColors({ action_item: ACTION_COLOR });
+      renderPage();
+
+      await waitFor(() => expect(card()).not.toBeNull());
+      expect(card()).toHaveAttribute("data-accent", ACTION_COLOR);
+      expect(card()).toHaveStyle({ borderLeftColor: ACTION_COLOR });
+      // The fill is a wash of the accent so the card text stays readable.
+      expect(card()).toHaveStyle({ backgroundColor: tint(ACTION_COLOR, 0.9) });
+    });
+
+    it("paints the New Action Item button in the same color", async () => {
+      withColors({ action_item: ACTION_COLOR });
+      renderPage();
+
+      const newBtn = await screen.findByRole("button", { name: "+ New Action Item" });
+      expect(newBtn).toHaveStyle({ backgroundColor: ACTION_COLOR });
+      expect(newBtn).toHaveStyle({ color: readableTextColor(ACTION_COLOR) });
+    });
+
+    it("paints reminder cards in the configured reminder color", async () => {
+      withColors({ reminder: REMINDER_COLOR });
+      renderPage();
+
+      // Switching to the Reminders content view forces the reminders tab.
+      fireEvent.click(document.querySelector("[data-fc-button='viewReminders']")!);
+
+      await waitFor(() => {
+        expect(screen.getByText("Follow up with client")).toBeInTheDocument();
+      });
+      expect(card()).toHaveAttribute("data-accent", REMINDER_COLOR);
+      expect(card()).toHaveStyle({ borderLeftColor: REMINDER_COLOR });
+      expect(card()).toHaveStyle({ backgroundColor: tint(REMINDER_COLOR, 0.9) });
+    });
+
+    it("falls back to the shipped reminder default when nothing is stored", async () => {
+      renderPage();
+      fireEvent.click(document.querySelector("[data-fc-button='viewReminders']")!);
+
+      await waitFor(() => {
+        expect(screen.getByText("Follow up with client")).toBeInTheDocument();
+      });
+      expect(card()).toHaveAttribute("data-accent", DEFAULT_CATEGORY_COLORS.reminder);
+    });
+
+    it("repaints the reminders sidebar as soon as a reminder color is picked", async () => {
+      renderPage();
+      fireEvent.click(document.querySelector("[data-fc-button='viewReminders']")!);
+      await waitFor(() => {
+        expect(screen.getByText("Follow up with client")).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByRole("button", { name: /Colors/ }));
+      fireEvent.click(await screen.findByTestId("color-row-reminder"));
+      fireEvent.click(screen.getByTestId(`swatch-reminder-${REMINDER_COLOR}`));
+
+      await waitFor(() => {
+        expect(card()).toHaveAttribute("data-accent", REMINDER_COLOR);
+      });
+    });
+
+    it("paints a scheduled reminder on the grid from the same reminder color", async () => {
+      // A scheduled reminder is a synthetic 15-minute marker carrying
+      // calendar_id "work_tracking" — it must still resolve as a reminder, not as an
+      // action item, and it keeps its washed fill with the accent as the edge.
+      localStorage.setItem(
+        "scheduledReminders",
+        JSON.stringify([{
+          reminderId: 1,
+          title: "Follow up with client",
+          start: "2026-07-30T09:00:00",
+          end: "2026-07-30T09:15:00",
+        }]),
+      );
+      withColors({ reminder: REMINDER_COLOR });
+      renderPage();
+
+      await waitFor(() => {
+        const marker = document.querySelector<HTMLElement>(
+          "[data-testid='calendar-event'][data-border-color='#174DB1']",
+        );
+        expect(marker).not.toBeNull();
+        expect(marker).toHaveAttribute("data-bg-color", tint(REMINDER_COLOR, 0.9));
+      });
+    });
+  });
+});
+
+// ── Editing and converting an event ───────────────────────────────────────────
+
+describe("CalendarPage — editing an event", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+    localStorage.clear();
+    server.use(
+      http.get("/api/v1/airtable/accounts/", () => HttpResponse.json({ results: [] })),
+      http.get("/api/v1/accounts/accounts/", () => HttpResponse.json({ results: [], count: 0 })),
+      http.get("/api/v1/accounts/admin-account/", () => HttpResponse.json({ id: 1, company_name: "Admin" })),
+    );
+  });
+
+  /** One meeting, PK 7, uid "gcal-7" — deliberately different so a test can prove which
+   *  one the PATCH url used. FullCalendar strips `id` from extendedProps, so a panel
+   *  built from the raw snapshot would PATCH `/events/undefined/`. */
+  function serveEvent(overrides: Record<string, unknown> = {}) {
+    server.use(
+      http.get("/api/v1/scheduler/events/", () =>
+        HttpResponse.json([
+          {
+            ...mockCalendarEvents[0],
+            id: 7,
+            google_event_id: "gcal-7",
+            title: "Q3 Planning",
+            description: "Original agenda",
+            location: "",
+            event_category: "meeting",
+            attendees: [],
+            is_synced: true,
+            ...overrides,
+          },
+        ]),
+      ),
+    );
+  }
+
+  /** Record what the details endpoint received. */
+  function captureDetailsPatch() {
+    const seen: { body: Record<string, unknown> | null; id: string; calls: number } = {
+      body: null, id: "", calls: 0,
+    };
+    server.use(
+      http.patch("/api/v1/scheduler/events/:id/details/", async ({ request, params }) => {
+        seen.body = (await request.json()) as Record<string, unknown>;
+        seen.id = String(params.id);
+        seen.calls += 1;
+        return HttpResponse.json({ ...mockCalendarEvents[0], id: 7, google_event_id: "gcal-7", ...seen.body });
+      }),
+    );
+    return seen;
+  }
+
+  async function eventEl() {
+    return waitFor(() => {
+      const found = document.querySelector("[data-testid='calendar-event']");
+      expect(found).not.toBeNull();
+      return found as HTMLElement;
+    });
+  }
+
+  /** Right-click the event and choose Edit — the path the user reported as broken. */
+  async function openEditViaMenu() {
+    renderPage();
+    fireEvent.contextMenu(await eventEl());
+    fireEvent.click(await screen.findByText("Edit"));
+    return waitFor(() => expect(screen.getByTestId("event-edit-form")).toBeInTheDocument());
+  }
+
+  const form = () => screen.getByTestId("event-edit-form");
+
+  it("right-click → Edit opens an editable form, not a read-only panel", async () => {
+    serveEvent();
+    await openEditViaMenu();
+
+    // The reported bug: Edit opened a panel with no inputs and no save.
+    expect(screen.getByLabelText("Title")).toHaveValue("Q3 Planning");
+    expect(screen.getByLabelText("Description")).toHaveValue("Original agenda");
+    expect(screen.getByLabelText("Location")).toBeInTheDocument();
+    expect(screen.getByLabelText("Starts")).toBeInTheDocument();
+    expect(screen.getByLabelText("Ends")).toBeInTheDocument();
+    expect(screen.getByText("Save")).toBeInTheDocument();
+  });
+
+  it("saves an edited title to the DB id, not undefined", async () => {
+    // The second bug: FullCalendar strips `id`, so the panel used to hold a row whose
+    // `id` was undefined and every PATCH would have gone to /events/undefined/.
+    const patch = captureDetailsPatch();
+    serveEvent();
+    await openEditViaMenu();
+
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Q3 Planning (revised)" } });
+    fireEvent.click(screen.getByText("Save"));
+
+    await waitFor(() => expect(patch.body).toEqual({ title: "Q3 Planning (revised)" }));
+    expect(patch.id).toBe("7");
+    expect(patch.id).not.toBe("undefined");
+  });
+
+  it("sends only the fields that changed", async () => {
+    const patch = captureDetailsPatch();
+    serveEvent();
+    await openEditViaMenu();
+
+    fireEvent.change(screen.getByLabelText("Location"), { target: { value: "Room 4" } });
+    fireEvent.click(screen.getByText("Save"));
+
+    await waitFor(() => expect(patch.body).toEqual({ location: "Room 4" }));
+  });
+
+  it("changes the type from the edit form", async () => {
+    const patch = captureDetailsPatch();
+    serveEvent();
+    await openEditViaMenu();
+
+    fireEvent.click(within(form()).getByRole("button", { name: /Focus Time/ }));
+    fireEvent.click(screen.getByText("Save"));
+
+    await waitFor(() => expect(patch.body).toEqual({ event_category: "focus_time" }));
+  });
+
+  it("offers exactly the six categories the model accepts", async () => {
+    // `action_item` and `reminder` are colorable but are not event_category values —
+    // offering either here would produce a 400 on save.
+    serveEvent();
+    await openEditViaMenu();
+
+    for (const c of EVENT_CATEGORY_META) {
+      expect(within(form()).getByRole("button", { name: new RegExp(c.label) })).toBeInTheDocument();
+    }
+    expect(within(form()).queryByRole("button", { name: /Action item/i })).not.toBeInTheDocument();
+    expect(form().querySelectorAll("[data-category]")).toHaveLength(6);
+  });
+
+  it("closes the form without saving on Cancel", async () => {
+    const patch = captureDetailsPatch();
+    serveEvent();
+    await openEditViaMenu();
+
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Discarded" } });
+    fireEvent.click(screen.getByText("Cancel"));
+
+    await waitFor(() => expect(screen.queryByTestId("event-edit-form")).not.toBeInTheDocument());
+    expect(patch.calls).toBe(0);
+  });
+
+  it("refuses an empty title and stays open", async () => {
+    const patch = captureDetailsPatch();
+    serveEvent();
+    await openEditViaMenu();
+
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "  " } });
+    fireEvent.click(screen.getByText("Save"));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("A title is required.");
+    expect(patch.calls).toBe(0);
+    expect(screen.getByTestId("event-edit-form")).toBeInTheDocument();
+  });
+
+  it("refuses an end before the start", async () => {
+    const patch = captureDetailsPatch();
+    serveEvent();
+    await openEditViaMenu();
+
+    fireEvent.change(screen.getByLabelText("Starts"), { target: { value: "2026-07-30T15:00" } });
+    fireEvent.change(screen.getByLabelText("Ends"), { target: { value: "2026-07-30T14:00" } });
+    fireEvent.click(screen.getByText("Save"));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("end time must be after");
+    expect(patch.calls).toBe(0);
+  });
+
+  it("keeps the form open and reports when the server rejects the save", async () => {
+    serveEvent();
+    server.use(
+      http.patch("/api/v1/scheduler/events/:id/details/", () =>
+        HttpResponse.json({ detail: "nope" }, { status: 400 }),
+      ),
+    );
+    await openEditViaMenu();
+
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Rejected" } });
+    fireEvent.click(screen.getByText("Save"));
+
+    // Closing on a rejected save would look exactly like success.
+    expect(await screen.findByRole("alert")).toHaveTextContent("Could not save");
+    expect(screen.getByTestId("event-edit-form")).toBeInTheDocument();
+  });
+
+  it("warns that saving notifies guests on a synced event with attendees", async () => {
+    serveEvent({ attendees: [{ email: "a@example.com", responseStatus: "accepted" }] });
+    await openEditViaMenu();
+    expect(within(form()).getByText(/notify them/i)).toBeInTheDocument();
+  });
+
+  it("does not warn about guests on a solo event", async () => {
+    serveEvent({ attendees: [] });
+    await openEditViaMenu();
+    expect(within(form()).queryByText(/notify them/i)).not.toBeInTheDocument();
+  });
+
+  it("does not warn about guests on an unsynced event", async () => {
+    serveEvent({ is_synced: false, attendees: [{ email: "a@example.com", responseStatus: "accepted" }] });
+    await openEditViaMenu();
+    expect(within(form()).queryByText(/notify them/i)).not.toBeInTheDocument();
+  });
+
+  describe("Convert to…", () => {
+    async function openConvert() {
+      renderPage();
+      fireEvent.contextMenu(await eventEl());
+      fireEvent.click(await screen.findByText("Convert to…"));
+    }
+
+    it("converts the event type in place", async () => {
+      const patch = captureDetailsPatch();
+      serveEvent();
+      await openConvert();
+
+      fireEvent.click(await screen.findByTitle("Convert to Task"));
+      await waitFor(() => expect(patch.body).toEqual({ event_category: "task" }));
+      expect(patch.id).toBe("7");
+    });
+
+    it("repaints the grid in the new type's color", async () => {
+      captureDetailsPatch();
+      serveEvent();
+      await openConvert();
+
+      fireEvent.click(await screen.findByTitle("Convert to Focus Time"));
+      await waitFor(() =>
+        expect(document.querySelector("[data-testid='calendar-event']"))
+          .toHaveAttribute("data-bg-color", DEFAULT_CATEGORY_COLORS.focus_time),
+      );
+    });
+
+    it("does not PATCH when the chosen type is the one already set", async () => {
+      const patch = captureDetailsPatch();
+      serveEvent({ event_category: "task" });
+      await openConvert();
+
+      const taskPill = await screen.findByTitle("Convert to Task");
+      expect(taskPill).toHaveAttribute("aria-pressed", "true");
+      fireEvent.click(taskPill);
+      await waitFor(() => expect(screen.queryByText("Convert to…")).not.toBeInTheDocument());
+      expect(patch.calls).toBe(0);
+    });
+
+    it("rolls the grid back when the type change is rejected", async () => {
+      serveEvent();
+      server.use(
+        http.patch("/api/v1/scheduler/events/:id/details/", () =>
+          HttpResponse.json({ event_category: "bad" }, { status: 400 }),
+        ),
+      );
+      await openConvert();
+
+      fireEvent.click(await screen.findByTitle("Convert to Task"));
+      await waitFor(() =>
+        expect(document.querySelector("[data-testid='calendar-event']"))
+          .toHaveAttribute("data-bg-color", DEFAULT_CATEGORY_COLORS.meeting),
+      );
+    });
+
+    it("offers no Action item pill among the categories", async () => {
+      serveEvent();
+      await openConvert();
+      await screen.findByTitle("Convert to Task");
+      expect(document.querySelectorAll("[data-convert-category]")).toHaveLength(6);
+      expect(document.querySelector("[data-convert-category='action_item']")).toBeNull();
+    });
+
+    it("creates an action item and keeps the event on the calendar", async () => {
+      const created: { calls: number; body: Record<string, unknown> | null } = { calls: 0, body: null };
+      server.use(
+        http.post("/api/v1/airtable/action-items/", async ({ request }) => {
+          created.calls += 1;
+          created.body = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json(
+            { ...mockActionItem, id: 42, airtable_id: "recNEW42", task: "Q3 Planning" },
+            { status: 201 },
+          );
+        }),
+      );
+      captureDetailsPatch();
+      serveEvent();
+      await openConvert();
+
+      fireEvent.click(await screen.findByText(/Action item/));
+
+      await waitFor(() => expect(created.calls).toBe(1));
+      expect(created.body).toMatchObject({ task: "Q3 Planning", status: "Open" });
+      // The whole point of this variant: the meeting survives.
+      expect(document.querySelector("[data-testid='calendar-event']")).not.toBeNull();
+    });
+
+    it("records the new action item's id on the event", async () => {
+      server.use(
+        http.post("/api/v1/airtable/action-items/", () =>
+          HttpResponse.json(
+            { ...mockActionItem, id: 42, airtable_id: "recNEW42", task: "Q3 Planning" },
+            { status: 201 },
+          ),
+        ),
+      );
+      const patch = captureDetailsPatch();
+      serveEvent();
+      await openConvert();
+
+      fireEvent.click(await screen.findByText(/Action item/));
+      await waitFor(() => expect(patch.body).toEqual({ agentpm_airtable_id: "recNEW42" }));
+    });
+
+    it("is not offered on a scheduled action item overlay", async () => {
+      // A `scheduled-*` uid is synthetic — its numeric id belongs to an action item, not a
+      // CalendarEvent, so there is no row to PATCH. Same gate Comment uses.
+      localStorage.setItem(
+        "scheduledActionItems",
+        JSON.stringify([{
+          airtableId: "recSCHED", task: "Prep deck", accountName: null,
+          start: "2026-07-30T09:00:00", end: "2026-07-30T09:30:00",
+        }]),
+      );
+      server.use(http.get("/api/v1/scheduler/events/", () => HttpResponse.json([])));
+      renderPage();
+      fireEvent.contextMenu(await eventEl());
+
+      await screen.findByText("Copy details");
+      expect(screen.queryByText("Convert to…")).not.toBeInTheDocument();
+    });
   });
 });

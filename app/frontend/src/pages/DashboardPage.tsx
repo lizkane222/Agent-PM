@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { airtableApi, schedulerApi } from "../lib/api";
+import { logActionItemUpdate } from "../lib/actionItemLog";
 import HomeIcon from "../assets/icons/Home.svg?react";
 import type { AirtableActionItem, AirtableAccount, CalendarEvent, Reminder } from "../types";
 
@@ -158,6 +159,7 @@ export default function DashboardPage() {
     );
     try {
       await airtableApi.updateActionItemStatus(item.airtable_id, nextStatus);
+      logActionItemUpdate(item, { status: nextStatus as AirtableActionItem["status"] });
     } catch {
       // revert on failure
       setActionItems((prev) =>

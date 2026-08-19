@@ -690,6 +690,33 @@ class GmailTestView(APIView):
             return Response({"ok": False, "error": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
 
 
+class GmailWatchView(APIView):
+    """
+    Queue a Gmail push-notification watch() registration/renewal for the
+    current user. The actual Gmail API call happens in the Celery task
+    (integrations.tasks.register_gmail_watch) so this endpoint only needs to
+    confirm the broker accepted the job.
+
+    POST /api/v1/integrations/gmail/watch/
+    Returns: { detail: str }
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from integrations.tasks import register_gmail_watch
+
+        try:
+            register_gmail_watch.delay(request.user.id)
+        except Exception:
+            logger.exception("Failed to queue register_gmail_watch for user %s", request.user.id)
+            return Response(
+                {"detail": "Failed to register watch. Check that Celery is running."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        return Response({"detail": "Gmail watch registration queued."})
+
+
 class GmailThreadsView(APIView):
     """
     Fetch Gmail threads relevant to a customer account, then use Claude to
@@ -846,12 +873,16 @@ class MeetingNotesFromEmailView(APIView):
     POST /api/v1/integrations/gmail/meeting-notes/
     Body (all optional): {
       "days": 30,                 # lookback window, capped at 180
-      "account_name": "Acme",     # narrow to one account's meetings
+      "account": "recXXX" | "12", # narrow to one AirtableAccount (PK or rec* id)
+      "account_name": "Acme",     # name fallback for accounts with no Airtable link
       "max_emails": 150,
       "max_summaries": 25
     }
+    Omit `account`/`account_name` to cover every meeting the caller can see. The account
+    detail page scopes to its own account; the profile and role pages do not.
+
     Returns the report from `meeting_notes.sync_meeting_notes_from_email`:
-      { days, account_name, scanned_emails, scanned_meetings,
+      { days, account, account_name, scoped_to_account, scanned_emails, scanned_meetings,
         updated: [{meeting_id, meeting_name, date, account_name, sources, email_subjects}],
         skipped: [{meeting_id, meeting_name, reason}],
         errors: [...], summaries_truncated: bool, max_summaries: int }
@@ -883,12 +914,14 @@ class MeetingNotesFromEmailView(APIView):
         max_emails = _int_param("max_emails", MAX_EMAILS, MAX_EMAILS)
         max_summaries = _int_param("max_summaries", MAX_SUMMARIES, MAX_SUMMARIES)
         account_name = (request.data.get("account_name") or "").strip()
+        account = str(request.data.get("account") or "").strip()
 
         try:
             report = sync_meeting_notes_from_email(
                 request.user,
                 days=days,
                 account_name=account_name,
+                account=account,
                 max_emails=max_emails,
                 max_summaries=max_summaries,
             )

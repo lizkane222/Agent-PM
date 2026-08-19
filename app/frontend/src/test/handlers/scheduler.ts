@@ -114,4 +114,9 @@ export const schedulerHandlers = [
   http.get("/api/v1/scheduler/events/", () =>
     HttpResponse.json(mockCalendarEvents)
   ),
+  // The scheduler-side mirror of action items, read by RolePage and ProfilePage.
+  // Distinct from /airtable/action-items/ in test/handlers/action_items.ts.
+  http.get("/api/v1/scheduler/action-items/", () =>
+    HttpResponse.json({ count: 0, next: null, previous: null, results: [] })
+  ),
 ];

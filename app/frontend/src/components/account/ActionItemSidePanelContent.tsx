@@ -1,7 +1,9 @@
 import { useState, useRef, useEffect } from "react";
 import { airtableApi } from "../../lib/api";
+import { logActionItemUpdate } from "../../lib/actionItemLog";
 import type { AirtableActionItem, ActionItemAttachment, TeamMember } from "../../types";
 import { useActionItemFieldOptions } from "../../hooks/useActionItemFieldOptions";
+import { useSlackLinkAutosave } from "../../hooks/useSlackLinkAutosave";
 import { AccPillSelect, AccPillDate, AccPillNumber, AccPillUrl } from "../shared/PillInputs";
 import CorporateIcon from "../../assets/icons/Corporate.svg?react";
 import { ActionItemCardOccurrences } from "./ActionItemCardOccurrences";
@@ -108,12 +110,15 @@ export function ActionItemSidePanelContent({
   }
 
   const set = (patch: Partial<AirtableActionItem>) => setForm((f) => ({ ...f, ...patch }));
+  // A pasted Slack link saves on its own — see hooks/useSlackLinkAutosave.ts.
+  const autosaveSlackLink = useSlackLinkAutosave();
 
   async function handleSave() {
     if (saving) return;
     setSaving(true);
     try {
       const { data } = await airtableApi.updateActionItemFields(item.airtable_id, form as Parameters<typeof airtableApi.updateActionItemFields>[1]);
+      logActionItemUpdate(item, form as Partial<AirtableActionItem>);
       onUpdated?.(data);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
@@ -253,7 +258,10 @@ export function ActionItemSidePanelContent({
       {/* Slack URL */}
       <div className="flex items-center gap-2">
         <span className="text-xs text-[var(--twilio-gray-60)] shrink-0">Slack</span>
-        <AccPillUrl value={form.slack_thread_url} onChange={(v) => set({ slack_thread_url: v })} />
+        <AccPillUrl
+          value={form.slack_thread_url}
+          onChange={(v) => { set({ slack_thread_url: v }); autosaveSlackLink(item, v, onUpdated); }}
+        />
       </div>
 
       {/* Account badge */}

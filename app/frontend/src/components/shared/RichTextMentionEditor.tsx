@@ -14,7 +14,7 @@ import Placeholder from "@tiptap/extension-placeholder";
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import { teamApi, searchApi, type SearchResult } from "../../lib/api";
 import { plainToHtml } from "../../lib/noteHelpers";
-import type { TeamMember } from "../../types";
+import type { TeamMember, CommentReference } from "../../types";
 
 export { plainToHtml };
 
@@ -167,11 +167,14 @@ export interface RichTextMentionEditorProps {
   /** Fired once per record reference inserted (single mode: on select;
    * multiselect mode: once per item, when the selection is confirmed). */
   onReferenceSelect?: (result: SearchResult) => void;
+  /** Fired with structured reference data when a record reference is inserted.
+   * Only called when refMultiSelect is true (comment mode). */
+  onReferenceInsert?: (reference: CommentReference) => void;
 }
 
 const RichTextMentionEditor = forwardRef<RichTextMentionEditorHandle, RichTextMentionEditorProps>(
   function RichTextMentionEditor(
-    { value, onChange, placeholder, autoFocus, minHeightClassName, onKeyDownCapture, onSubmit, refMultiSelect, onMentionSelect, onReferenceSelect },
+    { value, onChange, placeholder, autoFocus, minHeightClassName, onKeyDownCapture, onSubmit, refMultiSelect, onMentionSelect, onReferenceSelect, onReferenceInsert },
     ref
   ) {
     const [showLink, setShowLink] = useState(false);
@@ -344,8 +347,17 @@ const RichTextMentionEditor = forwardRef<RichTextMentionEditorHandle, RichTextMe
         )
         .run();
       onReferenceSelect?.(item.result);
+      if (onReferenceInsert && !refMultiSelect) {
+        const ref: CommentReference = {
+          resource_type: item.result.type as CommentReference["resource_type"],
+          resource_id: typeof item.result.id === "number" ? item.result.id : parseInt(String(item.result.id), 10),
+          label: item.result.title,
+          url: item.result.url || "",
+        };
+        onReferenceInsert(ref);
+      }
       dismissMention();
-    }, [editor, mentionAnchorPos, dismissMention, onReferenceSelect]);
+    }, [editor, mentionAnchorPos, dismissMention, onReferenceSelect, onReferenceInsert, refMultiSelect]);
 
     const togglePendingRef = useCallback((item: RefItem) => {
       setPendingRefs((prev) => {
@@ -362,9 +374,20 @@ const RichTextMentionEditor = forwardRef<RichTextMentionEditorHandle, RichTextMe
         .deleteRange({ from: mentionAnchorPos, to: from })
         .insertContent(bulletsHtml)
         .run();
-      pendingRefs.forEach((r) => onReferenceSelect?.(r));
+      pendingRefs.forEach((r) => {
+        onReferenceSelect?.(r);
+        if (onReferenceInsert) {
+          const ref: CommentReference = {
+            resource_type: r.type as CommentReference["resource_type"],
+            resource_id: typeof r.id === "number" ? r.id : parseInt(String(r.id), 10),
+            label: r.title,
+            url: r.url || "",
+          };
+          onReferenceInsert(ref);
+        }
+      });
       dismissMention();
-    }, [editor, mentionAnchorPos, pendingRefs, dismissMention, onReferenceSelect]);
+    }, [editor, mentionAnchorPos, pendingRefs, dismissMention, onReferenceSelect, onReferenceInsert]);
 
     const selectRefItem = useCallback((item: RefItem) => {
       if (refMultiSelect) togglePendingRef(item);

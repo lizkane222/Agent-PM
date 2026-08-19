@@ -42,6 +42,11 @@ class AirtableMeeting(models.Model):
     customer_slack = models.URLField(blank=True, default="")
     account_team_slack = models.URLField(blank=True, default="")
     last_synced = models.DateTimeField(auto_now=True)
+    # Rich references: list of {resource_type, resource_id, label, url} objects added via @# trigger
+    references = models.JSONField(
+        default=list,
+        help_text="Records referenced via @# picker: [{resource_type, resource_id, label, url}]",
+    )
 
     class Meta:
         ordering = ["-date"]
@@ -100,6 +105,11 @@ class AirtableActionItem(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
     marked_done_at = models.DateTimeField(null=True, blank=True)
     last_synced = models.DateTimeField(auto_now=True)
+    # Rich references: list of {resource_type, resource_id, label, url} objects added via @# trigger
+    references = models.JSONField(
+        default=list,
+        help_text="Records referenced via @# picker: [{resource_type, resource_id, label, url}]",
+    )
 
     class Meta:
         ordering = ["status", "due_date"]

@@ -85,6 +85,37 @@ def rfc2822(dt) -> str:
 GONG_FROM = "Gong <no-reply@gong.io>"
 ZOOM_FROM = "Zoom <no-reply@zoom.us>"
 
+# Modelled on a real Gong recap: prose lines well over the content gate's threshold.
+RECAP_BODY = """\
+GONG
+Your call is ready
+Key points
+1. Slack Channel and Zoom: Esther informed the team about a shared Slack channel for
+support and confirmed that Zoom will be used for future recordings of these calls.
+2. Data deletion: the customer asked how deletion requests propagate to downstream
+destinations and whether the existing retention window can be shortened safely.
+Next steps
+Esther will share the shared Slack channel invite with the customer team this week.
+Luka will confirm the retention window change with his platform team before Friday.
+"""
+
+# Modelled on a real Zoom "Meeting assets" notification: the words "Meeting summary" are
+# a link label, and the summary itself is only in the Zoom web app.
+NOTIFICATION_BODY = """\
+Meeting assets for Acme Q3 Planning are ready!
+Review action items
+Meeting summary
+Meeting summary
+Topic:
+Acme Q3 Planning
+Date:
+08/10/2026 11:30 AM
+https://twilio.zoom.us/rec/share/abc123
+View in Zoom
+Thank you for choosing Zoom,
+The Zoom Team
+"""
+
 
 # ── Title / date matching ─────────────────────────────────────────────────────
 
@@ -126,6 +157,100 @@ class TitleMatchingTests(TestCase):
     def test_short_titles_do_not_match_by_containment(self):
         """A 3-letter name inside a longer subject is a coincidence, not a match."""
         self.assertFalse(meeting_notes.titles_match("QBR", "Gong Call Recap: Beta Corp Kickoff QBR Prep Deep Dive"))
+
+
+class RealVendorSubjectFormatTests(TestCase):
+    """The formats these vendors actually send, which are not the documented ones.
+
+    Both were wrong in the first cut — Gong puts the meeting name first and appends its
+    boilerplate, Zoom wraps the name on both sides — so nothing matched at all. Pin them.
+    """
+
+    def test_gong_suffix_is_stripped(self):
+        self.assertEqual(
+            meeting_notes.normalize_title(
+                "Twilio & Autodesk Enterprise - sync: Call recording and analysis is ready"
+            ),
+            "twilio autodesk enterprise",
+        )
+
+    def test_gong_name_containing_a_colon_survives(self):
+        """"BigCommerce/Segment Sync: PS Engagement" has its own colon before the suffix."""
+        self.assertEqual(
+            meeting_notes.normalize_title(
+                "BigCommerce/Segment Sync: PS Engagement: Call recording and analysis is ready"
+            ),
+            "bigcommerce segment ps engagement",
+        )
+
+    def test_zoom_prefix_and_suffix_are_stripped(self):
+        self.assertEqual(
+            meeting_notes.normalize_title(
+                "Meeting assets for Twilio & Autodesk Enterprise - sync  are ready!"
+            ),
+            "twilio autodesk enterprise",
+        )
+
+    def test_zoom_name_containing_a_colon_survives(self):
+        self.assertEqual(
+            meeting_notes.normalize_title(
+                "Meeting assets for DAE: Segment Data Deletions - OCS Training Details are ready!"
+            ),
+            "dae segment data deletions ocs training details",
+        )
+
+    def test_real_gong_subject_matches_its_meeting(self):
+        self.assertTrue(meeting_notes.titles_match(
+            "Siemens / Twilio Segment - Implementation Call",
+            "Siemens / Twilio Segment - Implementation Call: Call recording and analysis is ready",
+        ))
+
+    def test_real_zoom_subject_matches_its_meeting(self):
+        self.assertTrue(meeting_notes.titles_match(
+            "[Internal] JPMC CCB | Stand-up",
+            "Meeting assets for  [Internal] JPMC CCB | Stand-up are ready!",
+        ))
+
+
+class SummaryContentGateTests(TestCase):
+    """A recap email and a "your recording is ready" notification look alike outside."""
+
+    def test_a_real_recap_passes(self):
+        self.assertTrue(meeting_notes.email_contains_summary(RECAP_BODY))
+
+    def test_a_link_only_notification_fails(self):
+        self.assertFalse(meeting_notes.email_contains_summary(NOTIFICATION_BODY))
+
+    def test_link_label_words_alone_do_not_qualify(self):
+        """Zoom writes "Meeting summary" as a link label — the words are not the summary."""
+        body = "Meeting summary\nReview action items\nRecording\nView in Zoom"
+        self.assertFalse(meeting_notes.email_contains_summary(body))
+
+    def test_urls_do_not_count_toward_content(self):
+        long_url = "https://twilio.zoom.us/rec/share/" + ("x" * 600)
+        self.assertFalse(meeting_notes.email_contains_summary(f"Recording\n{long_url}"))
+
+    def test_empty_body_fails(self):
+        self.assertFalse(meeting_notes.email_contains_summary(""))
+        self.assertFalse(meeting_notes.email_contains_summary(None))
+
+
+class NonRecapSubjectTests(TestCase):
+    def test_deletion_notices_are_dropped_before_matching(self):
+        gmail = FakeGmail([gmail_message(
+            "m1", "Your meeting - Andy / Liz : (HOLD) has been deleted", ZOOM_FROM,
+            rfc2822(timezone.now()), NOTIFICATION_BODY,
+        )])
+        self.assertEqual(meeting_notes.fetch_vendor_messages(gmail, 30), [])
+
+    def test_recaps_are_kept(self):
+        gmail = FakeGmail([gmail_message(
+            "m1", "Acme Q3 Planning: Call recording and analysis is ready", GONG_FROM,
+            rfc2822(timezone.now()), RECAP_BODY,
+        )])
+        kept = meeting_notes.fetch_vendor_messages(gmail, 30)
+        self.assertEqual(len(kept), 1)
+        self.assertTrue(kept[0]["has_summary"])
 
 
 class DateMatchingTests(TestCase):
@@ -355,6 +480,46 @@ class CandidateMeetingsTests(TestCase):
         )
         self.assertNotIn(undated, list(meeting_notes.candidate_meetings(self.staff, days=30)))
 
+    def test_account_filter_by_airtable_id_narrows_to_one_account(self):
+        """The account detail page scopes by rec* id, not the display name."""
+        acme_mtg = self._meeting("Acme Sync", self.acme, 2)
+        beta_mtg = self._meeting("Beta Sync", self.beta, 2)
+        found = list(meeting_notes.candidate_meetings(self.staff, days=30, account="recA"))
+        self.assertIn(acme_mtg, found)
+        self.assertNotIn(beta_mtg, found)
+
+    def test_account_filter_by_pk_narrows_to_one_account(self):
+        acme_mtg = self._meeting("Acme Sync", self.acme, 2)
+        beta_mtg = self._meeting("Beta Sync", self.beta, 2)
+        found = list(
+            meeting_notes.candidate_meetings(self.staff, days=30, account=str(self.acme.pk))
+        )
+        self.assertIn(acme_mtg, found)
+        self.assertNotIn(beta_mtg, found)
+
+    def test_account_takes_precedence_over_a_conflicting_name(self):
+        """`account` is the precise identifier, so it wins over a drifted name."""
+        acme_mtg = self._meeting("Acme Sync", self.acme, 2)
+        beta_mtg = self._meeting("Beta Sync", self.beta, 2)
+        found = list(meeting_notes.candidate_meetings(
+            self.staff, days=30, account_name="Beta Corp", account="recA"
+        ))
+        self.assertIn(acme_mtg, found)
+        self.assertNotIn(beta_mtg, found)
+
+    def test_unresolvable_account_narrows_to_empty_not_everything(self):
+        self._meeting("Acme Sync", self.acme, 2)
+        found = list(meeting_notes.candidate_meetings(self.staff, days=30, account="recNOPE"))
+        self.assertEqual(found, [])
+
+    def test_no_account_filter_covers_every_account(self):
+        """What the profile and role pages do."""
+        acme_mtg = self._meeting("Acme Sync", self.acme, 2)
+        beta_mtg = self._meeting("Beta Sync", self.beta, 2)
+        found = list(meeting_notes.candidate_meetings(self.staff, days=30))
+        self.assertIn(acme_mtg, found)
+        self.assertIn(beta_mtg, found)
+
     def test_account_name_filter_narrows_to_one_account(self):
         acme_mtg = self._meeting("Acme Sync", self.acme, 2)
         beta_mtg = self._meeting("Beta Sync", self.beta, 2)
@@ -389,8 +554,7 @@ class SyncMeetingNotesTests(TestCase):
     def test_gong_recap_fills_gong_notes(self):
         report = self._sync([gmail_message(
             "m1", "Gong Call Recap: Acme Q3 Planning", GONG_FROM,
-            rfc2822(self.meeting_at + timedelta(hours=1)),
-            "Recap\n- Discussed pricing",
+            rfc2822(self.meeting_at + timedelta(hours=1)), RECAP_BODY,
         )])
 
         self.meeting.refresh_from_db()
@@ -402,8 +566,7 @@ class SyncMeetingNotesTests(TestCase):
     def test_zoom_recap_fills_zoom_notes(self):
         report = self._sync([gmail_message(
             "m1", "Meeting Summary with Acme Q3 Planning", ZOOM_FROM,
-            rfc2822(self.meeting_at + timedelta(hours=1)),
-            "Quick recap\n- Discussed rollout",
+            rfc2822(self.meeting_at + timedelta(hours=1)), RECAP_BODY,
         )])
 
         self.meeting.refresh_from_db()
@@ -414,9 +577,9 @@ class SyncMeetingNotesTests(TestCase):
     def test_both_providers_are_stored_with_gong_listed_first(self):
         report = self._sync([
             gmail_message("m1", "Meeting Summary with Acme Q3 Planning", ZOOM_FROM,
-                          rfc2822(self.meeting_at + timedelta(hours=2)), "zoom body"),
+                          rfc2822(self.meeting_at + timedelta(hours=2)), RECAP_BODY),
             gmail_message("m2", "Gong Call Recap: Acme Q3 Planning", GONG_FROM,
-                          rfc2822(self.meeting_at + timedelta(hours=1)), "gong body"),
+                          rfc2822(self.meeting_at + timedelta(hours=1)), RECAP_BODY),
         ])
 
         self.meeting.refresh_from_db()
@@ -431,7 +594,7 @@ class SyncMeetingNotesTests(TestCase):
 
         report = self._sync([gmail_message(
             "m1", "Gong Call Recap: Acme Q3 Planning", GONG_FROM,
-            rfc2822(self.meeting_at + timedelta(hours=1)), "gong body",
+            rfc2822(self.meeting_at + timedelta(hours=1)), RECAP_BODY,
         )])
 
         self.meeting.refresh_from_db()
@@ -446,7 +609,7 @@ class SyncMeetingNotesTests(TestCase):
 
         self._sync([gmail_message(
             "m1", "Meeting Summary with Acme Q3 Planning", ZOOM_FROM,
-            rfc2822(self.meeting_at + timedelta(hours=1)), "zoom body",
+            rfc2822(self.meeting_at + timedelta(hours=1)), RECAP_BODY,
         )])
 
         self.meeting.refresh_from_db()
@@ -464,17 +627,71 @@ class SyncMeetingNotesTests(TestCase):
 
         report = self._sync([gmail_message(
             "m1", "Gong Call Recap: Acme Q3 Planning", GONG_FROM,
-            rfc2822(self.meeting_at + timedelta(hours=1)), "gong body",
+            rfc2822(self.meeting_at + timedelta(hours=1)), RECAP_BODY,
         )])
 
         self.meeting.refresh_from_db()
         self.assertEqual(self.meeting.gong_notes, "Recap\n- gong summary")
         self.assertEqual(report["updated"][0]["sources"], ["gong"])
 
+    def test_notification_without_a_summary_is_not_imported_as_notes(self):
+        """Zoom's notification body is link text. Saving it would be worse than empty."""
+        report = self._sync([gmail_message(
+            "m1", "Meeting assets for Acme Q3 Planning are ready!", ZOOM_FROM,
+            rfc2822(self.meeting_at + timedelta(hours=1)), NOTIFICATION_BODY,
+        )])
+
+        self.meeting.refresh_from_db()
+        self.assertEqual(self.meeting.zoom_notes, "")
+        self.assertEqual(report["updated"], [])
+        self.assertEqual(report["skipped"][0]["reason"], "email_has_no_summary")
+        self.assertEqual(report["skipped"][0]["sources_without_summary"], ["zoom"])
+        self.assertEqual(report["no_summary_in_email"], 1)
+
+    def test_notification_still_contributes_its_recording_link(self):
+        """The link is the only useful thing in a notification, so keep that much."""
+        report = self._sync([gmail_message(
+            "m1", "Meeting assets for Acme Q3 Planning are ready!", ZOOM_FROM,
+            rfc2822(self.meeting_at + timedelta(hours=1)), NOTIFICATION_BODY,
+        )])
+
+        self.meeting.refresh_from_db()
+        self.assertEqual(self.meeting.zoom_url, "https://twilio.zoom.us/rec/share/abc123")
+        self.assertEqual(self.meeting.zoom_notes, "")
+        self.assertEqual(report["recordings_linked"], 1)
+
+    def test_a_gong_recap_still_imports_when_zoom_only_notified(self):
+        """The real-world shape: Gong carries the recap, Zoom only links the recording."""
+        report = self._sync([
+            gmail_message("m1", "Meeting assets for Acme Q3 Planning are ready!", ZOOM_FROM,
+                          rfc2822(self.meeting_at + timedelta(hours=2)), NOTIFICATION_BODY),
+            gmail_message("m2", "Acme Q3 Planning: Call recording and analysis is ready", GONG_FROM,
+                          rfc2822(self.meeting_at + timedelta(hours=1)), RECAP_BODY),
+        ])
+
+        self.meeting.refresh_from_db()
+        self.assertEqual(self.meeting.gong_notes, "Recap\n- gong summary")
+        self.assertEqual(self.meeting.zoom_notes, "")
+        self.assertEqual(self.meeting.zoom_url, "https://twilio.zoom.us/rec/share/abc123")
+        self.assertEqual(report["updated"][0]["sources"], ["gong"])
+        self.assertEqual(report["updated"][0]["linked_sources"], ["zoom"])
+
+    def test_an_existing_recording_link_is_not_replaced_by_a_notification(self):
+        self.meeting.zoom_url = "https://zoom.us/rec/original"
+        self.meeting.save()
+
+        self._sync([gmail_message(
+            "m1", "Meeting assets for Acme Q3 Planning are ready!", ZOOM_FROM,
+            rfc2822(self.meeting_at + timedelta(hours=1)), NOTIFICATION_BODY,
+        )])
+
+        self.meeting.refresh_from_db()
+        self.assertEqual(self.meeting.zoom_url, "https://zoom.us/rec/original")
+
     def test_wrong_title_does_not_match(self):
         report = self._sync([gmail_message(
             "m1", "Gong Call Recap: Beta Corp Kickoff", GONG_FROM,
-            rfc2822(self.meeting_at + timedelta(hours=1)), "gong body",
+            rfc2822(self.meeting_at + timedelta(hours=1)), RECAP_BODY,
         )])
 
         self.meeting.refresh_from_db()
@@ -484,7 +701,7 @@ class SyncMeetingNotesTests(TestCase):
     def test_email_outside_the_date_window_does_not_match(self):
         report = self._sync([gmail_message(
             "m1", "Gong Call Recap: Acme Q3 Planning", GONG_FROM,
-            rfc2822(self.meeting_at + timedelta(days=10)), "gong body",
+            rfc2822(self.meeting_at + timedelta(days=10)), RECAP_BODY,
         )])
 
         self.meeting.refresh_from_db()
@@ -494,7 +711,7 @@ class SyncMeetingNotesTests(TestCase):
     def test_non_vendor_sender_is_ignored(self):
         report = self._sync([gmail_message(
             "m1", "Gong Call Recap: Acme Q3 Planning", "Someone <bob@example.com>",
-            rfc2822(self.meeting_at + timedelta(hours=1)), "gong body",
+            rfc2822(self.meeting_at + timedelta(hours=1)), RECAP_BODY,
         )])
 
         self.assertEqual(report["scanned_emails"], 0)
@@ -504,7 +721,7 @@ class SyncMeetingNotesTests(TestCase):
     def test_unparseable_date_header_is_skipped_not_fatal(self):
         report = self._sync([gmail_message(
             "m1", "Gong Call Recap: Acme Q3 Planning", GONG_FROM,
-            "not a date at all", "gong body",
+            "not a date at all", RECAP_BODY,
         )])
 
         self.assertEqual(report["scanned_emails"], 0)
@@ -517,13 +734,16 @@ class SyncMeetingNotesTests(TestCase):
         ):
             meeting_notes.sync_meeting_notes_from_email(self.user, gmail=FakeGmail([
                 gmail_message("m1", "Gong Call Recap: Acme Q3 Planning", GONG_FROM,
-                              rfc2822(self.meeting_at + timedelta(days=2)), "FAR"),
+                              rfc2822(self.meeting_at + timedelta(days=2)), "FAR\n" + RECAP_BODY),
                 gmail_message("m2", "Gong Call Recap: Acme Q3 Planning", GONG_FROM,
-                              rfc2822(self.meeting_at + timedelta(minutes=20)), "NEAR"),
+                              rfc2822(self.meeting_at + timedelta(minutes=20)), "NEAR\n" + RECAP_BODY),
             ]))
 
+        # The summariser here is the identity function, so the saved notes are the body
+        # of whichever email won — assert on its marker rather than the whole recap.
         self.meeting.refresh_from_db()
-        self.assertEqual(self.meeting.gong_notes, "NEAR")
+        self.assertTrue(self.meeting.gong_notes.startswith("NEAR"), self.meeting.gong_notes[:40])
+        self.assertNotIn("FAR", self.meeting.gong_notes)
 
     def test_recording_url_is_captured_when_blank(self):
         with patch(
@@ -534,7 +754,7 @@ class SyncMeetingNotesTests(TestCase):
                 gmail_message(
                     "m1", "Gong Call Recap: Acme Q3 Planning", GONG_FROM,
                     rfc2822(self.meeting_at + timedelta(hours=1)),
-                    "Listen at https://us-12345.app.gong.io/call?id=99",
+                    "Listen at https://us-12345.app.gong.io/call?id=99\n" + RECAP_BODY,
                 ),
             ]))
 
@@ -548,7 +768,7 @@ class SyncMeetingNotesTests(TestCase):
         self._sync([gmail_message(
             "m1", "Gong Call Recap: Acme Q3 Planning", GONG_FROM,
             rfc2822(self.meeting_at + timedelta(hours=1)),
-            "Listen at https://us-12345.app.gong.io/call?id=99",
+            "Listen at https://us-12345.app.gong.io/call?id=99\n" + RECAP_BODY,
         )])
 
         self.meeting.refresh_from_db()
@@ -562,9 +782,9 @@ class SyncMeetingNotesTests(TestCase):
         report = self._sync(
             [
                 gmail_message("m1", "Gong Call Recap: Acme Q3 Planning", GONG_FROM,
-                              rfc2822(self.meeting_at + timedelta(hours=1)), "a"),
+                              rfc2822(self.meeting_at + timedelta(hours=1)), RECAP_BODY),
                 gmail_message("m2", "Gong Call Recap: Acme Renewal Review", GONG_FROM,
-                              rfc2822(self.meeting_at + timedelta(hours=1)), "b"),
+                              rfc2822(self.meeting_at + timedelta(hours=1)), RECAP_BODY),
             ],
             max_summaries=1,
         )
@@ -575,6 +795,25 @@ class SyncMeetingNotesTests(TestCase):
         self.assertEqual(len(capped), 1)
         second.refresh_from_db()
         self.assertEqual(second.gong_notes, "")
+
+    def test_report_flags_a_scoped_scan(self):
+        report = self._sync([], account="recACCT1")
+        self.assertTrue(report["scoped_to_account"])
+        self.assertEqual(report["account"], "recACCT1")
+
+    def test_report_flags_an_unscoped_scan(self):
+        report = self._sync([])
+        self.assertFalse(report["scoped_to_account"])
+
+    def test_scoping_to_another_account_finds_nothing_here(self):
+        report = self._sync(
+            [gmail_message("m1", "Gong Call Recap: Acme Q3 Planning", GONG_FROM,
+                           rfc2822(self.meeting_at + timedelta(hours=1)), RECAP_BODY)],
+            account="recOTHER",
+        )
+        self.assertEqual(report["scanned_meetings"], 0)
+        self.meeting.refresh_from_db()
+        self.assertEqual(self.meeting.gong_notes, "")
 
     def test_days_argument_is_clamped_to_the_ceiling(self):
         report = self._sync([], days=9999)
@@ -599,12 +838,165 @@ class SyncMeetingNotesTests(TestCase):
                 outsider,
                 gmail=FakeGmail([gmail_message(
                     "m1", "Gong Call Recap: Acme Q3 Planning", GONG_FROM,
-                    rfc2822(self.meeting_at + timedelta(hours=1)), "gong body",
+                    rfc2822(self.meeting_at + timedelta(hours=1)), RECAP_BODY,
                 )]),
             )
         self.assertEqual(report["scanned_meetings"], 0)
         self.meeting.refresh_from_db()
         self.assertEqual(self.meeting.gong_notes, "")
+
+
+class UnlinkedCalendarEventTests(TestCase):
+    """Recaps for meetings that only exist as calendar events.
+
+    Notes hang off AirtableMeeting, so before this pass a recap for a Google Calendar
+    meeting that was never mirrored to Airtable had nowhere to go and was silently
+    skipped — while the user could plainly see the email in their inbox. On a real
+    mailbox that was 3 of 11 Gong recaps.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user("eventuser", password="pass", is_staff=True)
+        self.event_at = timezone.now() - timedelta(days=2)
+        self.event = self._event("Acme Q3 Planning", self.event_at)
+        # These imports land on `local-*` stubs, so the write-back promotes them with
+        # table.create — which must return a real-looking record id. A bare MagicMock
+        # here fails inside the CalendarEvent re-link with a FieldError.
+        patcher = patch("airtable_sync.write_back.get_table")
+        mock_table = patcher.start().return_value
+        mock_table.create.return_value = {"id": "recPROMOTED"}
+        self.addCleanup(patcher.stop)
+
+    def _event(self, title, when, owner=None, account=None, at_id=""):
+        from scheduler.models import CalendarEvent
+        return CalendarEvent.objects.create(
+            owner=owner or self.user,
+            title=title,
+            start_datetime=when,
+            end_datetime=when + timedelta(hours=1),
+            account=account,
+            agentpm_airtable_id=at_id,
+        )
+
+    def _recap(self, subject=None, when=None, source="gong", body=None):
+        return gmail_message(
+            "m1",
+            subject or "Acme Q3 Planning: Call recording and analysis is ready",
+            GONG_FROM if source == "gong" else ZOOM_FROM,
+            rfc2822(when or (self.event_at + timedelta(hours=1))),
+            body if body is not None else RECAP_BODY,
+        )
+
+    def _sync(self, messages, **kwargs):
+        with patch(
+            "integrations.meeting_notes.summarize_email",
+            side_effect=lambda body, name, source: f"Recap\n- {source} summary",
+        ):
+            return meeting_notes.sync_meeting_notes_from_email(
+                self.user, gmail=FakeGmail(messages), **kwargs
+            )
+
+    def test_a_matching_recap_creates_a_meeting_and_imports_into_it(self):
+        report = self._sync([self._recap()])
+
+        meeting = AirtableMeeting.objects.get(name="Acme Q3 Planning")
+        self.assertEqual(meeting.gong_notes, "Recap\n- gong summary")
+        self.assertEqual(meeting.date, self.event_at)
+        # The stub is created as `local-*` and then promoted to a real Airtable record by
+        # the write-through in the same run, so assert on the outcome, not the id shape.
+        self.assertEqual(report["meetings_created"], 1)
+        self.assertTrue(report["updated"][0]["created_meeting"])
+
+    def test_the_event_is_linked_back_so_the_page_finds_the_notes(self):
+        """Without the back-link the calendar page still shows an empty summary panel."""
+        self._sync([self._recap()])
+
+        self.event.refresh_from_db()
+        meeting = AirtableMeeting.objects.get(name="Acme Q3 Planning")
+        self.assertEqual(self.event.agentpm_airtable_id, meeting.airtable_id)
+
+    def test_no_meeting_is_created_when_nothing_matches(self):
+        self._sync([self._recap(subject="Totally Different Meeting: Call recording is ready")])
+        self.assertFalse(AirtableMeeting.objects.exists())
+
+    def test_no_meeting_is_created_for_a_link_only_notification(self):
+        """A bare recording link is not worth a new row."""
+        report = self._sync([self._recap(
+            subject="Meeting assets for Acme Q3 Planning are ready!",
+            source="zoom",
+            body=NOTIFICATION_BODY,
+        )])
+        self.assertFalse(AirtableMeeting.objects.exists())
+        self.assertEqual(report["meetings_created"], 0)
+
+    def test_an_event_already_linked_to_a_meeting_is_not_scanned_twice(self):
+        meeting = AirtableMeeting.objects.create(
+            airtable_id="recLINKED", name="Acme Q3 Planning", date=self.event_at,
+        )
+        self.event.agentpm_airtable_id = "recLINKED"
+        self.event.save(update_fields=["agentpm_airtable_id"])
+
+        report = self._sync([self._recap()])
+
+        self.assertEqual(report["scanned_unlinked_events"], 0)
+        self.assertEqual(len(report["updated"]), 1)
+        meeting.refresh_from_db()
+        self.assertEqual(meeting.gong_notes, "Recap\n- gong summary")
+        self.assertEqual(AirtableMeeting.objects.count(), 1)
+
+    def test_another_users_event_is_not_scanned(self):
+        other = User.objects.create_user("someone-else", password="pass")
+        self.event.owner = other
+        self.event.save(update_fields=["owner"])
+
+        report = self._sync([self._recap()])
+
+        self.assertEqual(report["scanned_unlinked_events"], 0)
+        self.assertFalse(AirtableMeeting.objects.exists())
+
+    def test_events_outside_the_window_are_not_scanned(self):
+        self.event.start_datetime = timezone.now() - timedelta(days=120)
+        self.event.save(update_fields=["start_datetime"])
+
+        report = self._sync([self._recap()], days=30)
+
+        self.assertEqual(report["scanned_unlinked_events"], 0)
+
+    def test_a_scoped_scan_keeps_an_event_on_that_account(self):
+        from accounts.models import Account
+        acct = Account.objects.create(company_name="Acme Corp", airtable_id="recACCT1")
+        self.event.account = acct
+        self.event.save(update_fields=["account"])
+
+        report = self._sync([self._recap()], account="recACCT1")
+
+        self.assertEqual(report["scanned_unlinked_events"], 1)
+        self.assertEqual(report["meetings_created"], 1)
+
+    def test_a_scoped_scan_drops_an_event_on_a_different_account(self):
+        from accounts.models import Account
+        other = Account.objects.create(company_name="Beta Corp", airtable_id="recOTHER")
+        self.event.account = other
+        self.event.save(update_fields=["account"])
+
+        report = self._sync([self._recap()], account="recACCT1")
+
+        self.assertEqual(report["scanned_unlinked_events"], 0)
+        self.assertFalse(AirtableMeeting.objects.exists())
+
+    def test_a_scoped_scan_drops_an_event_with_no_account(self):
+        """A scoped run must not import a meeting that may belong elsewhere."""
+        report = self._sync([self._recap()], account="recACCT1")
+
+        self.assertEqual(report["scanned_unlinked_events"], 0)
+        self.assertFalse(AirtableMeeting.objects.exists())
+
+    def test_an_unscoped_scan_keeps_an_event_with_no_account(self):
+        """Internal calls and 1:1s have no account and are the common case here."""
+        report = self._sync([self._recap()])
+
+        self.assertEqual(report["scanned_unlinked_events"], 1)
+        self.assertEqual(report["meetings_created"], 1)
 
 
 class BuildGmailServiceTests(TestCase):

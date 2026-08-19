@@ -32,6 +32,7 @@ class CalendarEventSerializer(serializers.ModelSerializer):
             "event_category",
             "attended",
             "agentpm_airtable_id",
+            "references",
             "created_at",
             "updated_at",
         ]

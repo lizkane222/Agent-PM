@@ -122,6 +122,68 @@ export async function convertEventToActionItem(
   return { item, logId };
 }
 
+// ─── Calendar Event → Action Item, keeping the event ─────────────────────────
+
+export interface ConvertLinkedResult {
+  item: AirtableActionItem;
+  logId: string;
+}
+
+/**
+ * Create an action item from a calendar event and **keep the event on the grid**, linked
+ * to the new item through the event's `agentpm_airtable_id` column.
+ *
+ * Distinct from `convertEventToActionItem` above, which deletes the source event — that is
+ * the right behaviour for `MeetingDetail`'s "convert" affordance, but wrong for the
+ * calendar's right-click "Convert to ▸ Action item": a meeting you already held is part of
+ * your calendar history, and deleting it to create a follow-up task loses that record.
+ *
+ * The link is written through the owner-scoped `details` action rather than the generic
+ * PATCH: `agentpm_airtable_id` is read-only on `CalendarEventSerializer`, and the generic
+ * path would 403 on an event linked to an account the caller isn't a member of.
+ */
+export async function convertEventToActionItemLinked(
+  event: CalendarEvent,
+): Promise<ConvertLinkedResult> {
+  const dueDate = event.start_datetime ? event.start_datetime.slice(0, 10) : null;
+
+  const { data: item } = await airtableApi.createActionItem({
+    task: event.title || "Untitled",
+    task_details: event.description || "",
+    status: "Open",
+    priority: "Medium",
+    due_date: dueDate,
+    account: event.account ?? null,
+    account_name: event.account_name ?? null,
+  } as Partial<AirtableActionItem>);
+
+  // Best effort: the action item is the point of the conversion, so a failure to record
+  // the back-link must not surface as "the conversion failed".
+  await schedulerApi
+    .updateEventDetails(event.id, { agentpm_airtable_id: item.airtable_id })
+    .catch(() => {});
+
+  addLog({
+    category: "calendar" as const,
+    message: `Created action item "${item.task || "Untitled"}" from calendar event "${event.title || "Untitled"}"`,
+    links: [
+      { label: "View action items", path: "/action-items" },
+      { label: "View calendar", path: "/calendar" },
+    ],
+    resource: { type: "calendar_event" as const, id: event.id },
+    restoreData: {
+      direction: "event_to_action_item_linked",
+      original: event as unknown as Record<string, unknown>,
+      createdItemAirtableId: item.airtable_id,
+      createdItemId: item.id,
+    },
+  });
+  const { getLogs } = await import("../lib/appLog");
+  const logId = getLogs()[0]?.id ?? "";
+
+  return { item, logId };
+}
+
 // ─── Restore helpers ──────────────────────────────────────────────────────────
 
 /** Called when user clicks "Restore" on a conversion log entry. */
@@ -140,6 +202,22 @@ export async function restoreConversion(
       category: "action_item",
       message: `Restored action item "${original.task || "Untitled"}" from calendar event`,
       links: [{ label: "View action items", path: "/action-items" }],
+    });
+  } else if (direction === "event_to_action_item_linked") {
+    // The event was never deleted, so undoing means dropping the action item and
+    // clearing the back-link — not recreating anything.
+    const original = restoreData.original as Partial<CalendarEvent>;
+    const itemId = restoreData.createdItemId as number;
+    await airtableApi.deleteActionItem(itemId).catch(() => {});
+    if (original.id) {
+      await schedulerApi
+        .updateEventDetails(original.id, { agentpm_airtable_id: "" })
+        .catch(() => {});
+    }
+    addLog({
+      category: "calendar",
+      message: `Removed the action item created from "${original.title || "Untitled"}"`,
+      links: [{ label: "View calendar", path: "/calendar" }],
     });
   } else if (direction === "event_to_action_item") {
     // Recreate the original calendar event, delete the action item

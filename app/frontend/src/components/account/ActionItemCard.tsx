@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import type { AirtableActionItem, AirtableMeeting, TeamMember } from "../../types";
 import { airtableApi } from "../../lib/api";
+import { logActionItemUpdate } from "../../lib/actionItemLog";
 import { ActionItemCardOccurrences } from "./ActionItemCardOccurrences";
 import { ActionItemModal } from "./ActionItemModal";
 import { ContextMenu, FocusPinBadge, focusPinMenuItem, type ContextMenuItem } from "../action-items/ContextMenu";
@@ -91,7 +92,7 @@ export function ActionItemCard({
       onClick: () => {
         const newStatus = item.status === "Done" ? "Open" : "Done";
         void airtableApi.updateActionItemFields(item.airtable_id, { status: newStatus })
-          .then(({ data }) => onUpdated?.(data))
+          .then(({ data }) => { logActionItemUpdate(item, { status: newStatus }); onUpdated?.(data); })
           .catch(() => {});
       },
     },
@@ -122,6 +123,7 @@ export function ActionItemCard({
           assignee_name: name,
           assignee_airtable_id: String(id),
         });
+        logActionItemUpdate(item, { assignee_name: name });
         onUpdated?.(updated);
         setAssignFlash(true);
         setTimeout(() => setAssignFlash(false), 1500);

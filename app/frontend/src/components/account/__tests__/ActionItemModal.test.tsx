@@ -3,6 +3,7 @@ import { render, screen, fireEvent, waitFor, within } from "@testing-library/rea
 import { http, HttpResponse } from "msw";
 import { server } from "../../../test/msw-server";
 import { ActionItemModal } from "../ActionItemModal";
+import { getLogsForResource } from "../../../lib/appLog";
 import type { AirtableActionItem } from "../../../types";
 
 vi.mock("../../comments/CommentContext", () => ({
@@ -45,6 +46,7 @@ const mockItem: AirtableActionItem = {
 };
 
 const ATTACHMENTS_URL = "/api/v1/airtable/action-items/:id/attachments/";
+const SLACK_URL = "https://acme.slack.com/archives/C123/p456";
 
 function registerHandlers() {
   server.use(
@@ -272,6 +274,90 @@ describe("ActionItemModal attachments", () => {
 
     await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
     expect(screen.queryByText("Checklist")).not.toBeInTheDocument();
+  });
+
+  // ── Slack link ──────────────────────────────────────────────────────────────
+
+  it("saves a pasted Slack link straight away, without waiting for Save", async () => {
+    const patches: Array<Record<string, unknown>> = [];
+    server.use(
+      http.patch("/api/v1/airtable/action-items/:id/fields/", async ({ request }) => {
+        patches.push((await request.json()) as Record<string, unknown>);
+        return HttpResponse.json({ ...mockItem, slack_thread_url: SLACK_URL });
+      })
+    );
+    const onUpdated = vi.fn();
+    render(<ActionItemModal item={mockItem} accountId={1} onClose={vi.fn()} onUpdated={onUpdated} />);
+    await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: /^Slack$/ }));
+    const input = screen.getByPlaceholderText("https://…");
+    fireEvent.paste(input, { clipboardData: { getData: () => SLACK_URL } });
+
+    // Every other field on this form is a draft you review before saving. A pasted link is
+    // not — before this it was dropped on the floor with no sign anything went wrong.
+    await waitFor(() => expect(patches).toEqual([{ slack_thread_url: SLACK_URL }]));
+    expect(onUpdated).toHaveBeenCalled();
+    // The chip replacing the input is the only confirmation the user gets.
+    await waitFor(() => expect(screen.getByText("Slack ↗")).toBeInTheDocument());
+  });
+
+  it("does not write when the pill is opened and dismissed with Escape", async () => {
+    const patches: unknown[] = [];
+    server.use(
+      http.patch("/api/v1/airtable/action-items/:id/fields/", async () => {
+        patches.push(1);
+        return HttpResponse.json(mockItem);
+      })
+    );
+    renderModal();
+    await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: /^Slack$/ }));
+    const input = screen.getByPlaceholderText("https://…");
+    fireEvent.change(input, { target: { value: SLACK_URL } });
+    fireEvent.keyDown(input, { key: "Escape" });
+
+    await new Promise((r) => setTimeout(r, 20));
+    expect(patches).toHaveLength(0);
+  });
+
+  // ── Activity log ────────────────────────────────────────────────────────────
+
+  it("records a field change in the activity log on Save", async () => {
+    localStorage.clear();
+    server.use(
+      http.patch("/api/v1/airtable/action-items/:id/fields/", () =>
+        HttpResponse.json({ ...mockItem, task: "Renamed task" })
+      ),
+      // addLog fires a fire-and-forget POST; give it a handler so the network layer is quiet.
+      http.post("/api/v1/realtime/activity/", () => HttpResponse.json({ id: 1 }, { status: 201 }))
+    );
+    renderModal();
+    await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
+
+    fireEvent.change(screen.getByDisplayValue("Fix billing issue"), { target: { value: "Renamed task" } });
+    fireEvent.click(screen.getByRole("button", { name: /Save changes/ }));
+
+    await waitFor(() => {
+      const logs = getLogsForResource("action_item", "recAAA001");
+      expect(logs.some((l) => l.message.includes("Title updated"))).toBe(true);
+    });
+  });
+
+  it("writes no activity entry when Save changes nothing", async () => {
+    localStorage.clear();
+    server.use(
+      http.patch("/api/v1/airtable/action-items/:id/fields/", () => HttpResponse.json(mockItem)),
+      http.post("/api/v1/realtime/activity/", () => HttpResponse.json({ id: 1 }, { status: 201 }))
+    );
+    renderModal();
+    await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: /Save changes/ }));
+
+    await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
+    expect(getLogsForResource("action_item", "recAAA001")).toHaveLength(0);
   });
 
   it("re-reads the attachment list on open so a prior upload is shown", async () => {

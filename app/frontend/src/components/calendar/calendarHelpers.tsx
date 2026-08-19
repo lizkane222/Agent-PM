@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { AirtableActionItem } from "../../types";
 import type { ScheduledItem, ScheduledReminder } from "../../types/calendar";
+import UrlPillInput from "../shared/UrlPillInput";
 
 // ── Drag-and-drop storage keys ────────────────────────────────────────────────
 export const CALENDAR_DRAG_KEY = "calendarDragActionItemId";
@@ -143,15 +144,9 @@ export function CalPillDate({ value, onChange }: { value: string; onChange: (v: 
 
 export function CalPillUrl({ value, onChange }: { value: string; onChange: (v: string) => void }) {
   const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLInputElement>(null);
-  useEffect(() => { if (open) ref.current?.focus(); }, [open]);
-  if (open) return (
-    <input ref={ref} type="url" defaultValue={value}
-      onBlur={(e) => { onChange(e.target.value); setOpen(false); }}
-      onClick={(e) => e.stopPropagation()} placeholder="https://…"
-      className="w-40 rounded-full border border-indigo-400 bg-white px-2.5 py-0.5 text-[12px] font-semibold focus:outline-none"
-    />
-  );
+  if (open) {
+    return <UrlPillInput value={value} onCommit={(v) => { onChange(v); setOpen(false); }} onCancel={() => setOpen(false)} />;
+  }
   return (
     <button type="button" onClick={(e) => { e.stopPropagation(); setOpen(true); }}
       className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[12px] font-semibold hover:opacity-75 transition-opacity cursor-pointer ${value ? "bg-indigo-50 text-indigo-700 ring-1 ring-indigo-200" : "bg-gray-100 text-[var(--twilio-gray-60)]"}`}

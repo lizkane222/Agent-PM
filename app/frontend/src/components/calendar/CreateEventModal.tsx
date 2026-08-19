@@ -12,7 +12,7 @@ import { airtableApi, accountsApi, teamApi } from "../../lib/api";
 import type { NewEventDraft, EventCategory, GuestEntry } from "../../types/calendar";
 import type { AirtableActionItem } from "../../types/airtable";
 import type { AccountArtifact } from "../../types/accounts";
-import { DEFAULT_CATEGORY_COLORS, borderFor, readableTextColor } from "../../lib/eventColors";
+import { DEFAULT_CATEGORY_COLORS, EVENT_CATEGORY_META, borderFor, readableTextColor } from "../../lib/eventColors";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -42,14 +42,9 @@ interface Props {
 
 // Labels and icons only — the active pill's color comes from the user's chosen
 // event-type colors (lib/eventColors.ts) so the pill matches the resulting event.
-const CATEGORY_META: { id: EventCategory; label: string; icon: string }[] = [
-  { id: "meeting",          label: "Meeting",          icon: "🗓" },
-  { id: "task",             label: "Task",             icon: "✓" },
-  { id: "out_of_office",   label: "Out of Office",    icon: "🚫" },
-  { id: "focus_time",      label: "Focus Time",       icon: "🎯" },
-  { id: "working_location", label: "Working Location", icon: "📍" },
-  { id: "appointment",     label: "Appointment",      icon: "📅" },
-];
+// The category list moved to lib/eventColors.ts so this modal, the detail panel's edit
+// form and the right-click "Convert to" menu cannot disagree about what types exist.
+const CATEGORY_META = EVENT_CATEGORY_META;
 
 const NOTIFICATION_OPTIONS: { value: number | null; label: string }[] = [
   { value: null,  label: "No notification" },

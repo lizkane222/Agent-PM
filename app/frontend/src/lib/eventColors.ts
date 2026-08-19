@@ -8,9 +8,13 @@
 
 import type { EventCategory } from "../types/calendar";
 
-/** Action items are not an `event_category` — they are identified by
- *  `calendar_id === "work_tracking"` — but they are still a colorable type. */
-export type ColorableEventType = EventCategory | "action_item";
+/**
+ * Action items and reminders are not `event_category` values — action items are
+ * identified by `calendar_id === "work_tracking"` and reminders by a
+ * `scheduled-reminder-*` uid — but both are still colorable types, painted on the
+ * grid and in the calendar's right-hand sidebars.
+ */
+export type ColorableEventType = EventCategory | "action_item" | "reminder";
 
 export interface PaletteGroup {
   name: string;
@@ -33,10 +37,10 @@ export const IMPORTANT_PALETTE: string[] =
 export const ALL_SWATCHES: string[] = PALETTES.flatMap((p) => p.colors);
 
 /**
- * Out-of-the-box colors: Bubblegum, extended with three Purple Pastel swatches.
+ * Out-of-the-box colors: Bubblegum, extended with Purple Pastel and one 90s swatch.
  *
- * Bubblegum has 5 colors for 7 types. Reusing two would make those types
- * indistinguishable, so the defaults borrow from the other pastel palette. The three
+ * Bubblegum has 5 colors for 8 types. Reusing swatches would make those types
+ * indistinguishable, so the defaults borrow from the other palettes. The three
  * near-white swatches (#F0F9F8, #F1EEFF, #FFF6ED) are skipped here because they read
  * as blank against the white grid — they remain selectable, just not defaults.
  */
@@ -44,21 +48,45 @@ export const DEFAULT_CATEGORY_COLORS: Record<ColorableEventType, string> = {
   meeting:          "#C3D3E0", // Purple Pastel — light blue
   task:             "#F2A2BD", // Bubblegum — pink
   action_item:      "#CFC1D8", // Purple Pastel — light purple
+  reminder:         "#E5A836", // 90s — amber; the pastels were spent, and amber is
+                               // what reminders have always been painted.
   out_of_office:    "#FED3DD", // Bubblegum — light pink
   focus_time:       "#82BFB7", // Bubblegum — teal
   working_location: "#C6E6E3", // Bubblegum — light aqua
   appointment:      "#DED1DB", // Purple Pastel — mauve
 };
 
-/** Display order and labels for the 7 colorable types. */
+/** Display order and labels for the 8 colorable types. */
 export const EVENT_TYPE_META: { id: ColorableEventType; label: string }[] = [
   { id: "meeting",          label: "Meeting" },
   { id: "task",             label: "Task" },
   { id: "action_item",      label: "Action item" },
+  { id: "reminder",         label: "Reminder" },
   { id: "out_of_office",    label: "Out of Office" },
   { id: "focus_time",       label: "Focus Time" },
   { id: "working_location", label: "Working Location" },
   { id: "appointment",      label: "Appointment" },
+];
+
+/**
+ * The event types that can actually be written to `CalendarEvent.event_category`, with
+ * the labels and icons every picker shows.
+ *
+ * Deliberately a **different** list from `EVENT_TYPE_META` above: that one has 8 entries
+ * because `action_item` and `reminder` are colorable, but neither is in the model's
+ * `EVENT_CATEGORY_CHOICES` — `PATCH /events/<pk>/details/` 400s on either. Anything that
+ * offers the user a type to save must iterate this list, not that one.
+ *
+ * Converting an event to an action item is therefore not a category change at all; it
+ * creates an AirtableActionItem and links it (see `convertEventToActionItemLinked`).
+ */
+export const EVENT_CATEGORY_META: { id: EventCategory; label: string; icon: string }[] = [
+  { id: "meeting",          label: "Meeting",          icon: "🗓" },
+  { id: "task",             label: "Task",             icon: "✓" },
+  { id: "out_of_office",    label: "Out of Office",    icon: "🚫" },
+  { id: "focus_time",       label: "Focus Time",       icon: "🎯" },
+  { id: "working_location", label: "Working Location", icon: "📍" },
+  { id: "appointment",      label: "Appointment",      icon: "📅" },
 ];
 
 /** Dark text color for light fills — Twilio Navy. */
@@ -110,6 +138,22 @@ export function darken(hex: string, amount: number): string {
   const k = 1 - Math.min(Math.max(amount, 0), 1);
   const out = channels(hex)
     .map((c) => Math.round(c * k).toString(16).padStart(2, "0"))
+    .join("");
+  return `#${out}`;
+}
+
+/**
+ * Mix each channel toward white. `amount` 0 → unchanged, 1 → white.
+ *
+ * The counterpart to `darken`, for surfaces that carry an accent color but must sit
+ * behind body text — the calendar sidebar cards, whose fill is a wash of the type
+ * color while the 3px left edge is the type color itself.
+ */
+export function tint(hex: string, amount: number): string {
+  if (!isHexColor(hex)) return hex;
+  const k = Math.min(Math.max(amount, 0), 1);
+  const out = channels(hex)
+    .map((c) => Math.round(c + (255 - c) * k).toString(16).padStart(2, "0"))
     .join("");
   return `#${out}`;
 }

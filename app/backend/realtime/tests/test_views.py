@@ -6,7 +6,7 @@ from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from rest_framework.test import APITestCase
 
-from realtime.models import VoiceSession
+from realtime.models import AgentActivityEvent, VoiceSession
 
 User = get_user_model()
 
@@ -150,3 +150,65 @@ class VoiceTwiMLViewTests(APITestCase):
             content_type="application/x-www-form-urlencoded",
         )
         self.assertIn(response.status_code, (403, 503))
+
+
+class AgentActivityEventViewSetTests(APITestCase):
+    """
+    AgentActivityEventViewSet — auth, owner scoping, ?page_size= widening (so the
+    activity-log restore can pull the full window in one request), and the
+    comment_reply event type validating as a choice.
+    """
+
+    URL = "/api/v1/realtime/activity/"
+
+    def setUp(self):
+        self.alice = User.objects.create_user(username="alice_act", password="pass")
+        self.bob = User.objects.create_user(username="bob_act", password="pass")
+
+    def test_list_unauthenticated_returns_401(self):
+        self.assertEqual(self.client.get(self.URL).status_code, 401)
+
+    def test_list_returns_only_own_events(self):
+        AgentActivityEvent.objects.create(user=self.alice, event_type="action_item", title="mine")
+        AgentActivityEvent.objects.create(user=self.bob, event_type="action_item", title="theirs")
+        self.client.force_authenticate(user=self.alice)
+        response = self.client.get(self.URL)
+        self.assertEqual(response.status_code, 200)
+        titles = [e["title"] for e in response.data["results"]]
+        self.assertIn("mine", titles)
+        self.assertNotIn("theirs", titles)
+
+    def test_default_page_size_is_capped_at_50(self):
+        for i in range(60):
+            AgentActivityEvent.objects.create(user=self.alice, event_type="action_item", title=f"e{i}")
+        self.client.force_authenticate(user=self.alice)
+        response = self.client.get(self.URL)
+        self.assertEqual(response.status_code, 200)
+        # The global default pagination ignores ?page_size and caps the page at 50.
+        self.assertEqual(len(response.data["results"]), 50)
+
+    def test_page_size_param_widens_the_page(self):
+        for i in range(60):
+            AgentActivityEvent.objects.create(user=self.alice, event_type="action_item", title=f"e{i}")
+        self.client.force_authenticate(user=self.alice)
+        response = self.client.get(self.URL, {"page_size": 500})
+        self.assertEqual(response.status_code, 200)
+        # ClientPageSizePagination honours ?page_size= so the whole window comes back at once.
+        self.assertEqual(len(response.data["results"]), 60)
+
+    def test_comment_reply_event_type_is_a_valid_choice(self):
+        self.client.force_authenticate(user=self.alice)
+        response = self.client.post(
+            self.URL,
+            {
+                "event_type": "comment_reply",
+                "title": "New reply on your comment",
+                "client_id": "reply-xyz",
+                "client_ts": 1000,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(
+            AgentActivityEvent.objects.filter(user=self.alice, event_type="comment_reply").exists()
+        )

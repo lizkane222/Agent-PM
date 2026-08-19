@@ -778,9 +778,22 @@ is matched to a meeting on **name and date**:
   per-bullet action-item buttons and @mention detection work on imported notes.
 
 **Key decisions**
-- **Scope is every meeting the user can see**, not the account being viewed. Visibility is
-  the union of team-member accounts *and* meetings linked to calendar events the user owns
-  — either clause alone drops real meetings (1:1s and internal calls have no account).
+- **Scope differs by host page**, and that difference is the point:
+  - The **account detail page** scopes to its own account. An import onto another
+    account's meeting isn't visible there, so reporting it would only confuse.
+  - The **profile and role pages** don't scope, covering every account the user is on —
+    that's the reason to run it from a personal page rather than account by account.
+  Both go through one component (`components/shared/GetMeetingNotesButton.tsx`) so the
+  request and the result wording can't drift between the three pages.
+- Scoping accepts `account` (AirtableAccount PK or `rec*` id) as well as `account_name`.
+  The id is preferred because a Django `Account.company_name` that has drifted from its
+  `AirtableAccount.name` matches nothing by name; the name stays as the fallback for
+  accounts with no Airtable link (per-user Admin workspaces) and for the agent, which
+  knows names rather than ids. A present-but-unresolvable filter narrows to empty rather
+  than falling through to everything.
+- **Underlying visibility** is the union of team-member accounts *and* meetings linked to
+  calendar events the user owns — either clause alone drops real meetings, since 1:1s and
+  internal calls have no account.
 - **Per provider, not per meeting.** An existing Gong recap does not block a Zoom import.
 - **Claude is a normaliser with a fallback, not a hard dependency.** No `ANTHROPIC_API_KEY`,
   or a failed call, falls back to `fallback_bullets` — the vendor's own text with footers
@@ -823,6 +836,72 @@ is matched to a meeting on **name and date**:
 - New endpoints in `lib/api.ts`: `updateMeetingZoomNotes(ByPk)`,
   `integrationsApi.getMeetingNotesFromEmail`.
 
+**Subject formats: the documented ones are not the ones that arrive**
+The first cut guessed `Gong Call Recap:` / `Meeting Summary with` prefixes and matched
+**nothing at all** against a real mailbox. What actually arrives:
+- Gong: `"<meeting name>: Call recording and analysis is ready"` — the name is a *prefix*
+  and the boilerplate is a *suffix*. Names contain their own colons
+  (`BigCommerce/Segment Sync: PS Engagement`), so the suffix is stripped by an
+  end-anchored regex rather than captured from the start.
+- Zoom: `"Meeting assets for <meeting name> are ready!"` — wrapped on *both* sides.
+
+`normalize_title` now strips both ends, iteratively, with the Gong-specific patterns tried
+before the bare `… is/are ready` catch-all (which would otherwise leave
+`…: Call recording and analysis` behind). Measured on a real 30-day mailbox: 0 matches
+before, 13 after. Verify against a real mailbox before adding to these lists.
+
+**Zoom emails do not contain the summary — and that shaped the design**
+Every Zoom "Meeting assets" email is a *notification*: `Review action items`,
+`Meeting summary`, `Topic:`, `Date:`, a share link, `View in Zoom`. The words "Meeting
+summary" are a **link label**; the summary itself only exists in the Zoom web app. Gong,
+by contrast, ships the full `Key points` / `Next steps` text in the body.
+
+The email *looks* like it contains a recap — it renders a card of grey summary-ish text —
+but that card is `st1.zoom.us/static/…/email/summary_preview.png`, a **static stock
+illustration** served to every recipient. Its visible text ("Design Sync", "Calendar Cards
+design", "Katie…") has nothing to do with the actual meeting. The email is HTML-only, 27KB
+of markup reducing to 376 chars of text, and `Quick recap` / `Next steps` appear nowhere in
+the source. Don't spend time trying to parse it — check `<img>` sources before assuming
+text is missing from an extractor.
+
+Importing indiscriminately would have filled meetings with notes made of link text, so
+there is now a content gate: `email_contains_summary()` counts characters on lines of ≥8
+words after removing URLs, and requires ≥400. The measured distribution over 28 real
+emails is Gong 3139–4505 and Zoom 0–238, so 400 sits in a wide gap. Consequences:
+- A gated-out email still contributes its **recording link** (`zoom_url`) — the only
+  useful thing in it — reported as `recordings_linked`.
+- The meeting is skipped with reason `email_has_no_summary`, rolled up as
+  `no_summary_in_email`, and the UI says so explicitly. The user can *see* those emails in
+  their inbox, so silence would read as a bug rather than as "these link to the summary".
+- Non-recap notices (`… has been deleted`, invites, registrations) are dropped before
+  matching by `_NON_RECAP_SUBJECT_RES`.
+
+**Notes hang off AirtableMeeting, but most meetings are calendar-only**
+This was the actual cause of "I can see the email but the meeting has no notes". The scan
+originally iterated `AirtableMeeting` rows only, and on the real account **every**
+CalendarEvent in the window had `agentpm_airtable_id=""` — so 3 of 11 Gong recaps had
+nowhere to attach and were silently skipped.
+
+There is now a second pass over `candidate_events()`: calendar events the user owns, in
+window, with no meeting row behind them. When a recap with a real summary matches one,
+`airtable_sync/meeting_stubs.get_or_create_meeting_for_event()` creates the same `local-*`
+stub the manual paste path has always created, links the event back via
+`agentpm_airtable_id` (without which the calendar page still shows an empty panel), and
+imports into it. That helper is *extracted from* `_meeting_notes_by_event`, which now calls
+it — one stub implementation, not two.
+
+- A stub is created **only when there is a real summary to store**. A bare recording link
+  isn't worth a new row.
+- Account scoping for events is best-effort: an event is kept in a *scoped* scan only when
+  its account resolves to the requested one, so events with no account FK are scanned only
+  in unscoped (profile / role) runs. A scoped run must not quietly import a meeting that
+  may belong elsewhere.
+- Reported as `scanned_unlinked_events` / `meetings_created`, and each such row is flagged
+  `created_meeting` and rendered with a "· new" suffix.
+- Verified on the real mailbox: the 3 previously-orphaned Gong recaps now resolve,
+  including the exact meeting from the bug report (event pk=948, 2026-08-12
+  "Twilio & Autodesk Enterprise - setting up Segment").
+
 **A trap worth knowing about**
 Airtable `richText` columns normalise a cleared value to `"\n"`, never `""`, and never drop
 the key once written — so `if at_gong_notes:` reads an *empty* Airtable cell as content.
@@ -846,18 +925,39 @@ existed for `gong_notes` before this change.
   re-fetch invisible at the network layer.
 - Result-row assertions use a `textContent` matcher: the provider name sits in its own
   `<span>` for capitalisation, so `getByText(/name.*provider/)` can't span it.
+- `RolePage`'s `CollapsibleSection` header is itself a `<button>`, so anything passed as
+  `headerRight` becomes a nested button and its text is absorbed into the header's
+  accessible name — `getByRole("button", {name: /GET Meeting Notes/})` finds **two**.
+  Query by title instead. (The nesting is pre-existing: `+ New` and the remove button are
+  already there, and `headerRight` stops propagation so the collapse doesn't fire.)
 
 **Verified**
-- 531/531 backend (68 new), 699/699 frontend (34 new).
+- 571/571 backend (108 new), 900/900 frontend (56 new).
 - `tsc -p tsconfig.app.json` reports **zero** errors in any file touched here.
   `npm run build` is currently red on `CalendarPage.tsx` / `ActionItemsSidebar.tsx` — a
   concurrent session's in-flight `StepsPanel` insertion referencing an out-of-scope `item`.
 - Dev DB migrated; backup at `/tmp/db.sqlite3.pre-meeting-notes`.
 
+**Four copies of the meeting-summary panel — all now have the toggle**
+The panel is duplicated four ways, and a Zoom-only meeting read as empty in any copy that
+hadn't been updated:
+1. `components/account/GongSummaryPanel.tsx` — the shared one (account SidePanel).
+2. `pages/AccountDetailPage.tsx` local copy (~L1413) — that page is additive-edits-only.
+3. `components/calendar/MeetingDetail.tsx::MeetingSummarySection` (~L1972) — the calendar
+   page's own copy, and the one in the bug report's screenshot.
+4. `components/account/AccountMeetingNotesFeed.tsx` — read-only, still zero consumers.
+
+All four share `MeetingSummarySourceToggle` / `preferredMeetingSource`. `MeetingSummarySection`
+has three save paths (`persistAndNotify`, `saveRaw`, `handleClear`) that were each hardcoded
+to the Gong endpoints; they now route through one `saveForSource()` so **Clear** clears only
+the active provider. Also made provider-agnostic: the read-only matched-meeting block in
+`MeetingDetail` (labels which provider it's showing, and links both recordings), the
+`AccountMeetingNotesFeed` display, and the status-report payload (`zoom_notes` alongside
+`gong_notes`).
+
 **Left open**
-- `AccountMeetingNotesFeed` renders `meeting.gong_notes` only and has no source toggle. It
-  still has zero consumers, so it was left alone.
-- `MeetingDetail.tsx:2373` shows `match.gong_notes` with no Zoom fallback.
+- `AccountMeetingNotesFeed` has no *editable* toggle — it's a read-only feed with zero
+  consumers, so it only got the display fallback.
 
 ---
 
@@ -1084,3 +1184,689 @@ each still has other callers in the file, so only `AccountNote` needed dropping.
   text* of `ActionItemsSidebar.tsx` / `CalendarPage.tsx`, files this session never opened, and
   their mtimes were minutes newer than any edit here. When the tree is shared, check `ls -lT`
   before believing a failure is yours.
+
+---
+
+### 2026-08-18 — Blank RolePage + ProfilePage: a DRF envelope typed as a bare array
+
+**Symptom**
+`/role/:slug` (e.g. `/role/sa`) and `/profile` rendered nothing at all. Every other route
+was fine.
+
+**Root cause**
+`/api/v1/layouts/working-sessions/` and `/api/v1/layouts/page-notes/` are plain
+`ModelViewSet`s (`layouts/views.py:81,109`) with no `pagination_class`, so they inherit the
+global `PageNumberPagination` and answer with `{count, next, previous, results}`. But
+`workingSessionApi.list()` and `userPageNoteApi.list()` in `lib/api.ts` were typed
+`WorkingSession[]` / `UserPageNote[]`, and both pages did `setSessions(r.data)` straight into
+state declared as an array.
+
+So an **object** landed in `sessions`, and `sessions.map(...)`
+(`ProfilePage.tsx:656`, `RolePage.tsx:1594`) plus `sessions.find(...)` threw
+`TypeError: sessions.map is not a function`. A throw during render unmounts the entire route
+subtree — hence a blank page rather than an error message anywhere.
+
+What made the wrong typing look right: the sibling `layouts/pinned/` **is** a custom `@action`
+returning `Response(serializer.data)` — a bare array (`layouts/views.py:78`). Two shapes are
+live under one prefix, and the URL doesn't tell you which.
+
+`page-notes` had a quieter version of the same bug: `r.data[0]` on the envelope is `undefined`,
+so the notepad always looked empty and a save POSTed a **duplicate** note instead of PATCHing
+the existing one.
+
+**Fix** — `lib/api.ts` only; no API route, request shape, or response shape changed.
+- New `unwrapResults<T>()` helper: accepts either shape and always resolves `T[]`
+  (`Array.isArray(data) ? data : data?.results ?? []`).
+- Applied to `workingSessionApi.list`, `userPageNoteApi.list`, and — deliberately —
+  `layoutsApi.listPinned`, so that route keeps working today *and* survives someone adding
+  pagination to it later. Call sites unchanged: the helper preserves the `AxiosResponse`
+  shape, so `r.data` / `({ data })` destructuring still works.
+
+**Key decisions**
+- **Fixed on the frontend, not by setting `pagination_class = None`** on the two viewsets.
+  That would have been a smaller diff but it changes a response shape, which hard constraint
+  #1 forbids — and CLAUDE.md already assigns envelope-unwrapping to the fetcher.
+- **Tolerant of both shapes rather than pinned to one.** Normally guessing is the bug, but
+  here the `/layouts/` family genuinely serves both, so a fetcher that accepts either is the
+  only version that can't be wrong.
+- `?? []` matters as much as the `Array.isArray` branch: an error body or a `{}` response
+  must still yield an array, or the crash just moves.
+
+**How it was found** (the diagnostic path is the reusable part)
+The MSW/jsdom render **passed** with every request unhandled — the `.catch(() => {})` on each
+fetch left `sessions` at its `[]` initial value, so the page rendered fine. The bug only
+exists when the request **succeeds**. Sequence that worked:
+1. `tsc` clean, Vite transform clean, all routes 401-not-404 → not a build or routing fault.
+2. Minted a short-lived JWT in-process and hit the live server: **all 11 endpoints 200**.
+   So the backend was healthy and the fault had to be client-side and data-dependent.
+3. Dumped the real response bodies and diffed shapes → `page-notes` and `working-sessions`
+   came back `dict` with `results`, `pinned` came back `list`. That was the whole answer.
+4. Replayed the real bodies into jsdom → `sessions.map is not a function`, reproduced.
+
+**Test-harness notes**
+- New `test/handlers/layouts.ts` and `test/handlers/skills.ts`, both registered in
+  `msw-server.ts` **and** `setup.ts`'s `extraHandlers`. The layouts defaults deliberately
+  encode the real asymmetry — `pinned/` bare, the rest enveloped — via an exported
+  `layoutsPage()` helper, so future page tests exercise the same mix production does rather
+  than a convenient all-arrays fiction that would have hidden this bug.
+- Added a `/scheduler/action-items/` default handler to `test/handlers/scheduler.ts`
+  (distinct from `/airtable/action-items/` in `action_items.ts`).
+- `getByText(/Pinned Layouts/i)` is ambiguous on ProfilePage — the empty-state copy reads
+  "No pinned layouts." Anchor on `"Working Sessions"` instead.
+
+**Verified**
+- 801/801 frontend, 75 files (14 new: 7 `lib/__tests__/layoutsApi.test.ts`,
+  4 `pages/__tests__/ProfilePage.test.tsx`, 3 `pages/__tests__/RolePage.test.tsx` — these two
+  pages previously had **no** test file at all). 531/531 backend. `npm run build` clean.
+- Beyond the committed tests, both pages were rendered once against the **actual live
+  response bodies** pulled from the dev server; both mount clean. That throwaway fixture test
+  was deleted rather than committed, since it pinned one machine's data.
+- Frontend-only diff, so no migration and no daphne restart — Vite hot-reloads it.
+
+**Also fixed (pre-existing, blocking the build)**
+- `lib/__tests__/actionItemEvents.test.ts:1` imported `vi` and never used it → TS6133, which
+  fails `npm run build`. Committed that way in 9fcfa4e. Removed the unused import; nothing
+  else in that file touched.
+
+**Left open**
+- The other seven `profiles/me/` callers and the double-GET on CalendarPage mount are still
+  outstanding (noted in earlier entries).
+- Nothing audits fetcher return types against real response shapes. `unwrapResults` is now
+  available for any other list fetcher typed as a bare array; the ones under `/layouts/` were
+  the only crashing cases, but the pattern was not otherwise swept.
+
+---
+
+### 2026-08-19 — Calendar action-items sidebar: six ordered sections + filter flags
+
+**Why**
+The sidebar rendered one flat list in API order. `AirtableActionItemViewSet` sets
+`pagination_class = None` and applies no `order_by`, so a card's position told you nothing,
+and the only filter was the free-text box.
+
+**Which file actually renders** — this is the trap. There are two copies:
+
+| File | |
+|---|---|
+| `pages/CalendarPage.tsx:1322` local `ActionItemsSidebar` | **The live one.** Reached via that file's *own* local `ItemsSidebar` (L2105) from L4795. |
+| `components/calendar/ActionItemsSidebar.tsx` | Reachable only through `components/calendar/ItemsSidebar.tsx`, which has **zero consumers**. Dead, but it has the only renderable test surface. |
+
+`pages/__tests__/CalendarPage.test.tsx:216` mocks `components/calendar/ItemsSidebar` — the
+**wrong module**. That mock has never had any effect on what CalendarPage renders.
+
+**Order** (each group `created_at` desc), a card appearing exactly once in its first match:
+Currently Tracking → Staged Today → Pinned In Progress → In Progress → Open → Done.
+
+The first three are *positional* state, not status. Note the naming collision:
+`ZONE_LABELS.active` is the string `"In Progress"` while its column header reads "Currently
+Tracking" — so **Tracking = zone `active`**, **In Progress = `status`**.
+
+**What changed**
+- `lib/actionItemSidebarOrder.ts` (new) — `SIDEBAR_GROUPS` (single source of truth for both
+  section headers and chips), `DONE_WINDOW_DAYS = 14`, `isRecentlyDone`, `groupForItem`,
+  `matchesFlags`, `groupActionItems`. In `lib/` because two components must not drift.
+- `hooks/useActionItemZoneSets.ts` (new) — `createLocalStore` over `actionItemZones`,
+  returning `{trackingIds, stagedIds}`, in the same shape `useFocusPins` owns
+  `actionFocusPins`. Replaces the duplicated inline `stagedIds` useState in both sidebars
+  (both of which read only the `today` zone). Exports `reloadActionItemZones()`.
+- `components/calendar/SidebarFilterFlags.tsx` (new) — the six-chip row. Accent arrives as a
+  prop: CalendarPage paints from `colors.colorFor("action_item")`, the twin uses `WORK_TRACKING_COLOR`.
+- Both sidebars: fetch `status` → `"Open,In Progress,Done"`; grouped render with a
+  `data-section={group.key}` micro-header + count; `visibleCount`/`isNarrowed` empty state.
+- `test/setup.ts` — `reloadActionItemZones()` in `afterEach`, alongside `resetRequestCache()`.
+
+**Key decisions**
+- **Done is fetched always, rendered only for the last 14 days.** The endpoint is unpaginated,
+  so the fetch is unbounded either way (55 Done rows in the dev DB); the *list* is what needed
+  bounding. The window is printed in the header (`Done · last 14 days`) so the cap is not silent.
+- `isRecentlyDone` uses `marked_done_at ?? updated_at`. The viewset only stamps
+  `marked_done_at` on a status *transition*, so rows that arrived Done from an Airtable sync
+  have it null — 4 of 55 in the dev DB. A strict filter would have silently hidden them.
+  No usable timestamp ⇒ treated as recent rather than dropped.
+- **Flags are independent predicates, not section membership.** Ticking "Open" reaches every
+  `status === "Open"` card *including* one sitting in the Tracking section (it still renders
+  under Tracking). Group-membership semantics would mean a flag could only ever find cards in
+  its own section, which reads as a bug. Union across ticked flags; empty selection = everything.
+- Positional state outranks the status filter, so a Blocked card the user *staged* still shows,
+  while an unstaged Blocked/Backlogged card stays hidden as it always has been.
+- `activeTimers` is deliberately **not** folded into Tracking — the other two positional groups
+  are "where the card lives" state; a running timer is a different axis.
+- Flags are session-only, not persisted, matching the existing `filterTerm`.
+- `liveIds` is still computed **before** the keep-filter, so timer/scheduled-item pruning is
+  unchanged — and it incidentally improves: a Done item with a live timer is no longer pruned.
+- CalendarPage's fetch dropped `Blocked,Backlogged,Complete`. "Complete" is not in the model
+  (Open/In Progress/Done/Blocked/Backlogged) and matched nothing; the twin was already cleaned up.
+
+**Test-harness notes**
+- Section headers must be queried by `data-section`, **not** by text: "In Progress", "Open" and
+  "Done" all also appear as the status badge on every card (and "Done" as the expanded card's
+  save button), so `getByText` is ambiguous.
+- CalendarPage's copy cannot be rendered — neither it nor its wrapper is exported. Covered by
+  `sidebarOrderingParity.test.ts`, which reads the source of both copies, the way
+  `checklistParity.test.ts` guards StepsPanel. Behaviour is tested against the module copy.
+- `ActionItemsSidebarFreshness.test.tsx`'s status assertion updated to `"Open,In Progress,Done"`.
+
+**Verified**
+- **895/895 frontend** (80 files; 54 new: 19 `lib/__tests__/actionItemSidebarOrder.test.ts`,
+  7 `hooks/__tests__/useActionItemZoneSets.test.ts`, 14 `ActionItemsSidebarOrdering.test.tsx`,
+  14 `sidebarOrderingParity.test.ts`), **571/571 backend**, `npm run build` clean.
+- Frontend-only diff, so no migration and no daphne restart. All five changed/new modules
+  confirmed transforming clean through the live Vite server.
+
+**Also of note**
+- A mid-session `ActionItemsPage.test.tsx` failure ("keeps the row highlight while the cursor
+  crosses the row's own children") was a **concurrent session's** in-flight edit, not this
+  change: that file's mtime moved *during* the run and the reported source line differed
+  between two consecutive runs. `ActionItemsPage.tsx` has zero references to any module added
+  here. It passes with this change's `test/setup.ts` line both present and absent.
+
+**Left open**
+- The two sidebar copies still duplicate their JSX; only the logic is shared now.
+- `CalendarPage.test.tsx:216` mocks the wrong `ItemsSidebar` module — harmless today, but it
+  means nothing in that suite exercises the real sidebar.
+- Manual drag-reorder (`actionItemOrder`, used by Stage Today / Currently Tracking on
+  ActionItemsPage) is **not** honoured by the sidebar; those sections sort by `created_at` desc
+  like every other group.
+
+---
+
+### 2026-08-19 — Drop an action item on a collapsed account, in both grouped views
+
+**What was actually broken**
+
+The request read as one bug but was two different situations, and they had opposite diagnoses.
+Establishing which was which came first — a throwaway test against the real DOM and MSW, since
+the drop machinery is all DOM events and jsdom runs them faithfully.
+
+- **Views grid** (default `kanban` view, one row per account): the collapsed-row drop *already
+  worked*. The outer row `<div>` carries `onDragOver`/`onDrop` outside the `!rowCollapsed`
+  branch, so a folded row has been a drop target all along. It just never said so, and it
+  flickered — see below.
+- **Projects view**: genuinely had **no** account drop target anywhere. Each group header is a
+  plain `<button>` with no `onDrop`, and an expanded group's cards sit in a `StatusBoardView`
+  whose columns only change *status*. Worse than inert: dropping a card on another group's
+  column *did* fire, via the `externalDragId && !dragId` branch, so the status changed while the
+  account did not — and the card snapped straight back into the group it was dragged out of.
+
+**Backend**: untouched. No migration, no daphne restart.
+
+**Frontend — `pages/ActionItemsPage.tsx` only**
+
+- `assignItemToAccount(resolvedId, item, accountKey)` — extracted from `handleDrop`'s `accounts`
+  branch, now the single mutation site for account reassignment. Both views route through it, so
+  the optimistic update, the Airtable write and the activity-log line can't drift.
+- `handleAccountGroupDrop` — the Projects view's drop handler. Assigns the account and
+  **deliberately does not touch `zones`**.
+- `ProjectsView` — new `accounts` + `onAccountDrop` props. Groups are built from the **account
+  list**, not from the items, so every known account has a header even with zero items. Names
+  matching no known account still get a group (so nothing renders nowhere) but are **not** drop
+  targets, mirroring the Views grid's "Unmatched account" row. "No Account" is always present
+  now, as the clear-the-account target.
+- `StatusBoardView` — new optional `accountKey` / `onAccountDrop`. A column drop on a *grouped*
+  board now means "this status **and** this account". Gated on `!dragId`: a local `dragId` means
+  the drag started on this board, so the account is already right and no PATCH is sent.
+- `leftElement(e)` + `CollapsedRowDropHint` for the Views grid (below).
+
+**Key decisions**
+
+- **The Projects view must not change the item's zone; the Views grid must.** Dropping in the
+  Views grid literally means "put it in the Views grid". Projects renders every real item
+  regardless of zone, so setting `zones` there would silently yank a card out of Stage Today as
+  a side effect of filing it under an account. This is why `assignItemToAccount` owns no zone
+  logic and each caller decides for itself.
+- **Empty accounts render as header-only, no chevron, no board.** Five blank status columns per
+  account the user has never filed work under would bury the populated groups. The header alone
+  *is* the group and the drop target. Its button stays enabled (a `disabled` button does not
+  reliably receive drop events) but loses the hover style, so it doesn't advertise a toggle with
+  nothing to toggle.
+- **Blanks are skipped, not promoted.** `handleAccountGroupDrop` bails on `local-*`. Projects
+  never renders blanks; the only way one arrives is a drag out of Unstaged, and the Views grid
+  is the path that owns `promoteBlankItem`. Same `canPin` precedent as focus pins and comments.
+- **`overGroupKey` is local to `ProjectsView`, and `isOver` is gated on `dragInFlight`.** A
+  page-level state write on every `dragover` would re-render every group in the list; gating on
+  the drag still being live means a cancelled drag can't leave a group highlighted, with no
+  `dragend` listener needed.
+- An unresolvable `accountKey` returns early rather than falling through to "clear the account".
+
+**Two real Views-grid bugs found while auditing it**
+
+1. **`onDragLeave` fired on every child boundary.** `dragleave` bubbles, so crossing from the
+   account label into the card strip flipped the shared `dragOverZone` to `null` and re-rendered
+   the whole page — then the next `dragover` set it back. A flicker at best; with a tree this
+   size it can cost the `drop` event itself. Both account rows now use
+   `if (leftElement(e)) onDragLeave()`, the same guard `StatusBoardView` already used.
+2. **A drop on the account a card was already filed under fired a pointless PATCH** plus a
+   misleading "Moved …" log line. `assignItemToAccount` now diffs the update against the item
+   first, via `sameFieldValue` — which treats `null` / `undefined` / `""` as equal, because
+   Airtable returns `""` where the app writes `null` and a strict compare would call every
+   already-cleared field changed.
+
+Also added `CollapsedRowDropHint`: a collapsed row is ~40px of label and gave no sign it accepted
+a drop, so filing a card into a folded-away account meant aiming on faith. Rendered **only while
+a card is in the air**, so the resting grid is unchanged.
+
+**Test-harness notes**
+- `fireEvent.dragLeave` cannot carry `relatedTarget` — the same trap as `clientY` and
+  `dragOverAt`: jsdom has no `DragEvent`, RTL falls back to a plain `Event`, and the property is
+  silently dropped. Every dragleave then reads as "the pointer left", which is exactly the
+  behaviour under test. New `dragLeaveTo()` dispatches a `MouseEvent` named `"dragleave"` instead.
+- Two new `data-testid`s (`collapsed-drop-hint`, `project-group-<groupKey>`) rather than walking
+  class strings: "Drop here" also appears on the Views grid's empty card strips, and an account
+  name appears in both a Projects header and every card's badge, so text queries are ambiguous.
+- Reaching the Projects view: its headers carry no `title`, while the Views grid's collapse
+  toggles do — so `queryByTitle(/Collapse Acme Corp/)` going null is the signal the swap landed.
+
+**Verified**
+- 895/895 frontend, 80 files (8 new in `ActionItemsPage.test.tsx`: collapsed-row drop in the
+  Views grid, drag-only hint, no-redundant-PATCH, the dragleave guard, all-accounts-have-a-group,
+  collapsed-group drop in Projects, zone-preservation, and cross-group status-column drop).
+  571/571 backend. `npm run build` clean.
+- Every claim about what was broken was reproduced at the network layer via MSW first, not
+  inferred from reading the code — the Views-grid half turned out to already work, which reading
+  alone would not have settled.
+
+**Left open**
+- Verified in jsdom, not in a real browser. The two fixes that jsdom cannot really exercise are
+  the re-render/flicker one (`leftElement`) and drag auto-scroll of the grid's `overflow-y-auto`
+  container when the target account is off-screen.
+- `DueDateView` and the ungrouped `status` view are not account-grouped, so they have no account
+  drop targets and were left alone.
+- A search matching nothing still short-circuits `ProjectsView` to "No items match", so no groups
+  render and nothing can be dropped during a dead search.
+
+---
+
+### 2026-08-19 — The loading flash after a drop: the page was reloading on its own broadcast
+
+**Symptom**
+Dragging an action item from one account to another briefly replaced the whole board with the
+full-page "Loading…" — reads as a glitch, not as progress.
+
+**Root cause — nothing to do with the drag**
+
+`lib/api.ts:314-319` installs a response interceptor that calls `notifyActionItemsChanged()`
+after **every** non-GET to `/airtable/action-items` or `/scheduler/action-items`. That helper
+(`lib/actionItemEvents.ts`) dispatches a *synthetic* `StorageEvent` so listeners in the same
+document hear it — the real `storage` event never fires in the tab that wrote.
+
+`ActionItemsPage`'s own `onStorage` handler matched `actionItemsUpdated` and called `load()`,
+which starts with `setIsLoading(true)`, and `isLoading` short-circuits the entire page to a
+single "Loading…" div. So the page was reloading itself in response to its own mutation, and
+blanking while it did — for the length of four parallel requests. Every mutation on the page did
+this, not just drops; the drag is simply where it is most visible.
+
+**Fix** — `pages/ActionItemsPage.tsx` only. No API, request or response shape changed.
+- `load()` takes `{ silent }`. Silent skips the `isLoading` flip, so the grid keeps rendering
+  while the refresh runs. The first mount stays loud; every event-driven reload is silent.
+  Same `{ silent: true }` shape `DashboardPage` already uses for its own broadcast listener.
+- `scheduleSilentReload()` — a 250ms trailing debounce (`SILENT_RELOAD_DEBOUNCE_MS`) in front of
+  the silent reload, cleared on unmount.
+
+**Key decisions**
+- **Silent, not suppressed.** Ignoring the page's own broadcast would be a smaller diff, but
+  `notifyActionItemsChanged` carries no origin, and some mutation paths on this page may be
+  relying on the reload to reconcile. Keeping the refetch preserves the freshness guarantee; only
+  the spinner had to go.
+- **The debounce is a correctness fix, not just a request saving.** A cross-account drop onto a
+  status column PATCHes the account *and* the status, so two broadcasts arrive back to back. Two
+  overlapping `load()`s each end in `setAllItems(newItems)` and can land in either order.
+- **The Refresh button stays loud.** It is an explicit request for a reload, so the blank is the
+  feedback. Only the reloads the user did not ask for went silent.
+- The optimistic update has already moved the card, so the silent reload only confirms it — there
+  is no window where the board shows stale placement.
+
+**Test-harness note (this one nearly shipped a fake test)**
+The first version of the no-blanking test **passed with the fix reverted**. MSW answers inside a
+microtask, so a loud reload flashed and cleared before any assertion could observe it. The test
+now holds the second `/airtable/action-items/` response open for 250ms and asserts inside that
+window. Both new tests were checked by reverting the one-line fix and confirming they go red.
+
+Second trap: after the drop the card is filed under the *collapsed* Beta Inc row, which correctly
+renders no cards — so `getByText("Fix billing issue")` fails for the right reason. The assertion
+is on the row's `GroupCounts` ("1 open") instead, which also proves the update rendered.
+
+**Verified**
+- 902/902 frontend, 80 files (2 new: no-blanking, and broadcast coalescing measured at the network
+  layer by counting MSW hits). `npm run build` clean, `tsc -p tsconfig.app.json` clean.
+- Frontend-only diff, so no migration and no daphne restart.
+
+**Left open**
+- Every other page that listens for `actionItemsUpdated` has the same self-broadcast reload
+  (`CalendarPage`, `ActionItemsSidebar`, `AccountDetailPage`, `DashboardPage`). Only `Dashboard`
+  is already silent. Not swept here — each has its own loading UI to check.
+- The reload still refetches items, both account lists and the profile on every broadcast. Silent
+  now, but four requests per mutation is worth revisiting given this repo's 429 history.
+
+---
+
+### 2026-08-19 — Account Detail kanban: column ordering rules
+
+**Requested**
+- **Open** — by `created_at`, oldest at the top, most recent at the bottom.
+- **In Progress / Done / Blocked / Backlogged** — by the order the item was moved into that
+  column, most recent at the bottom.
+
+Before this, `kanbanItems.filter(i => i.status === status)` had **no** sort at all, so all five
+columns echoed raw API order.
+
+**What changed**
+
+- `hooks/useStatusArrivalOrder.ts` (new) — `useStatusArrivalOrder(items)` returns
+  `orderForStatus(items, status)`, and is simultaneously the observer that records moves.
+  Built on `createLocalStore` (`lib/localStore.ts`), same as `useFocusPins` /
+  `useAccountGroupCollapse`. Storage key `actionItemStatusArrival-v1`, shape
+  `Record<status, airtable_id[]>` in arrival order, oldest first.
+- `pages/AccountDetailPage.tsx` — hook called at component top level (it must see every
+  `actionItems` change, and the kanban lives inside a render closure where hooks can't go);
+  `orderForStatus(...)` wraps the filter at both column render sites.
+- `test/setup.ts` — `reloadStatusArrivalOrder()` in `afterEach`, alongside the other
+  module-level store resets.
+
+**Key decisions**
+
+- **Arrivals are recorded by observing `actionItems`, not by instrumenting each mutation site.**
+  Status changes on this page come from the kanban drag, the card's own editor, the detail modal,
+  and a broadcast refetch can bring in a change made on another page. One diff-against-last-seen
+  observer catches all of them, and a future call site cannot forget to call it.
+- **A first sighting is not an arrival.** An item we did not watch move keeps the chronological
+  fallback rather than jumping to the bottom of its column — otherwise every mount would reorder
+  the board, since mounting "sees" every item for the first time.
+- **Unrecorded items sort above recorded ones.** Follows directly from "most recent at the
+  bottom": something we never watched arrive is older news than something we did. It also makes
+  the day-one state (no records at all) exactly equal to chronological order.
+- **Done falls back to `marked_done_at`, not `created_at`.** It is the one status the server
+  timestamps, and Done is the column most likely to be full of items completed long before any
+  arrival was recorded — creation order says nothing useful about them.
+- **Open ignores arrival records entirely.** It is an inbox; dragging something back out of In
+  Progress should not park it at the bottom of the backlog.
+- **Client-side, no migration.** There is no server field for "when did this enter Blocked", and
+  adding one means a model change plus a write on every status change — a lot of machinery for a
+  display order. Documented as the same `useResource`/HOOK_SPEC exemption `lib/localStore.ts`
+  claims.
+- **`withArrival` clears the id from every other status** before appending. A stale entry under
+  the status an item left would make it sort as though it had never left.
+- Capped at `MAX_IDS_PER_STATUS = 500`, dropping from the **front**. Ids are never pruned on
+  delete because this page only sees one account's items, so pruning against them would discard
+  every other account's records. Dropping the oldest arrivals is order-preserving in aggregate:
+  an unrecorded id sorts above every recorded one, which is where those already were.
+
+**Test-harness notes**
+- The column-lookup helper first walked `header.parentElement.parentElement`, which lands on the
+  **grid**, not a column. Two consequences, both silent: `within()` then saw every column at
+  once, and `fireEvent.drop` hit an element with no `onDrop`, so the drag tests exercised
+  nothing. The column is the header's *parent*.
+- The header must be matched on its full class prefix
+  (`flex items-center gap-1.5 text-xs font-semibold`), not just `font-semibold` — every card
+  renders its own status as a bold pill, so a looser match picks up cards.
+- Fixtures for the drag tests list the moved item **first**, so raw API order *and* creation
+  order both disagree with the expected result. Without that, one test passed by coincidence
+  even with the ordering removed.
+
+**Verified**
+- 919/919 frontend, 81 files (17 new: 13 `hooks/__tests__/useStatusArrivalOrder.test.ts`,
+  4 in `AccountDetailPage.test.tsx`). 571/571 backend. `npm run build` and
+  `tsc -p tsconfig.app.json` clean.
+- All 4 page tests confirmed red with the `orderForStatus` calls removed, all 13 hook tests
+  exercise the store directly.
+- Frontend-only diff, so no migration and no daphne restart.
+
+**Left open**
+- Ordering *within* a column is not user-draggable — a drop anywhere on a column appends to the
+  bottom. `ActionItemsPage` has a `beforeId` insertion-hint protocol for that; wiring it in here
+  would mean per-card drag handlers on an out-of-scope page.
+- The arrival map is global, not per-account. Harmless (an item has one account) but it means one
+  localStorage key grows with every account's traffic, hence the cap.
+
+---
+
+### 2026-08-19 — Calendar: "Edit" that actually edits, and convert an event to another type
+
+**Two bugs and a feature, all in the right-click / detail-panel path.**
+
+**Bug 1 — "Edit" opened a read-only panel.** `EventDetailPanel` had editors for exactly two
+special cases: `isScheduledReminder` and `isScheduledActionItem`. For an ordinary event the
+footer offered only "Set reminder for this event" and "Delete event". There was **no edit form
+and no save path for a plain calendar event at all**, so the menu's Edit entry
+(`setSelectedEvent(ev)`) could not lead anywhere.
+
+**Bug 2 — the panel never had a usable PK.** Both entry points put FullCalendar's
+`extendedProps` straight into `selectedEvent` (`handleEventClick`, and the Edit menu item).
+**FullCalendar strips `id`** — it owns that prop — so `selectedEvent.id` was always `undefined`
+and any PATCH would have gone to `/events/undefined/`. The codebase already knew this:
+`toggleAttendance` and the Comment menu entry each re-look-up the row from `eventsRef`. The
+workaround was just never applied where the panel opens. (`handleEventClick`'s toggle-off check
+compared `prev?.id === extProps.id` — i.e. `undefined === undefined`.)
+
+Fixed with one `resolveEventRow(snapshot)` helper called at both entry points, so every panel
+consumer gets a row with a real PK instead of each one repeating the lookup.
+
+**Feature — Convert to…** Right-click → "Convert to…" expands inline (no submenu machinery;
+same trick "Mark as important!" uses) offering the six categories plus "Action item".
+
+**What "type" can be — the constraint that shaped this**
+
+`CalendarEvent.EVENT_CATEGORY_CHOICES` has **six** values: meeting, task, out_of_office,
+focus_time, working_location, appointment. `action_item` and `reminder` are **not** DB
+categories — they exist only in the frontend's `ColorableEventType`, for painting synthetic
+overlays. So converting to any of the five other types is an in-place `event_category` change,
+while "convert to action item" has to create an `AirtableActionItem`.
+
+**Per the user's decision: the event is kept**, linked through its existing
+`agentpm_airtable_id`. New `convertEventToActionItemLinked` in `hooks/useConvert.ts`,
+deliberately *not* the existing `convertEventToActionItem` (which deletes the source and is
+still what `MeetingDetail` wants) — a meeting you held is history, and spinning off a follow-up
+task should not erase it.
+
+**Backend** — `scheduler/views.py`
+- New `@action PATCH /scheduler/events/<pk>/details/`. A dedicated action, not the generic
+  PATCH, for the **same documented reason `attendance` is one**: `perform_update` runs
+  `RequireAccountMembershipMixin`, which resolves the account off `serializer.instance` when the
+  patch omits it — so it 403s a user editing *their own* meeting whenever it is linked to an
+  account they aren't a team member of. Google-synced meetings get auto-linked to accounts, so
+  that is the common case. A test pins the generic path still 403ing, so the action can't be
+  "simplified" away.
+- `DETAILS_EDITABLE_FIELDS` whitelist; unknown keys ignored, not an error. `event_category`
+  validated against the model choices (400 on `action_item`, `reminder`, `"Task"`, …).
+  `start >= end` → 400, compared against the *stored* value so a one-sided patch is still caught.
+  `all_day` checked with `isinstance(..., bool)` — the `1 == True` trap `attendance` hit.
+- **Widened the Google push.** `perform_update` called `_update_in_google` only when the *times*
+  changed, but `_sync_google_calendar` rewrites title/description/location/times/status from
+  Google on every sync — so a local title edit was saved and then silently reverted. Now a
+  shared `_push_update_if_needed` fires on any change to `GOOGLE_OWNED_EVENT_FIELDS`, from both
+  the new action and the generic PATCH. Failures stay logged-not-raised: the local row is
+  authoritative.
+- `event_category` and `agentpm_airtable_id` are deliberately **outside** the snapshot, so a
+  type change or a link write does not trigger a pointless Google write (Google has neither
+  field, and the sync already preserves the category).
+
+**Frontend**
+- `lib/eventColors.ts` — new `EVENT_CATEGORY_META` (the six saveable categories + icons).
+  `CreateEventModal`'s local `CATEGORY_META` now aliases it, so the create modal, the panel's
+  type picker and the convert menu cannot disagree about what types exist.
+- `lib/api.ts` — `schedulerApi.updateEventDetails(id, patch)`.
+- `EventDetailPanel` — edit form for the plain-event branch (title / type pills / start / end /
+  location / description), reachable from "Edit event", a double-click on read mode, or the
+  context menu (via an `editRequestId` counter — a boolean could not re-open after a cancel).
+  Sends only changed fields. Re-seeds from props only when *not* mid-edit, because the parent
+  re-renders on every calendar poll and would otherwise wipe the form.
+- `saveEventDetails` re-throws so the panel keeps the form open on failure — closing it would
+  look exactly like success.
+
+**A real gap the tests caught**
+
+`agentpm_airtable_id` is in `CalendarEventSerializer.read_only_fields`, so handing it to the
+serializer was **silently dropped and returned 200** — the worst kind of failure. Now assigned
+on the model directly, exactly as `attendance` does with the equally read-only `attended`.
+
+**Outward-facing side effect, surfaced in the UI**
+
+Pushing to Google means Google emails the guest list. The form shows an amber note ("…saving
+will update it in Google and notify them") when the event `is_synced` *and* has attendees — said
+before the click rather than discovered after it.
+
+**Verified**
+- **943/943 frontend** (81 files; 24 new: 20 in `CalendarPage.test.tsx`, 4 in
+  `eventColors.test.ts`), **595/595 backend** (24 new: `CalendarEventDetailsUpdateTest` +
+  `CalendarEventGooglePushTest`).
+- A frontend test pins the PATCH url as `/events/7/details/` and asserts it is **not**
+  `"undefined"` — the bug-2 regression guard.
+- Daphne restarted; `/scheduler/events/1/details/` returns **401, not 404**, so the route is
+  live. All five changed modules confirmed transforming clean through Vite.
+
+**Also of note**
+- `npm run build` is red on **another session's in-flight edit**: `AccountDetailPage.tsx:32`
+  imports `useSlackLinkAutosave` without using it yet (TS6133). That file's mtime is newer than
+  every edit here and the symbol appears nowhere in this change. `tsc -p tsconfig.app.json`
+  reports that as the **only** error in the repo, and `npx vite build` bundles clean.
+- **`pkill -f daphne` kills Vite and ngrok too.** `npm run start-agent-pm` runs all three under
+  one `concurrently` parent, so killing any child makes the parent exit and takes the siblings
+  with it. CLAUDE.md's restart snippet is only safe if daphne was started standalone —
+  otherwise re-run `npm run start-agent-pm`. The stack was restored.
+
+**Left open**
+- `lib/useConvert.ts` and `hooks/useConvert.ts` are near-identical copies differing only in
+  import paths; all consumers import the `hooks/` one, so the `lib/` copy is dead. Untouched
+  here, but it is a live drift hazard — `convertEventToActionItemLinked` exists in only one of them.
+- The Google push is fire-and-forget, so an edit can succeed locally and still be reverted by a
+  later sync if Google was unreachable at the time. Surfacing that needs a retry queue.
+- `all_day` is accepted by the endpoint but has no control in the edit form.
+
+---
+
+### 2026-08-19 — Slack link: pasted URLs were silently discarded
+
+**Two separate faults, both needed fixing**
+
+1. **The pill only committed on `blur`.** All five copies of the URL pill (`PillUrl` on
+   ActionItemsPage, `AccPillUrl` in `components/shared/PillInputs.tsx` *and* its diverged twin in
+   AccountDetailPage, `CalPillUrl` in CalendarPage *and* `calendarHelpers`) were byte-identical
+   inputs with `onBlur` as the only commit path. Paste a link and press Enter, or paste and click
+   something that does not move focus, and the value never reached the form at all — the pill just
+   collapsed back to "Slack".
+2. **Even on blur, most surfaces only updated local form state.** The account and action-item
+   forms all wait for an explicit Save. (The two calendar copies were already fine: their cards
+   commit on click-outside via `commitEdit`.)
+
+**What changed**
+
+- `components/shared/UrlPillInput.tsx` (new) — the open-state input, now shared by all five
+  pills. Commits on **paste** (and closes, so the "Slack ↗" chip is the confirmation), on Enter,
+  and on blur; Escape cancels. One-commit guard, because committing unmounts the input and
+  removing a focused element can fire blur on the way out — that would have PATCHed twice.
+- `hooks/useSlackLinkAutosave.ts` (new) — `saveSlackThreadUrl(item, url)` plus the hook that
+  fires it and reports failures. Wired into the six surfaces that edit a **saved** item:
+  `components/account/ActionItemModal`, `ActionItemSidePanelContent`, both diverged copies in
+  `AccountDetailPage`, and `ActionItemsPage`'s `ActionItemFields` (via new optional
+  `autosaveTarget` / `onAutosaved` props) and `KanbanCard`.
+
+**Key decisions**
+
+- **Only this field autosaves.** Every other field on these forms is a draft you review before
+  saving; a Slack URL is pasted from the clipboard and is either right or not. Making the whole
+  form autosave would change what the Save button means on six surfaces at once.
+- **Paste closes the pill.** The collapsed chip is the only feedback that the value took, and ✎
+  reopens it. Keeping the input open after a paste-save would leave the user with no signal.
+- **The paste is spliced in by hand** (`clipboardData.getData` + selection range +
+  `preventDefault`) rather than read back after the default paste. The post-paste value is not
+  available synchronously, and deferring a tick to read `input.value` would not work in jsdom,
+  which never applies clipboard data to an input — so that version would also be untestable.
+- **Create forms are deliberately excluded** (`NewActionItemCard`, the new-item card in
+  AccountDetailPage, and both calendar create forms): there is no record to PATCH yet. The same
+  is enforced defensively in `saveSlackThreadUrl`, which no-ops on a `local-*` id.
+- **A failed autosave reports through `useAppError`.** The chip renders the new link from local
+  form state either way, so the user has every reason to think it saved — silence is the worst
+  outcome. `useAppError` has a no-op default, so surfaces mounted without the provider still
+  write, they just get no banner.
+- `saveSlackThreadUrl` normalises `null`/`undefined`/`""` when checking for a change, since
+  Airtable returns `null` for a never-set URL while the TS type says `string`.
+- Sharing the input added `stopPropagation` on click to the two copies that lacked it. Invisible,
+  and it stops a click in the input reaching a card whose own `onClick` opens a modal.
+
+**Verified**
+- 964/964 frontend, 83 files (26 new: 11 `UrlPillInput.test.tsx`, 8
+  `hooks/__tests__/useSlackLinkAutosave.test.tsx`, 2 in `ActionItemModal.test.tsx`, plus 5 from
+  the earlier entries in this session). 595/595 backend. `npm run build` and
+  `tsc -p tsconfig.app.json` clean.
+- Both halves pinned by sabotage: removing the `autosaveSlackLink` call fails the modal test;
+  removing the paste-commit fails 4 tests across two files.
+- Frontend-only diff, so no migration and no daphne restart.
+
+**Left open**
+- The two calendar create forms and `NewActionItemCard` still only carry the link into the create
+  payload, which is correct — noted only so nobody "fixes" them later.
+- Five near-identical pill wrappers remain (only the input is shared). Their chip/button markup
+  differs slightly per page, and unifying it would be a visible-styling risk.
+
+---
+
+### 2026-08-19 — Every action-item update reaches the activity log (card + page)
+
+**Symptom**
+An action item showed "created" and then nothing until "deleted" — every edit in between was
+invisible on both the card's Activity Log section and the `/logs` page.
+
+**Root cause**
+The activity log is entirely frontend-driven: one `addLog()` (`lib/appLog.ts`) writes a
+localStorage entry tagged with a `resource` and dispatches a synthetic `storage` event, which
+feeds *both* `ActivityLogSection` (filtered by resource → the card) and `LogsPage` (all entries).
+The single writer already fanned out to both surfaces — the problem was that only create, delete,
+zone-drag, reminder and conversion paths ever called it. Everyday edits (modal/side-panel Save,
+inline field edits, status changes, reassignment, calendar due-date drags) route through
+`updateActionItemFields` / `updateActionItemStatus` and logged **nothing**.
+
+**What changed**
+
+Frontend:
+- `lib/actionItemLog.ts` (new) — `logActionItemUpdate(before, changes)`. Diffs a fixed field set
+  (`status`, `priority`, `due_date`, `task`, `task_details`, `assignee_name`, `account_name`,
+  `estimated_time`, `time_spent`, `prep_time`, `slack_thread_url`), emits **one** `addLog` entry
+  per save summarising the changed fields (`"<task>" — Status: Open → In Progress; Reassigned to
+  Jane`). In `lib/` so the diff logic/phrasing can't drift across the many diverged action-item
+  UIs (same rationale as `lib/localStore.ts` / `lib/eventColors.ts`). No circular risk: `api.ts`
+  doesn't import `appLog`, and this only imports `addLog`.
+- Wired into every update handler that logged nothing: `components/account/ActionItemModal`,
+  `ActionItemSidePanelContent`, `ActionItemCard` (Mark Done/Reopen + reassign drop),
+  `hooks/useSlackLinkAutosave`, `pages/ActionItemsPage` (`handleSaveItem` + external-drop-status),
+  `pages/DashboardPage`, `components/calendar/KanbanCard` / `MeetingDetail` / `ActionItemsSidebar`,
+  `pages/CalendarPage` (handleUpdate, onUpdateActionItem, 2 due-date drag sites),
+  `pages/AccountDetailPage` (2 handleSave sites + handleKanbanDrop).
+
+Backend-restore fixes (older activity never returned after a localStorage clear):
+- `lib/appLog.ts` `syncLogsFromBackend` now requests `page_size=500` (was page 1 ≈ 50) and keeps
+  `comment_reply` entries on restore (was dropped by the allowed-category filter).
+- `lib/api.ts` — `realtimeApi.listActivity` accepts `page_size`.
+- `realtime/views.py` — `AgentActivityEventViewSet` gets `ClientPageSizePagination` so
+  `?page_size=` is honoured (global default ignores it). The `[:500]` cap stays; Django allows
+  re-slicing a sliced queryset within bounds, so pagination over it is safe.
+- `realtime/models.py` — added `comment_reply` to `EVENT_TYPE_CHOICES`. **No migration needed**:
+  `0003_add_comment_reply_event_type` already declared it; the model file had merely drifted out
+  of sync with its own migration.
+
+**Key decisions**
+- **Per-field diff messages, not a generic "updated" line** (user choice). Long-text fields report
+  "Title updated" / "Description edited" rather than dumping content.
+- **`isBlank` treats 0 as blank** for the numeric time fields, and `null`/`undefined`/`""` as
+  equal — Airtable returns `""`/`null` where the app writes the other, so without this every save
+  logged a spurious diff.
+- **Handlers that already emit semantic entries were left untouched** (zone-drag "Moved X from Y
+  to Z", blank-promotion account link, timeline add) — adding a field diff there would double-log.
+- **`local-*` items are skipped** (same guard as focus pins/comments — `promoteBlankItem` discards
+  the id, so a log against it would orphan).
+- Slack autosave logs with the returned `data` (real task label) but the *old* URL restored into
+  `before`, so the diff still fires.
+
+**Verified**
+- 984/984 frontend (85 files; new: 15 `lib/__tests__/actionItemLog.test.ts`,
+  3 `lib/__tests__/appLog.test.ts`, 2 in `ActionItemModal.test.tsx`), 603/603 backend
+  (5 new in `realtime/tests/test_views.py::AgentActivityEventViewSetTests`), `npm run build` clean.
+- Wiring test confirmed meaningful by sabotage (removing the `logActionItemUpdate` call in
+  `ActionItemModal.handleSave` turns it red).
+- Daphne restarted standalone (the view changed); `/api/v1/realtime/activity/?page_size=500`
+  returns 401 not 404. Killed only the daphne child (concurrently has no `--kill-others`), so Vite
+  (:5173, 200) and ngrok (:4040, 200) stayed up.
+
+**Left open**
+- Other pages listening for `actionItemsUpdated` still self-broadcast-reload (noted earlier); not
+  related to logging.
+- The helper's field set is fixed; a new user-facing field needs adding to `LOGGED_FIELDS` +
+  `clauseFor`.

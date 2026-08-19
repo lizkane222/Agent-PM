@@ -24,8 +24,11 @@ import KanbanCard from "./KanbanCard";
 import LogTimeModal from "./LogTimeModal";
 import ActivityLogSection from "../ActivityLogSection";
 import { convertActionItemToEvent, convertEventToActionItem, restoreConversion } from "../../hooks/useConvert";
+import { logActionItemUpdate } from "../../lib/actionItemLog";
 import RichTextMentionEditor, { type RichTextMentionEditorHandle } from "../shared/RichTextMentionEditor";
 import { sanitizeHtml, plainToHtml, htmlToPreviewText } from "../../lib/noteHelpers";
+import { MeetingSummarySourceToggle, preferredMeetingSource } from "../account/MeetingSummarySourceToggle";
+import type { MeetingNotesSource } from "../../lib/api";
 
 interface Props {
   event: CalendarEvent;
@@ -221,6 +224,7 @@ function ActionItemEditModal({
       if (form.time_spent !== item.time_spent) patch.time_spent = form.time_spent;
       if (Object.keys(patch).length > 0) {
         const { data } = await airtableApi.updateActionItemFields(item.airtable_id, patch);
+        logActionItemUpdate(item, patch);
         onSaved({ ...item, ...data });
       } else {
         onClose();
@@ -1024,6 +1028,7 @@ export default function MeetingDetail({ event, attended = true, onToggleAttendan
             eventId={event.id}
             meetingId={result?.this_meeting?.id}
             existingNotes={result?.this_meeting?.gong_notes ?? undefined}
+            existingZoomNotes={result?.this_meeting?.zoom_notes ?? undefined}
             accountName={result?.account?.name ?? null}
             airtableAccountId={result?.account ? (result.account as { id?: number }).id ?? null : null}
             accountTeamMembers={accountTeamMembers}
@@ -1083,7 +1088,9 @@ export default function MeetingDetail({ event, attended = true, onToggleAttendan
                     if (!item || item.status === col) return;
                     // Optimistic update — KanbanCard's own handler does the API call
                     handleStatusChange(airtableId, col);
-                    airtableApi.updateActionItemStatus(airtableId, col).catch(() => {
+                    airtableApi.updateActionItemStatus(airtableId, col).then(() => {
+                      logActionItemUpdate(item, { status: col });
+                    }).catch(() => {
                       // Revert on failure
                       handleStatusChange(airtableId, item.status);
                     });
@@ -1969,21 +1976,33 @@ function GongBulletRow({ text, eventId, accountName, airtableAccountId, isLast, 
   );
 }
 
-function MeetingSummarySection({ eventId, meetingId, existingNotes, accountName, airtableAccountId, accountTeamMembers, onCreatedActionItem }: {
+function MeetingSummarySection({ eventId, meetingId, existingNotes, existingZoomNotes, accountName, airtableAccountId, accountTeamMembers, onCreatedActionItem }: {
   eventId: number;
   meetingId?: number;
   existingNotes?: string;
+  existingZoomNotes?: string;
   accountName?: string | null;
   airtableAccountId?: number | null;
   accountTeamMembers?: AccountTeamMember[];
   onCreatedActionItem?: (item: AirtableActionItem) => void;
 }) {
   const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
-  const [raw, setRaw] = useState(existingNotes ?? "");
-  const [items, setItems] = useState<(GongItem & { mentionedMembers?: TeamMember[] })[]>(() =>
-    existingNotes?.trim() ? parseBullets(existingNotes) : []
+  // Both providers are held at once and `raw`/`items`/`showPaste` view the active one —
+  // the same shape as the other two summary panels. Whitespace-only counts as empty:
+  // Airtable richText reports "\n" forever once a cell has been written and cleared.
+  const [notesBySource, setNotesBySource] = useState<Record<MeetingNotesSource, string>>(() => ({
+    gong: existingNotes?.trim() ? existingNotes : "",
+    zoom: existingZoomNotes?.trim() ? existingZoomNotes : "",
+  }));
+  const [source, setSource] = useState<MeetingNotesSource>(() =>
+    preferredMeetingSource(existingNotes, existingZoomNotes)
   );
-  const [showPaste, setShowPaste] = useState(!existingNotes?.trim());
+  const initialText = notesBySource[source];
+  const [raw, setRaw] = useState(initialText);
+  const [items, setItems] = useState<(GongItem & { mentionedMembers?: TeamMember[] })[]>(() =>
+    initialText.trim() ? parseBullets(initialText) : []
+  );
+  const [showPaste, setShowPaste] = useState(!initialText.trim());
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const resolvedMeetingId = useRef<number | undefined>(meetingId);
 
@@ -1991,16 +2010,46 @@ function MeetingSummarySection({ eventId, meetingId, existingNotes, accountName,
     teamApi.listMembers().then(({ data }) => setTeamMembers(data.results ?? [])).catch(() => {});
   }, []);
 
-  const prevExistingRef = useRef(existingNotes);
-  useEffect(() => {
-    if (existingNotes !== prevExistingRef.current) {
-      prevExistingRef.current = existingNotes;
-      resolvedMeetingId.current = meetingId;
-      setRaw(existingNotes ?? "");
-      setItems(existingNotes?.trim() ? parseBullets(existingNotes) : []);
-      setShowPaste(!existingNotes?.trim());
+  function showSource(next: MeetingNotesSource, store: Record<MeetingNotesSource, string>) {
+    setSource(next);
+    const text = store[next] ?? "";
+    setRaw(text);
+    setItems(text.trim() ? parseBullets(text) : []);
+    setShowPaste(!text.trim());
+  }
+
+  /** Save `text` to whichever provider the toggle is on. Used by every save path. */
+  async function saveForSource(text: string) {
+    setNotesBySource((prev) => ({ ...prev, [source]: text }));
+    if (resolvedMeetingId.current) {
+      const save = source === "zoom"
+        ? airtableApi.updateMeetingZoomNotesByPk
+        : airtableApi.updateMeetingGongNotesByPk;
+      await save(resolvedMeetingId.current, text);
+      return;
     }
-  }, [existingNotes, meetingId]);
+    const save = source === "zoom"
+      ? airtableApi.updateMeetingZoomNotes
+      : airtableApi.updateMeetingGongNotes;
+    const { data } = await save(eventId, text);
+    resolvedMeetingId.current = data.id;
+  }
+
+  const prevExistingRef = useRef(existingNotes);
+  const prevExistingZoomRef = useRef(existingZoomNotes);
+  useEffect(() => {
+    if (existingNotes !== prevExistingRef.current || existingZoomNotes !== prevExistingZoomRef.current) {
+      prevExistingRef.current = existingNotes;
+      prevExistingZoomRef.current = existingZoomNotes;
+      resolvedMeetingId.current = meetingId;
+      const store: Record<MeetingNotesSource, string> = {
+        gong: existingNotes?.trim() ? existingNotes : "",
+        zoom: existingZoomNotes?.trim() ? existingZoomNotes : "",
+      };
+      setNotesBySource(store);
+      showSource(preferredMeetingSource(store.gong, store.zoom), store);
+    }
+  }, [existingNotes, existingZoomNotes, meetingId]);
 
   async function persistAndNotify(text: string, parsed: GongItem[]) {
     const notified = new Set<number>();
@@ -2015,12 +2064,7 @@ function MeetingSummarySection({ eventId, meetingId, existingNotes, accountName,
     if (!resolvedMeetingId.current && !eventId) return;
     setSaveState("saving");
     try {
-      if (resolvedMeetingId.current) {
-        await airtableApi.updateMeetingGongNotesByPk(resolvedMeetingId.current, text.trim());
-      } else {
-        const { data } = await airtableApi.updateMeetingGongNotes(eventId, text.trim());
-        resolvedMeetingId.current = data.id;
-      }
+      await saveForSource(text.trim());
       setSaveState("saved");
       setTimeout(() => setSaveState("idle"), 2500);
     } catch {
@@ -2067,12 +2111,7 @@ function MeetingSummarySection({ eventId, meetingId, existingNotes, accountName,
     if (!resolvedMeetingId.current && !eventId) return;
     setSaveState("saving");
     try {
-      if (resolvedMeetingId.current) {
-        await airtableApi.updateMeetingGongNotesByPk(resolvedMeetingId.current, text.trim());
-      } else {
-        const { data } = await airtableApi.updateMeetingGongNotes(eventId, text.trim());
-        resolvedMeetingId.current = data.id;
-      }
+      await saveForSource(text.trim());
       setSaveState("saved");
       setTimeout(() => setSaveState("idle"), 2500);
     } catch {
@@ -2088,11 +2127,8 @@ function MeetingSummarySection({ eventId, meetingId, existingNotes, accountName,
     if (!resolvedMeetingId.current && !eventId) return;
     setSaveState("saving");
     try {
-      if (resolvedMeetingId.current) {
-        await airtableApi.updateMeetingGongNotesByPk(resolvedMeetingId.current, "");
-      } else {
-        await airtableApi.updateMeetingGongNotes(eventId, "");
-      }
+      // Clears only the active provider — the other one's notes stay put.
+      await saveForSource("");
       setSaveState("saved");
       setTimeout(() => setSaveState("idle"), 2500);
     } catch {
@@ -2110,6 +2146,12 @@ function MeetingSummarySection({ eventId, meetingId, existingNotes, accountName,
           {saveState === "error" && <span style={{ fontSize: "0.6875rem", color: "#dc2626" }}>Save failed</span>}
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+          <MeetingSummarySourceToggle
+            value={source}
+            onChange={(next) => showSource(next, notesBySource)}
+            hasGong={!!notesBySource.gong.trim()}
+            hasZoom={!!notesBySource.zoom.trim()}
+          />
           {items.length > 0 && (
             <button onClick={() => void handleClear()} style={{ fontSize: "0.6875rem", color: "#9ca3af", background: "none", border: "none", cursor: "pointer", padding: 0 }}>
               Clear
@@ -2129,7 +2171,9 @@ function MeetingSummarySection({ eventId, meetingId, existingNotes, accountName,
             onPaste={handlePaste}
             onBlur={() => { if (raw.trim()) void saveRaw(raw); }}
             rows={7}
-            placeholder="Paste your Gong AI summary, meeting notes, or any bulleted text here…"
+            placeholder={source === "zoom"
+              ? "Paste your Zoom AI Companion summary or any bulleted text here…"
+              : "Paste your Gong AI summary, meeting notes, or any bulleted text here…"}
             style={{ width: "100%", fontSize: "0.8125rem", border: "1px solid #e5e7eb", borderRadius: "7px", padding: "8px 10px", outline: "none", resize: "vertical", lineHeight: 1.5, boxSizing: "border-box", color: "var(--twilio-navy)" }}
           />
           <button onClick={() => void handleParse()} disabled={!raw.trim()} style={{ marginTop: "5px", width: "100%", padding: "5px 0", fontSize: "0.75rem", fontWeight: 700, background: "#6366f1", color: "#fff", border: "none", borderRadius: "6px", cursor: raw.trim() ? "pointer" : "not-allowed", opacity: raw.trim() ? 1 : 0.4 }}>
@@ -2370,11 +2414,19 @@ function AirtableMeetingSection({
             </div>
           </div>
         )}
-        {match.gong_notes ? (
+        {/* Read-only view of whatever notes exist. Gong wins when both do, matching the
+            editable panel's default; falling back to Zoom keeps a Zoom-only meeting from
+            reading as "no notes yet". */}
+        {(match.gong_notes?.trim() || match.zoom_notes?.trim()) ? (
           <div>
-            <p className="text-sm font-medium text-[var(--twilio-navy)] mb-1">Meeting Notes</p>
+            <p className="text-sm font-medium text-[var(--twilio-navy)] mb-1">
+              Meeting Notes
+              <span className="ml-1.5 text-xs font-normal text-[var(--twilio-gray-60)]">
+                {match.gong_notes?.trim() ? "Gong" : "Zoom"}
+              </span>
+            </p>
             <div className="bg-gray-50 border border-gray-200 rounded-lg p-3 text-sm text-[var(--twilio-gray-80)] whitespace-pre-wrap">
-              {match.gong_notes}
+              {match.gong_notes?.trim() ? match.gong_notes : match.zoom_notes}
             </div>
             {match.gong_url && (
               <a
@@ -2384,6 +2436,16 @@ function AirtableMeetingSection({
                 className="text-sm text-indigo-500 hover:underline mt-1 inline-block"
               >
                 View Gong recording →
+              </a>
+            )}
+            {match.zoom_url && (
+              <a
+                href={match.zoom_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-sm text-indigo-500 hover:underline mt-1 inline-block ml-3"
+              >
+                View Zoom recording →
               </a>
             )}
           </div>

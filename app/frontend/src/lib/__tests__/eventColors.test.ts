@@ -3,6 +3,7 @@ import {
   ALL_SWATCHES,
   DARK_TEXT,
   DEFAULT_CATEGORY_COLORS,
+  EVENT_CATEGORY_META,
   EVENT_TYPE_META,
   IMPORTANT_PALETTE,
   LIGHT_TEXT,
@@ -12,6 +13,7 @@ import {
   isHexColor,
   readableTextColor,
   relativeLuminance,
+  tint,
   withAlpha,
 } from "../eventColors";
 
@@ -52,7 +54,14 @@ describe("DEFAULT_CATEGORY_COLORS", () => {
     expect(Object.keys(DEFAULT_CATEGORY_COLORS)).toHaveLength(EVENT_TYPE_META.length);
   });
 
-  it("gives all seven types a distinct color", () => {
+  it("includes reminder, which is not an event_category", () => {
+    // Reminders are synthetic grid markers keyed by a "scheduled-reminder-*" uid, but
+    // the calendar's reminders sidebar and those markers still need a chosen color.
+    expect(EVENT_TYPE_META.map((t) => t.id)).toContain("reminder");
+    expect(DEFAULT_CATEGORY_COLORS.reminder).toBe("#E5A836");
+  });
+
+  it("gives every type a distinct color", () => {
     const colors = Object.values(DEFAULT_CATEGORY_COLORS).map((c) => c.toLowerCase());
     expect(new Set(colors).size).toBe(colors.length);
   });
@@ -121,6 +130,27 @@ describe("darken", () => {
   });
 });
 
+describe("tint", () => {
+  it("leaves a color untouched at 0 and whitens it at 1", () => {
+    expect(tint("#82BFB7", 0)).toBe("#82bfb7");
+    expect(tint("#82BFB7", 1)).toBe("#ffffff");
+  });
+
+  it("always lightens, for every offered swatch", () => {
+    for (const color of ALL_SWATCHES) {
+      expect(relativeLuminance(tint(color, 0.9))).toBeGreaterThan(relativeLuminance(color));
+    }
+  });
+
+  it("produces a surface that reads with dark text, even from the darkest swatch", () => {
+    expect(readableTextColor(tint("#18363E", 0.9))).toBe(DARK_TEXT);
+  });
+
+  it("passes malformed input through untouched", () => {
+    expect(tint("nope", 0.5)).toBe("nope");
+  });
+});
+
 describe("borderFor", () => {
   it("darkens near-white fills so the event keeps an edge", () => {
     const border = borderFor("#F0F9F8");
@@ -162,6 +192,41 @@ describe("isHexColor", () => {
   it("rejects anything else", () => {
     for (const bad of ["AABBCC", "#AABBC", "#AABBCCDD", "red", "", null, undefined, 123]) {
       expect(isHexColor(bad)).toBe(false);
+    }
+  });
+});
+
+describe("EVENT_CATEGORY_META", () => {
+  // The six values in CalendarEvent.EVENT_CATEGORY_CHOICES. Kept as a literal rather
+  // than derived from the source list, so this fails if either side drifts.
+  const DB_CATEGORIES = [
+    "meeting", "task", "out_of_office", "focus_time", "working_location", "appointment",
+  ];
+
+  it("holds exactly the categories the model accepts, in order", () => {
+    expect(EVENT_CATEGORY_META.map((c) => c.id)).toEqual(DB_CATEGORIES);
+  });
+
+  it("excludes the colorable-but-unsaveable types", () => {
+    // `action_item` and `reminder` are in EVENT_TYPE_META because they get painted, but
+    // neither is an event_category — offering either in a type picker would 400 on save.
+    const ids = EVENT_CATEGORY_META.map((c) => c.id) as string[];
+    expect(ids).not.toContain("action_item");
+    expect(ids).not.toContain("reminder");
+  });
+
+  it("is the colorable list minus exactly those two", () => {
+    const colorable = EVENT_TYPE_META.map((t) => t.id).filter(
+      (id) => id !== "action_item" && id !== "reminder",
+    );
+    expect([...EVENT_CATEGORY_META.map((c) => c.id)].sort()).toEqual([...colorable].sort());
+  });
+
+  it("gives every category a label, an icon and a default color", () => {
+    for (const c of EVENT_CATEGORY_META) {
+      expect(c.label.length).toBeGreaterThan(0);
+      expect(c.icon.length).toBeGreaterThan(0);
+      expect(isHexColor(DEFAULT_CATEGORY_COLORS[c.id])).toBe(true);
     }
   });
 });

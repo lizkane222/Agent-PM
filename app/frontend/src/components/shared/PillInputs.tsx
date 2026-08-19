@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import UrlPillInput from "./UrlPillInput";
 
 export function AccPillSelect<T extends string>({ value, options, colorMap, placeholder, onChange }: {
   value: T | undefined;
@@ -62,11 +63,8 @@ export function AccPillNumber({ value, label, onChange }: { value: number | null
 
 export function AccPillUrl({ value, onChange }: { value: string | undefined; onChange: (v: string) => void }) {
   const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLInputElement>(null);
-  useEffect(() => { if (open) ref.current?.focus(); }, [open]);
   if (open) {
-    return <input ref={ref} type="url" defaultValue={value ?? ""} onBlur={(e) => { onChange(e.target.value); setOpen(false); }} placeholder="https://…"
-      className="w-40 rounded-full border border-indigo-400 bg-white px-2.5 py-0.5 text-[12px] font-semibold focus:outline-none" />;
+    return <UrlPillInput value={value} onCommit={(v) => { onChange(v); setOpen(false); }} onCancel={() => setOpen(false)} />;
   }
   if (value) {
     return (

@@ -107,8 +107,10 @@ describe("Calendar action items sidebar freshness", () => {
     await waitFor(() => expect(screen.getByText("Already here")).toBeInTheDocument());
 
     // The old filter also asked for Blocked/Backlogged and discarded them, plus a
-    // "Complete" status that does not exist in the model.
-    expect(state.statusParams[0]).toBe("Open,In Progress");
+    // "Complete" status that does not exist in the model. Done is asked for because the
+    // sidebar has a Done section (bounded on render to DONE_WINDOW_DAYS).
+    expect(state.statusParams[0]).toBe("Open,In Progress,Done");
     expect(state.statusParams[0]).not.toContain("Complete");
+    expect(state.statusParams[0]).not.toContain("Backlogged");
   });
 });

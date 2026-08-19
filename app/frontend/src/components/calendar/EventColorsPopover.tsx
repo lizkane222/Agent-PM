@@ -18,18 +18,27 @@ export default function EventColorsPopover({
   onReset,
   onClose,
   error,
+  ignoreSelector,
 }: {
   colorFor: (type: ColorableEventType) => string;
   onSelect: (type: ColorableEventType, color: string) => void;
   onReset: () => void;
   onClose: () => void;
   error?: string | null;
+  /**
+   * CSS selector for the trigger that opened this panel, when the trigger is not a
+   * DOM ancestor of it. Without this, a mousedown on the trigger closes the panel and
+   * the click that follows reopens it — so the trigger can never be used to dismiss.
+   */
+  ignoreSelector?: string;
 }) {
   const [openType, setOpenType] = useState<ColorableEventType | null>(null);
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     function onOutside(e: MouseEvent) {
+      const target = e.target as Element | null;
+      if (ignoreSelector && target?.closest?.(ignoreSelector)) return;
       if (!ref.current?.contains(e.target as Node)) onClose();
     }
     function onKey(e: KeyboardEvent) {
@@ -41,7 +50,7 @@ export default function EventColorsPopover({
       document.removeEventListener("mousedown", onOutside);
       document.removeEventListener("keydown", onKey);
     };
-  }, [onClose]);
+  }, [onClose, ignoreSelector]);
 
   return (
     <div

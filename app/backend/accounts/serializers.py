@@ -48,7 +48,7 @@ class AccountNoteSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = AccountNote
-        fields = ["id", "account", "author", "author_username", "author_display", "content", "created_at", "updated_at"]
+        fields = ["id", "account", "author", "author_username", "author_display", "content", "references", "created_at", "updated_at"]
         read_only_fields = ["id", "account", "author", "author_username", "author_display", "created_at", "updated_at"]
 
 

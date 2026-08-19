@@ -7,6 +7,11 @@ import type { AirtableActionItem, AirtableMeeting, CalendarEvent, MeetingNote } 
 
 // ── Gong summary section — renders parsed bullets with per-bullet action buttons ──
 
+/** Notes for a meeting, preferring Gong and falling back to Zoom. */
+function meetingSummaryText(meeting: AirtableMeeting): string {
+  return meeting.gong_notes?.trim() ? meeting.gong_notes : (meeting.zoom_notes ?? "");
+}
+
 function GongSummaryRow({
   meeting,
   eventId,
@@ -20,7 +25,7 @@ function GongSummaryRow({
   airtableAccountId?: number | null;
   onCreatedActionItem?: (item: AirtableActionItem) => void;
 }) {
-  const items: GongItem[] = parseBullets(meeting.gong_notes);
+  const items: GongItem[] = parseBullets(meetingSummaryText(meeting));
   if (items.length === 0) return null;
 
   return (
@@ -175,9 +180,9 @@ export function AccountMeetingNotesFeed({
       });
     }
 
-    // Airtable meetings with gong_notes not yet covered by any calendar event
+    // Airtable meetings with notes (either provider) not yet covered by a calendar event
     for (const meeting of meetings) {
-      if (!meeting.gong_notes || coveredMeetingIds.has(meeting.id)) continue;
+      if (!meetingSummaryText(meeting) || coveredMeetingIds.has(meeting.id)) continue;
       entries.push({
         meeting,
         event: undefined,
@@ -300,7 +305,7 @@ export function AccountMeetingNotesFeed({
                 {/* Notes — level 3 (indented from meeting title) */}
                 <ul style={{ listStyle: "none", margin: 0, padding: "0 0 2px 28px" }}>
                   {/* Gong / meeting summary */}
-                  {meeting?.gong_notes && (
+                  {meeting && meetingSummaryText(meeting) && (
                     <GongSummaryRow
                       meeting={meeting}
                       eventId={event?.id ?? 0}
@@ -325,7 +330,7 @@ export function AccountMeetingNotesFeed({
                   ))}
 
                   {/* Empty state when no notes or gong summary */}
-                  {!meeting?.gong_notes && notes.length === 0 && (
+                  {!(meeting && meetingSummaryText(meeting)) && notes.length === 0 && (
                     <li style={{ padding: "6px 10px 6px 10px" }}>
                       <span style={{ fontSize: "0.75rem", color: "var(--twilio-gray-40, #9ca3af)", fontStyle: "italic" }}>
                         No notes yet

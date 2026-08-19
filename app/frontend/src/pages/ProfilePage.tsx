@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { NavLink } from "react-router-dom";
 import { DndContext, useDroppable } from "@dnd-kit/core";
+import { GetMeetingNotesButton } from "../components/shared/GetMeetingNotesButton";
 import {
   accountsApi,
   agentSkillsApi,
@@ -358,7 +359,12 @@ function MySkillsSection({ agentSkills }: { agentSkills: AgentSkill[] }) {
   const pinned = agentSkills.filter(s => s.pinned_by_me).slice(0, 5);
   return (
     <div style={CARD}>
-      <p style={SECTION_HEADER}>Pinned Skills</p>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+        <p style={SECTION_HEADER}>Pinned Skills</p>
+        {/* Unscoped on purpose — from a personal page the useful run covers every
+            account the user is on, not one at a time. */}
+        <GetMeetingNotesButton />
+      </div>
       {pinned.length === 0 && (
         <p style={{ fontSize: "0.8125rem", color: "#9ca3af" }}>No pinned skills. Pin a skill from the Skills page.</p>
       )}

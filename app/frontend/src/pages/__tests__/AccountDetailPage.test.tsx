@@ -323,6 +323,128 @@ describe("AccountDetailPage — kanban views", () => {
     expect(within(section).getByText("New")).toBeInTheDocument();
   });
 
+  // ── Column ordering ──────────────────────────────────────────────────────────
+
+  describe("status column ordering", () => {
+    /**
+     * The status column whose header reads `status`.
+     *
+     * Anchored on the header's exact class string, not just "font-semibold": every card also
+     * renders its own status as a bold pill, so a looser match picks up cards too. And the
+     * column is the header's *parent* — going one level higher lands on the grid, whose
+     * `within()` then sees every column at once and which has no `onDrop` at all.
+     */
+    function column(section: HTMLElement, status: string): HTMLElement {
+      const header = within(section)
+        .getAllByText(status)
+        .find((el) => el.className.startsWith("flex items-center gap-1.5 text-xs font-semibold"));
+      if (!header) throw new Error(`no kanban header for "${status}"`);
+      const col = header.parentElement;
+      if (!col) throw new Error(`no column body for "${status}"`);
+      return col;
+    }
+
+    /** Task names in the order they are rendered inside a column. */
+    function tasksIn(section: HTMLElement, status: string, names: string[]): string[] {
+      const col = column(section, status);
+      return names.filter((n) => within(col).queryByText(n) !== null).sort((a, b) => {
+        const ea = within(col).getByText(a);
+        const eb = within(col).getByText(b);
+        // Node.compareDocumentPosition: 4 == b follows a.
+        return ea.compareDocumentPosition(eb) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+      });
+    }
+
+    it("orders Open oldest-first, newest at the bottom", async () => {
+      registerHandlers([
+        makeItem({ airtable_id: "recN3", id: 3, task: "Newest open", created_at: "2026-03-01T00:00:00Z" }),
+        makeItem({ airtable_id: "recN1", id: 1, task: "Oldest open", created_at: "2026-01-01T00:00:00Z" }),
+        makeItem({ airtable_id: "recN2", id: 2, task: "Middle open", created_at: "2026-02-01T00:00:00Z" }),
+      ]);
+      await renderPage();
+      const section = await getSection();
+      await waitFor(() => within(section).getByText("Oldest open"));
+
+      // The API order is deliberately shuffled; the column must not echo it.
+      expect(tasksIn(section, "Open", ["Newest open", "Oldest open", "Middle open"]))
+        .toEqual(["Oldest open", "Middle open", "Newest open"]);
+    });
+
+    it("orders Done by marked_done_at, not creation order", async () => {
+      registerHandlers([
+        makeItem({
+          airtable_id: "recD1", id: 1, task: "Made first, finished last", status: "Done",
+          created_at: "2026-01-01T00:00:00Z", marked_done_at: "2026-06-01T00:00:00Z",
+        }),
+        makeItem({
+          airtable_id: "recD2", id: 2, task: "Made last, finished first", status: "Done",
+          created_at: "2026-05-01T00:00:00Z", marked_done_at: "2026-02-01T00:00:00Z",
+        }),
+      ]);
+      await renderPage();
+      const section = await getSection();
+      await waitFor(() => within(section).getByText("Made first, finished last"));
+
+      expect(tasksIn(section, "Done", ["Made first, finished last", "Made last, finished first"]))
+        .toEqual(["Made last, finished first", "Made first, finished last"]);
+    });
+
+    it("puts a card dragged into In Progress at the bottom of that column", async () => {
+      registerHandlers([
+        // Listed first and created long before the item already in the column, so both the
+        // raw API order and creation order would put it on top. Arrival order must win.
+        makeItem({ airtable_id: "recP2", id: 2, task: "Just moved", status: "Open", created_at: "2020-01-01T00:00:00Z" }),
+        makeItem({ airtable_id: "recP1", id: 1, task: "Already running", status: "In Progress", created_at: "2026-01-01T00:00:00Z" }),
+      ]);
+      server.use(
+        http.patch("/api/v1/airtable/action-items/:id/status/", () => HttpResponse.json({}))
+      );
+      await renderPage();
+      const section = await getSection();
+      await waitFor(() => within(section).getByText("Just moved"));
+
+      const inProgress = column(section, "In Progress");
+      fireEvent.drop(inProgress, {
+        dataTransfer: {
+          getData: (k: string) => (k === "kanbanItemId" ? "recP2" : ""),
+          types: ["kanbanitemid"],
+        },
+      });
+
+      await waitFor(() => expect(within(inProgress).queryByText("Just moved")).toBeInTheDocument());
+      expect(tasksIn(section, "In Progress", ["Already running", "Just moved"]))
+        .toEqual(["Already running", "Just moved"]);
+    });
+
+    it("keeps two successive drags in the order they were made", async () => {
+      registerHandlers([
+        makeItem({ airtable_id: "recQ1", id: 1, task: "Dragged second", status: "Open", created_at: "2026-01-01T00:00:00Z" }),
+        makeItem({ airtable_id: "recQ2", id: 2, task: "Dragged first", status: "Open", created_at: "2026-02-01T00:00:00Z" }),
+      ]);
+      server.use(
+        http.patch("/api/v1/airtable/action-items/:id/status/", () => HttpResponse.json({}))
+      );
+      await renderPage();
+      const section = await getSection();
+      await waitFor(() => within(section).getByText("Dragged first"));
+
+      const blocked = column(section, "Blocked");
+      const dropOn = (id: string) =>
+        fireEvent.drop(blocked, {
+          dataTransfer: { getData: (k: string) => (k === "kanbanItemId" ? id : ""), types: ["kanbanitemid"] },
+        });
+
+      dropOn("recQ2");
+      await waitFor(() => expect(within(blocked).queryByText("Dragged first")).toBeInTheDocument());
+      dropOn("recQ1");
+      await waitFor(() => expect(within(blocked).queryByText("Dragged second")).toBeInTheDocument());
+
+      // Creation order would give the reverse; the column is a log of what you moved.
+      expect(tasksIn(section, "Blocked", ["Dragged first", "Dragged second"]))
+        .toEqual(["Dragged first", "Dragged second"]);
+    });
+  });
+
   // ── Accounts not linked to an Airtable record ────────────────────────────────
   //
   // Per-user Admin accounts have a blank airtable_id and are never linked to the shared
@@ -454,7 +576,7 @@ describe("AccountDetailPage — GET Meeting Notes", () => {
     expect(await screen.findByRole("button", { name: /GET Meeting Notes/i })).toBeInTheDocument();
   });
 
-  it("posts to the scan endpoint with no account filter", async () => {
+  it("scopes the scan to this account", async () => {
     let body: unknown = "not called";
     server.use(
       http.post(SCAN_PATH, async ({ request }) => {
@@ -466,8 +588,13 @@ describe("AccountDetailPage — GET Meeting Notes", () => {
     await renderPage();
     await clickButton();
 
+    // Scoped by airtable_id, not just the display name: a Django company_name that has
+    // drifted from its AirtableAccount name would otherwise match nothing.
     await waitFor(() => expect(body).not.toBe("not called"));
-    expect(body).toEqual({});
+    expect(body).toEqual({
+      account: mockAirtableAccount.airtable_id,
+      account_name: mockAccountWithMembers.company_name,
+    });
   });
 
   it("reports the scan counts when nothing was found", async () => {
@@ -476,7 +603,7 @@ describe("AccountDetailPage — GET Meeting Notes", () => {
     await renderPage();
     await clickButton();
 
-    expect(await screen.findByText(/No new meeting notes found/i)).toBeInTheDocument();
+    expect(await screen.findByText(/No new meeting notes found for Acme Corp/i)).toBeInTheDocument();
     expect(screen.getByText(/3 recap emails against 2 meetings/i)).toBeInTheDocument();
   });
 
@@ -500,13 +627,13 @@ describe("AccountDetailPage — GET Meeting Notes", () => {
     expect(rowMatching(/Q3 Review.*gong/i)).toBeTruthy();
   });
 
-  it("names the other account when a recap landed outside this page", async () => {
+  it("does not name the account on rows, since every row is this account", async () => {
     server.use(
       http.post(SCAN_PATH, () => HttpResponse.json({
         ...emptyReport,
         updated: [{
-          meeting_id: 9, airtable_id: "recMTG009", meeting_name: "Beta Kickoff",
-          date: null, account_name: "Beta Corp", sources: ["zoom"],
+          meeting_id: 1, airtable_id: "recMTG001", meeting_name: "Q3 Review",
+          date: null, account_name: "Acme Corp", sources: ["zoom"],
         }],
       }))
     );
@@ -515,7 +642,9 @@ describe("AccountDetailPage — GET Meeting Notes", () => {
     await clickButton();
 
     await screen.findByText(/Added notes to 1 meeting/i);
-    expect(rowMatching(/Beta Kickoff.*zoom.*Beta Corp/i)).toBeTruthy();
+    const row = rowMatching(/Q3 Review/);
+    expect(row).toBeTruthy();
+    expect(row!.textContent).not.toMatch(/Acme Corp/);
   });
 
   it("says when the per-run summary limit was reached", async () => {

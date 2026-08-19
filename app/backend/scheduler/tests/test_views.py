@@ -6,6 +6,7 @@ from django.urls import reverse
 from rest_framework.test import APITestCase
 
 from scheduler.models import CalendarEvent, MeetingNote, Reminder
+from scheduler.views import CalendarEventViewSet
 from team.models import UserProfile
 
 User = get_user_model()
@@ -426,3 +427,259 @@ class CalendarEventAttendanceTest(APITestCase):
 
         event.refresh_from_db()
         self.assertIs(event.attended, False)
+
+
+# ── Event details editing ─────────────────────────────────────────────────────
+
+def details_url(pk):
+    return f"/api/v1/scheduler/events/{pk}/details/"
+
+
+class CalendarEventDetailsUpdateTest(APITestCase):
+    """`PATCH /events/<pk>/details/` — the owner editing their own event.
+
+    Before this, the calendar's right-click "Edit" opened a panel with no edit form and
+    no save path for an ordinary event; `event_category` was write-once at creation.
+
+    A dedicated action rather than the generic PATCH for the same reason `attendance` is
+    one: the generic path runs RequireAccountMembershipMixin, which resolves the account
+    off the existing instance and so 403s a user editing their *own* meeting whenever it
+    is linked to an account they are not a team member of.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.user = _make_user("details_user")
+        self.other = _make_user("details_other")
+        self.event = _make_event(self.user)
+        self.client.force_authenticate(user=self.user)
+
+    def test_requires_auth(self):
+        self.client.force_authenticate(user=None)
+        resp = self.client.patch(details_url(self.event.pk), {"title": "Nope"}, format="json")
+        self.assertEqual(resp.status_code, 401)
+
+    def test_edits_title_description_and_location(self):
+        resp = self.client.patch(
+            details_url(self.event.pk),
+            {"title": "Renamed", "description": "Notes here", "location": "Room 4"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["title"], "Renamed")
+        self.event.refresh_from_db()
+        self.assertEqual(self.event.title, "Renamed")
+        self.assertEqual(self.event.description, "Notes here")
+        self.assertEqual(self.event.location, "Room 4")
+
+    def test_edits_times(self):
+        resp = self.client.patch(
+            details_url(self.event.pk),
+            {"start_datetime": "2026-08-20T14:00:00Z", "end_datetime": "2026-08-20T15:00:00Z"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.event.refresh_from_db()
+        self.assertEqual(self.event.start_datetime.hour, 14)
+
+    def test_converts_the_event_type(self):
+        resp = self.client.patch(
+            details_url(self.event.pk), {"event_category": "task"}, format="json"
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["event_category"], "task")
+        self.event.refresh_from_db()
+        self.assertEqual(self.event.event_category, "task")
+
+    def test_accepts_every_model_category(self):
+        for value, _label in CalendarEvent.EVENT_CATEGORY_CHOICES:
+            with self.subTest(category=value):
+                resp = self.client.patch(
+                    details_url(self.event.pk), {"event_category": value}, format="json"
+                )
+                self.assertEqual(resp.status_code, 200)
+                self.event.refresh_from_db()
+                self.assertEqual(self.event.event_category, value)
+
+    def test_rejects_an_unknown_category(self):
+        """`action_item` is a frontend-only colorable type, not a DB category."""
+        for bad in ["action_item", "reminder", "Task", "", "nonsense"]:
+            with self.subTest(category=bad):
+                resp = self.client.patch(
+                    details_url(self.event.pk), {"event_category": bad}, format="json"
+                )
+                self.assertEqual(resp.status_code, 400)
+        self.event.refresh_from_db()
+        self.assertEqual(self.event.event_category, "meeting")
+
+    def test_rejects_end_before_start(self):
+        resp = self.client.patch(
+            details_url(self.event.pk),
+            {"start_datetime": "2026-08-20T15:00:00Z", "end_datetime": "2026-08-20T14:00:00Z"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.event.refresh_from_db()
+        self.assertEqual(self.event.start_datetime.hour, 10)
+
+    def test_rejects_a_new_start_after_the_existing_end(self):
+        """A one-sided patch is still checked against the value already stored."""
+        resp = self.client.patch(
+            details_url(self.event.pk), {"start_datetime": "2026-08-20T23:00:00Z"}, format="json"
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_rejects_a_non_boolean_all_day(self):
+        for bad in [1, 0, "yes", {}]:
+            with self.subTest(value=bad):
+                resp = self.client.patch(
+                    details_url(self.event.pk), {"all_day": bad}, format="json"
+                )
+                self.assertEqual(resp.status_code, 400)
+
+    def test_ignores_fields_outside_the_whitelist(self):
+        resp = self.client.patch(
+            details_url(self.event.pk),
+            {"title": "Kept", "owner": self.other.pk, "is_synced": True, "attended": False},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.event.refresh_from_db()
+        self.assertEqual(self.event.title, "Kept")
+        self.assertEqual(self.event.owner, self.user)
+        self.assertFalse(self.event.is_synced)
+        self.assertIsNone(self.event.attended)
+
+    def test_requires_at_least_one_editable_field(self):
+        resp = self.client.patch(details_url(self.event.pk), {"nope": 1}, format="json")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_cannot_touch_another_users_event(self):
+        theirs = _make_event(self.other, title="Their meeting")
+        resp = self.client.patch(details_url(theirs.pk), {"title": "Hijacked"}, format="json")
+        self.assertEqual(resp.status_code, 404)
+        theirs.refresh_from_db()
+        self.assertEqual(theirs.title, "Their meeting")
+
+    def test_works_on_an_event_linked_to_a_non_member_account(self):
+        """The reason this is an action and not the generic PATCH.
+
+        Google-synced meetings get auto-linked to accounts, so a user editing their own
+        meeting hits this constantly — it is the common case, not an edge case.
+        """
+        from accounts.models import Account
+
+        account = Account.objects.create(company_name="Someone Else Corp")
+        event = _make_event(self.user, title="Linked", account=account)
+        resp = self.client.patch(details_url(event.pk), {"title": "Edited"}, format="json")
+        self.assertEqual(resp.status_code, 200)
+        event.refresh_from_db()
+        self.assertEqual(event.title, "Edited")
+
+    def test_generic_patch_still_403s_on_a_non_member_account(self):
+        """Documents why the action exists — remove this and the action is pointless."""
+        from accounts.models import Account
+
+        account = Account.objects.create(company_name="Not Mine Corp")
+        event = _make_event(self.user, title="Linked", account=account)
+        resp = self.client.patch(
+            f"/api/v1/scheduler/events/{event.pk}/", {"title": "Edited"}, format="json"
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_records_the_action_item_link(self):
+        """"Convert to action item" keeps the event and stores the new item's id."""
+        resp = self.client.patch(
+            details_url(self.event.pk), {"agentpm_airtable_id": "recABC123"}, format="json"
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.event.refresh_from_db()
+        self.assertEqual(self.event.agentpm_airtable_id, "recABC123")
+
+
+class CalendarEventGooglePushTest(APITestCase):
+    """When a local edit is pushed back to Google.
+
+    `_sync_google_calendar` rewrites title/description/location/times/status from Google
+    on every sync, so an edit that is not pushed is silently reverted the next time the
+    sync runs. `perform_update` used to push only when the *times* changed.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.user = _make_user("push_user")
+        self.client.force_authenticate(user=self.user)
+        self.synced = _make_event(
+            self.user, title="Synced", google_event_id="g-push-1", is_synced=True
+        )
+
+    def _patch_details(self, body, event=None):
+        from unittest.mock import patch as mock_patch
+
+        target = event or self.synced
+        with mock_patch.object(
+            CalendarEventViewSet, "_update_in_google"
+        ) as push:
+            resp = self.client.patch(details_url(target.pk), body, format="json")
+        return resp, push
+
+    def test_pushes_a_title_change(self):
+        resp, push = self._patch_details({"title": "Renamed in app"})
+        self.assertEqual(resp.status_code, 200)
+        push.assert_called_once()
+
+    def test_pushes_a_description_change(self):
+        _resp, push = self._patch_details({"description": "New agenda"})
+        push.assert_called_once()
+
+    def test_pushes_a_time_change(self):
+        _resp, push = self._patch_details(
+            {"start_datetime": "2026-08-20T16:00:00Z", "end_datetime": "2026-08-20T17:00:00Z"}
+        )
+        push.assert_called_once()
+
+    def test_does_not_push_a_category_only_change(self):
+        """Google has no category field, and the sync already preserves ours."""
+        resp, push = self._patch_details({"event_category": "focus_time"})
+        self.assertEqual(resp.status_code, 200)
+        push.assert_not_called()
+
+    def test_does_not_push_the_action_item_link(self):
+        """`agentpm_airtable_id` lives in extendedProperties, which the push omits."""
+        _resp, push = self._patch_details({"agentpm_airtable_id": "recXYZ"})
+        push.assert_not_called()
+
+    def test_does_not_push_a_no_op_edit(self):
+        _resp, push = self._patch_details({"title": "Synced"})
+        push.assert_not_called()
+
+    def test_does_not_push_an_unsynced_event(self):
+        local = _make_event(self.user, title="Local only")
+        _resp, push = self._patch_details({"title": "Renamed"}, event=local)
+        push.assert_not_called()
+
+    def test_a_google_failure_does_not_lose_the_local_edit(self):
+        from unittest.mock import patch as mock_patch
+
+        with mock_patch.object(
+            CalendarEventViewSet, "_update_in_google", side_effect=RuntimeError("Google down")
+        ):
+            resp = self.client.patch(
+                details_url(self.synced.pk), {"title": "Saved anyway"}, format="json"
+            )
+        self.assertEqual(resp.status_code, 200)
+        self.synced.refresh_from_db()
+        self.assertEqual(self.synced.title, "Saved anyway")
+
+    def test_generic_patch_now_pushes_a_content_only_change(self):
+        """The widened condition: it used to push only on a time change."""
+        from unittest.mock import patch as mock_patch
+
+        with mock_patch.object(CalendarEventViewSet, "_update_in_google") as push:
+            resp = self.client.patch(
+                f"/api/v1/scheduler/events/{self.synced.pk}/",
+                {"title": "Via generic patch"},
+                format="json",
+            )
+        self.assertEqual(resp.status_code, 200)
+        push.assert_called_once()

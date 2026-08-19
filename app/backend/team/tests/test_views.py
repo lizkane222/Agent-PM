@@ -186,6 +186,14 @@ class CalendarColorsTest(APITestCase):
         """Action items are not an event_category but are still colorable."""
         self.assertEqual(self._patch({"categories": {"action_item": "#CFC1D8"}}).status_code, 200)
 
+    def test_reminder_is_a_valid_type(self):
+        """Reminders have no event_category either, but the calendar colors them."""
+        resp = self._patch({"categories": {"reminder": "#E5A836"}})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            resp.data["calendar_colors"]["categories"], {"reminder": "#E5A836"}
+        )
+
     def test_patch_stores_important_overrides(self):
         resp = self._patch({"important": {"gcal-event-123": "#842D78"}})
         self.assertEqual(resp.status_code, 200)

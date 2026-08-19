@@ -21,6 +21,7 @@ from .serializers import (
 )
 from .sync import publish_activity_event
 from core.mixins import TwilioSignatureRequiredMixin  # shared, single canonical copy
+from core.pagination import ClientPageSizePagination
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +179,7 @@ class AgentActivityEventViewSet(viewsets.ModelViewSet):
 
     serializer_class = AgentActivityEventSerializer
     permission_classes = [IsAuthenticated]
+    pagination_class = ClientPageSizePagination
     http_method_names = ["get", "post", "head", "options"]
 
     def get_queryset(self):

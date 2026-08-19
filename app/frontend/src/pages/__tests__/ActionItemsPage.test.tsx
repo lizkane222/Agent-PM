@@ -1121,4 +1121,318 @@ describe("ActionItemsPage", () => {
     expect(requested).toHaveLength(2);
     for (const url of requested) expect(url).toContain("page_size=500");
   });
+
+  // ── Cross-account drops ───────────────────────────────────────────────────────
+  // Moving a card from an account you have expanded to one you have collapsed, in both
+  // account-grouped views. "Beta Inc" deliberately owns no items, so it is also the
+  // zero-item case: an account you have never filed work under is exactly when you need
+  // it to be a drop target.
+
+  describe("dragging an action item to another account", () => {
+    /** Bodies of every account PATCH the page sent, in order. */
+    let fieldPatches: Array<Record<string, unknown>>;
+
+    beforeEach(() => {
+      fieldPatches = [];
+      server.use(
+        http.get("/api/v1/airtable/accounts/", () =>
+          HttpResponse.json({
+            results: [
+              { id: 1, airtable_id: "recACCT1", name: "Acme Corp" },
+              { id: 2, airtable_id: "recACCT2", name: "Beta Inc" },
+            ],
+            count: 2,
+          })
+        ),
+        http.patch("/api/v1/airtable/action-items/:id/fields/", async ({ request, params }) => {
+          const body = (await request.json()) as Record<string, unknown>;
+          fieldPatches.push({ ...body, __id: params.id });
+          return HttpResponse.json({ ...mockItem, ...body });
+        })
+      );
+    });
+
+    /** Collapse account groups by key before the page mounts. */
+    async function collapseGroups(...keys: string[]) {
+      const { reloadAccountGroupCollapse, ACCOUNT_COLLAPSE_KEY } =
+        await import("../../hooks/useAccountGroupCollapse");
+      localStorage.setItem(ACCOUNT_COLLAPSE_KEY, JSON.stringify(keys));
+      // No storage event fires in the document that wrote, so the module-level store has
+      // to be told to re-read.
+      reloadAccountGroupCollapse();
+    }
+
+    /** The Views-grid row (or Projects-view group card) containing `el`. */
+    function rowContaining(el: HTMLElement, marker: string): HTMLElement {
+      let node: HTMLElement | null = el;
+      while (node && !node.className.includes(marker)) node = node.parentElement;
+      if (!node) throw new Error(`no ancestor matching "${marker}"`);
+      return node;
+    }
+
+    /** The Views-grid card for `taskName` — its cards render the task as text, not an input. */
+    function gridCardFor(taskName: string): HTMLElement {
+      const card = screen.getByText(taskName).closest("[draggable='true']");
+      if (!card) throw new Error(`no draggable card for "${taskName}"`);
+      return card as HTMLElement;
+    }
+
+    /**
+     * Dispatch a dragleave that actually carries `relatedTarget`.
+     *
+     * The same trap as `dragOverAt`: jsdom has no `DragEvent`, so RTL falls back to a plain
+     * `Event` and silently drops `relatedTarget` — every dragleave would then read as
+     * "the pointer left", which is precisely the behaviour under test. `MouseEvent` keeps it.
+     */
+    function dragLeaveTo(target: HTMLElement, relatedTarget: Node | null) {
+      const ev = new MouseEvent("dragleave", { bubbles: true, cancelable: true, relatedTarget });
+      Object.defineProperty(ev, "dataTransfer", { value: DT() });
+      fireEvent(target, ev);
+    }
+
+    function dragCardOnto(card: HTMLElement, target: HTMLElement) {
+      fireEvent.dragStart(card, { dataTransfer: DT() });
+      fireEvent.dragOver(target, { dataTransfer: DT() });
+      fireEvent.drop(target, { dataTransfer: DT() });
+    }
+
+    /**
+     * Switch to the Projects view.
+     *
+     * The Views grid's account rows carry a `title` on their collapse toggle and the
+     * Projects headers do not, so its absence is the signal that the swap has happened.
+     */
+    async function switchToProjects() {
+      fireEvent.click(screen.getByRole("button", { name: "Projects" }));
+      await waitFor(() => {
+        expect(screen.queryByTitle(/Collapse Acme Corp/i)).not.toBeInTheDocument();
+        expect(screen.queryByTitle(/Expand Beta Inc/i)).not.toBeInTheDocument();
+      });
+    }
+
+    // ── Views grid ──────────────────────────────────────────────────────────────
+
+    it("files a card under a collapsed account row in the Views grid", async () => {
+      await collapseGroups("beta inc");
+      await renderPageStable();
+      await waitFor(() => expect(screen.getByTitle(/Expand Beta Inc/i)).toBeInTheDocument());
+
+      const betaRow = rowContaining(screen.getByTitle(/Expand Beta Inc/i), "border-b border-gray-100");
+      dragCardOnto(gridCardFor("Fix billing issue"), betaRow);
+
+      await waitFor(() => expect(fieldPatches).toHaveLength(1));
+      expect(fieldPatches[0]).toMatchObject({ account_name: "Beta Inc", account: 2, __id: "recAAA001" });
+    });
+
+    it("shows a drop hint on a collapsed row only while a card is in the air", async () => {
+      await collapseGroups("beta inc");
+      await renderPageStable();
+      await waitFor(() => expect(screen.getByTitle(/Expand Beta Inc/i)).toBeInTheDocument());
+
+      // A collapsed row has always accepted drops but said nothing about it. The hint is
+      // drag-only, so the resting grid is unchanged.
+      expect(screen.queryAllByTestId("collapsed-drop-hint")).toHaveLength(0);
+
+      fireEvent.dragStart(gridCardFor("Fix billing issue"), { dataTransfer: DT() });
+      await waitFor(() => expect(screen.getAllByTestId("collapsed-drop-hint").length).toBeGreaterThan(0));
+
+      const betaRow = rowContaining(screen.getByTitle(/Expand Beta Inc/i), "border-b border-gray-100");
+      fireEvent.dragOver(betaRow, { dataTransfer: DT() });
+      await waitFor(() =>
+        expect(within(betaRow).getByTestId("collapsed-drop-hint")).toHaveTextContent("Drop to file under Beta Inc")
+      );
+    });
+
+    it("does not PATCH when a card is dropped on the account it is already filed under", async () => {
+      await renderPageStable();
+      await waitFor(() => expect(screen.getByTitle(/Collapse Acme Corp/i)).toBeInTheDocument());
+
+      const acmeRow = rowContaining(screen.getByTitle(/Collapse Acme Corp/i), "border-b border-gray-100");
+      dragCardOnto(gridCardFor("Fix billing issue"), acmeRow);
+
+      // Airtable answers `""` where the app writes null, so a strict field compare would
+      // report an unchanged account as changed and fire a pointless write.
+      await new Promise((r) => setTimeout(r, 20));
+      expect(fieldPatches).toHaveLength(0);
+    });
+
+    it("keeps the row highlight while the cursor crosses the row's own children", async () => {
+      await collapseGroups("beta inc");
+      await renderPageStable();
+      await waitFor(() => expect(screen.getByTitle(/Expand Beta Inc/i)).toBeInTheDocument());
+
+      fireEvent.dragStart(gridCardFor("Fix billing issue"), { dataTransfer: DT() });
+      const label = screen.getByTitle(/Expand Beta Inc/i);
+      const betaRow = rowContaining(label, "border-b border-gray-100");
+
+      const hint = () => within(betaRow).getByTestId("collapsed-drop-hint");
+      fireEvent.dragOver(betaRow, { dataTransfer: DT() });
+      await waitFor(() => expect(hint()).toHaveTextContent("Drop to file under Beta Inc"));
+
+      // dragleave bubbles from every child. Clearing the shared dragOverZone on each
+      // crossing re-renders the whole page mid-drag, which reads as a dead drop target.
+      dragLeaveTo(label, betaRow);
+      expect(hint()).toHaveTextContent("Drop to file under Beta Inc");
+
+      // Genuinely leaving the row still clears it.
+      dragLeaveTo(betaRow, document.body);
+      await waitFor(() => expect(hint()).toHaveTextContent("Drop here"));
+    });
+
+    it("never blanks the grid to a loading screen after a drop", async () => {
+      // The post-drop refetch is held open so the loading window is genuinely observable.
+      // Without the delay MSW answers inside a microtask and a loud reload would flash and
+      // clear before any assertion could see it — the test would pass either way.
+      let itemFetches = 0;
+      server.use(
+        http.get("/api/v1/airtable/action-items/", async () => {
+          itemFetches += 1;
+          if (itemFetches > 1) await new Promise((r) => setTimeout(r, 250));
+          return HttpResponse.json([mockItem]);
+        })
+      );
+      await collapseGroups("beta inc");
+      await renderPageStable();
+      await waitFor(() => expect(screen.getByTitle(/Expand Beta Inc/i)).toBeInTheDocument());
+
+      // lib/api.ts broadcasts actionItemsUpdated from a response interceptor after every
+      // action-item mutation, and this page listens to its own broadcast — so the PATCH
+      // used to trigger a full reload that replaced the whole board with "Loading…".
+      const betaRow = rowContaining(screen.getByTitle(/Expand Beta Inc/i), "border-b border-gray-100");
+      dragCardOnto(gridCardFor("Fix billing issue"), betaRow);
+
+      await waitFor(() => expect(fieldPatches).toHaveLength(1));
+      // Wait past the debounce so the refetch is actually in flight, then assert the board
+      // is still on screen rather than replaced.
+      await waitFor(() => expect(itemFetches).toBe(2));
+      expect(screen.queryByText(/loading/i)).not.toBeInTheDocument();
+      // The board is still there, and it already shows the result: the card is now counted
+      // under Beta Inc, whose collapsed row hides the card itself.
+      const collapsedBeta = rowContaining(screen.getByTitle(/Expand Beta Inc/i), "border-b border-gray-100");
+      expect(within(collapsedBeta).getByText("1 open")).toBeInTheDocument();
+      expect(screen.getByTitle(/Collapse Acme Corp/i)).toBeInTheDocument();
+    });
+
+    it("coalesces the reload broadcasts from a single two-field drop", async () => {
+      let itemFetches = 0;
+      server.use(
+        http.get("/api/v1/airtable/action-items/", () => {
+          itemFetches += 1;
+          return HttpResponse.json([
+            mockItem,
+            { ...mockItem, id: 2, airtable_id: "recBBB002", account: 2, account_name: "Beta Inc", task: "Beta chore" },
+          ]);
+        }),
+        http.patch("/api/v1/airtable/action-items/:id/status/", async ({ request, params }) => {
+          fieldPatches.push({ ...(await request.json() as Record<string, unknown>), __id: params.id });
+          return HttpResponse.json({});
+        })
+      );
+      await renderPageStable();
+      await waitFor(() => expect(screen.getByTitle(/Collapse Beta Inc/i)).toBeInTheDocument());
+      await switchToProjects();
+      await waitFor(() => expect(screen.getByText("Beta chore")).toBeInTheDocument());
+      const afterMount = itemFetches;
+
+      // A drop on another group's status column PATCHes the account and the status, so two
+      // broadcasts arrive back to back. Two overlapping reloads can apply their setAllItems
+      // in either order, so collapsing them is a correctness fix, not only a request saving.
+      const betaGroup = screen.getByTestId("project-group-beta inc");
+      const doneColumn = rowContaining(within(betaGroup).getByText("Done"), "flex flex-col rounded-lg");
+      fireEvent.dragStart(screen.getByText("Fix billing issue").closest("[draggable='true']") as HTMLElement, { dataTransfer: DT() });
+      fireEvent.drop(doneColumn, { dataTransfer: DT() });
+
+      await waitFor(() => expect(fieldPatches.length).toBeGreaterThanOrEqual(2));
+      await new Promise((r) => setTimeout(r, 500));
+      expect(itemFetches - afterMount).toBe(1);
+    });
+
+    // ── Projects view ───────────────────────────────────────────────────────────
+
+    it("gives every known account a group in the Projects view, even with no items", async () => {
+      await renderPageStable();
+      await waitFor(() => expect(screen.getByTitle(/Collapse Acme Corp/i)).toBeInTheDocument());
+      await switchToProjects();
+
+      // Groups used to be derived from the items alone, so an account with no work on it
+      // had no header — and therefore no way to receive the first card filed under it.
+      await waitFor(() => expect(screen.getByTestId("project-group-beta inc")).toBeInTheDocument());
+      expect(screen.getByTestId("project-group-acme corp")).toBeInTheDocument();
+      expect(screen.getByTestId("project-group-__none__")).toBeInTheDocument();
+
+      // An empty group is the header alone — five blank status columns per unused account
+      // would bury the ones with work in them.
+      const beta = screen.getByTestId("project-group-beta inc");
+      expect(within(beta).getByText("Beta Inc")).toBeInTheDocument();
+      expect(within(beta).queryByText("In Progress")).not.toBeInTheDocument();
+      expect(within(screen.getByTestId("project-group-acme corp")).getByText("In Progress")).toBeInTheDocument();
+    });
+
+    it("files a card under a collapsed account group in the Projects view", async () => {
+      await collapseGroups("beta inc");
+      await renderPageStable();
+      await waitFor(() => expect(screen.getByTitle(/Expand Beta Inc/i)).toBeInTheDocument());
+      await switchToProjects();
+      await waitFor(() => expect(screen.getByText("Beta Inc")).toBeInTheDocument());
+
+      const betaGroup = screen.getByTestId("project-group-beta inc");
+      dragCardOnto(screen.getByText("Fix billing issue").closest("[draggable='true']") as HTMLElement, betaGroup);
+
+      await waitFor(() => expect(fieldPatches).toHaveLength(1));
+      expect(fieldPatches[0]).toMatchObject({ account_name: "Beta Inc", account: 2, __id: "recAAA001" });
+    });
+
+    it("a Projects-view drop reassigns the account without moving the card out of its zone", async () => {
+      localStorage.setItem("actionItemZones", JSON.stringify({ recAAA001: "today" }));
+      await renderPageStable();
+      await waitFor(() => expect(screen.getByTitle(/Collapse Acme Corp/i)).toBeInTheDocument());
+      await switchToProjects();
+      await waitFor(() => expect(screen.getByText("Beta Inc")).toBeInTheDocument());
+
+      const betaGroup = screen.getByTestId("project-group-beta inc");
+      dragCardOnto(screen.getByText("Fix billing issue").closest("[draggable='true']") as HTMLElement, betaGroup);
+
+      await waitFor(() => expect(fieldPatches).toHaveLength(1));
+      // Projects renders every real item whatever its zone, so a drop there must not
+      // silently yank the card out of Stage Today.
+      expect(JSON.parse(localStorage.getItem("actionItemZones") ?? "{}").recAAA001).toBe("today");
+    });
+
+    it("a drop on another group's status column sets both the account and the status", async () => {
+      // Both groups need an item so both render a status board.
+      server.use(
+        http.get("/api/v1/airtable/action-items/", () =>
+          HttpResponse.json([
+            mockItem,
+            { ...mockItem, id: 2, airtable_id: "recBBB002", account: 2, account_name: "Beta Inc", task: "Beta chore" },
+          ])
+        ),
+        http.patch("/api/v1/airtable/action-items/:id/status/", async ({ request, params }) => {
+          fieldPatches.push({ ...(await request.json() as Record<string, unknown>), __id: params.id });
+          return HttpResponse.json({});
+        })
+      );
+      await renderPageStable();
+      await waitFor(() => expect(screen.getByTitle(/Collapse Beta Inc/i)).toBeInTheDocument());
+      await switchToProjects();
+      await waitFor(() => expect(screen.getByText("Beta chore")).toBeInTheDocument());
+
+      const betaGroup = screen.getByTestId("project-group-beta inc");
+      const doneColumn = rowContaining(within(betaGroup).getByText("Done"), "flex flex-col rounded-lg");
+      const card = screen.getByText("Fix billing issue").closest("[draggable='true']") as HTMLElement;
+
+      fireEvent.dragStart(card, { dataTransfer: DT() });
+      fireEvent.drop(doneColumn, { dataTransfer: DT() });
+
+      // Before this, only the status changed — the card kept Acme Corp and so snapped
+      // straight back into the group it had been dragged out of.
+      await waitFor(() => expect(fieldPatches.length).toBeGreaterThanOrEqual(2));
+      expect(fieldPatches).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ account_name: "Beta Inc", account: 2, __id: "recAAA001" }),
+          expect.objectContaining({ status: "Done", __id: "recAAA001" }),
+        ])
+      );
+    });
+  });
 });

@@ -120,4 +120,29 @@ describe("EventColorsPopover", () => {
     fireEvent.mouseDown(within(screen.getByRole("dialog")).getByText("Event colors"));
     expect(onClose).not.toHaveBeenCalled();
   });
+
+  it("offers Reminder, which has no event_category of its own", () => {
+    renderPopover();
+    const row = screen.getByTestId("color-row-reminder");
+    expect(row).toHaveTextContent("Reminder");
+    expect(row).toHaveAttribute("data-color", DEFAULT_CATEGORY_COLORS.reminder);
+  });
+
+  it("ignores a mousedown on the trigger named by ignoreSelector", () => {
+    // The trigger lives outside the panel (a FullCalendar toolbar button), so without
+    // this the mousedown closes the panel and the trigger's click reopens it.
+    const trigger = document.createElement("button");
+    trigger.className = "trigger-btn";
+    document.body.appendChild(trigger);
+    try {
+      const { onClose } = renderPopover({ ignoreSelector: ".trigger-btn" });
+      fireEvent.mouseDown(trigger);
+      expect(onClose).not.toHaveBeenCalled();
+      // Anything else outside still dismisses.
+      fireEvent.mouseDown(document.body);
+      expect(onClose).toHaveBeenCalledTimes(1);
+    } finally {
+      trigger.remove();
+    }
+  });
 });

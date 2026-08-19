@@ -4,6 +4,8 @@ import { cleanup } from "@testing-library/react";
 import { server } from "./msw-server";
 import { resetRequestCache } from "../lib/requestCache";
 import { resetCommentSummaries } from "../lib/commentSummaryStore";
+import { reloadActionItemZones } from "../hooks/useActionItemZoneSets";
+import { reloadStatusArrivalOrder } from "../hooks/useStatusArrivalOrder";
 import { accountHandlers } from "./handlers/accounts";
 import { actionItemHandlers } from "./handlers/action_items";
 import { commentsHandlers } from "./handlers/comments";
@@ -13,6 +15,8 @@ import { realtimeHandlers } from "./handlers/realtime";
 import { syncReviewHandlers } from "./handlers/sync_review";
 import { accountFeedHandlers } from "./handlers/account_feed";
 import { searchHandlers } from "./handlers/search";
+import { layoutsHandlers } from "./handlers/layouts";
+import { skillsHandlers } from "./handlers/skills";
 
 // These handlers must always be registered. They're added here (not only in
 // msw-server.ts) so the test suite is resilient to editor buffer reverts.
@@ -26,6 +30,8 @@ const extraHandlers = [
   ...syncReviewHandlers,
   ...accountFeedHandlers,
   ...searchHandlers,
+  ...layoutsHandlers,
+  ...skillsHandlers,
 ];
 
 beforeAll(() => {
@@ -44,5 +50,12 @@ afterEach(() => {
   // module-level and shared by every card, so a summary fetched in one test would
   // otherwise still be cached (and never re-requested) in the next.
   resetCommentSummaries();
+  // The actionItemZones store (hooks/useActionItemZoneSets.ts) is module-level too, and
+  // `localStorage.clear()` fires no storage event — so without this a zone set by one test
+  // still groups the next test's cards. Same trap reloadFocusPins() exists for.
+  reloadActionItemZones();
+  // Same trap again for the kanban status arrival order (hooks/useStatusArrivalOrder.ts):
+  // a status move recorded by one test would otherwise still order the next test's columns.
+  reloadStatusArrivalOrder();
 });
 afterAll(() => server.close());

@@ -400,32 +400,11 @@ def _meeting_notes_by_event(request, event_id: int, source: str):
         if not allowed:
             return Response({"detail": "Event not found."}, status=status.HTTP_404_NOT_FOUND)
 
-    meeting = None
-    if event.agentpm_airtable_id:
-        meeting = AirtableMeeting.objects.filter(airtable_id=event.agentpm_airtable_id).first()
+    # No Airtable-synced meeting yet ⇒ a local stub is created so notes are never lost.
+    # Shared with the recap-email scanner via meeting_stubs so the two can't diverge.
+    from .meeting_stubs import get_or_create_meeting_for_event
 
-    if not meeting:
-        # No Airtable-synced meeting yet — create a local stub so notes are never lost.
-        stub_id = f"local-{event_id}-{uuid.uuid4().hex[:8]}"
-        at_account = None
-        if event.account_id:
-            # CalendarEvent.account → accounts.Account; resolve to AirtableAccount via airtable_id
-            try:
-                from accounts.models import Account as DjangoAccount
-                django_acct = DjangoAccount.objects.get(pk=event.account_id)
-                if django_acct.airtable_id:
-                    at_account = AirtableAccount.objects.filter(airtable_id=django_acct.airtable_id).first()
-            except Exception:
-                pass
-        meeting = AirtableMeeting.objects.create(
-            airtable_id=stub_id,
-            account=at_account,
-            name=event.title or "",
-            date=event.start_datetime,
-        )
-        # Link back so next call resolves immediately
-        event.agentpm_airtable_id = stub_id
-        event.save(update_fields=["agentpm_airtable_id"])
+    meeting = get_or_create_meeting_for_event(event)
 
     _save_meeting_notes(meeting, source, notes)
     return Response(AirtableMeetingSerializer(meeting).data)

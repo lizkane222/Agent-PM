@@ -7,12 +7,14 @@ import imageIconUrl from "../assets/icons/Image.svg";
 import statisticsIconUrl from "../assets/icons/Statistics.svg";
 import cloudUploadIconUrl from "../assets/icons/Cloud Upload.svg";
 import { accountsApi, airtableApi, teamApi, skillsApi, schedulerApi, integrationsApi, searchApi } from "../lib/api";
-import type { GmailThread, MeetingNotesEmailReport, MeetingNotesSource, SearchResult } from "../lib/api";
+import type { GmailThread, MeetingNotesSource, SearchResult } from "../lib/api";
 import { MeetingSummarySourceToggle, preferredMeetingSource } from "../components/account/MeetingSummarySourceToggle";
+import { GetMeetingNotesButton } from "../components/shared/GetMeetingNotesButton";
 import type { Account, AccountArtifact, AccountNote, AccountQuickLink, ActionItemAttachment, AirtableAccount, AirtableActionItem, AirtableMeeting, Attendee, CalendarEvent, CustomerContact, CustomerContactNote, MeetingNote, Reminder, TeamMember } from "../types";
 import { ROLE_META, getTitleRole } from "../lib/titleRoles";
 import { useLogGlow } from "../hooks/useLogGlow";
 import { addLog } from "../lib/appLog";
+import { logActionItemUpdate } from "../lib/actionItemLog";
 import { useScheduledOccurrences } from "../hooks/useScheduledOccurrences";
 import { useActionItemFieldOptions } from "../hooks/useActionItemFieldOptions";
 import { useCurrentUser } from "../context/CurrentUserContext";
@@ -26,6 +28,9 @@ import StepsPanel from "../components/action-items/StepsPanel";
 import { ACTION_ITEMS_UPDATED_KEY } from "../lib/actionItemEvents";
 import ArtifactPicker from "../components/action-items/ArtifactPicker";
 import { useFocusPins } from "../hooks/useFocusPins";
+import { useStatusArrivalOrder } from "../hooks/useStatusArrivalOrder";
+import UrlPillInput from "../components/shared/UrlPillInput";
+import { useSlackLinkAutosave } from "../hooks/useSlackLinkAutosave";
 import InlineCommentThread from "../components/comments/InlineCommentThread";
 import ActivityLogSection from "../components/ActivityLogSection";
 import { convertActionItemToEvent, restoreConversion } from "../hooks/useConvert";
@@ -290,11 +295,8 @@ function AccPillNumber({ value, label, onChange }: { value: number | null | unde
 
 function AccPillUrl({ value, onChange }: { value: string | undefined; onChange: (v: string) => void }) {
   const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLInputElement>(null);
-  useEffect(() => { if (open) ref.current?.focus(); }, [open]);
   if (open) {
-    return <input ref={ref} type="url" defaultValue={value ?? ""} onBlur={(e) => { onChange(e.target.value); setOpen(false); }} placeholder="https://…"
-      className="w-40 rounded-full border border-indigo-400 bg-white px-2.5 py-0.5 text-[12px] font-semibold focus:outline-none" />;
+    return <UrlPillInput value={value} onCommit={(v) => { onChange(v); setOpen(false); }} onCancel={() => setOpen(false)} />;
   }
   if (value) {
     return (
@@ -515,6 +517,8 @@ function ActionItemModal({
 
   const accent = PRIORITY_ACCENT[form.priority ?? item.priority] ?? "#9ca3af";
   const set = (patch: Partial<AirtableActionItem>) => setForm((f) => ({ ...f, ...patch }));
+  // A pasted Slack link saves on its own — see hooks/useSlackLinkAutosave.ts.
+  const autosaveSlackLink = useSlackLinkAutosave();
 
   async function handleDelete() {
     if (!window.confirm("Delete this action item? This cannot be undone.")) return;
@@ -534,6 +538,7 @@ function ActionItemModal({
     setSaveError(null);
     try {
       const { data } = await airtableApi.updateActionItemFields(item.airtable_id, form as Parameters<typeof airtableApi.updateActionItemFields>[1]);
+      logActionItemUpdate(item, form as Partial<AirtableActionItem>);
       onUpdated?.(data);
       onClose();
     } catch (err: unknown) {
@@ -672,7 +677,10 @@ function ActionItemModal({
             <AccPillNumber value={form.estimated_time} label="Est." onChange={(v) => set({ estimated_time: v ?? 0 })} />
             <AccPillNumber value={form.time_spent} label="Spent" onChange={(v) => set({ time_spent: v ?? 0 })} />
             <AccPillNumber value={form.prep_time} label="Prep" onChange={(v) => set({ prep_time: v ?? 0 })} />
-            <AccPillUrl value={form.slack_thread_url} onChange={(v) => set({ slack_thread_url: v })} />
+            <AccPillUrl
+              value={form.slack_thread_url}
+              onChange={(v) => { set({ slack_thread_url: v }); autosaveSlackLink(item, v, onUpdated); }}
+            />
           </div>
 
           {/* Assignee */}
@@ -2306,12 +2314,15 @@ function ActionItemSidePanelContent({
   }
 
   const set = (patch: Partial<AirtableActionItem>) => setForm((f) => ({ ...f, ...patch }));
+  // A pasted Slack link saves on its own — see hooks/useSlackLinkAutosave.ts.
+  const autosaveSlackLink = useSlackLinkAutosave();
 
   async function handleSave() {
     if (saving) return;
     setSaving(true);
     try {
       const { data } = await airtableApi.updateActionItemFields(item.airtable_id, form as Parameters<typeof airtableApi.updateActionItemFields>[1]);
+      logActionItemUpdate(item, form as Partial<AirtableActionItem>);
       onUpdated?.(data);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
@@ -2450,7 +2461,10 @@ function ActionItemSidePanelContent({
       {/* Slack URL */}
       <div className="flex items-center gap-2">
         <span className="text-xs text-[var(--twilio-gray-60)] shrink-0">Slack</span>
-        <AccPillUrl value={form.slack_thread_url} onChange={(v) => set({ slack_thread_url: v })} />
+        <AccPillUrl
+          value={form.slack_thread_url}
+          onChange={(v) => { set({ slack_thread_url: v }); autosaveSlackLink(item, v, onUpdated); }}
+        />
       </div>
 
       {/* Account badge */}
@@ -5239,6 +5253,11 @@ export default function AccountDetailPage() {
   const [account, setAccount] = useState<Account | null>(null);
   const [airtableAccount, setAirtableAccount] = useState<AirtableAccount | null>(null);
   const [actionItems, setActionItems] = useState<AirtableActionItem[]>([]);
+  // Ordering for the kanban status columns: Open chronological, every other column by the
+  // order items were moved into it. Also the observer that records those moves, so it has to
+  // see every actionItems change — hence a hook at the top level rather than inside the
+  // kanban's render closure.
+  const { orderForStatus } = useStatusArrivalOrder(actionItems);
   const [meetings, setMeetings] = useState<AirtableMeeting[]>([]);
   const [calendarEvents, setCalendarEvents] = useState<CalendarEvent[]>([]);
   const [notes, setNotes] = useState<AccountNote[]>([]);
@@ -5262,15 +5281,6 @@ export default function AccountDetailPage() {
     | { stage: "idle" }
     | { stage: "loading"; message: string }
     | { stage: "done"; report: string; durationMs: number }
-    | { stage: "error"; message: string }
-  >({ stage: "idle" });
-  // "GET Meeting Notes" — scans the user's Gong/Zoom recap emails for meetings that
-  // have no AI summary yet. Scans every meeting the user can see, not just this
-  // account's, so the count in the result may exceed what this page displays.
-  const [meetingNotesState, setMeetingNotesState] = useState<
-    | { stage: "idle" }
-    | { stage: "loading" }
-    | { stage: "done"; report: MeetingNotesEmailReport }
     | { stage: "error"; message: string }
   >({ stage: "idle" });
   const [noteDragOverSection, setNoteDragOverSection] = useState<"actions" | "reminders" | "artifacts" | null>(null);
@@ -5582,29 +5592,16 @@ export default function AccountDetailPage() {
     setAccountReminders((prev) => [...prev, data]);
   }
 
-  async function handleGetMeetingNotes() {
-    if (!account || meetingNotesState.stage === "loading") return;
-    setMeetingNotesState({ stage: "loading" });
-    try {
-      // No account_name — the scan covers every meeting the user can see, so recaps
-      // land on other accounts' meetings too rather than needing a visit per account.
-      const { data } = await integrationsApi.getMeetingNotesFromEmail();
-      setMeetingNotesState({ stage: "done", report: data });
-
-      // Re-read this account's meetings so any summary just imported shows up without
-      // a reload. Mirrors the initial fetch's account/account_name scoping.
-      const scope: Record<string, string> = account.airtable_id
-        ? { account: String(account.airtable_id) }
-        : { account_name: account.company_name };
-      const refreshed = await airtableApi.listMeetings(scope);
-      setMeetings(refreshed.data.results);
-    } catch (err: unknown) {
-      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      setMeetingNotesState({
-        stage: "error",
-        message: detail ?? "Could not read Gmail. Check the connection in Settings.",
-      });
-    }
+  /** Re-read this account's meetings so a just-imported summary shows up. */
+  async function refreshMeetings() {
+    if (!account) return;
+    // Mirrors the initial fetch's scoping: airtable_id when the account is linked,
+    // otherwise the name (per-user Admin workspaces have no Airtable record).
+    const scope: Record<string, string> = account.airtable_id
+      ? { account: String(account.airtable_id) }
+      : { account_name: account.company_name };
+    const { data } = await airtableApi.listMeetings(scope);
+    setMeetings(data.results);
   }
 
   if (loading) return <div className="flex items-center justify-center h-full text-sm text-[var(--twilio-navy)]">Loading…</div>;
@@ -5937,74 +5934,14 @@ export default function AccountDetailPage() {
         <div className="rounded-lg px-5 py-4" style={{ background: "var(--surface, #fff)", border: "1px solid var(--border, rgba(0,0,0,0.08))", boxShadow: "0 1px 4px rgba(0,0,0,0.04)" }}>
           <div className="flex items-center justify-between gap-2 mb-3 flex-wrap">
             <p className="text-xs font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide">Timeline</p>
-            <button
-              onClick={() => void handleGetMeetingNotes()}
-              disabled={meetingNotesState.stage === "loading"}
-              title="Check your email for Gong or Zoom meeting summaries and attach them to meetings that don't have notes yet"
-              className="flex items-center gap-1.5 text-xs font-medium disabled:opacity-60 px-3 py-1.5 rounded-md transition-opacity hover:opacity-90"
-              style={{ background: "var(--twilio-red, #e22)", color: "#fff", border: "none" }}
-            >
-              {meetingNotesState.stage === "loading" ? (
-                <>
-                  <svg className="animate-spin w-3 h-3" viewBox="0 0 24 24" fill="none">
-                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
-                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"/>
-                  </svg>
-                  Checking email…
-                </>
-              ) : (
-                <>
-                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-3 h-3">
-                    <rect x="1.5" y="3" width="13" height="10" rx="1.5"/>
-                    <path d="M1.5 4.5L8 9l6.5-4.5" strokeLinecap="round"/>
-                  </svg>
-                  GET Meeting Notes
-                </>
-              )}
-            </button>
+            {/* Scoped to this account: an import onto some other account's meeting
+                wouldn't be visible here, so reporting it would just confuse. The
+                profile and role pages run the unscoped version. */}
+            <GetMeetingNotesButton
+              scope={{ account: account.airtable_id || undefined, accountName: account.company_name }}
+              onImported={refreshMeetings}
+            />
           </div>
-
-          {meetingNotesState.stage === "error" && (
-            <p role="alert" className="text-[11px] mb-3" style={{ color: "var(--twilio-red, #e22)" }}>
-              {meetingNotesState.message}
-            </p>
-          )}
-
-          {meetingNotesState.stage === "done" && (() => {
-            const { report } = meetingNotesState;
-            const updated = report.updated;
-            return (
-              <div
-                role="status"
-                className="mb-3 rounded-md px-3 py-2"
-                style={{ background: "rgba(99,102,241,0.06)", border: "1px solid rgba(99,102,241,0.2)" }}
-              >
-                <p className="text-[11px] font-semibold" style={{ color: "#4f46e5" }}>
-                  {updated.length === 0
-                    ? `No new meeting notes found — scanned ${report.scanned_emails} recap ${report.scanned_emails === 1 ? "email" : "emails"} against ${report.scanned_meetings} ${report.scanned_meetings === 1 ? "meeting" : "meetings"}.`
-                    : `Added notes to ${updated.length} ${updated.length === 1 ? "meeting" : "meetings"}.`}
-                </p>
-                {updated.length > 0 && (
-                  <ul className="mt-1 space-y-0.5">
-                    {updated.map((item) => (
-                      <li key={item.meeting_id} className="text-[11px] text-[var(--twilio-navy)]">
-                        {item.meeting_name || "Untitled meeting"}
-                        {item.date ? ` · ${new Date(item.date).toLocaleDateString(undefined, { month: "short", day: "numeric" })}` : ""}
-                        {" · "}
-                        <span style={{ textTransform: "capitalize" }}>{item.sources.join(" + ")}</span>
-                        {item.account_name && item.account_name !== account.company_name ? ` · ${item.account_name}` : ""}
-                      </li>
-                    ))}
-                  </ul>
-                )}
-                {report.summaries_truncated && (
-                  <p className="text-[11px] mt-1" style={{ color: "var(--twilio-gray-60)" }}>
-                    Stopped at the per-run limit of {report.max_summaries}. Run it again to pick up the rest.
-                  </p>
-                )}
-              </div>
-            );
-          })()}
 
           <AccountTimeline
             meetings={meetings}
@@ -6130,6 +6067,7 @@ export default function AccountDetailPage() {
               setActionItems((prev) => prev.map((i) => i.airtable_id === airtableId ? { ...i, status: targetStatus } : i));
               try {
                 await airtableApi.updateActionItemStatus(airtableId, targetStatus);
+                logActionItemUpdate(prev_item, { status: targetStatus });
               } catch {
                 setActionItems((prev) => prev.map((i) => i.airtable_id === airtableId ? { ...i, status: prev_item.status } : i));
               }
@@ -6138,7 +6076,7 @@ export default function AccountDetailPage() {
             return (
               <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(200px, 1fr)) minmax(200px, 1fr) minmax(252px, auto)", gap: "10px", alignItems: "start" }}>
                 {(["Open", "In Progress", "Done"] as const).map((status) => {
-                  const colItems = kanbanItems.filter((i) => i.status === status);
+                  const colItems = orderForStatus(kanbanItems.filter((i) => i.status === status), status);
                   const { header, dot, bg, dropBg } = KANBAN_COL_STYLE[status];
                   const isOver = kanbanDragOverCol === status;
                   return (
@@ -6185,7 +6123,7 @@ export default function AccountDetailPage() {
                 {/* Blocked + Backlogged share one column, stacked */}
                 <div className="flex flex-col gap-0" style={{ minHeight: 80 }}>
                   {(["Blocked", "Backlogged"] as const).map((status, i) => {
-                    const colItems = kanbanItems.filter((item) => item.status === status);
+                    const colItems = orderForStatus(kanbanItems.filter((item) => item.status === status), status);
                     const { header, dot, bg, dropBg } = KANBAN_COL_STYLE[status];
                     const isOver = kanbanDragOverCol === status;
                     return (
@@ -6271,7 +6209,7 @@ export default function AccountDetailPage() {
                   name: g.name,
                   meetings: g.meetingIds.flatMap((mid) => {
                     const m = meetings.find((x) => x.airtable_id === mid);
-                    return m ? [{ name: m.name, date: m.date, duration: m.duration, expected_topics: m.expected_topics, gong_notes: m.gong_notes }] : [];
+                    return m ? [{ name: m.name, date: m.date, duration: m.duration, expected_topics: m.expected_topics, gong_notes: m.gong_notes, zoom_notes: m.zoom_notes }] : [];
                   }),
                   action_items: g.actionIds.flatMap((aid) => {
                     const item = actionItems.find((x) => x.airtable_id === aid);

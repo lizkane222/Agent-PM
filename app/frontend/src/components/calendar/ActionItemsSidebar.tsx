@@ -4,17 +4,20 @@ import { useActionItemFieldOptions } from "../../hooks/useActionItemFieldOptions
 import { useScheduledOccurrences } from "../../hooks/useScheduledOccurrences";
 import { airtableApi, teamApi } from "../../lib/api";
 import { addLog } from "../../lib/appLog";
+import { logActionItemUpdate } from "../../lib/actionItemLog";
 import type { AirtableActionItem, AirtableAccount } from "../../types";
 import { ContextMenu, FocusPinBadge, focusPinMenuItem, type ContextMenuItem } from "../action-items/ContextMenu";
 import StepsPanel from "../action-items/StepsPanel";
 import { useFocusPins } from "../../hooks/useFocusPins";
+import { useActionItemZoneSets } from "../../hooks/useActionItemZoneSets";
+import { groupActionItems, DONE_WINDOW_DAYS, isRecentlyDone, type SidebarGroupKey } from "../../lib/actionItemSidebarOrder";
+import SidebarFilterFlags from "./SidebarFilterFlags";
 import CommentPreviewList from "../comments/CommentPreviewList";
 import { useCommentMenuItem } from "../comments/commentMenuItem";
 import { useExportTray } from "../../hooks/useExportTray";
 import {
   CALENDAR_DRAG_KEY,
   CALENDAR_DRAG_ACCOUNT_KEY,
-  ACTION_ITEM_ZONES_KEY,
   SCHEDULED_ITEMS_KEY,
   WORK_TRACKING_COLOR,
   PRIORITY_COLORS_CAL,
@@ -422,12 +425,10 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
   useEffect(() => {
     if (expandItemId) setForcedExpandId(expandItemId);
   }, [expandItemId]);
-  const [stagedIds, setStagedIds] = useState<Set<string>>(() => {
-    try {
-      const zones: Record<string, string> = JSON.parse(localStorage.getItem(ACTION_ITEM_ZONES_KEY) ?? "{}");
-      return new Set(Object.entries(zones).filter(([, v]) => v === "today").map(([k]) => k));
-    } catch { return new Set(); }
-  });
+  // Where each card sits — the first three sections are positional state, not status.
+  const { trackingIds, stagedIds } = useActionItemZoneSets();
+  const { pinnedIds } = useFocusPins();
+  const [selectedFlags, setSelectedFlags] = useState<Set<SidebarGroupKey>>(() => new Set());
   // Create form state
   const [creating, setCreating] = useState(false);
   const [form, setForm] = useState({ ...BLANK_FORM });
@@ -448,13 +449,18 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
       // Ask for exactly what the sidebar shows. The old filter listed Blocked/Backlogged
       // and then discarded them client-side, plus a "Complete" status that does not exist
       // in the model (Open / In Progress / Done / Blocked / Backlogged) and so matched
-      // nothing. `fresh` because this also runs on an actionItemsUpdated broadcast, which
+      // nothing. Done joined the list for the Done section — rendering is bounded to the
+      // last DONE_WINDOW_DAYS, the fetch is not (the endpoint is unpaginated).
+      // `fresh` because this also runs on an actionItemsUpdated broadcast, which
       // can originate in another tab and leave this tab's GET cache warm.
-      .listActionItems({ status: "Open,In Progress" }, { fresh: true })
+      .listActionItems({ status: "Open,In Progress,Done" }, { fresh: true })
       .then(({ data }) => {
         const all = data ?? [];
+        // Computed before the keep-filter, so pruning below sees every live record.
         const liveIds = new Set(all.map((i: AirtableActionItem) => i.airtable_id));
-        setItems(all.filter((i: AirtableActionItem) => i.status === "Open" || i.status === "In Progress"));
+        setItems(all.filter((i: AirtableActionItem) =>
+          i.status === "Open" || i.status === "In Progress" || (i.status === "Done" && isRecentlyDone(i))
+        ));
         // Prune stale activeTimers
         try {
           const timers: Record<string, unknown> = JSON.parse(localStorage.getItem("activeTimers") ?? "{}");
@@ -486,16 +492,10 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
   useEffect(() => {
     let debounceTimer: ReturnType<typeof setTimeout> | null = null;
     function onStorage(e: StorageEvent) {
-      if (e.key === "actionItemsUpdated") {
-        if (debounceTimer) clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(() => { void fetchItems(); }, 500);
-        return;
-      }
-      if (e.key !== ACTION_ITEM_ZONES_KEY) return;
-      try {
-        const zones: Record<string, string> = JSON.parse(e.newValue ?? "{}");
-        setStagedIds(new Set(Object.entries(zones).filter(([, v]) => v === "today").map(([k]) => k)));
-      } catch { /* ignore */ }
+      // Zone changes are handled by useActionItemZoneSets, which owns that key's listener.
+      if (e.key !== "actionItemsUpdated") return;
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => { void fetchItems(); }, 500);
     }
     window.addEventListener("storage", onStorage);
     return () => {
@@ -578,6 +578,7 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
     setItems((prev) => prev.map((i) => i.airtable_id === item.airtable_id ? { ...i, ...patch } : i));
     try {
       await airtableApi.updateActionItemFields(item.airtable_id, patch);
+      logActionItemUpdate(item, patch);
       window.dispatchEvent(new StorageEvent("storage", { key: "actionItemsUpdated", newValue: "1" }));
     } catch {
       // Revert on failure
@@ -618,7 +619,7 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
   }
 
   const [filterTerm, setFilterTerm] = useState("");
-  const filteredItems = filterTerm.trim()
+  const textMatched = filterTerm.trim()
     ? items.filter((i) => {
         const q = filterTerm.toLowerCase();
         return (
@@ -629,6 +630,19 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
         );
       })
     : items;
+
+  // Text box and flag chips compose: a card must satisfy both.
+  const groups = groupActionItems(textMatched, { trackingIds, stagedIds, pinnedIds, selectedFlags });
+  const visibleCount = groups.reduce((n, g) => n + g.items.length, 0);
+  const isNarrowed = !!filterTerm.trim() || selectedFlags.size > 0;
+
+  function toggleFlag(key: SidebarGroupKey) {
+    setSelectedFlags((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      return next;
+    });
+  }
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
@@ -655,17 +669,33 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
             </button>
           )}
         </div>
+        <div className="pt-1.5">
+          <SidebarFilterFlags
+            selected={selectedFlags}
+            onToggle={toggleFlag}
+            onClear={() => setSelectedFlags(new Set())}
+            accent={WORK_TRACKING_COLOR}
+          />
+        </div>
       </div>
 
       <div className="flex-1 overflow-y-auto px-3 py-2 space-y-2">
         {loading ? (
           <p className="text-sm text-[var(--twilio-gray-60)] py-2">Loading…</p>
-        ) : filteredItems.length === 0 && !creating ? (
+        ) : visibleCount === 0 && !creating ? (
           <p className="text-sm text-[var(--twilio-gray-60)] py-2">
-            {filterTerm ? "No matches." : "No open action items."}
+            {isNarrowed ? "No matches." : "No open action items."}
           </p>
         ) : (
-          filteredItems.map((item) => {
+          groups.map((group) => (
+          <div key={group.key} className="space-y-2">
+            {/* Section header — the same micro-header vocabulary the card's "On calendar"
+                label uses, so it reads as part of the sidebar rather than a new surface. */}
+            <p data-section={group.key} className="text-[9px] font-semibold uppercase tracking-wide text-[var(--twilio-gray-60)] flex items-center gap-1">
+              <span>{group.key === "done" ? `${group.label} · last ${DONE_WINDOW_DAYS} days` : group.label}</span>
+              <span className="opacity-60">{group.items.length}</span>
+            </p>
+            {group.items.map((item) => {
             const isStaged = stagedIds.has(item.airtable_id);
             return (
               <div key={item.airtable_id} className="relative">
@@ -729,7 +759,9 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
                 )}
               </div>
             );
-          })
+            })}
+          </div>
+          ))
         )}
       </div>
 

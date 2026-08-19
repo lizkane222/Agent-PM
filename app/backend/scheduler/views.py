@@ -19,6 +19,45 @@ from .serializers import ActionItemSerializer, CalendarEventSerializer, MeetingN
 
 logger = logging.getLogger(__name__)
 
+# Fields the `details` action lets an owner edit on their own event.
+#
+# `agentpm_airtable_id` is here so "convert this event to an action item" can record the
+# link it creates. It is safe to expose: `_sync_google_calendar` only overwrites it when
+# Google actually carries a value, so a locally-written link survives the next sync.
+DETAILS_EDITABLE_FIELDS = frozenset({
+    "title",
+    "description",
+    "location",
+    "start_datetime",
+    "end_datetime",
+    "all_day",
+    "event_category",
+    "agentpm_airtable_id",
+})
+
+# The fields Google owns — i.e. the ones `_sync_google_calendar` puts in its
+# `update_or_create` defaults and therefore rewrites on every sync, and the ones
+# `_update_in_google` sends back. A local edit to any of them must be pushed or it is
+# silently reverted. Deliberately excludes `event_category` (no Google equivalent, and
+# the sync already preserves it) and `agentpm_airtable_id` (carried in extendedProperties,
+# which `_update_in_google` does not send).
+GOOGLE_OWNED_EVENT_FIELDS = (
+    "title",
+    "description",
+    "location",
+    "start_datetime",
+    "end_datetime",
+    "all_day",
+    "status",
+)
+
+
+def _google_owned_snapshot(event):
+    """Comparable tuple of the Google-owned fields, or None for no instance."""
+    if event is None:
+        return None
+    return tuple(str(getattr(event, field, "")) for field in GOOGLE_OWNED_EVENT_FIELDS)
+
 
 class CalendarEventViewSet(RequireAccountMembershipMixin, viewsets.ModelViewSet):
     """List, create, update, and delete calendar events."""
@@ -191,10 +230,8 @@ class CalendarEventViewSet(RequireAccountMembershipMixin, viewsets.ModelViewSet)
     def perform_update(self, serializer):
         # Guard against re-parenting an event to an account the caller isn't on.
         self._check_account_membership(self._resolve_target_account(serializer))
-        # Capture old datetimes before save so we know whether times changed
-        instance = serializer.instance
-        old_start = str(instance.start_datetime) if instance else None
-        old_end = str(instance.end_datetime) if instance else None
+        # Snapshot the Google-owned fields before save so we know whether to push.
+        before = _google_owned_snapshot(serializer.instance)
 
         event = serializer.save()
 
@@ -204,16 +241,101 @@ class CalendarEventViewSet(RequireAccountMembershipMixin, viewsets.ModelViewSet)
             detail=event.title,
         )
 
-        # Sync time changes to Google Calendar for any synced event
-        times_changed = (
-            old_start != str(event.start_datetime) or
-            old_end != str(event.end_datetime)
+        # Push to Google whenever any field Google owns changed — not just the times.
+        # `_sync_google_calendar` rewrites title/description/location/times/status from
+        # Google on every sync, so a local edit that is not pushed is silently reverted
+        # the next time the sync runs.
+        self._push_update_if_needed(event, before)
+
+    def _push_update_if_needed(self, event, before):
+        """Push to Google iff the event is synced and a Google-owned field changed.
+
+        Failures are logged, never raised: the local row is authoritative and losing the
+        edit because Google was unreachable would be worse than the row drifting.
+        """
+        if not (event.is_synced and event.google_event_id):
+            return
+        if _google_owned_snapshot(event) == before:
+            return
+        try:
+            self._update_in_google(event)
+        except Exception:
+            logger.exception("Failed to update event '%s' in Google Calendar", event.title)
+
+    @action(detail=True, methods=["patch"], url_path="details")
+    def details(self, request, pk=None):
+        """PATCH /scheduler/events/<pk>/details/ — edit an event the caller owns.
+
+        Body may contain any of DETAILS_EDITABLE_FIELDS; anything else is ignored.
+
+        A dedicated action rather than the generic PATCH for the same reason `attendance`
+        is one: the generic update path runs RequireAccountMembershipMixin, which resolves
+        the account off `serializer.instance` when the patch omits it — so it would 403 a
+        user editing *their own* meeting whenever that meeting happens to be linked to an
+        account they are not a team member of. Google-synced meetings get auto-linked to
+        accounts, so that is the common case, not the edge case. `get_queryset` is already
+        scoped to `owner=request.user`, so another user's event 404s here.
+        """
+        event = self.get_object()
+
+        patch = {k: v for k, v in request.data.items() if k in DETAILS_EDITABLE_FIELDS}
+        if not patch:
+            return Response(
+                {"detail": f"Provide at least one of: {', '.join(sorted(DETAILS_EDITABLE_FIELDS))}."},
+                status=400,
+            )
+
+        if "event_category" in patch:
+            valid = dict(CalendarEvent.EVENT_CATEGORY_CHOICES)
+            # Validated rather than trusted: an unrecognised category has no color and no
+            # label anywhere in the UI, so it would render as an untyped blank forever.
+            if patch["event_category"] not in valid:
+                return Response(
+                    {"event_category": f"Must be one of: {', '.join(valid)}."}, status=400
+                )
+
+        if "all_day" in patch and not isinstance(patch["all_day"], bool):
+            # isinstance, not truthiness — Python treats 1 == True, so a membership or
+            # bool() test would silently accept integers. Same trap `attendance` hit.
+            return Response({"all_day": "Must be true or false."}, status=400)
+
+        # `agentpm_airtable_id` is read_only on the serializer (it is normally owned by the
+        # Airtable/Google sync), so handing it to the serializer would be silently dropped
+        # and return a misleading 200. Assign it on the model instead — the same thing
+        # `attendance` does with the equally read-only `attended`.
+        link_id = patch.pop("agentpm_airtable_id", None)
+        if link_id is not None and not isinstance(link_id, str):
+            return Response({"agentpm_airtable_id": "Must be a string."}, status=400)
+
+        serializer = self.get_serializer(event, data=patch, partial=True)
+        serializer.is_valid(raise_exception=True)
+
+        # Compare against the values that will actually be stored, so a patch that only
+        # touches one endpoint is still checked against the other's existing value.
+        new_start = serializer.validated_data.get("start_datetime", event.start_datetime)
+        new_end = serializer.validated_data.get("end_datetime", event.end_datetime)
+        if new_start and new_end and new_start >= new_end:
+            return Response({"end_datetime": "Must be after start_datetime."}, status=400)
+
+        before = _google_owned_snapshot(event)
+        updated = serializer.save()
+
+        if link_id is not None:
+            updated.agentpm_airtable_id = link_id
+            updated.save(update_fields=["agentpm_airtable_id", "updated_at"])
+
+        publish_activity_event(
+            request.user, "calendar_event.updated",
+            "**Updated** Calendar Event",
+            detail=updated.title,
         )
-        if times_changed and event.is_synced and event.google_event_id:
-            try:
-                self._update_in_google(event)
-            except Exception:
-                logger.exception("Failed to update event '%s' in Google Calendar", event.title)
+
+        # `event_category` is deliberately absent from the snapshot: Google has no such
+        # field, and `_sync_google_calendar` already preserves it across syncs, so a
+        # type change alone must not fire a pointless Google write.
+        self._push_update_if_needed(updated, before)
+
+        return Response(self.get_serializer(updated).data)
 
     def perform_destroy(self, instance):
         title = instance.title

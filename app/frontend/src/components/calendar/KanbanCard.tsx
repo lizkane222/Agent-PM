@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { AirtableActionItem } from "../../types";
 import { airtableApi } from "../../lib/api";
+import { logActionItemUpdate } from "../../lib/actionItemLog";
 import CorporateIcon from "../../assets/icons/Corporate.svg?react";
 import { useActionItemFieldOptions } from "../../hooks/useActionItemFieldOptions";
 import { useExportTray } from "../../hooks/useExportTray";
@@ -62,6 +63,7 @@ export default function KanbanCard({ item, onStatusChange, onDoubleClick }: Prop
     setUpdating(true);
     try {
       await airtableApi.updateActionItemStatus(item.airtable_id, newStatus);
+      logActionItemUpdate(item, { status: newStatus });
       onStatusChange(item.airtable_id, newStatus);
     } finally {
       setUpdating(false);

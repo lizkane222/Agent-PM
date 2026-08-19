@@ -352,6 +352,27 @@ function emptyPage<T>(): AxiosResponse<PaginatedResponse<T>> {
   });
 }
 
+// ── Envelope unwrapping ───────────────────────────────────────────────────────
+// Some list endpoints answer with a bare JSON array and others with the DRF
+// `{count, next, previous, results}` envelope, and which one you get is not
+// obvious from the URL. Under `/layouts/` both shapes are live at once: `pinned/`
+// is a custom @action returning `Response(serializer.data)` (bare array), while
+// `working-sessions/` and `page-notes/` are plain ModelViewSets that inherit the
+// global PageNumberPagination (envelope).
+//
+// A fetcher that guesses wrong hands the page an object where it declared an
+// array, and the mismatch does not surface until a render calls `.map` on it —
+// which throws during render and unmounts the whole route, blanking the page.
+// So accept either shape and always resolve the array.
+function unwrapResults<T>(
+  promise: Promise<AxiosResponse<T[] | PaginatedResponse<T>>>,
+): Promise<AxiosResponse<T[]>> {
+  return promise.then(res => ({
+    ...res,
+    data: Array.isArray(res.data) ? res.data : res.data?.results ?? [],
+  }));
+}
+
 // ── Typed API helpers ─────────────────────────────────────────────────────────
 
 export interface TokenStats {
@@ -403,6 +424,17 @@ export const schedulerApi = {
    *  written by an owner-scoped action that skips the account-membership check. */
   setEventAttendance: (id: number, attended: boolean | null) =>
     apiClient.patch<CalendarEvent>(`/scheduler/events/${id}/attendance/`, { attended }),
+  /** Edit an event the caller owns: title/description/location/times/type, plus the
+   *  action-item link. Separate from `updateEvent` for the same reason
+   *  `setEventAttendance` is: the generic PATCH runs RequireAccountMembershipMixin, which
+   *  403s a user editing their *own* meeting when it is linked to an account they aren't
+   *  a team member of — and Google-synced meetings get auto-linked to accounts. */
+  updateEventDetails: (
+    id: number,
+    patch: Partial<Pick<CalendarEvent,
+      "title" | "description" | "location" | "start_datetime" | "end_datetime" | "all_day"
+      | "event_category" | "agentpm_airtable_id">>,
+  ) => apiClient.patch<CalendarEvent>(`/scheduler/events/${id}/details/`, patch),
 
   listActionItems: (params?: Record<string, string>) =>
     apiClient.get<PaginatedResponse<ActionItem>>("/scheduler/action-items/", { params }),
@@ -722,7 +754,7 @@ export const airtableApi = {
 
 export const realtimeApi = {
   getSyncToken: () => apiClient.get<SyncToken>("/realtime/sync-token/"),
-  listActivity: (params?: { event_type?: string; since?: string }) =>
+  listActivity: (params?: { event_type?: string; since?: string; page_size?: number }) =>
     apiClient.get<PaginatedResponse<AgentActivityEvent>>("/realtime/activity/", { params }),
   createActivity: (data: {
     event_type: string;
@@ -834,11 +866,14 @@ export const layoutsApi = {
   pin: (id: number) =>
     apiClient.post<{ pinned: boolean }>(`/layouts/${id}/pin/`),
   listPinned: () =>
-    apiClient.get<PageLayout[]>("/layouts/pinned/"),
+    unwrapResults(apiClient.get<PageLayout[] | PaginatedResponse<PageLayout>>("/layouts/pinned/")),
 };
 
 export const workingSessionApi = {
-  list: () => apiClient.get<WorkingSession[]>("/layouts/working-sessions/"),
+  list: () =>
+    unwrapResults(apiClient.get<WorkingSession[] | PaginatedResponse<WorkingSession>>(
+      "/layouts/working-sessions/",
+    )),
   create: (data: { name: string; canvas_nodes?: unknown[]; record_refs?: ExportItemSnapshot[] }) =>
     apiClient.post<WorkingSession>("/layouts/working-sessions/", data),
   update: (id: number, data: Partial<Pick<WorkingSession, "name" | "canvas_nodes" | "record_refs">>) =>
@@ -847,7 +882,10 @@ export const workingSessionApi = {
 };
 
 export const userPageNoteApi = {
-  list: () => apiClient.get<UserPageNote[]>("/layouts/page-notes/"),
+  list: () =>
+    unwrapResults(apiClient.get<UserPageNote[] | PaginatedResponse<UserPageNote>>(
+      "/layouts/page-notes/",
+    )),
   create: (data: { content: string; account_ref_label?: string }) =>
     apiClient.post<UserPageNote>("/layouts/page-notes/", data),
   update: (id: number, data: Partial<Pick<UserPageNote, "content" | "account_ref_label">>) =>
@@ -941,18 +979,32 @@ export interface MeetingNotesUpdate {
   account_name: string | null;
   sources: MeetingNotesSource[];
   email_subjects?: Partial<Record<MeetingNotesSource, string>>;
+  /** Providers whose recording link was saved even though they carried no summary. */
+  linked_sources?: MeetingNotesSource[];
+  /** True when this meeting existed only as a calendar event until the import ran. */
+  created_meeting?: boolean;
 }
 
 export interface MeetingNotesSkip {
   meeting_id: number;
   meeting_name: string;
-  reason: "already_summarized" | "no_matching_email" | "summary_limit_reached";
+  reason:
+    | "already_summarized"
+    | "no_matching_email"
+    | "summary_limit_reached"
+    /** A recap email matched but carried only links — the summary lives in the vendor's app. */
+    | "email_has_no_summary";
+  sources_without_summary?: MeetingNotesSource[];
+  linked_sources?: MeetingNotesSource[];
 }
 
 /** Report returned by POST /integrations/gmail/meeting-notes/. */
 export interface MeetingNotesEmailReport {
   days: number;
+  account: string;
   account_name: string;
+  /** True when the scan was narrowed to one account rather than all of the user's. */
+  scoped_to_account: boolean;
   scanned_emails: number;
   scanned_meetings: number;
   updated: MeetingNotesUpdate[];
@@ -960,6 +1012,14 @@ export interface MeetingNotesEmailReport {
   errors: Array<{ meeting_id: number; meeting_name: string; source?: string; detail: string }>;
   summaries_truncated: boolean;
   max_summaries: number;
+  /** Meetings whose matched email was a notification with no summary in it. */
+  no_summary_in_email: number;
+  /** Recording links saved from emails that carried no summary. */
+  recordings_linked: number;
+  /** Calendar events considered in the second pass because they had no meeting row. */
+  scanned_unlinked_events: number;
+  /** Meeting records created for calendar events that had none. */
+  meetings_created: number;
 }
 
 export interface GmailThread {
@@ -997,7 +1057,12 @@ export const integrationsApi = {
     apiClient.get<{ threads: GmailThread[] }>("/integrations/gmail/threads/", { params }),
   // Scans Gong / Zoom recap emails and fills in meetings that have no AI summary yet.
   // Never overwrites existing notes, so it is safe to call repeatedly.
-  getMeetingNotesFromEmail: (body?: { days?: number; account_name?: string }) =>
+  //
+  // `account` (AirtableAccount PK or `rec*` id) scopes the scan to one account, which is
+  // what the account detail page does; `account_name` is the fallback for accounts with
+  // no Airtable link. Omit both to cover every account the user is on — what the profile
+  // and role pages do.
+  getMeetingNotesFromEmail: (body?: { days?: number; account?: string; account_name?: string }) =>
     apiClient.post<MeetingNotesEmailReport>("/integrations/gmail/meeting-notes/", body ?? {}),
   // NOTE: no backend route exists yet for this — the caller (ThreadCard, orphaned/unwired)
   // is not reachable from any current page, so this is a type-level stub only.

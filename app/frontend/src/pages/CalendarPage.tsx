@@ -16,6 +16,7 @@ import { useActionItemFieldOptions } from "../hooks/useActionItemFieldOptions";
 import DOMPurify from "dompurify";
 import { schedulerApi, integrationsApi, teamApi, airtableApi, accountsApi, salesforceApi } from "../lib/api";
 import { addLog } from "../lib/appLog";
+import { logActionItemUpdate } from "../lib/actionItemLog";
 import { useLogGlow } from "../hooks/useLogGlow";
 import { useCurrentUser } from "../context/CurrentUserContext";
 import { useCommentContext } from "../components/comments/CommentContext";
@@ -25,25 +26,33 @@ import { useAppError } from "../context/AppErrorContext";
 import { ContextMenu, FocusPinBadge, focusPinMenuItem } from "../components/action-items/ContextMenu";
 import StepsPanel from "../components/action-items/StepsPanel";
 import { useFocusPins } from "../hooks/useFocusPins";
+import { useActionItemZoneSets } from "../hooks/useActionItemZoneSets";
+import { groupActionItems, DONE_WINDOW_DAYS, isRecentlyDone, type SidebarGroupKey } from "../lib/actionItemSidebarOrder";
+import SidebarFilterFlags from "../components/calendar/SidebarFilterFlags";
 import DayBar from "../components/calendar/DayBar";
 import MeetingDetail from "../components/calendar/MeetingDetail";
 import AccountsSidebar from "../components/calendar/AccountsSidebar";
 import CreateEventModal from "../components/calendar/CreateEventModal";
 import type { SavePayload } from "../components/calendar/CreateEventModal";
 import RichTextMentionEditor from "../components/shared/RichTextMentionEditor";
+import UrlPillInput from "../components/shared/UrlPillInput";
 import EventColorsPopover from "../components/calendar/EventColorsPopover";
 import { useCalendarColors } from "../hooks/useCalendarColors";
+import { convertEventToActionItemLinked } from "../hooks/useConvert";
 import {
+  EVENT_CATEGORY_META,
   EVENT_TYPE_META,
   IMPORTANT_PALETTE,
   borderFor,
+  darken,
   readableTextColor,
+  tint,
   withAlpha,
   type ColorableEventType,
 } from "../lib/eventColors";
 import { sanitizeHtml, plainToHtml, htmlToPreviewText } from "../lib/noteHelpers";
 import type { AirtableActionItem, AirtableAccount, CalendarEvent, LogTimeDayAssignment, Reminder, SalesforceProject } from "../types";
-import type { ContentView, NewEventDraft } from "../types/calendar";
+import type { ContentView, EventCategory, NewEventDraft } from "../types/calendar";
 import { getRsvp, dateToLocalISO, toLocalISO, addMsToLocalISO } from "twilio-agent-pm-shared";
 import type { RsvpStatus } from "twilio-agent-pm-shared";
 
@@ -87,7 +96,16 @@ function statusColor(status: CalendarEvent["status"]): string {
     : "#3b82f6"; // blue-500 — meetings
 }
 
-const WORK_TRACKING_COLOR = "#a78bfa"; // violet-400 — action items (light purple)
+/** How much white is mixed into an accent to get a card/event surface behind text.
+ *  0.9 keeps the wash faint enough that body text stays readable on any palette. */
+const SURFACE_TINT = 0.9;
+
+/** True for the synthetic 15-minute markers a scheduled reminder puts on the grid.
+ *  They carry `calendar_id: "work_tracking"`, so this test must be applied *before*
+ *  the work-tracking one or every reminder would read as an action item. */
+function isScheduledReminderEvent(e: CalendarEvent): boolean {
+  return !!e.google_event_id?.startsWith("scheduled-reminder-");
+}
 
 /**
  * True only when the owner explicitly marked this event "Did not attend".
@@ -131,9 +149,14 @@ function eventBaseColor(e: CalendarEvent, colors: ColorResolver): string {
   if (e.status === "cancelled") return statusColor(e.status);
   const important = colors.importantFor(eventUid(e));
   if (important) return important;
-  const type: ColorableEventType =
-    e.calendar_id === "work_tracking" ? "action_item" : (e.event_category || "meeting");
-  return colors.colorFor(type);
+  return colors.colorFor(colorableTypeFor(e));
+}
+
+/** Which colorable type an event is painted as. */
+function colorableTypeFor(e: CalendarEvent): ColorableEventType {
+  if (isScheduledReminderEvent(e) || e.calendar_id === "reminders") return "reminder";
+  if (e.calendar_id === "work_tracking") return "action_item";
+  return e.event_category || "meeting";
 }
 
 function fadeColor(hex: string, amount = 0.45): string {
@@ -148,15 +171,20 @@ function fadeColor(hex: string, amount = 0.45): string {
 function toFullCalendarEvent(e: CalendarEvent, colors: ColorResolver): EventInput {
   const isWorkSession = e.calendar_id === "work_tracking";
   const isScheduled = e.google_event_id?.startsWith("scheduled-");
-  const isScheduledReminder = e.google_event_id?.startsWith("scheduled-reminder-");
+  const isScheduledReminder = isScheduledReminderEvent(e);
   const isDbWorkTracking = isWorkSession && !!e.agentpm_airtable_id && e.is_synced;
-  // Work sessions resolve through eventBaseColor too (as the "action_item" type), so
-  // an important override applies to them as well.
+  // Work sessions and reminders resolve through eventBaseColor too (as the
+  // "action_item" / "reminder" types), so an important override applies to them.
   const resolved = eventBaseColor(e, colors);
-  const backgroundColor = isScheduledReminder ? "#FFFBEB" : resolved;
-  const borderColor = isScheduledReminder ? "#f59e0b" : borderFor(resolved);
+  // Reminders keep their washed-fill / strong-edge treatment — they are 15-minute
+  // markers rather than blocks of time, and a solid fill reads as a real event. Both
+  // sides come from the user's reminder color. An "important" override paints solid
+  // like any other event, because that is a deliberate per-event flag.
+  const washed = isScheduledReminder && !colors.importantFor(eventUid(e)) && e.status !== "cancelled";
+  const backgroundColor = washed ? tint(resolved, SURFACE_TINT) : resolved;
+  const borderColor = washed ? resolved : borderFor(resolved);
   // Pastel defaults mean white text is often unreadable — pick per background.
-  const textColor = isScheduledReminder ? "#92400e" : readableTextColor(backgroundColor);
+  const textColor = readableTextColor(backgroundColor);
   return {
     id: String(e.id),
     title: isScheduled ? e.title : isWorkSession ? `⏱ ${e.title}` : e.title,
@@ -200,11 +228,19 @@ interface EventDetailPanelProps {
   actionItem?: AirtableActionItem | null;
   onUpdateActionItem?: (patch: Partial<AirtableActionItem>) => void;
   onUpdateScheduleTime?: (newStart: string, newEnd: string) => void;
+  /** Save edits to an ordinary calendar event. Absent ⇒ the event is not editable. */
+  onUpdateEvent?: (patch: EventDetailsPatch) => Promise<void>;
+  /** Bumped by the context menu's Edit entry to open straight into the edit form. */
+  editRequestId?: number;
   /** Resolves the header color from the user's chosen event-type colors. */
   colors: ColorResolver;
 }
 
-function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAccount, onUnlink, onRemove, onDelete, onUpdateReminder, actionItem, onUpdateActionItem, onUpdateScheduleTime, colors }: EventDetailPanelProps) {
+/** The fields `PATCH /events/<pk>/details/` accepts from this panel. */
+type EventDetailsPatch = Partial<Pick<CalendarEvent,
+  "title" | "description" | "location" | "start_datetime" | "end_datetime" | "event_category">>;
+
+function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAccount, onUnlink, onRemove, onDelete, onUpdateReminder, actionItem, onUpdateActionItem, onUpdateScheduleTime, onUpdateEvent, editRequestId, colors }: EventDetailPanelProps) {
   const { status: statusOptions } = useActionItemFieldOptions();
   const [dropOver, setDropOver] = useState(false);
   const isWorkSession = event.calendar_id === "work_tracking";
@@ -239,6 +275,80 @@ function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAcc
   });
   const [newRemSaving, setNewRemSaving] = useState(false);
   const [newRemDone, setNewRemDone] = useState(false);
+
+  // ── Ordinary-event edit form ────────────────────────────────────────────────
+  // Until now this panel had editors only for scheduled reminders and scheduled action
+  // items, so right-click → Edit on a plain meeting opened a read-only panel.
+  const isPlainEvent = !isScheduledReminder && !isScheduledActionItem;
+  const canEditEvent = isPlainEvent && !!onUpdateEvent && !!event.id;
+  const [evEditing, setEvEditing] = useState(false);
+  const [evSaving, setEvSaving] = useState(false);
+  const [evError, setEvError] = useState<string | null>(null);
+  const blankEvForm = useCallback(() => ({
+    title: event.title,
+    description: event.description ?? "",
+    location: event.location ?? "",
+    // datetime-local wants local wall-clock, which toLocalISO already produces.
+    start: toLocalISO(event.start_datetime).slice(0, 16),
+    end: toLocalISO(event.end_datetime).slice(0, 16),
+    category: (event.event_category || "meeting") as EventCategory,
+  }), [event]);
+  const [evForm, setEvForm] = useState(blankEvForm);
+
+  // Re-seed when a different event is selected, but never while the user is mid-edit —
+  // the parent re-renders this panel on every calendar poll, which would wipe the form.
+  useEffect(() => {
+    if (!evEditing) setEvForm(blankEvForm());
+  }, [blankEvForm, evEditing]);
+
+  // Enter edit mode when the context menu asks. Skips the initial mount (id 0/undefined)
+  // so merely opening the panel by clicking an event does not pop the form open.
+  useEffect(() => {
+    if (editRequestId && canEditEvent) {
+      setEvForm(blankEvForm());
+      setEvError(null);
+      setEvEditing(true);
+    }
+  // blankEvForm intentionally omitted: this must fire on an Edit request, not on every
+  // event-object identity change (the poll produces a new object each time).
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editRequestId, canEditEvent]);
+
+  /** Warn before an edit that Google will email to the guest list. */
+  const evEditNotifiesGuests = event.is_synced && !!event.google_event_id && event.attendees.length > 0;
+
+  async function commitEventEdit() {
+    if (!onUpdateEvent) return;
+    if (!evForm.title.trim()) { setEvError("A title is required."); return; }
+    const startIso = toLocalISO(`${evForm.start}:00`);
+    const endIso = toLocalISO(`${evForm.end}:00`);
+    if (new Date(startIso) >= new Date(endIso)) {
+      setEvError("The end time must be after the start time.");
+      return;
+    }
+
+    // Send only what changed, so a category-only edit doesn't look like a content edit
+    // to the server and trigger a pointless Google write.
+    const patch: EventDetailsPatch = {};
+    if (evForm.title !== event.title) patch.title = evForm.title.trim();
+    if (evForm.description !== (event.description ?? "")) patch.description = evForm.description;
+    if (evForm.location !== (event.location ?? "")) patch.location = evForm.location;
+    if (evForm.start !== toLocalISO(event.start_datetime).slice(0, 16)) patch.start_datetime = startIso;
+    if (evForm.end !== toLocalISO(event.end_datetime).slice(0, 16)) patch.end_datetime = endIso;
+    if (evForm.category !== (event.event_category || "meeting")) patch.event_category = evForm.category;
+    if (Object.keys(patch).length === 0) { setEvEditing(false); return; }
+
+    setEvSaving(true);
+    setEvError(null);
+    try {
+      await onUpdateEvent(patch);
+      setEvEditing(false);
+    } catch {
+      setEvError("Could not save. Please try again.");
+    } finally {
+      setEvSaving(false);
+    }
+  }
 
   async function createReminderForEvent() {
     if (!newRemTitle.trim() || !newRemDueAt) return;
@@ -570,9 +680,109 @@ function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAcc
             </div>
           )}
         </div>
+      ) : evEditing ? (
+        <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3 text-sm" data-testid="event-edit-form">
+          <div>
+            <label className="text-sm text-[var(--twilio-gray-60)] uppercase tracking-wide mb-1 block" htmlFor="ev-edit-title">Title</label>
+            <input
+              id="ev-edit-title"
+              autoFocus
+              type="text"
+              value={evForm.title}
+              onChange={(e) => setEvForm((f) => ({ ...f, title: e.target.value }))}
+              className="w-full rounded-lg border border-gray-200 px-2.5 py-1.5 text-[13px] text-[var(--twilio-navy)] focus:outline-none focus:border-indigo-400"
+            />
+          </div>
+
+          <div>
+            <p className="text-sm text-[var(--twilio-gray-60)] uppercase tracking-wide mb-1">Type</p>
+            {/* Driven off EVENT_CATEGORY_META — the six categories the model accepts.
+                "Action item" is deliberately absent: it is not an event_category, so
+                saving it would 400. That conversion lives in the right-click menu. */}
+            <div className="flex flex-wrap gap-1.5">
+              {EVENT_CATEGORY_META.map((c) => {
+                const active = evForm.category === c.id;
+                const fill = colors.colorFor(c.id);
+                return (
+                  <button
+                    key={c.id}
+                    type="button"
+                    data-category={c.id}
+                    data-active={active ? "true" : "false"}
+                    onClick={() => setEvForm((f) => ({ ...f, category: c.id }))}
+                    className={[
+                      "px-2.5 py-1 rounded-full text-xs font-medium border transition-colors",
+                      active ? "" : "bg-white border-gray-200 text-gray-600 hover:border-gray-300",
+                    ].join(" ")}
+                    style={active ? { backgroundColor: fill, borderColor: borderFor(fill), color: readableTextColor(fill) } : undefined}
+                  >
+                    {c.icon} {c.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="flex gap-2">
+            <div className="flex-1 min-w-0">
+              <label className="text-sm text-[var(--twilio-gray-60)] uppercase tracking-wide mb-1 block" htmlFor="ev-edit-start">Starts</label>
+              <input
+                id="ev-edit-start"
+                type="datetime-local"
+                value={evForm.start}
+                onChange={(e) => setEvForm((f) => ({ ...f, start: e.target.value }))}
+                className="w-full rounded-lg border border-gray-200 px-2 py-1.5 text-[12px] focus:outline-none focus:border-indigo-400"
+              />
+            </div>
+            <div className="flex-1 min-w-0">
+              <label className="text-sm text-[var(--twilio-gray-60)] uppercase tracking-wide mb-1 block" htmlFor="ev-edit-end">Ends</label>
+              <input
+                id="ev-edit-end"
+                type="datetime-local"
+                value={evForm.end}
+                onChange={(e) => setEvForm((f) => ({ ...f, end: e.target.value }))}
+                className="w-full rounded-lg border border-gray-200 px-2 py-1.5 text-[12px] focus:outline-none focus:border-indigo-400"
+              />
+            </div>
+          </div>
+
+          <div>
+            <label className="text-sm text-[var(--twilio-gray-60)] uppercase tracking-wide mb-1 block" htmlFor="ev-edit-location">Location</label>
+            <input
+              id="ev-edit-location"
+              type="text"
+              value={evForm.location}
+              onChange={(e) => setEvForm((f) => ({ ...f, location: e.target.value }))}
+              placeholder="Room, address or link"
+              className="w-full rounded-lg border border-gray-200 px-2.5 py-1.5 text-[13px] focus:outline-none focus:border-indigo-400 placeholder:text-gray-400"
+            />
+          </div>
+
+          <div>
+            <label className="text-sm text-[var(--twilio-gray-60)] uppercase tracking-wide mb-1 block" htmlFor="ev-edit-description">Description</label>
+            <textarea
+              id="ev-edit-description"
+              rows={4}
+              value={evForm.description}
+              onChange={(e) => setEvForm((f) => ({ ...f, description: e.target.value }))}
+              className="w-full rounded-lg border border-gray-200 px-2.5 py-1.5 text-[13px] leading-relaxed resize-none focus:outline-none focus:border-indigo-400"
+            />
+          </div>
+
+          {evEditNotifiesGuests && (
+            /* Saving pushes to Google, which emails the guest list. Said before the
+               click, not discovered after it. */
+            <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1.5">
+              This event is on your Google Calendar with {event.attendees.length} guest{event.attendees.length === 1 ? "" : "s"} — saving will update it in Google and notify them.
+            </p>
+          )}
+          {evError && <p role="alert" className="text-[12px] text-red-600">{evError}</p>}
+        </div>
       ) : (
         <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3 text-sm">
-          <div>
+          <div
+            onDoubleClick={() => { if (canEditEvent) { setEvForm(blankEvForm()); setEvEditing(true); } }}
+          >
             <p className="text-sm text-[var(--twilio-gray-60)] uppercase tracking-wide mb-1">When</p>
             <p className="text-[var(--twilio-navy)]">
               {new Date(event.start_datetime).toLocaleString()} –{" "}
@@ -667,7 +877,27 @@ function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAcc
             >Edit action item</button>
           )
         )}
-        {!isScheduledReminder && !isScheduledActionItem && (
+        {canEditEvent && (
+          evEditing ? (
+            <div className="flex gap-2">
+              <button
+                onClick={() => { setEvEditing(false); setEvError(null); setEvForm(blankEvForm()); }}
+                className="flex-1 text-[12px] font-medium py-2 rounded-lg border border-gray-200 text-[var(--twilio-gray-60)] hover:bg-gray-50 transition-colors"
+              >Cancel</button>
+              <button
+                onClick={() => void commitEventEdit()}
+                disabled={evSaving}
+                className="flex-1 text-[12px] font-semibold py-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 transition-colors"
+              >{evSaving ? "Saving…" : "Save"}</button>
+            </div>
+          ) : (
+            <button
+              onClick={() => { setEvForm(blankEvForm()); setEvError(null); setEvEditing(true); }}
+              className="w-full text-[12px] font-semibold py-2 rounded-lg border border-indigo-200 text-indigo-600 hover:bg-indigo-50 transition-colors"
+            >Edit event</button>
+          )
+        )}
+        {!isScheduledReminder && !isScheduledActionItem && !evEditing && (
           newRemOpen ? (
             <div className="flex flex-col gap-2 rounded-lg border border-amber-200 bg-amber-50 p-2">
               <input
@@ -704,7 +934,7 @@ function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAcc
             >Set reminder for this event</button>
           )
         )}
-        {(onRemove || onDelete) && (
+        {(onRemove || onDelete) && !evEditing && (
           <button
             onClick={onRemove ?? onDelete}
             className="w-full text-[12px] font-medium py-2 rounded-lg border border-red-200 text-red-600 hover:bg-red-50 transition-colors"
@@ -928,15 +1158,9 @@ function CalPillDate({ value, onChange }: { value: string; onChange: (v: string)
 
 function CalPillUrl({ value, onChange }: { value: string; onChange: (v: string) => void }) {
   const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLInputElement>(null);
-  useEffect(() => { if (open) ref.current?.focus(); }, [open]);
-  if (open) return (
-    <input ref={ref} type="url" defaultValue={value}
-      onBlur={(e) => { onChange(e.target.value); setOpen(false); }}
-      onClick={(e) => e.stopPropagation()} placeholder="https://…"
-      className="w-40 rounded-full border border-indigo-400 bg-white px-2.5 py-0.5 text-[12px] font-semibold focus:outline-none"
-    />
-  );
+  if (open) {
+    return <UrlPillInput value={value} onCommit={(v) => { onChange(v); setOpen(false); }} onCancel={() => setOpen(false)} />;
+  }
   return (
     <button type="button" onClick={(e) => { e.stopPropagation(); setOpen(true); }}
       className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[12px] font-semibold hover:opacity-75 transition-opacity cursor-pointer ${value ? "bg-indigo-50 text-indigo-700 ring-1 ring-indigo-200" : "bg-gray-100 text-[var(--twilio-gray-60)]"}`}
@@ -964,7 +1188,7 @@ function OccurrencesList({ airtableId }: { airtableId: string }) {
   );
 }
 
-function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onUpdate, onAccountDrop, accounts, teamMembers, forceExpand }: {
+function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onUpdate, onAccountDrop, accounts, teamMembers, forceExpand, accent }: {
   item: AirtableActionItem;
   onDragStart: (e: React.DragEvent) => void;
   onDelete: () => void;
@@ -974,6 +1198,8 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
   accounts: AirtableAccount[];
   teamMembers: { id: number; full_name: string }[];
   forceExpand?: boolean;
+  /** The user's action-item color — the same one the grid paints scheduled items with. */
+  accent: string;
 }) {
   const { status: statusOptions } = useActionItemFieldOptions();
   const [expanded, setExpanded] = useState(forceExpand ?? false);
@@ -1060,9 +1286,10 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
       <div
         ref={cardRef}
         className="rounded-lg select-none"
+        data-accent={accent}
         style={{
-          background: "#F5F3FF",
-          borderLeft: "3px solid #a78bfa",
+          background: tint(accent, SURFACE_TINT),
+          borderLeft: `3px solid ${accent}`,
           padding: "8px 10px",
           display: "flex",
           flexDirection: "column",
@@ -1212,10 +1439,11 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
         }
       }}
       className="rounded-lg select-none cursor-pointer group"
+      data-accent={accent}
       style={{
         position: "relative",
-        background: "#F5F3FF",
-        borderLeft: "3px solid #a78bfa",
+        background: tint(accent, SURFACE_TINT),
+        borderLeft: `3px solid ${accent}`,
         padding: "8px 10px",
         display: "flex",
         flexDirection: "column",
@@ -1294,7 +1522,11 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
   );
 }
 
-function ActionItemsSidebar({ expandItemId }: { onDropToast?: (msg: string, type: "success" | "warn") => void; expandItemId?: string | null }) {
+function ActionItemsSidebar({ expandItemId, colors }: { onDropToast?: (msg: string, type: "success" | "warn") => void; expandItemId?: string | null; colors: ColorResolver }) {
+  // The sidebar paints itself in the same colors the grid uses, so a card and the
+  // block it becomes when dragged onto the calendar always match.
+  const accent = colors.colorFor("action_item");
+  const reminderAccent = colors.colorFor("reminder");
   const currentUser = useCurrentUser();
   const { status: statusOptions } = useActionItemFieldOptions();
   const [items, setItems] = useState<AirtableActionItem[]>([]);
@@ -1305,12 +1537,10 @@ function ActionItemsSidebar({ expandItemId }: { onDropToast?: (msg: string, type
   useEffect(() => {
     if (expandItemId) setForcedExpandId(expandItemId);
   }, [expandItemId]);
-  const [stagedIds, setStagedIds] = useState<Set<string>>(() => {
-    try {
-      const zones: Record<string, string> = JSON.parse(localStorage.getItem(ACTION_ITEM_ZONES_KEY) ?? "{}");
-      return new Set(Object.entries(zones).filter(([, v]) => v === "today").map(([k]) => k));
-    } catch { return new Set(); }
-  });
+  // Where each card sits — the first three sections are positional state, not status.
+  const { trackingIds, stagedIds } = useActionItemZoneSets();
+  const { pinnedIds } = useFocusPins();
+  const [selectedFlags, setSelectedFlags] = useState<Set<SidebarGroupKey>>(() => new Set());
 
   // Create form state
   const [creating, setCreating] = useState(false);
@@ -1329,12 +1559,19 @@ function ActionItemsSidebar({ expandItemId }: { onDropToast?: (msg: string, type
 
   const fetchItems = () =>
     airtableApi
-      .listActionItems({ status: "Open,In Progress,Blocked,Backlogged,Complete" })
+      // Exactly what the sidebar shows. The old filter listed Blocked/Backlogged and then
+      // discarded them client-side, plus a "Complete" status that does not exist in the model
+      // (Open / In Progress / Done / Blocked / Backlogged) and so matched nothing. Done joined
+      // the list for the Done section — rendering is bounded to the last DONE_WINDOW_DAYS, the
+      // fetch is not (the endpoint is unpaginated).
+      .listActionItems({ status: "Open,In Progress,Done" })
       .then(({ data }) => {
-        // Only show open/in-progress in the sidebar
         const all = data ?? [];
+        // Computed before the keep-filter, so pruning below sees every live record.
         const liveIds = new Set(all.map((i: AirtableActionItem) => i.airtable_id));
-        setItems(all.filter((i: AirtableActionItem) => i.status === "Open" || i.status === "In Progress"));
+        setItems(all.filter((i: AirtableActionItem) =>
+          i.status === "Open" || i.status === "In Progress" || (i.status === "Done" && isRecentlyDone(i))
+        ));
         // Prune stale activeTimers
         try {
           const timers: Record<string, unknown> = JSON.parse(localStorage.getItem("activeTimers") ?? "{}");
@@ -1365,12 +1602,8 @@ function ActionItemsSidebar({ expandItemId }: { onDropToast?: (msg: string, type
 
   useEffect(() => {
     function onStorage(e: StorageEvent) {
-      if (e.key === "actionItemsUpdated") { void fetchItems(); return; }
-      if (e.key !== ACTION_ITEM_ZONES_KEY) return;
-      try {
-        const zones: Record<string, string> = JSON.parse(e.newValue ?? "{}");
-        setStagedIds(new Set(Object.entries(zones).filter(([, v]) => v === "today").map(([k]) => k)));
-      } catch { /* ignore */ }
+      // Zone changes are handled by useActionItemZoneSets, which owns that key's listener.
+      if (e.key === "actionItemsUpdated") void fetchItems();
     }
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
@@ -1389,8 +1622,8 @@ function ActionItemsSidebar({ expandItemId }: { onDropToast?: (msg: string, type
       JSON.stringify({
         title: item.task,
         duration: "00:15",
-        backgroundColor: WORK_TRACKING_COLOR,
-        borderColor: WORK_TRACKING_COLOR,
+        backgroundColor: accent,
+        borderColor: accent,
         extendedProps: { airtableId: item.airtable_id, accountName: item.account_name ?? "" },
       })
     );
@@ -1450,6 +1683,7 @@ function ActionItemsSidebar({ expandItemId }: { onDropToast?: (msg: string, type
     setItems((prev) => prev.map((i) => i.airtable_id === item.airtable_id ? { ...i, ...patch } : i));
     try {
       await airtableApi.updateActionItemFields(item.airtable_id, patch);
+      logActionItemUpdate(item, patch);
       window.dispatchEvent(new StorageEvent("storage", { key: "actionItemsUpdated", newValue: "1" }));
     } catch {
       // Revert on failure
@@ -1490,7 +1724,7 @@ function ActionItemsSidebar({ expandItemId }: { onDropToast?: (msg: string, type
   }
 
   const [filterTerm, setFilterTerm] = useState("");
-  const filteredItems = filterTerm.trim()
+  const textMatched = filterTerm.trim()
     ? items.filter((i) => {
         const q = filterTerm.toLowerCase();
         return (
@@ -1501,6 +1735,19 @@ function ActionItemsSidebar({ expandItemId }: { onDropToast?: (msg: string, type
         );
       })
     : items;
+
+  // Text box and flag chips compose: a card must satisfy both.
+  const groups = groupActionItems(textMatched, { trackingIds, stagedIds, pinnedIds, selectedFlags });
+  const visibleCount = groups.reduce((n, g) => n + g.items.length, 0);
+  const isNarrowed = !!filterTerm.trim() || selectedFlags.size > 0;
+
+  function toggleFlag(key: SidebarGroupKey) {
+    setSelectedFlags((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      return next;
+    });
+  }
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
@@ -1527,17 +1774,33 @@ function ActionItemsSidebar({ expandItemId }: { onDropToast?: (msg: string, type
             </button>
           )}
         </div>
+        <div className="pt-1.5">
+          <SidebarFilterFlags
+            selected={selectedFlags}
+            onToggle={toggleFlag}
+            onClear={() => setSelectedFlags(new Set())}
+            accent={accent}
+          />
+        </div>
       </div>
 
       <div className="flex-1 overflow-y-auto px-3 py-2 space-y-2">
         {loading ? (
           <p className="text-sm text-[var(--twilio-gray-60)] py-2">Loading…</p>
-        ) : filteredItems.length === 0 && !creating ? (
+        ) : visibleCount === 0 && !creating ? (
           <p className="text-sm text-[var(--twilio-gray-60)] py-2">
-            {filterTerm ? "No matches." : "No open action items."}
+            {isNarrowed ? "No matches." : "No open action items."}
           </p>
         ) : (
-          filteredItems.map((item) => {
+          groups.map((group) => (
+          <div key={group.key} className="space-y-2">
+            {/* Section header — the same micro-header vocabulary the card's "On calendar"
+                label uses, so it reads as part of the sidebar rather than a new surface. */}
+            <p data-section={group.key} className="text-[9px] font-semibold uppercase tracking-wide text-[var(--twilio-gray-60)] flex items-center gap-1">
+              <span>{group.key === "done" ? `${group.label} · last ${DONE_WINDOW_DAYS} days` : group.label}</span>
+              <span className="opacity-60">{group.items.length}</span>
+            </p>
+            {group.items.map((item) => {
             const isStaged = stagedIds.has(item.airtable_id);
             return (
               <div key={item.airtable_id} className="relative">
@@ -1546,6 +1809,7 @@ function ActionItemsSidebar({ expandItemId }: { onDropToast?: (msg: string, type
                 )}
                 <ActionItemCard_Cal
                   item={item}
+                  accent={accent}
                   forceExpand={forcedExpandId === item.airtable_id}
                   onDragStart={(e) => handleDragStart(e, item)}
                   onDelete={() => handleDelete(item)}
@@ -1571,16 +1835,19 @@ function ActionItemsSidebar({ expandItemId }: { onDropToast?: (msg: string, type
                 />
                 {/* Reminder popover */}
                 {reminderItemId === item.airtable_id && (
-                  <div className="mt-1 rounded-lg border border-amber-200 bg-amber-50 p-2.5 flex flex-col gap-2">
-                    <p className="text-[11px] font-semibold text-amber-800">{item.reminder_due_at ? "Edit Reminder" : "Set Reminder"}</p>
+                  <div
+                    className="mt-1 rounded-lg p-2.5 flex flex-col gap-2"
+                    style={{ background: tint(reminderAccent, SURFACE_TINT), border: `1px solid ${tint(reminderAccent, 0.55)}` }}
+                  >
+                    <p className="text-[11px] font-semibold" style={{ color: darken(reminderAccent, 0.45) }}>{item.reminder_due_at ? "Edit Reminder" : "Set Reminder"}</p>
                     <div className="flex gap-1.5">
                       <input type="date" value={reminderDate} onChange={(e) => setReminderDate(e.target.value)}
-                        className="flex-1 text-[11px] rounded border border-amber-200 px-1.5 py-1 focus:outline-none focus:border-amber-400"
-                        style={{ background: "#fff" }}
+                        className="flex-1 text-[11px] rounded px-1.5 py-1 focus:outline-none"
+                        style={{ background: "#fff", border: `1px solid ${tint(reminderAccent, 0.55)}` }}
                       />
                       <input type="time" value={reminderTime} onChange={(e) => setReminderTime(e.target.value)}
-                        className="w-20 text-[11px] rounded border border-amber-200 px-1.5 py-1 focus:outline-none focus:border-amber-400"
-                        style={{ background: "#fff" }}
+                        className="w-20 text-[11px] rounded px-1.5 py-1 focus:outline-none"
+                        style={{ background: "#fff", border: `1px solid ${tint(reminderAccent, 0.55)}` }}
                       />
                     </div>
                     <div className="flex gap-1.5">
@@ -1588,11 +1855,12 @@ function ActionItemsSidebar({ expandItemId }: { onDropToast?: (msg: string, type
                         onClick={() => void handleSetReminder(item)}
                         disabled={reminderSaving || !reminderDate}
                         className="flex-1 text-[11px] font-semibold py-1 rounded-md transition-colors disabled:opacity-40"
-                        style={{ background: "#f59e0b", color: "#fff" }}
+                        style={{ background: reminderAccent, color: readableTextColor(reminderAccent) }}
                       >{reminderSaving ? "…" : "Set"}</button>
                       <button
                         onClick={() => void handleClearReminder(item)}
-                        className="text-[11px] font-semibold px-2 py-1 rounded-md border border-amber-200 text-amber-700 hover:bg-amber-100 transition-colors disabled:opacity-30"
+                        className="text-[11px] font-semibold px-2 py-1 rounded-md transition-colors disabled:opacity-30"
+                        style={{ border: `1px solid ${tint(reminderAccent, 0.55)}`, color: darken(reminderAccent, 0.35) }}
                         disabled={!item.reminder_due_at}
                       >Clear</button>
                       <button onClick={() => setReminderItemId(null)} className="text-[11px] px-2 py-1 rounded-md border border-gray-200 text-gray-500 hover:bg-gray-100 transition-colors">✕</button>
@@ -1601,14 +1869,16 @@ function ActionItemsSidebar({ expandItemId }: { onDropToast?: (msg: string, type
                 )}
               </div>
             );
-          })
+            })}
+          </div>
+          ))
         )}
       </div>
 
       {/* Create card — pinned at bottom */}
       {creating && (
         <div className="shrink-0 border-t border-gray-100">
-          <div className="rounded-xl flex flex-col overflow-hidden m-3" style={{ background: "#F5F3FF", border: "1px solid #ddd6fe" }}>
+          <div className="rounded-xl flex flex-col overflow-hidden m-3" style={{ background: tint(accent, SURFACE_TINT), border: `1px solid ${tint(accent, 0.55)}` }}>
             {/* Task title */}
             <div className="px-4 pt-3 pb-2">
               <input
@@ -1616,7 +1886,8 @@ function ActionItemsSidebar({ expandItemId }: { onDropToast?: (msg: string, type
                 value={form.task}
                 onChange={(e) => setForm((f) => ({ ...f, task: e.target.value }))}
                 placeholder="Name or short description"
-                className="w-full text-xs font-semibold text-[var(--twilio-navy)] bg-transparent border-b border-violet-200 focus:border-violet-400 focus:outline-none pb-1 placeholder:text-[var(--twilio-gray-60)] placeholder:font-normal"
+                className="w-full text-xs font-semibold text-[var(--twilio-navy)] bg-transparent border-b focus:outline-none pb-1 placeholder:text-[var(--twilio-gray-60)] placeholder:font-normal"
+                style={{ borderBottomColor: tint(accent, 0.45) }}
               />
             </div>
 
@@ -1707,8 +1978,8 @@ function ActionItemsSidebar({ expandItemId }: { onDropToast?: (msg: string, type
               <button
                 onClick={() => void handleCreate()}
                 disabled={saving || !form.task.trim()}
-                className="px-3 py-1 text-[11px] font-semibold uppercase tracking-wide rounded-md text-white disabled:opacity-40 transition-colors"
-                style={{ background: "#a78bfa" }}
+                className="px-3 py-1 text-[11px] font-semibold uppercase tracking-wide rounded-md disabled:opacity-40 transition-colors"
+                style={{ background: accent, color: readableTextColor(accent) }}
               >{saving ? "Saving…" : "Save"}</button>
             </div>
           </div>
@@ -1720,8 +1991,8 @@ function ActionItemsSidebar({ expandItemId }: { onDropToast?: (msg: string, type
         <div className="shrink-0 px-3 pb-3 pt-1 border-t border-gray-100">
           <button
             onClick={() => { setCreating(true); setForm({ ...BLANK_FORM }); }}
-            className="w-full text-[11px] font-semibold py-1.5 rounded-lg transition-colors text-white"
-            style={{ background: "#a78bfa" }}
+            className="w-full text-[11px] font-semibold py-1.5 rounded-lg transition-colors"
+            style={{ background: accent, color: readableTextColor(accent) }}
           >+ New Action Item</button>
         </div>
       )}
@@ -1731,11 +2002,13 @@ function ActionItemsSidebar({ expandItemId }: { onDropToast?: (msg: string, type
 
 // ── Reminder card ─────────────────────────────────────────────────────────────
 
-function ReminderCard_Cal({ reminder, onDragStart, onDelete, onUpdate }: {
+function ReminderCard_Cal({ reminder, onDragStart, onDelete, onUpdate, accent }: {
   reminder: Reminder;
   onDragStart: (e: React.DragEvent) => void;
   onDelete: () => void;
   onUpdate: (patch: Partial<Reminder>) => void;
+  /** The user's reminder color — the same one the grid paints scheduled reminders with. */
+  accent: string;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [editTitle, setEditTitle] = useState(reminder.title);
@@ -1780,7 +2053,8 @@ function ReminderCard_Cal({ reminder, onDragStart, onDelete, onUpdate }: {
       <div
         ref={cardRef}
         className="rounded-lg select-none"
-        style={{ background: "#FFFBEB", borderLeft: "3px solid #f59e0b", padding: "8px 10px", display: "flex", flexDirection: "column", gap: 6, boxShadow: "0 2px 8px rgba(0,0,0,0.10)" }}
+        data-accent={accent}
+        style={{ background: tint(accent, SURFACE_TINT), borderLeft: `3px solid ${accent}`, padding: "8px 10px", display: "flex", flexDirection: "column", gap: 6, boxShadow: "0 2px 8px rgba(0,0,0,0.10)" }}
       >
         <input
           autoFocus
@@ -1788,7 +2062,8 @@ function ReminderCard_Cal({ reminder, onDragStart, onDelete, onUpdate }: {
           onChange={(e) => setEditTitle(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); commitEdit(); } if (e.key === "Escape") setExpanded(false); }}
           placeholder="Reminder title"
-          className="w-full text-[13px] font-medium text-[var(--twilio-navy)] bg-white rounded px-2 py-1 border border-amber-300 focus:outline-none focus:border-amber-500"
+          className="w-full text-[13px] font-medium text-[var(--twilio-navy)] bg-white rounded px-2 py-1 border focus:outline-none"
+          style={{ borderColor: tint(accent, 0.45) }}
         />
         <textarea
           value={editBody}
@@ -1803,7 +2078,8 @@ function ReminderCard_Cal({ reminder, onDragStart, onDelete, onUpdate }: {
             type="datetime-local"
             value={editDueAt}
             onChange={(e) => setEditDueAt(e.target.value)}
-            className="flex-1 text-[11px] rounded border border-amber-200 px-1.5 py-1 focus:outline-none focus:border-amber-400 bg-white"
+            className="flex-1 text-[11px] rounded border px-1.5 py-1 focus:outline-none bg-white"
+            style={{ borderColor: tint(accent, 0.55) }}
           />
         </div>
         <div className="flex items-center justify-between pt-0.5">
@@ -1813,7 +2089,11 @@ function ReminderCard_Cal({ reminder, onDragStart, onDelete, onUpdate }: {
           >
             <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="M3 3l10 10M13 3L3 13"/></svg>
           </button>
-          <button onClick={(e) => { e.stopPropagation(); commitEdit(); }} className="text-[11px] font-semibold px-2.5 py-1 rounded-md bg-amber-500 text-white hover:bg-amber-600 transition-colors">Done</button>
+          <button
+            onClick={(e) => { e.stopPropagation(); commitEdit(); }}
+            className="text-[11px] font-semibold px-2.5 py-1 rounded-md transition-colors"
+            style={{ background: accent, color: readableTextColor(accent) }}
+          >Done</button>
         </div>
       </div>
     );
@@ -1826,10 +2106,14 @@ function ReminderCard_Cal({ reminder, onDragStart, onDelete, onUpdate }: {
       onDragStart={onDragStart}
       onClick={() => setExpanded(true)}
       className="rounded-lg select-none cursor-pointer group"
-      style={{ background: "#FFFBEB", borderLeft: "3px solid #f59e0b", padding: "8px 10px", display: "flex", flexDirection: "column", gap: 4, boxShadow: "0 1px 3px rgba(0,0,0,0.08)" }}
+      data-accent={accent}
+      style={{ background: tint(accent, SURFACE_TINT), borderLeft: `3px solid ${accent}`, padding: "8px 10px", display: "flex", flexDirection: "column", gap: 4, boxShadow: "0 1px 3px rgba(0,0,0,0.08)" }}
     >
       <div className="flex items-center gap-1.5 flex-wrap">
-        <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded whitespace-nowrap bg-amber-50 text-amber-700">{statusLabel}</span>
+        <span
+          className="text-[10px] font-semibold px-1.5 py-0.5 rounded whitespace-nowrap"
+          style={{ background: tint(accent, 0.78), color: darken(accent, 0.4) }}
+        >{statusLabel}</span>
         <span className="text-[10px] text-[var(--twilio-gray-60)]">{dueLabel}</span>
         <button
           onClick={(e) => { e.stopPropagation(); onDelete(); }}
@@ -1851,10 +2135,10 @@ function ReminderCard_Cal({ reminder, onDragStart, onDelete, onUpdate }: {
         const occurrences = readScheduledReminders().filter((r) => r.reminderId === reminder.id && new Date(r.start) >= new Date(new Date().setHours(0,0,0,0)));
         if (occurrences.length === 0) return null;
         return (
-          <div className="mt-1 pt-1.5 border-t border-amber-200/70">
-            <p className="text-[10px] font-semibold text-amber-600 uppercase tracking-wide mb-0.5">On calendar</p>
+          <div className="mt-1 pt-1.5 border-t" style={{ borderColor: tint(accent, 0.6) }}>
+            <p className="text-[10px] font-semibold uppercase tracking-wide mb-0.5" style={{ color: darken(accent, 0.25) }}>On calendar</p>
             {occurrences.map((o) => (
-              <span key={o.start} className="text-[10px] text-amber-700 block">
+              <span key={o.start} className="text-[10px] block" style={{ color: darken(accent, 0.4) }}>
                 {new Date(o.start).toLocaleString(undefined, { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}
               </span>
             ))}
@@ -1867,7 +2151,8 @@ function ReminderCard_Cal({ reminder, onDragStart, onDelete, onUpdate }: {
 
 // ── Reminders tab content ─────────────────────────────────────────────────────
 
-function RemindersTabContent(_props: { onDropToast: (msg: string, type: "success" | "warn") => void }) {
+function RemindersTabContent({ colors }: { onDropToast: (msg: string, type: "success" | "warn") => void; colors: ColorResolver }) {
+  const accent = colors.colorFor("reminder");
   const [reminders, setReminders] = useState<Reminder[]>([]);
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
@@ -1982,6 +2267,7 @@ function RemindersTabContent(_props: { onDropToast: (msg: string, type: "success
             <ReminderCard_Cal
               key={r.id}
               reminder={r}
+              accent={accent}
               onDragStart={(e) => handleReminderDragStart(e, r)}
               onDelete={() => void handleDelete(r)}
               onUpdate={(patch) => void handleUpdate(r, patch)}
@@ -1993,7 +2279,7 @@ function RemindersTabContent(_props: { onDropToast: (msg: string, type: "success
       {/* Create form */}
       {creating && (
         <div className="shrink-0 border-t border-gray-100">
-          <div className="rounded-xl flex flex-col overflow-hidden m-3" style={{ background: "#FFFBEB", border: "1px solid #fde68a" }}>
+          <div className="rounded-xl flex flex-col overflow-hidden m-3" style={{ background: tint(accent, SURFACE_TINT), border: `1px solid ${tint(accent, 0.55)}` }}>
             <div className="px-4 pt-3 pb-2 flex flex-col gap-2">
               <input
                 autoFocus
@@ -2001,14 +2287,16 @@ function RemindersTabContent(_props: { onDropToast: (msg: string, type: "success
                 onChange={(e) => setNewTitle(e.target.value)}
                 onKeyDown={(e) => { if (e.key === "Enter") void handleCreate(); if (e.key === "Escape") setCreating(false); }}
                 placeholder="Reminder title"
-                className="w-full text-xs font-semibold text-[var(--twilio-navy)] bg-white border-b border-amber-200 focus:border-amber-400 focus:outline-none pb-1 placeholder:text-[var(--twilio-gray-60)] placeholder:font-normal"
+                className="w-full text-xs font-semibold text-[var(--twilio-navy)] bg-white border-b focus:outline-none pb-1 placeholder:text-[var(--twilio-gray-60)] placeholder:font-normal"
+                style={{ borderBottomColor: tint(accent, 0.55) }}
               />
               <textarea
                 value={newBody}
                 onChange={(e) => setNewBody(e.target.value)}
                 rows={2}
                 placeholder="Notes (optional)"
-                className="w-full rounded-md border border-amber-100 bg-white px-2.5 py-1.5 text-xs text-[var(--twilio-navy)] placeholder:text-[var(--twilio-gray-60)] focus:bg-white focus:border-amber-300 focus:outline-none resize-none leading-relaxed"
+                className="w-full rounded-md border bg-white px-2.5 py-1.5 text-xs text-[var(--twilio-navy)] placeholder:text-[var(--twilio-gray-60)] focus:bg-white focus:outline-none resize-none leading-relaxed"
+                style={{ borderColor: tint(accent, 0.7) }}
               />
               <div className="flex items-center gap-2">
                 <span className="text-[10px] text-[var(--twilio-gray-60)] shrink-0">Due:</span>
@@ -2016,7 +2304,8 @@ function RemindersTabContent(_props: { onDropToast: (msg: string, type: "success
                   type="datetime-local"
                   value={newDueAt}
                   onChange={(e) => setNewDueAt(e.target.value)}
-                  className="flex-1 text-[11px] rounded border border-amber-200 px-1.5 py-1 focus:outline-none focus:border-amber-400 bg-white"
+                  className="flex-1 text-[11px] rounded border px-1.5 py-1 focus:outline-none bg-white"
+                  style={{ borderColor: tint(accent, 0.55) }}
                 />
               </div>
             </div>
@@ -2025,7 +2314,8 @@ function RemindersTabContent(_props: { onDropToast: (msg: string, type: "success
               <button
                 onClick={() => void handleCreate()}
                 disabled={saving || !newTitle.trim()}
-                className="px-3 py-1 text-[11px] font-semibold uppercase tracking-wide rounded-md bg-amber-500 text-white hover:bg-amber-600 disabled:opacity-40 transition-colors"
+                className="px-3 py-1 text-[11px] font-semibold uppercase tracking-wide rounded-md disabled:opacity-40 transition-colors"
+                style={{ background: accent, color: readableTextColor(accent) }}
               >{saving ? "Saving…" : "Save"}</button>
             </div>
           </div>
@@ -2038,7 +2328,7 @@ function RemindersTabContent(_props: { onDropToast: (msg: string, type: "success
           <button
             onClick={() => setCreating(true)}
             className="w-full text-[11px] font-semibold py-1.5 rounded-lg transition-colors"
-            style={{ background: "#f59e0b", color: "#fff" }}
+            style={{ background: accent, color: readableTextColor(accent) }}
           >+ New Reminder</button>
         </div>
       )}
@@ -2048,7 +2338,7 @@ function RemindersTabContent(_props: { onDropToast: (msg: string, type: "success
 
 // ── Combined Items Sidebar (Action Items + Reminders tabs) ────────────────────
 
-function ItemsSidebar({ onDropToast, forceTab, expandItemId }: { onDropToast: (msg: string, type: "success" | "warn") => void; forceTab?: "action-items" | "reminders"; expandItemId?: string | null }) {
+function ItemsSidebar({ onDropToast, forceTab, expandItemId, colors }: { onDropToast: (msg: string, type: "success" | "warn") => void; forceTab?: "action-items" | "reminders"; expandItemId?: string | null; colors: ColorResolver }) {
   const [tab, setTab] = useState<"action-items" | "reminders">(forceTab ?? "action-items");
 
   useEffect(() => {
@@ -2061,9 +2351,9 @@ function ItemsSidebar({ onDropToast, forceTab, expandItemId }: { onDropToast: (m
 
       {/* Tab body — each mounts/unmounts so state resets on switch */}
       {tab === "action-items" ? (
-        <ActionItemsSidebar onDropToast={onDropToast} expandItemId={expandItemId} />
+        <ActionItemsSidebar onDropToast={onDropToast} expandItemId={expandItemId} colors={colors} />
       ) : (
-        <RemindersTabContent onDropToast={onDropToast} />
+        <RemindersTabContent onDropToast={onDropToast} colors={colors} />
       )}
     </div>
   );
@@ -3050,6 +3340,9 @@ function LogTimePanel({
 export default function CalendarPage() {
   const [events, setEvents] = useState<CalendarEvent[]>([]);
   const [selectedEvent, setSelectedEvent] = useState<CalendarEvent | null>(null);
+  // Bumped by the context menu's Edit entry. A counter rather than a boolean so choosing
+  // Edit again after cancelling re-opens the form — a boolean would already be true.
+  const [eventEditRequestId, setEventEditRequestId] = useState(0);
   const [meetingPanelCollapsed, setMeetingPanelCollapsed] = useState(false);
   const [, setIsLoading] = useState(true);
   const [isSyncing, setIsSyncing] = useState(false);
@@ -3139,6 +3432,8 @@ export default function CalendarPage() {
   const [colorsPanelOpen, setColorsPanelOpen] = useState(false);
   // Which context-menu row has its "Mark as important!" swatches expanded
   const [importantPickerOpen, setImportantPickerOpen] = useState(false);
+  // …and whether "Convert to…" has its type pills expanded
+  const [convertPickerOpen, setConvertPickerOpen] = useState(false);
   useLogGlow(pageRef);
 
   // Scheduled action items dragged onto the calendar (persisted in localStorage)
@@ -3261,7 +3556,7 @@ export default function CalendarPage() {
   }, [activeTimers]);
 
   // The important-color swatches belong to one menu opening, never the next
-  useEffect(() => { setImportantPickerOpen(false); }, [ctxMenu]);
+  useEffect(() => { setImportantPickerOpen(false); setConvertPickerOpen(false); }, [ctxMenu]);
 
   // Close context menu on Escape
   useEffect(() => {
@@ -3358,7 +3653,9 @@ export default function CalendarPage() {
 
   const handleEventClick = useCallback(
     (info: EventClickArg) => {
-      const extProps = info.event.extendedProps as CalendarEvent;
+      // Resolve to the DB row up front: extendedProps has no `id`, so a panel opened
+      // from a raw snapshot could not save anything.
+      const extProps = resolveEventRow(info.event.extendedProps as CalendarEvent);
       const isToggleOff = (prev: CalendarEvent | null) => prev?.google_event_id === extProps.google_event_id && prev?.id === extProps.id;
       setSelectedEvent((prev) => {
         const next = isToggleOff(prev) ? null : extProps;
@@ -3460,12 +3757,114 @@ export default function CalendarPage() {
   }, [linkEventToAccount]);
 
   /**
+   * Swap a FullCalendar `extendedProps` snapshot for the real DB row.
+   *
+   * **FullCalendar strips `id`** — it owns that prop — so anything read out of
+   * `extendedProps` has `id === undefined`. Every save path therefore needs the PK
+   * resolved from `eventsRef` by `google_event_id`. `toggleAttendance` and the Comment
+   * menu entry each did that lookup inline; doing it here, at the two points where an
+   * event enters `selectedEvent`, means the detail panel always holds a row with a real
+   * PK and no downstream consumer has to know about the quirk.
+   *
+   * Falls back to the snapshot so a synthetic overlay (`scheduled-*`, `active-timer-*`),
+   * which has no row in `events`, still opens its panel as before.
+   */
+  const resolveEventRow = useCallback((snapshot: CalendarEvent): CalendarEvent => {
+    const uid = snapshot.google_event_id;
+    const row = eventsRef.current.find(
+      (e) => (uid && e.google_event_id === uid) || (snapshot.id && e.id === snapshot.id),
+    );
+    // Merge rather than replace: extendedProps can carry render-only fields the fetched
+    // row lacks, and the row carries `id` plus any field the snapshot predates.
+    return row ? { ...snapshot, ...row } : snapshot;
+  }, []);
+
+  /**
+   * Save edits to an ordinary calendar event, and repaint the grid optimistically.
+   *
+   * Re-throws on failure so the panel can keep the form open and show its own message —
+   * closing the form on a rejected save would look like it had been accepted.
+   */
+  const saveEventDetails = useCallback(async (
+    ev: CalendarEvent,
+    patch: Partial<Pick<CalendarEvent,
+      "title" | "description" | "location" | "start_datetime" | "end_datetime" | "event_category">>,
+  ) => {
+    const row = resolveEventRow(ev);
+    const pk = row.id;
+    if (!pk) throw new Error("This event has no server record to edit.");
+
+    const uid = row.google_event_id;
+    const matches = (e: CalendarEvent) => e.id === pk || (!!uid && e.google_event_id === uid);
+    // Snapshot only the keys being changed, so a rollback cannot clobber a field that a
+    // concurrent poll updated in the meantime.
+    const previous = Object.fromEntries(
+      Object.keys(patch).map((k) => [k, row[k as keyof CalendarEvent]]),
+    ) as Partial<CalendarEvent>;
+
+    localMutationRef.current = true;
+    setEvents((prev) => prev.map((e) => (matches(e) ? { ...e, ...patch } : e)));
+    setSelectedEvent((prev) => (prev && matches(prev) ? { ...prev, ...patch } : prev));
+
+    try {
+      const { data } = await schedulerApi.updateEventDetails(pk, patch);
+      // Adopt the server's version — it normalises datetimes and is the authority on
+      // what actually persisted.
+      setEvents((prev) => prev.map((e) => (matches(e) ? { ...e, ...data } : e)));
+      setSelectedEvent((prev) => (prev && matches(prev) ? { ...prev, ...data } : prev));
+    } catch (err) {
+      setEvents((prev) => prev.map((e) => (matches(e) ? { ...e, ...previous } : e)));
+      setSelectedEvent((prev) => (prev && matches(prev) ? { ...prev, ...previous } : prev));
+      reportError("Could not save the event. Please try again.");
+      throw err;
+    }
+  }, [resolveEventRow, reportError]);
+
+  /**
+   * Change an event's type in place from the right-click menu.
+   *
+   * Only the six `EVENT_CATEGORY_CHOICES` values are valid — `action_item` is a
+   * frontend-only colorable type and would 400. Converting to an action item is a
+   * different operation entirely (`handleConvertEventToActionItem`).
+   */
+  const convertEventCategory = useCallback(async (ev: CalendarEvent, category: EventCategory) => {
+    // Swallowed: saveEventDetails already rolled back and reported the failure. Nothing
+    // further for the menu to do — it has already closed.
+    await saveEventDetails(ev, { event_category: category }).catch(() => {});
+  }, [saveEventDetails]);
+
+  /**
+   * Create an action item from an event and keep the event on the grid, linked to it.
+   *
+   * `action_item` is not an `event_category`, so this cannot be a type change — and the
+   * meeting is history worth keeping, so unlike `convertEventToActionItem` (used by
+   * MeetingDetail) the source event is not deleted.
+   */
+  const handleConvertEventToActionItem = useCallback(async (ev: CalendarEvent) => {
+    const row = resolveEventRow(ev);
+    if (!row.id) {
+      reportError("This item has no server record, so it cannot be converted.");
+      return;
+    }
+    try {
+      const { item } = await convertEventToActionItemLinked(row);
+      // Same broadcast every other create path uses, so the action-items sidebar and the
+      // Action Items page both pick the new row up without a reload.
+      window.dispatchEvent(new StorageEvent("storage", { key: "actionItemsUpdated", newValue: item.airtable_id }));
+      setEvents((prev) => prev.map((e) =>
+        e.id === row.id ? { ...e, agentpm_airtable_id: item.airtable_id } : e
+      ));
+    } catch {
+      reportError("Could not create the action item. Please try again.");
+    }
+  }, [resolveEventRow, reportError]);
+
+  /**
    * Flip a meeting between Attended and Did not attend, persisting to the server.
    *
-   * The PK has to be resolved from `eventsRef` rather than read off `ev.id`:
-   * `selectedEvent` comes from FullCalendar's `extendedProps`, and FullCalendar
-   * strips `id` (it owns that prop), so `ev.id` is undefined here. Same lookup the
-   * Comment menu entry does.
+   * Keeps its own `eventsRef` lookup: callers hand it a snapshot captured on right-click,
+   * which may predate the current status, and it needs the fetched row's `attended` value
+   * as well as its PK.
    */
   const toggleAttendance = useCallback(async (ev: CalendarEvent) => {
     const uid = ev.google_event_id;
@@ -3774,7 +4173,9 @@ export default function CalendarPage() {
       schedulerApi.updateEvent(ev.id, { start_datetime: newStart, end_datetime: newEnd })
         .catch(() => { info.revert(); })
         .finally(() => { localMutationRef.current = false; });
-      airtableApi.updateActionItemFields(ev.agentpm_airtable_id, { due_date: newStart.slice(0, 10) }).catch(() => {});
+      airtableApi.updateActionItemFields(ev.agentpm_airtable_id, { due_date: newStart.slice(0, 10) })
+        .then(() => logActionItemUpdate({ airtable_id: ev.agentpm_airtable_id, task: ev.title ?? "" } as AirtableActionItem, { due_date: newStart.slice(0, 10) }))
+        .catch(() => {});
       bustEventCache();
       return;
     }
@@ -3808,7 +4209,9 @@ export default function CalendarPage() {
     localStorage.setItem(SCHEDULED_ITEMS_KEY, JSON.stringify(items));
     setScheduledItems([...items]);
     // Keep the action item's due_date in sync with the new start date
-    airtableApi.updateActionItemFields(airtableId, { due_date: newStart.slice(0, 10) }).catch(() => {});
+    airtableApi.updateActionItemFields(airtableId, { due_date: newStart.slice(0, 10) })
+      .then(() => logActionItemUpdate({ airtable_id: airtableId, task: items[idx].task ?? "" } as AirtableActionItem, { due_date: newStart.slice(0, 10) }))
+      .catch(() => {});
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [applyMeetingReschedule, userEmail]);
 
@@ -3829,7 +4232,9 @@ export default function CalendarPage() {
       schedulerApi.updateEvent(ev.id, { start_datetime: newStart, end_datetime: newEnd })
         .catch(() => { info.revert(); })
         .finally(() => { localMutationRef.current = false; });
-      airtableApi.updateActionItemFields(ev.agentpm_airtable_id, { due_date: newStart.slice(0, 10) }).catch(() => {});
+      airtableApi.updateActionItemFields(ev.agentpm_airtable_id, { due_date: newStart.slice(0, 10) })
+        .then(() => logActionItemUpdate({ airtable_id: ev.agentpm_airtable_id, task: ev.title ?? "" } as AirtableActionItem, { due_date: newStart.slice(0, 10) }))
+        .catch(() => {});
       bustEventCache();
       return;
     }
@@ -3864,7 +4269,9 @@ export default function CalendarPage() {
     localStorage.setItem(SCHEDULED_ITEMS_KEY, JSON.stringify(items));
     setScheduledItems([...items]);
     // Keep the action item's due_date in sync with the new start date
-    airtableApi.updateActionItemFields(airtableId, { due_date: newStart.slice(0, 10) }).catch(() => {});
+    airtableApi.updateActionItemFields(airtableId, { due_date: newStart.slice(0, 10) })
+      .then(() => logActionItemUpdate({ airtable_id: airtableId, task: items[idx].task ?? "" } as AirtableActionItem, { due_date: newStart.slice(0, 10) }))
+      .catch(() => {});
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [applyMeetingReschedule, userEmail]);
 
@@ -3973,6 +4380,29 @@ export default function CalendarPage() {
   const calendarRef = useRef<FullCalendar>(null);
   const calendarWrapRef = useRef<HTMLDivElement>(null);
   const [, setGutterWidth] = useState(48);
+
+  /**
+   * Open/close the Colors panel, anchoring it under the calendar's header toolbar.
+   *
+   * The trigger is a FullCalendar `customButtons` entry, so it lives in FC's own DOM
+   * and cannot be a positioning parent for the popover. The toolbar is measured on
+   * open instead; the fallback covers jsdom, where getBoundingClientRect is all zeros.
+   */
+  const COLORS_ANCHOR_FALLBACK = { top: 72, right: 16 };
+  const [colorsAnchor, setColorsAnchor] = useState(COLORS_ANCHOR_FALLBACK);
+  const toggleColorsPanel = useCallback(() => {
+    setColorsPanelOpen((open) => {
+      if (open) return false;
+      const wrap = calendarWrapRef.current;
+      const toolbar = wrap?.querySelector<HTMLElement>(".fc-header-toolbar");
+      if (wrap && toolbar) {
+        const w = wrap.getBoundingClientRect();
+        const t = toolbar.getBoundingClientRect();
+        if (t.height > 0) setColorsAnchor({ top: t.bottom - w.top, right: Math.max(0, w.right - t.right) });
+      }
+      return true;
+    });
+  }, []);
 
   // ── Hover time tooltip ───────────────────────────────────────────────────────
   const [hoverTooltip, setHoverTooltip] = useState<{
@@ -4681,32 +5111,6 @@ export default function CalendarPage() {
         >
           {isSyncing ? "Syncing…" : "Sync Google Calendar"}
         </button>
-        {/* Colors — per-event-type palette picker */}
-        <div className="relative">
-          <button
-            onClick={() => setColorsPanelOpen((v) => !v)}
-            aria-expanded={colorsPanelOpen}
-            className={["flex items-center gap-2 rounded-full px-4 py-2 text-sm font-semibold border shadow-sm transition-colors", colorsPanelOpen ? "bg-indigo-600 border-indigo-600 text-white shadow-md" : "bg-white border-gray-300 text-[var(--twilio-navy)] hover:bg-gray-50 hover:border-indigo-300"].join(" ")}
-          >
-            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" className="w-3.5 h-3.5 shrink-0">
-              <circle cx="10" cy="10" r="7" />
-              <circle cx="10" cy="6.5" r="1.2" fill="currentColor" stroke="none" />
-              <circle cx="13.2" cy="9.4" r="1.2" fill="currentColor" stroke="none" />
-              <circle cx="7" cy="9" r="1.2" fill="currentColor" stroke="none" />
-              <circle cx="9.6" cy="13" r="1.2" fill="currentColor" stroke="none" />
-            </svg>
-            Colors
-          </button>
-          {colorsPanelOpen && (
-            <EventColorsPopover
-              colorFor={calendarColors.colorFor}
-              onSelect={calendarColors.setCategoryColor}
-              onReset={calendarColors.resetCategoryColors}
-              onClose={() => setColorsPanelOpen(false)}
-              error={calendarColors.error}
-            />
-          )}
-        </div>
         {/* Divider */}
         <div className="w-px h-5 bg-gray-300 mx-2 shrink-0" />
         <button
@@ -4742,6 +5146,7 @@ export default function CalendarPage() {
         style={{ width: ACTION_W }}
       >
         <ItemsSidebar
+          colors={calendarColors}
           onDropToast={(msg, type) => { setDropToast({ msg, type }); setTimeout(() => setDropToast(null), 3000); }}
           forceTab={
             contentView === "reminders" ? "reminders"
@@ -4784,6 +5189,8 @@ export default function CalendarPage() {
             }
             onDropAccount={(accountId, accountName) => void linkEventToAccount(accountId, accountName)}
             onUnlink={() => selectedEvent.google_event_id && void unlinkEvent(selectedEvent.google_event_id)}
+            editRequestId={eventEditRequestId}
+            onUpdateEvent={isCommentableEvent(selectedEvent) ? (patch) => saveEventDetails(selectedEvent, patch) : undefined}
             onRemove={
               selectedEvent.google_event_id?.startsWith("scheduled-") ||
               selectedEvent.google_event_id?.startsWith("active-timer-") ||
@@ -4806,6 +5213,7 @@ export default function CalendarPage() {
               setSelectedActionItem((prev) => prev ? { ...prev, ...patch } : prev);
               try {
                 await airtableApi.updateActionItemFields(selectedActionItem.airtable_id, patch);
+                logActionItemUpdate(selectedActionItem, patch);
                 window.dispatchEvent(new StorageEvent("storage", { key: "actionItemsUpdated", newValue: "1" }));
                 // Update event title in calendar if task name changed
                 if (patch.task && selectedEvent) {
@@ -4938,9 +5346,12 @@ export default function CalendarPage() {
               </div>
 
               {/* 1. Edit — open event detail panel */}
+              {/* `ev` is the right-click snapshot from extendedProps, which has no `id` —
+                  resolve it so the panel that opens can actually save. */}
               {menuBtn("Edit", "✏️", () => {
-                setSelectedEvent(ev);
+                setSelectedEvent(resolveEventRow(ev));
                 setMeetingPanelCollapsed(false);
+                setEventEditRequestId((n) => n + 1);
               })}
 
               {/* 1b. Comment */}
@@ -4968,6 +5379,70 @@ export default function CalendarPage() {
                 didNotAttend(liveEv) ? "Mark as attended" : "Mark as did not attend",
                 didNotAttend(liveEv) ? "✅" : "🚫",
                 () => void toggleAttendance(liveEv),
+              )}
+
+              {/* 1b-iii. Convert to — change the event's type, or spin off an action item.
+                   Expands inline for the same reason "Mark as important!" below does: this
+                   menu is hand-rolled and has no submenu support.
+
+                   Meetings only. A `scheduled-*` overlay or an active timer has no
+                   CalendarEvent row, so there is nothing to PATCH — the numeric id in its
+                   uid belongs to a Reminder or an action item. Same gate as Comment. */}
+              {isMeeting && (
+                <>
+                  <button
+                    className="w-full text-left px-3 py-2 text-[13px] flex items-center gap-2.5 transition-colors rounded-lg text-gray-700 hover:bg-gray-100"
+                    onClick={() => setConvertPickerOpen((v) => !v)}
+                    aria-expanded={convertPickerOpen}
+                  >
+                    <span className="text-[15px] leading-none w-4 text-center">🔀</span>
+                    Convert to…
+                  </button>
+                  {convertPickerOpen && (
+                    <div className="px-2 pb-1.5 flex flex-col gap-1.5">
+                      <div className="flex flex-wrap gap-1">
+                        {EVENT_CATEGORY_META.map((c) => {
+                          const active = (liveEv.event_category || "meeting") === c.id;
+                          const fill = calendarColors.colorFor(c.id);
+                          return (
+                            <button
+                              key={c.id}
+                              data-convert-category={c.id}
+                              aria-pressed={active}
+                              title={`Convert to ${c.label}`}
+                              onClick={() => {
+                                setConvertPickerOpen(false);
+                                setCtxMenu(null);
+                                if (!active) void convertEventCategory(liveEv, c.id);
+                              }}
+                              className={[
+                                "px-2 py-0.5 rounded-full text-[11px] font-medium border transition-colors",
+                                active ? "" : "bg-white border-gray-200 text-gray-600 hover:border-gray-300",
+                              ].join(" ")}
+                              style={active ? { backgroundColor: fill, borderColor: borderFor(fill), color: readableTextColor(fill) } : undefined}
+                            >
+                              {c.icon} {c.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      {/* Not a category — `action_item` is not in EVENT_CATEGORY_CHOICES, so
+                          this creates a record instead of changing a field. The meeting is
+                          kept: it is history, and a follow-up task shouldn't erase it. */}
+                      <button
+                        data-convert-action-item
+                        onClick={() => {
+                          setConvertPickerOpen(false);
+                          setCtxMenu(null);
+                          void handleConvertEventToActionItem(liveEv);
+                        }}
+                        className="w-full text-left px-1 py-1 text-[12px] text-indigo-600 hover:text-indigo-800 transition-colors"
+                      >
+                        ✦ Action item — keeps this event
+                      </button>
+                    </div>
+                  )}
+                </>
               )}
 
               {/* 1c. Mark as important! — per-event color from the 90s palette.
@@ -5208,7 +5683,21 @@ export default function CalendarPage() {
 
         {/* Calendar — takes full available width */}
         <div className="relative">
-        <div ref={calendarWrapRef} className="bg-white rounded-lg border border-gray-200 shadow-sm p-4" data-content-view={contentView}>
+        {/* Colors — per-event-type palette picker, anchored under the toolbar's
+            right-hand button row where its trigger lives. */}
+        {colorsPanelOpen && (
+          <div className="absolute z-40" style={{ top: colorsAnchor.top, right: colorsAnchor.right }}>
+            <EventColorsPopover
+              colorFor={calendarColors.colorFor}
+              onSelect={calendarColors.setCategoryColor}
+              onReset={calendarColors.resetCategoryColors}
+              onClose={() => setColorsPanelOpen(false)}
+              error={calendarColors.error}
+              ignoreSelector=".fc-colorsButton-button"
+            />
+          </div>
+        )}
+        <div ref={calendarWrapRef} className="bg-white rounded-lg border border-gray-200 shadow-sm p-4" data-content-view={contentView} data-colors-open={colorsPanelOpen}>
           <style>{`
             /* Base colour for all toolbar buttons */
             .fc .fc-button {
@@ -5241,6 +5730,12 @@ export default function CalendarPage() {
             [data-content-view="action-items"] .fc-viewActionItems-button,
             [data-content-view="reminders"] .fc-viewReminders-button,
             [data-content-view="accounts"] .fc-viewAccounts-button {
+              background-color: #1f2937 !important;
+              border-color: #1f2937 !important;
+              color: #fff !important;
+            }
+            /* Colors button active state — the panel is open */
+            [data-colors-open="true"] .fc-colorsButton-button {
               background-color: #1f2937 !important;
               border-color: #1f2937 !important;
               color: #fff !important;
@@ -5289,11 +5784,15 @@ export default function CalendarPage() {
                 text: "Accounts",
                 click: () => { setContentView("accounts"); setAccountPanelOpen(true); },
               },
+              colorsButton: {
+                text: "Colors",
+                click: toggleColorsPanel,
+              },
             }}
             headerToolbar={{
               left: "prev,next today",
               center: "title",
-              right: "viewAll,viewMeetings,viewActionItems,viewReminders,viewAccounts toggleWeekends dayGridMonth,timeGridWeek,timeGridDay",
+              right: "viewAll,viewMeetings,viewActionItems,viewReminders,viewAccounts toggleWeekends dayGridMonth,timeGridWeek,timeGridDay colorsButton",
             }}
             events={filteredEvents.map((e) => {
               const base = toFullCalendarEvent(e, calendarColors);

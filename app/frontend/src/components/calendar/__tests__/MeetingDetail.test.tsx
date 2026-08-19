@@ -165,3 +165,116 @@ describe("MeetingDetail — Enter adds a meeting note", () => {
     await waitFor(() => expect(calls).toBe(1));
   });
 });
+
+// ── Meeting summary: Gong / Zoom parity ───────────────────────────────────────
+
+/**
+ * MeetingDetail keeps its *own* copy of the meeting-summary panel (a fourth, after the
+ * shared one, AccountDetailPage's local one, and the account SidePanel). It was Gong-only
+ * — a meeting whose notes came from Zoom read as empty on the calendar page even though
+ * the notes were stored. These pin the toggle and the per-provider save on this copy.
+ */
+describe("MeetingDetail — meeting summary provider toggle", () => {
+  const GONG_NOTES = "Recap\n- Gong said pricing";
+  const ZOOM_NOTES = "Recap\n- Zoom said rollout";
+
+  /** MeetingSummarySection re-reads the meeting through the match endpoint. */
+  function serveMatch(overrides: { gong_notes?: string; zoom_notes?: string }) {
+    server.use(
+      http.post("/api/v1/airtable/match/", () =>
+        HttpResponse.json({
+          matched: true,
+          account: { id: 1, name: "Acme Corp" },
+          this_meeting: {
+            id: 7, airtable_id: "recMTG007", name: "Q3 Review", date: null,
+            duration: 0, expected_topics: "", gong_notes: "", gong_url: "",
+            zoom_notes: "", zoom_url: "", customer_slack: "", account_team_slack: "",
+            last_synced: "", account: 1, account_name: "Acme Corp",
+            ...overrides,
+          },
+        })
+      )
+    );
+  }
+
+  beforeEach(() => {
+    localStorage.clear();
+    vi.stubGlobal("WebSocket", FakeSocket);
+    registerHandlers();
+  });
+
+  it("shows the Gong notes and marks Gong active", async () => {
+    serveMatch({ gong_notes: GONG_NOTES });
+    renderDetail();
+
+    expect(await screen.findByText("Gong said pricing")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Gong" })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("opens on Zoom when only Zoom has notes", async () => {
+    serveMatch({ zoom_notes: ZOOM_NOTES });
+    renderDetail();
+
+    expect(await screen.findByText("Zoom said rollout")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Zoom" })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("swaps the rendered bullets when the toggle is clicked", async () => {
+    serveMatch({ gong_notes: GONG_NOTES, zoom_notes: ZOOM_NOTES });
+    renderDetail();
+
+    await screen.findByText("Gong said pricing");
+    fireEvent.click(screen.getByRole("button", { name: "Zoom" }));
+
+    expect(await screen.findByText("Zoom said rollout")).toBeInTheDocument();
+    expect(screen.queryByText("Gong said pricing")).not.toBeInTheDocument();
+  });
+
+  it("saves a paste to the zoom-notes endpoint while Zoom is active", async () => {
+    const hits: string[] = [];
+    serveMatch({ gong_notes: GONG_NOTES });
+    server.use(
+      http.patch("/api/v1/airtable/meetings/:id/zoom-notes/", async ({ request }) => {
+        const body = await request.json() as { zoom_notes: string };
+        hits.push(body.zoom_notes);
+        return HttpResponse.json({ id: 7, zoom_notes: body.zoom_notes });
+      }),
+      http.patch("/api/v1/airtable/meetings/:id/gong-notes/", () => {
+        throw new Error("a Zoom paste must not overwrite gong_notes");
+      })
+    );
+
+    renderDetail();
+    await screen.findByText("Gong said pricing");
+    fireEvent.click(screen.getByRole("button", { name: "Zoom" }));
+
+    const box = await screen.findByPlaceholderText(/Zoom AI Companion summary/i);
+    fireEvent.change(box, { target: { value: "- Pasted a Zoom recap" } });
+    fireEvent.click(screen.getByRole("button", { name: /Parse & Save/i }));
+
+    await waitFor(() => expect(hits).toEqual(["- Pasted a Zoom recap"]));
+  });
+
+  it("Clear only clears the active provider", async () => {
+    const cleared: string[] = [];
+    serveMatch({ gong_notes: GONG_NOTES, zoom_notes: ZOOM_NOTES });
+    server.use(
+      http.patch("/api/v1/airtable/meetings/:id/zoom-notes/", async ({ request }) => {
+        const body = await request.json() as { zoom_notes: string };
+        cleared.push(`zoom:${body.zoom_notes}`);
+        return HttpResponse.json({ id: 7, zoom_notes: "" });
+      }),
+      http.patch("/api/v1/airtable/meetings/:id/gong-notes/", () => {
+        throw new Error("clearing Zoom must not touch gong_notes");
+      })
+    );
+
+    renderDetail();
+    await screen.findByText("Gong said pricing");
+    fireEvent.click(screen.getByRole("button", { name: "Zoom" }));
+    await screen.findByText("Zoom said rollout");
+    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+
+    await waitFor(() => expect(cleared).toEqual(["zoom:"]));
+  });
+});

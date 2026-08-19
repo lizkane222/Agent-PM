@@ -90,7 +90,7 @@ export function getLogsForResource(type: LogResource["type"], id: number | strin
  */
 export async function syncLogsFromBackend(): Promise<void> {
   try {
-    const resp = await realtimeApi.listActivity();
+    const resp = await realtimeApi.listActivity({ page_size: 500 });
     const remote = resp.data.results ?? [];
     const existing = readAll();
     const existingIds = new Set(existing.map((e) => e.id));
@@ -102,7 +102,7 @@ export async function syncLogsFromBackend(): Promise<void> {
       // Only restore frontend-originated events (those with a client_id and a frontend category)
       if (!clientId || existingIds.has(clientId)) continue;
       const category = ev.event_type as LogCategory;
-      if (!["account", "team", "action_item", "calendar"].includes(category)) continue;
+      if (!["account", "team", "action_item", "calendar", "comment_reply"].includes(category)) continue;
       const meta = ev.metadata as { links?: { label: string; path: string }[]; resource?: LogResource };
       restored.push({
         id: clientId,

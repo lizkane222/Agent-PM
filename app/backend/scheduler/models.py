@@ -65,6 +65,11 @@ class CalendarEvent(models.Model):
     agentpm_airtable_id = models.CharField(max_length=255, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    # Rich references: list of {resource_type, resource_id, label, url} objects added via @# trigger
+    references = models.JSONField(
+        default=list,
+        help_text="Records referenced via @# picker: [{resource_type, resource_id, label, url}]",
+    )
 
     class Meta:
         ordering = ["start_datetime"]

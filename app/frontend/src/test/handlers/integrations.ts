@@ -5,7 +5,9 @@ import type { MeetingNotesEmailReport } from "../../lib/api";
 /** Default: a scan that found nothing. Tests override with server.use() for hits. */
 export const mockMeetingNotesReport: MeetingNotesEmailReport = {
   days: 30,
+  account: "",
   account_name: "",
+  scoped_to_account: false,
   scanned_emails: 0,
   scanned_meetings: 0,
   updated: [],
@@ -13,6 +15,10 @@ export const mockMeetingNotesReport: MeetingNotesEmailReport = {
   errors: [],
   summaries_truncated: false,
   max_summaries: 25,
+  no_summary_in_email: 0,
+  recordings_linked: 0,
+  scanned_unlinked_events: 0,
+  meetings_created: 0,
 };
 
 export const mockGmailCredential = {

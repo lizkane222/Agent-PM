@@ -13,6 +13,8 @@ import { realtimeHandlers } from "./handlers/realtime";
 import { syncReviewHandlers } from "./handlers/sync_review";
 import { accountFeedHandlers } from "./handlers/account_feed";
 import { searchHandlers } from "./handlers/search";
+import { layoutsHandlers } from "./handlers/layouts";
+import { skillsHandlers } from "./handlers/skills";
 
 export const server = setupServer(
   ...schedulerHandlers,
@@ -29,4 +31,6 @@ export const server = setupServer(
   ...syncReviewHandlers,
   ...accountFeedHandlers,
   ...searchHandlers,
+  ...layoutsHandlers,
+  ...skillsHandlers,
 );

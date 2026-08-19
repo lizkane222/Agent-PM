@@ -137,9 +137,13 @@ class UserProfileSerializer(serializers.ModelSerializer):
 
         from scheduler.models import CalendarEvent
 
-        # Action items are not an event_category — they are identified by
-        # calendar_id="work_tracking" — but they are still a colorable type.
-        valid_types = {v for v, _label in CalendarEvent.EVENT_CATEGORY_CHOICES} | {"action_item"}
+        # Action items and reminders are not event_category values — action items are
+        # identified by calendar_id="work_tracking" and reminders by a
+        # "scheduled-reminder-*" uid — but both are colorable types.
+        valid_types = (
+            {v for v, _label in CalendarEvent.EVENT_CATEGORY_CHOICES}
+            | {"action_item", "reminder"}
+        )
 
         for key, cap in (("categories", None), ("important", self.IMPORTANT_COLOR_LIMIT)):
             section = value.get(key)

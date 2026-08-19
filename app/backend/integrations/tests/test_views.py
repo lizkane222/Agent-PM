@@ -607,6 +607,51 @@ class MeetingNotesFromEmailViewTest(APITestCase):
         self.assertEqual(kwargs["account_name"], "Acme Corp")
 
     @patch("integrations.meeting_notes.sync_meeting_notes_from_email")
+    def test_passes_the_account_identifier_through(self, mock_sync):
+        """The account detail page scopes by rec* id; profile/role pages send neither."""
+        mock_sync.return_value = {
+            "days": 30, "account": "recACME001", "account_name": "Acme Corp",
+            "scoped_to_account": True, "scanned_emails": 0, "scanned_meetings": 0,
+            "updated": [], "skipped": [], "errors": [], "summaries_truncated": False,
+            "max_summaries": 25,
+        }
+
+        self.client.post(
+            self.URL, {"account": "recACME001", "account_name": "Acme Corp"}, format="json"
+        )
+
+        kwargs = mock_sync.call_args.kwargs
+        self.assertEqual(kwargs["account"], "recACME001")
+        self.assertEqual(kwargs["account_name"], "Acme Corp")
+
+    @patch("integrations.meeting_notes.sync_meeting_notes_from_email")
+    def test_omitting_the_account_scans_everything(self, mock_sync):
+        mock_sync.return_value = {
+            "days": 30, "account": "", "account_name": "", "scoped_to_account": False,
+            "scanned_emails": 0, "scanned_meetings": 0, "updated": [], "skipped": [],
+            "errors": [], "summaries_truncated": False, "max_summaries": 25,
+        }
+
+        self.client.post(self.URL, {}, format="json")
+
+        kwargs = mock_sync.call_args.kwargs
+        self.assertEqual(kwargs["account"], "")
+        self.assertEqual(kwargs["account_name"], "")
+
+    @patch("integrations.meeting_notes.sync_meeting_notes_from_email")
+    def test_numeric_account_pk_is_coerced_to_string(self, mock_sync):
+        """A JSON body can send the PK as a number; the resolver expects a string."""
+        mock_sync.return_value = {
+            "days": 30, "account": "12", "account_name": "", "scoped_to_account": True,
+            "scanned_emails": 0, "scanned_meetings": 0, "updated": [], "skipped": [],
+            "errors": [], "summaries_truncated": False, "max_summaries": 25,
+        }
+
+        self.client.post(self.URL, {"account": 12}, format="json")
+
+        self.assertEqual(mock_sync.call_args.kwargs["account"], "12")
+
+    @patch("integrations.meeting_notes.sync_meeting_notes_from_email")
     def test_days_is_clamped_to_the_ceiling(self, mock_sync):
         mock_sync.return_value = {
             "days": 180, "account_name": "", "scanned_emails": 0, "scanned_meetings": 0,
@@ -642,3 +687,42 @@ class MeetingNotesFromEmailViewTest(APITestCase):
         self.assertIn("detail", resp.json())
         # The upstream message is not leaked to the client.
         self.assertNotIn("exploded", resp.json()["detail"])
+
+
+# ── Gmail Watch ─────────────────────────────────────────────────────────────
+
+class GmailWatchViewTest(APITestCase):
+    URL = "/api/v1/integrations/gmail/watch/"
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="watcher", email="watcher@example.com", password="pw"
+        )
+
+    def test_unauthenticated_returns_401(self):
+        resp = self.client.post(self.URL)
+
+        self.assertEqual(resp.status_code, 401)
+
+    @patch("integrations.tasks.register_gmail_watch.delay")
+    def test_queues_the_task_for_the_current_user(self, mock_delay):
+        self.client.force_authenticate(user=self.user)
+
+        resp = self.client.post(self.URL)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("detail", resp.json())
+        mock_delay.assert_called_once_with(self.user.id)
+
+    @patch("integrations.tasks.register_gmail_watch.delay")
+    def test_broker_failure_returns_503_not_500(self, mock_delay):
+        mock_delay.side_effect = RuntimeError("[Errno 111] Connection refused")
+        self.client.force_authenticate(user=self.user)
+
+        resp = self.client.post(self.URL)
+
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(
+            resp.json()["detail"],
+            "Failed to register watch. Check that Celery is running.",
+        )

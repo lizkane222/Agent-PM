@@ -7,6 +7,7 @@ import CommentPreviewList from "../components/comments/CommentPreviewList";
 import { useCommentMenuItem } from "../components/comments/commentMenuItem";
 import type { ActionItemAttachment, ActionItemDependency, AirtableActionItem, AirtableAccount, CalendarEvent, TeamMember, UserProfile } from "../types";
 import { addLog } from "../lib/appLog";
+import { logActionItemUpdate } from "../lib/actionItemLog";
 import { convertActionItemToEvent, restoreConversion } from "../hooks/useConvert";
 import { useLogGlow } from "../hooks/useLogGlow";
 import { useScheduledOccurrences } from "../hooks/useScheduledOccurrences";
@@ -55,6 +56,8 @@ import {
 import { useCardCollapse } from "../hooks/useCardCollapse";
 import ActivityLogSection from "../components/ActivityLogSection";
 import RichTextMentionEditor from "../components/shared/RichTextMentionEditor";
+import UrlPillInput from "../components/shared/UrlPillInput";
+import { useSlackLinkAutosave } from "../hooks/useSlackLinkAutosave";
 
 // Unified account shape used in the kanban accounts zone.
 // Airtable accounts get prefix "at-", app accounts get prefix "app-".
@@ -93,6 +96,36 @@ const STATUS_COLORS: Record<string, string> = {
 // recXXX, so a pin recorded against one would be orphaned forever. Never offer to pin them.
 function canPinItem(item: AirtableActionItem): boolean {
   return !item.airtable_id.startsWith("local-");
+}
+
+/**
+ * How long to wait before a background refresh triggered by an `actionItemsUpdated`
+ * broadcast actually runs, so a burst from one user action collapses into a single reload.
+ */
+const SILENT_RELOAD_DEBOUNCE_MS = 250;
+
+/**
+ * Compare two action-item field values, treating `null` / `undefined` / `""` as the same.
+ *
+ * Airtable hands back `""` where the app writes `null`, so a strict compare reports every
+ * already-cleared field as changed — which would fire a redundant PATCH on every drop onto
+ * the account a card is already filed under.
+ */
+function sameFieldValue(a: unknown, b: unknown): boolean {
+  const norm = (v: unknown) => (v === null || v === undefined || v === "" ? null : v);
+  return norm(a) === norm(b);
+}
+
+/**
+ * Clear a row's drag highlight only when the pointer has really left it.
+ *
+ * `dragleave` bubbles from every child, so a bare handler fires as the cursor crosses from
+ * the account label into the card strip and back — flipping the shared `dragOverZone` to
+ * null and re-rendering the whole page on each crossing. That reads as an unresponsive drop
+ * target and, with a tree this size, can cost the `drop` event itself.
+ */
+function leftElement(e: React.DragEvent): boolean {
+  return !e.currentTarget.contains(e.relatedTarget as Node | null);
 }
 
 function fmtTime(seconds: number): string {
@@ -261,20 +294,8 @@ function PillUrl({ value, onChange }: {
   onChange: (v: string) => void;
 }) {
   const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLInputElement>(null);
-  useEffect(() => { if (open) ref.current?.focus(); }, [open]);
   if (open) {
-    return (
-      <input
-        ref={ref}
-        type="url"
-        defaultValue={value ?? ""}
-        onBlur={(e) => { onChange(e.target.value); setOpen(false); }}
-        onClick={(e) => e.stopPropagation()}
-        placeholder="https://…"
-        className="w-40 rounded-full border border-indigo-400 bg-white px-2.5 py-0.5 text-[12px] font-semibold focus:outline-none"
-      />
-    );
+    return <UrlPillInput value={value} onCommit={(v) => { onChange(v); setOpen(false); }} onCancel={() => setOpen(false)} />;
   }
   if (value) {
     return (
@@ -318,6 +339,8 @@ function ActionItemFields({
   teamMembers = [],
   accounts = [],
   afterDetails,
+  autosaveTarget,
+  onAutosaved,
 }: {
   form: Partial<AirtableActionItem>;
   onChange: (updated: Partial<AirtableActionItem>) => void;
@@ -328,8 +351,14 @@ function ActionItemFields({
   /** Rendered as its own section directly below the description. The expanded modal puts
    *  the checklist here; inline cards leave it empty. */
   afterDetails?: React.ReactNode;
+  /** The saved item these fields edit, when there is one. Only the Slack pill uses it, to
+   *  persist a pasted link without waiting for Save — see hooks/useSlackLinkAutosave.ts.
+   *  Omitted by create forms, which have no record to patch yet. */
+  autosaveTarget?: AirtableActionItem;
+  onAutosaved?: (updated: AirtableActionItem) => void;
 }) {
   const { status: statusOptions } = useActionItemFieldOptions();
+  const autosaveSlackLink = useSlackLinkAutosave();
   const assigneeName = form.assignee_name || (form.assignee_airtable_id ? form.assignee_airtable_id : "");
   const memberNames = ["Unassigned", ...teamMembers.map((m) => m.full_name)] as string[];
 
@@ -384,7 +413,13 @@ function ActionItemFields({
         <PillNumber value={form.estimated_time} label="Est." onChange={(v) => onChange({ estimated_time: v ?? 0 })} />
         <PillNumber value={form.time_spent} label="Spent" onChange={(v) => onChange({ time_spent: v ?? 0 })} />
         <PillNumber value={form.prep_time} label="Prep" onChange={(v) => onChange({ prep_time: v ?? 0 })} />
-        <PillUrl value={form.slack_thread_url} onChange={(v) => onChange({ slack_thread_url: v })} />
+        <PillUrl
+          value={form.slack_thread_url}
+          onChange={(v) => {
+            onChange({ slack_thread_url: v });
+            if (autosaveTarget) autosaveSlackLink(autosaveTarget, v, onAutosaved);
+          }}
+        />
       </div>
 
       {/* Assignee */}
@@ -1046,6 +1081,8 @@ function CardModal({
         <ActionItemFields
           form={form}
           onChange={(patch) => setForm((f) => ({ ...f, ...patch }))}
+          autosaveTarget={item}
+          onAutosaved={onUpdated}
           teamMembers={teamMembers}
           accounts={accounts}
           // Its own section immediately below the description. Real Airtable items only —
@@ -1540,6 +1577,8 @@ function KanbanCard({
   const { addToTray } = useExportTray();
   const { isPinned, toggle: toggleFocusPin } = useFocusPins();
   const { isCollapsed: isCardCollapsed, toggle: toggleCardCollapse } = useCardCollapse();
+  // A pasted Slack link saves on its own — see hooks/useSlackLinkAutosave.ts.
+  const autosaveSlackLink = useSlackLinkAutosave();
   const [ctxPos, setCtxPos] = useState<{ x: number; y: number } | null>(null);
 
   // Never pin a local-* blank — promoteBlankItem discards that id for a real recXXX.
@@ -1786,7 +1825,10 @@ function KanbanCard({
           <PillNumber value={form.estimated_time} label="Est." onChange={(v) => setForm((f) => ({ ...f, estimated_time: v ?? 0 }))} />
           <PillNumber value={form.time_spent} label="Spent" onChange={(v) => setForm((f) => ({ ...f, time_spent: v ?? 0 }))} />
           <PillNumber value={form.prep_time} label="Prep" onChange={(v) => setForm((f) => ({ ...f, prep_time: v ?? 0 }))} />
-          <PillUrl value={form.slack_thread_url} onChange={(v) => setForm((f) => ({ ...f, slack_thread_url: v }))} />
+          <PillUrl
+            value={form.slack_thread_url}
+            onChange={(v) => { setForm((f) => ({ ...f, slack_thread_url: v })); autosaveSlackLink(item, v, onUpdated); }}
+          />
           {teamMembers.length > 0 && (
             <PillSelect
               value={(assigneeName || "Unassigned") as string}
@@ -1954,6 +1996,8 @@ function KanbanCard({
           <ActionItemFields
             form={form}
             onChange={(patch) => setForm((f) => ({ ...f, ...patch }))}
+            autosaveTarget={item}
+            onAutosaved={onUpdated}
             teamMembers={teamMembers}
             accounts={accounts}
             hideTask
@@ -2220,6 +2264,28 @@ function GroupCounts({ items }: { items: AirtableActionItem[] }) {
   );
 }
 
+/**
+ * "Drop here" affordance filling the body of a collapsed account row.
+ *
+ * A collapsed row has always accepted drops — it just gave no sign of it, so filing a card
+ * under an account you had folded away meant aiming at a 40px strip on faith. Rendered only
+ * while a card is actually in the air, so the resting grid is unchanged.
+ */
+function CollapsedRowDropHint({ active, dragInFlight, name }: { active: boolean; dragInFlight: boolean; name: string }) {
+  if (!dragInFlight) return <div className="flex-1" />;
+  return (
+    <div data-testid="collapsed-drop-hint" className="flex-1 flex items-center px-3 py-2 min-w-0">
+      <span
+        className={`text-[11px] font-semibold rounded-md border border-dashed px-2 py-1 truncate transition-colors ${
+          active ? "border-indigo-400 text-indigo-600 bg-indigo-50" : "border-gray-300 text-[var(--twilio-gray-60)]"
+        }`}
+      >
+        {active ? `Drop to file under ${name}` : "Drop here"}
+      </span>
+    </div>
+  );
+}
+
 // Insertion marker shown between cards while dragging inside a hand-ordered zone.
 // Sits in the container's existing gap, so showing it reflows nothing.
 function DropIndicator() {
@@ -2268,6 +2334,7 @@ function DropZone({
   onRestoreToViews,
   externalDragId,
   onExternalDropWithStatus,
+  onAccountDrop,
   focusMode,
   reorderable,
   dragId,
@@ -2316,6 +2383,9 @@ function DropZone({
   // The airtable_id being dragged from outside this zone (so status columns can accept external drops)
   externalDragId?: string | null;
   onExternalDropWithStatus?: (airtableId: string, status: AirtableActionItem["status"]) => void;
+  /** File the dragged card under an account without touching its zone. Used by the Projects
+   *  view's per-group drop targets; `"none"` clears the account. */
+  onAccountDrop?: (e: React.DragEvent, accountKey: string) => void;
   /** Focus mode is on. Pinned items are hoisted into the Pinned In Progress section, so
    *  the accounts grid shows them as ghosts instead of full cards. */
   focusMode?: boolean;
@@ -2486,10 +2556,12 @@ function DropZone({
           <div className="flex-1 p-4 overflow-auto">
             <ProjectsView
               items={viewItems}
+              accounts={accounts ?? []}
               onExpand={onExpand}
               onSave={onSaveFieldsOnly ?? onSave}
               externalDragId={externalDragId}
               onExternalDrop={onExternalDropWithStatus}
+              onAccountDrop={onAccountDrop}
               onDragStart={onDragStart}
               onDragEnd={onDragLeave}
             />
@@ -2511,7 +2583,7 @@ function DropZone({
               <div
                 className={`flex flex-col border-b border-gray-100 transition-colors ${isAccOver ? "bg-indigo-50" : "hover:bg-gray-50"}`}
                 onDragOver={(e) => onDragOver(e, zoneKey)}
-                onDragLeave={onDragLeave}
+                onDragLeave={(e) => { if (leftElement(e)) onDragLeave(); }}
                 onDrop={(e) => onDrop(e, "accounts", "none")}
               >
                 <div className="flex items-stretch">
@@ -2526,6 +2598,7 @@ function DropZone({
                     </button>
                     {rowCollapsed && <div className="mt-1 pl-4"><GroupCounts items={[...noAccItems, ...noAccCompleted]} /></div>}
                   </div>
+                  {rowCollapsed && <CollapsedRowDropHint active={isAccOver} dragInFlight={!!externalDragId} name="No Account" />}
                   {!rowCollapsed && <>
                   <div className="flex-1 overflow-x-auto">
                     <div className="flex flex-row gap-2 p-2 min-w-0">
@@ -2619,7 +2692,7 @@ function DropZone({
                 key={acc.key}
                 className={`flex flex-col border-b border-gray-100 transition-colors ${isAccOver ? "bg-indigo-50" : "hover:bg-gray-50"}`}
                 onDragOver={(e) => onDragOver(e, zoneKey)}
-                onDragLeave={onDragLeave}
+                onDragLeave={(e) => { if (leftElement(e)) onDragLeave(); }}
                 onDrop={(e) => onDrop(e, "accounts", acc.key)}
               >
                 <div className="flex items-stretch">
@@ -2645,6 +2718,7 @@ function DropZone({
                       ? <div className="mt-1 pl-5"><GroupCounts items={[...accItems, ...accCompleted]} /></div>
                       : acc.source === "airtable" && <span className="text-[10px] text-[var(--twilio-gray-60)] mt-0.5 pl-5">Airtable</span>}
                   </div>
+                  {rowCollapsed && <CollapsedRowDropHint active={isAccOver} dragInFlight={!!externalDragId} name={acc.name} />}
                   {!rowCollapsed && <>
                   {/* Cards scrolling horizontally */}
                   <div className="flex-1 overflow-x-auto">
@@ -2959,6 +3033,8 @@ function StatusBoardView({
   onSave,
   externalDragId,
   onExternalDrop,
+  accountKey,
+  onAccountDrop,
   onDragStart: onOuterDragStart,
   onDragEnd: onOuterDragEnd,
 }: {
@@ -2970,6 +3046,14 @@ function StatusBoardView({
   teamMembers: TeamMember[];
   externalDragId?: string | null;
   onExternalDrop?: (airtableId: string, status: AirtableActionItem["status"]) => void;
+  /**
+   * The account this board belongs to, when it is one group of the Projects view. A column
+   * drop then means "this status **and** this account", so a card dragged in from another
+   * group lands where it was dropped. Omitted by the ungrouped Status view, which leaves
+   * account assignment alone.
+   */
+  accountKey?: string;
+  onAccountDrop?: (e: React.DragEvent, accountKey: string) => void;
   onDragStart?: (e: React.DragEvent, item: AirtableActionItem) => void;
   onDragEnd?: () => void;
 }) {
@@ -2994,8 +3078,15 @@ function StatusBoardView({
     return localStatus[item.airtable_id] ?? item.status;
   }
 
-  async function handleDrop(col: AirtableActionItem["status"]) {
+  async function handleDrop(col: AirtableActionItem["status"], e?: React.DragEvent) {
     setOverCol(null);
+
+    // A local `dragId` means the drag started on this board, so the card is already filed
+    // under this account. Anything else came from outside — another account's group, Stage
+    // Today, Currently Tracking — and a grouped board files it under its own account as well
+    // as setting the status. Without this the card's status changed but its account did not,
+    // so it snapped straight back to the group it was dragged out of.
+    if (accountKey && !dragId && e) onAccountDrop?.(e, accountKey);
 
     // External drag (from Stage Today / In Progress) takes priority
     if (externalDragId && !dragId) {
@@ -3029,7 +3120,7 @@ function StatusBoardView({
             style={{ minWidth: 280, border: isOver ? "1.5px solid #818cf8" : "1px solid #e5e7eb", maxHeight: "calc(100vh - 200px)" }}
             onDragOver={(e) => { e.preventDefault(); setOverCol(col); }}
             onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setOverCol(null); }}
-            onDrop={(e) => { e.stopPropagation(); void handleDrop(col); }}
+            onDrop={(e) => { e.stopPropagation(); void handleDrop(col, e); }}
           >
             <div className="flex items-center gap-2 px-4 py-3 border-b border-gray-100 shrink-0">
               <span className="text-sm font-semibold text-[var(--twilio-navy)]">{col}</span>
@@ -3113,7 +3204,7 @@ function StatusBoardView({
               }}
               onDragOver={(e) => { e.preventDefault(); setOverCol(col); }}
               onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setOverCol(null); }}
-              onDrop={(e) => { e.stopPropagation(); void handleDrop(col); }}
+              onDrop={(e) => { e.stopPropagation(); void handleDrop(col, e); }}
             >
               <div className="flex items-center gap-2 px-4 py-3 border-b border-gray-100 shrink-0">
                 <span className={`text-sm font-semibold ${col === "Blocked" ? "text-red-700" : "text-slate-600"}`}>{col}</span>
@@ -3341,38 +3432,105 @@ function DueDateView({
 
 // ── Projects view ─────────────────────────────────────────────────────────────
 
+/** One account group in the Projects view. */
+interface ProjectGroup {
+  /** React key. */
+  key: string;
+  displayName: string;
+  /** Key into the shared collapse store. */
+  groupKey: string;
+  /** Account key to file a dropped card under, or `null` if the group is not a drop target. */
+  accountKey: string | null;
+  items: AirtableActionItem[];
+  /** The group's name matches no known account, so cards can't be filed into it. */
+  unmatched?: boolean;
+}
+
 function ProjectsView({
   items,
+  accounts,
   onExpand,
   onSave,
   externalDragId,
   onExternalDrop,
+  onAccountDrop,
   onDragStart,
   onDragEnd,
 }: {
   items: AirtableActionItem[];
+  accounts: KanbanAccount[];
   onExpand: (item: AirtableActionItem) => void;
   onSave: (item: AirtableActionItem, fields: Partial<AirtableActionItem>) => Promise<void>;
   externalDragId?: string | null;
   onExternalDrop?: (airtableId: string, status: AirtableActionItem["status"]) => void;
+  /** File the dragged card under an account. `"none"` clears the account. */
+  onAccountDrop?: (e: React.DragEvent, accountKey: string) => void;
   onDragStart?: (e: React.DragEvent, item: AirtableActionItem) => void;
   onDragEnd?: () => void;
 }) {
-  // Collect unique account names, "No Account" last
-  const accountGroups = useMemo(() => {
-    const map = new Map<string, AirtableActionItem[]>();
+  /**
+   * One group per known account — including accounts with no items — so every account is a
+   * drop target. Without the empty ones a card could only ever be moved to an account that
+   * already had work on it, which is backwards: filing the first item under an account is
+   * exactly when you need the target.
+   *
+   * `accounts` arrives alphabetised from the page, so groups keep their previous order and
+   * stay in step with the Views grid. "No Account" is last, as before.
+   */
+  const accountGroups = useMemo<ProjectGroup[]>(() => {
+    const byName = new Map<string, AirtableActionItem[]>();
+    const noAccount: AirtableActionItem[] = [];
     for (const item of items) {
-      const key = item.account_name ?? "__none__";
-      if (!map.has(key)) map.set(key, []);
-      map.get(key)!.push(item);
+      const name = item.account_name?.trim();
+      if (!name) { noAccount.push(item); continue; }
+      const k = name.toLowerCase();
+      if (!byName.has(k)) byName.set(k, []);
+      byName.get(k)!.push(item);
     }
-    // Sort: named accounts alphabetically, then "No Account" at the end
-    const named = [...map.entries()]
-      .filter(([k]) => k !== "__none__")
-      .sort(([a], [b]) => a.localeCompare(b));
-    const noAcc = map.get("__none__");
-    return noAcc ? [...named, ["__none__" as string, noAcc] as [string, AirtableActionItem[]]] : named;
-  }, [items]);
+
+    const groups: ProjectGroup[] = accounts.map((acc) => {
+      const k = acc.name.trim().toLowerCase();
+      const groupItems = byName.get(k) ?? [];
+      byName.delete(k);
+      return {
+        key: acc.key,
+        displayName: acc.name,
+        groupKey: accountGroupKey(acc.name),
+        accountKey: acc.key,
+        items: groupItems,
+      };
+    });
+
+    // Names left over match no known account. Kept so an item is never rendered nowhere,
+    // but deliberately not drop targets — filing into an unresolvable bucket has no meaning,
+    // exactly as in the Views grid's "Unmatched account" row.
+    for (const [, groupItems] of [...byName.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+      const name = groupItems[0].account_name!.trim();
+      groups.push({
+        key: `unmatched-${name}`,
+        displayName: name,
+        groupKey: accountGroupKey(name),
+        accountKey: null,
+        items: groupItems,
+        unmatched: true,
+      });
+    }
+
+    groups.push({
+      key: "__none__",
+      displayName: "No Account",
+      groupKey: NO_ACCOUNT_GROUP_KEY,
+      accountKey: "none",
+      items: noAccount,
+    });
+    return groups;
+  }, [items, accounts]);
+
+  // Which group the cursor is currently over. Local rather than lifted to the page: the
+  // highlight is purely presentational here, and a page-level state write on every dragover
+  // would re-render every group in the list.
+  const [overGroupKey, setOverGroupKey] = useState<string | null>(null);
+  const dragInFlight = !!externalDragId;
 
   // Collapse state is shared with the Views grid (and persisted), so the Collapse all
   // button and the user's per-group choices carry across views and navigation.
@@ -3384,31 +3542,62 @@ function ProjectsView({
 
   return (
     <div className="flex flex-col gap-4">
-      {accountGroups.map(([key, groupItems]) => {
-        const displayName = key === "__none__" ? "No Account" : key;
-        const groupKey = key === "__none__" ? NO_ACCOUNT_GROUP_KEY : accountGroupKey(key);
+      {accountGroups.map((group) => {
+        const { key, displayName, groupKey, accountKey, items: groupItems } = group;
         const isCollapsed = isGroupCollapsed(groupKey);
         const openCount = groupItems.filter((i) => i.status !== "Done").length;
         const doneCount = groupItems.filter((i) => i.status === "Done").length;
+        const isDropTarget = !!accountKey && !!onAccountDrop;
+        // Gated on the drag still being in flight so a stale hover key left behind by a
+        // cancelled drag can't keep a group highlighted — no dragend listener needed.
+        const isOver = isDropTarget && dragInFlight && overGroupKey === key;
+        // A group with nothing in it has no board worth expanding — the header alone is the
+        // whole group, and the drop target. Showing five empty status columns for every
+        // account the user has never filed work under would bury the populated groups.
+        const isEmpty = groupItems.length === 0;
         return (
-          <div key={key} className="bg-white rounded-lg shadow-blue-md overflow-hidden">
-            {/* Group header */}
+          <div
+            key={key}
+            data-testid={`project-group-${groupKey}`}
+            className={`bg-white rounded-lg overflow-hidden transition-colors ${isOver ? "bg-indigo-50 shadow-blue-lg" : "shadow-blue-md"}`}
+            style={isOver ? { outline: "2px solid #818cf8", outlineOffset: -1 } : undefined}
+            onDragOver={isDropTarget ? (e) => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; setOverGroupKey(key); } : undefined}
+            onDragLeave={isDropTarget ? (e) => { if (leftElement(e)) setOverGroupKey(null); } : undefined}
+            onDrop={isDropTarget ? (e) => { setOverGroupKey(null); void onAccountDrop!(e, accountKey!); } : undefined}
+          >
+            {/* Group header. Doubles as the drop target for a collapsed group, which is the
+                only part of it on screen. */}
             <button
-              onClick={() => toggleGroup(groupKey)}
-              className="w-full flex items-center gap-3 px-4 py-3 border-b border-gray-100 hover:bg-gray-50 transition-colors text-left"
+              onClick={() => { if (!isEmpty) toggleGroup(groupKey); }}
+              title={isDropTarget && dragInFlight ? `Drop to file under ${displayName}` : undefined}
+              // Left enabled when empty even though the click is a no-op: a disabled button
+              // does not reliably receive drop events, and the header IS the drop target for
+              // an empty group. The hover style is dropped instead, so it doesn't advertise
+              // a toggle that has nothing to toggle.
+              className={`w-full flex items-center gap-3 px-4 py-3 border-b border-gray-100 transition-colors text-left ${isOver ? "bg-indigo-50" : isEmpty ? "cursor-default" : "hover:bg-gray-50"}`}
             >
-              <svg
-                viewBox="0 0 12 12"
-                fill="currentColor"
-                className={`w-3 h-3 shrink-0 text-[var(--twilio-gray-60)] transition-transform ${isCollapsed ? "-rotate-90" : ""}`}
-              >
-                <path d="M6 8L1 3h10z"/>
-              </svg>
+              {isEmpty ? (
+                <span className="w-3 shrink-0" aria-hidden="true" />
+              ) : (
+                <svg
+                  viewBox="0 0 12 12"
+                  fill="currentColor"
+                  className={`w-3 h-3 shrink-0 text-[var(--twilio-gray-60)] transition-transform ${isCollapsed ? "-rotate-90" : ""}`}
+                >
+                  <path d="M6 8L1 3h10z"/>
+                </svg>
+              )}
               <CorporateIcon width={12} height={12} className="shrink-0 text-indigo-400 opacity-70" />
-              <span className="text-sm font-semibold text-[var(--twilio-navy)] flex-1 min-w-0 truncate">
+              <span className={`text-sm font-semibold flex-1 min-w-0 truncate ${group.unmatched ? "text-amber-700 italic" : "text-[var(--twilio-navy)]"} ${isEmpty ? "opacity-60" : ""}`}>
                 {displayName}
               </span>
               <span className="text-xs text-[var(--twilio-gray-60)] shrink-0 flex items-center gap-2">
+                {/* Only while a card is in the air, so the resting layout is unchanged. */}
+                {isDropTarget && dragInFlight && (
+                  <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold border border-dashed ${isOver ? "border-indigo-400 text-indigo-600 bg-indigo-50" : "border-gray-300 text-[var(--twilio-gray-60)]"}`}>
+                    {isOver ? "Drop to file here" : "Drop here"}
+                  </span>
+                )}
                 {openCount > 0 && (
                   <span className="inline-flex items-center gap-1 bg-indigo-50 text-indigo-600 px-2 py-0.5 rounded-full text-[11px] font-semibold">
                     {openCount} open
@@ -3422,10 +3611,12 @@ function ProjectsView({
               </span>
             </button>
             {/* Status board for this account */}
-            {!isCollapsed && (
+            {!isCollapsed && !isEmpty && (
               <div className="p-4">
                 <StatusBoardView
                   items={groupItems}
+                  accountKey={accountKey ?? undefined}
+                  onAccountDrop={onAccountDrop}
                   onExpand={onExpand}
                   onSave={onSave}
                   onDelete={() => {}}
@@ -3737,8 +3928,16 @@ export default function ActionItemsPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [allItems]);
 
-  const load = useCallback(async () => {
-    setIsLoading(true);
+  /**
+   * Fetch items, accounts and profile.
+   *
+   * `silent` skips the `isLoading` flip, so the grid keeps rendering while the refresh runs.
+   * Every reload that is *not* the first mount is silent: there is already data on screen,
+   * and replacing a populated board with a full-page "Loading…" for the length of four
+   * parallel requests reads as a glitch rather than as progress.
+   */
+  const load = useCallback(async (opts?: { silent?: boolean }) => {
+    if (!opts?.silent) setIsLoading(true);
     try {
       const [itemsRes, atAccountsRes, appAccountsRes, profileRes] = await Promise.all([
         airtableApi.listActionItems(),
@@ -3818,6 +4017,32 @@ export default function ActionItemsPage() {
 
   useEffect(() => { void load(); }, [load]);
 
+  /**
+   * Refresh in the background, coalescing bursts.
+   *
+   * `lib/api.ts` broadcasts `actionItemsUpdated` from a response interceptor after **every**
+   * action-item mutation, and this page listens to that broadcast — including its own. So a
+   * single drag fired a full reload, and a drag that changes two fields (a cross-account drop
+   * onto a status column sends an account PATCH and a status PATCH) fired two, overlapping.
+   * Two concurrent `load()`s can apply their `setAllItems` in either order, so coalescing is
+   * a correctness fix as much as a request-volume one.
+   *
+   * The window is short enough to be imperceptible; the optimistic update has already put the
+   * card where the user dropped it, so this reload only has to confirm it.
+   */
+  const reloadTimer = useRef<number | null>(null);
+  const scheduleSilentReload = useCallback(() => {
+    if (reloadTimer.current !== null) window.clearTimeout(reloadTimer.current);
+    reloadTimer.current = window.setTimeout(() => {
+      reloadTimer.current = null;
+      void load({ silent: true });
+    }, SILENT_RELOAD_DEBOUNCE_MS);
+  }, [load]);
+
+  useEffect(() => () => {
+    if (reloadTimer.current !== null) window.clearTimeout(reloadTimer.current);
+  }, []);
+
   const fetchTeamMembers = () => teamApi.listMembers().then(({ data }) => setTeamMembers(data.results)).catch(() => {});
 
   useEffect(() => { void fetchTeamMembers(); }, []);
@@ -3833,7 +4058,7 @@ export default function ActionItemsPage() {
   useEffect(() => {
     function onStorage(e: StorageEvent) {
       if (e.key === "teamUpdated") { void fetchTeamMembers(); return; }
-      if (e.key === "accountsUpdated" || e.key === "actionItemsUpdated") { void load(); return; }
+      if (e.key === "accountsUpdated" || e.key === "actionItemsUpdated") { scheduleSilentReload(); return; }
 
       // Manual card order changed in another tab. Adopt it wholesale rather than merging:
       // an ordering is a total order, so last-write-wins is the only coherent policy.
@@ -3909,7 +4134,9 @@ export default function ActionItemsPage() {
     }
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
-  }, []);
+    // scheduleSilentReload is stable, so listing it cannot cause a re-subscribe.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scheduleSilentReload]);
 
   function itemsInZone(zone: Zone): AirtableActionItem[] {
     return allItems.filter((i) => {
@@ -3957,7 +4184,77 @@ export default function ActionItemsPage() {
     setDropHint(null);
   }
 
+  /**
+   * File an item under an account, or clear its account when `accountKey === "none"`.
+   *
+   * The single mutation site for account reassignment: the Views grid's row drops and the
+   * Projects view's per-group drops both route through it, so the optimistic update, the
+   * Airtable write and the activity-log entry can't drift between the two views.
+   *
+   * Deliberately does **not** touch `zones` — which account a card is filed under and which
+   * panel it sits in are separate decisions. The Views grid sets the zone itself, because
+   * dropping there literally means "put it in the Views grid"; the Projects view renders
+   * every real item regardless of zone, so a drop there must not yank a card out of Stage
+   * Today as a side effect.
+   *
+   * The PATCH is skipped when nothing would change, so dropping a card on the account it is
+   * already filed under is free rather than a redundant write plus a misleading log line.
+   */
+  async function assignItemToAccount(resolvedId: string, item: AirtableActionItem, accountKey: string) {
+    const acc = accountKey === "none" ? null : accounts.find((a) => a.key === accountKey);
+    // An unresolvable key would otherwise silently clear the account.
+    if (accountKey !== "none" && !acc) return;
 
+    if (acc) {
+      setAccountAssign((prev) => ({ ...prev, [resolvedId]: accountKey }));
+    } else {
+      setAccountAssign((prev) => { const next = { ...prev }; delete next[resolvedId]; return next; });
+    }
+
+    const updates: Partial<AirtableActionItem> = acc
+      ? { account_name: acc.name, account: acc.id }
+      : { account_name: null, account: null };
+    // The per-user Admin workspace is private to its assignee, so filing a card there has
+    // to name one — an unassigned Admin item is shared with everyone.
+    if (acc && acc.name.toLowerCase() === "admin" && myProfile?.airtable_collaborator_id) {
+      updates.assignee_airtable_id = myProfile.airtable_collaborator_id;
+      updates.assignee_name = myProfile.display_name || myProfile.email || "";
+    }
+
+    const changed = (Object.keys(updates) as (keyof AirtableActionItem)[])
+      .some((k) => !sameFieldValue(item[k], updates[k]));
+    if (!changed) return;
+
+    setAllItems((prev) => prev.map((i) => i.airtable_id === resolvedId ? { ...i, ...updates } : i));
+    if (resolvedId.startsWith("local-")) return;
+
+    try { await airtableApi.updateActionItemFields(resolvedId, updates); } catch { /* best effort */ }
+    addLog({
+      category: "action_item",
+      message: acc
+        ? `Moved "${item.task || "Untitled"}" to Views under "${acc.name}"`
+        : `Moved "${item.task || "Untitled"}" to Views (no account)`,
+      links: [{ label: "View action items", path: "/action-items" }],
+      resource: { type: "action_item", id: resolvedId },
+    });
+  }
+
+  /**
+   * A card was dropped on an account group in the Projects view.
+   *
+   * Blanks are skipped rather than promoted: `promoteBlankItem` throws away the `local-*` id
+   * for a real recXXX, and the Projects view never renders blanks in the first place — the
+   * only way one reaches here is a drag out of Unstaged, where the Views grid is the path
+   * that owns promotion.
+   */
+  async function handleAccountGroupDrop(e: React.DragEvent, accountKey: string) {
+    e.preventDefault();
+    if (!dragId) return;
+    const item = allItems.find((i) => i.airtable_id === dragId);
+    setDragId(null);
+    if (!item || item.airtable_id.startsWith("local-")) return;
+    await assignItemToAccount(item.airtable_id, item, accountKey);
+  }
 
   async function handleDrop(e: React.DragEvent, targetZoneArg: Zone, accountKey?: string) {
     e.preventDefault();
@@ -4002,44 +4299,7 @@ export default function ActionItemsPage() {
       setZones((prev) => ({ ...prev, [resolvedId]: "accounts" }));
 
       // Always update account assignment when dropped into a specific bucket.
-      if (accountKey === "none") {
-        // No Account row — clear account assignment
-        setAccountAssign((prev) => { const next = { ...prev }; delete next[resolvedId]; return next; });
-        const updates: Partial<AirtableActionItem> = { account_name: null, account: null };
-        setAllItems((prev) => prev.map((i) => i.airtable_id === resolvedId ? { ...i, ...updates } : i));
-        if (!resolvedId.startsWith("local-")) {
-          try { await airtableApi.updateActionItemFields(resolvedId, updates); } catch { /* best effort */ }
-          addLog({
-            category: "action_item",
-            message: `Moved "${item.task || "Untitled"}" to Views (no account)`,
-            links: [{ label: "View action items", path: "/action-items" }],
-            resource: { type: "action_item", id: resolvedId },
-          });
-        }
-      } else {
-        setAccountAssign((prev) => ({ ...prev, [resolvedId]: accountKey }));
-        const acc = accounts.find((a) => a.key === accountKey);
-        if (acc) {
-          const isAdmin = acc.name.toLowerCase() === "admin";
-          const updates: Partial<AirtableActionItem> = { account_name: acc.name, account: acc.id };
-          if (isAdmin && myProfile?.airtable_collaborator_id) {
-            updates.assignee_airtable_id = myProfile.airtable_collaborator_id;
-            updates.assignee_name = myProfile.display_name || myProfile.email || "";
-          }
-          setAllItems((prev) =>
-            prev.map((i) => i.airtable_id === resolvedId ? { ...i, ...updates } : i)
-          );
-          if (!resolvedId.startsWith("local-")) {
-            try { await airtableApi.updateActionItemFields(resolvedId, updates); } catch { /* best effort */ }
-            addLog({
-              category: "action_item",
-              message: `Moved "${item.task || "Untitled"}" to Views under "${acc.name}"`,
-              links: [{ label: "View action items", path: "/action-items" }],
-              resource: { type: "action_item", id: resolvedId },
-            });
-          }
-        }
-      }
+      await assignItemToAccount(resolvedId, item, accountKey);
 
       // Top up blanks if the item came from Unstaged
       if (prevZoneAccounts === "unstaged") {
@@ -4347,12 +4607,14 @@ export default function ActionItemsPage() {
   // ── Edit / save ────────────────────────────────────────────────────────────
 
   async function handleSaveItem(airtableId: string, updated: Partial<AirtableActionItem>) {
+    const before = allItems.find((i) => i.airtable_id === airtableId);
     // Optimistic: update local state immediately so handleDrop sees the latest data
     setAllItems((prev) => prev.map((i) => i.airtable_id === airtableId ? { ...i, ...updated } : i));
     // Skip API for local-only blank items
     if (airtableId.startsWith("local-")) return;
     try {
       await airtableApi.updateActionItemFields(airtableId, updated);
+      if (before) logActionItemUpdate(before, updated);
     } catch { reportError("Failed to save action item"); }
   }
 
@@ -4846,11 +5108,16 @@ export default function ActionItemsPage() {
           focusMode={focusMode}
           onRestoreToViews={(item) => setZones((prev) => ({ ...prev, [item.airtable_id]: "accounts" }))}
           externalDragId={dragId}
+          onAccountDrop={handleAccountGroupDrop}
           onExternalDropWithStatus={async (airtableId, status) => {
+            const before = allItems.find((i) => i.airtable_id === airtableId);
             setZones((prev) => ({ ...prev, [airtableId]: "accounts" }));
             setAllItems((prev) => prev.map((i) => i.airtable_id === airtableId ? { ...i, status } : i));
             if (!airtableId.startsWith("local-")) {
-              try { await airtableApi.updateActionItemStatus(airtableId, status); } catch { /* best effort */ }
+              try {
+                await airtableApi.updateActionItemStatus(airtableId, status);
+                if (before) logActionItemUpdate(before, { status });
+              } catch { /* best effort */ }
             }
           }}
         />

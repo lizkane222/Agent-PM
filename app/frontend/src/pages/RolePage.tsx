@@ -13,6 +13,7 @@ import {
   type DragEndEvent,
 } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
+import { GetMeetingNotesButton } from "../components/shared/GetMeetingNotesButton";
 import {
   agentSkillsApi, skillsApi, accountsApi, teamApi,
   schedulerApi, commentsApi, layoutsApi,
@@ -2038,6 +2039,11 @@ function RolePageInner({ titleRole }: { titleRole: TitleRole }) {
       case "skills": return (
         <CollapsibleSection key="skills" title="My Skills" accentColor={meta.border} textColor={meta.text} headerRight={
           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            {/* In the header, not the body: the body is gated on skills.length and would
+                hide this for a role with no Claude skills. Unscoped on purpose — a role
+                page covers the whole book of business, so the useful run is every account
+                the user is on. The account detail page runs the scoped version. */}
+            <GetMeetingNotesButton />
             <button
               onClick={() => navigate("/skills")}
               style={{ fontSize: "0.6rem", fontWeight: 700, letterSpacing: "0.06em", padding: "2px 8px", borderRadius: 20, background: meta.bg, color: meta.text, border: `1px solid ${meta.border}44`, cursor: "pointer", textTransform: "uppercase" }}

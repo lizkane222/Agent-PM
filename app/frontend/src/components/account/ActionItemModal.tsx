@@ -3,12 +3,14 @@ import CorporateIcon from "../../assets/icons/Corporate.svg?react";
 import { airtableApi } from "../../lib/api";
 import type { ActionItemAttachment, AirtableActionItem, AirtableMeeting, TeamMember } from "../../types";
 import { useActionItemFieldOptions } from "../../hooks/useActionItemFieldOptions";
+import { useSlackLinkAutosave } from "../../hooks/useSlackLinkAutosave";
 import CommentTrigger from "../comments/CommentTrigger";
 import CommentPreviewList from "../comments/CommentPreviewList";
 import { AccPillSelect, AccPillDate, AccPillNumber, AccPillUrl } from "../shared/PillInputs";
 import { ActionItemCardOccurrences } from "./ActionItemCardOccurrences";
 import StepsPanel from "../action-items/StepsPanel";
 import { convertActionItemToEvent, restoreConversion } from "../../hooks/useConvert";
+import { logActionItemUpdate } from "../../lib/actionItemLog";
 import ActivityLogSection from "../ActivityLogSection";
 import { ArtifactIconImg, CATALOG_BY_KEY, getAutoIconKey } from "./ArtifactIcon";
 import ArtifactPicker from "../action-items/ArtifactPicker";
@@ -87,6 +89,8 @@ export function ActionItemModal({
 
   const accent = PRIORITY_ACCENT[form.priority ?? item.priority] ?? "#9ca3af";
   const set = (patch: Partial<AirtableActionItem>) => setForm((f) => ({ ...f, ...patch }));
+  // A pasted Slack link saves on its own — see hooks/useSlackLinkAutosave.ts.
+  const autosaveSlackLink = useSlackLinkAutosave();
 
   async function handleDelete() {
     setDeleting(true);
@@ -112,6 +116,7 @@ export function ActionItemModal({
     setSaveError(null);
     try {
       const { data } = await airtableApi.updateActionItemFields(item.airtable_id, form as Parameters<typeof airtableApi.updateActionItemFields>[1]);
+      logActionItemUpdate(item, form as Partial<AirtableActionItem>);
       onUpdated?.(data);
       onClose();
     } catch (err: unknown) {
@@ -273,7 +278,10 @@ export function ActionItemModal({
             <AccPillNumber value={form.estimated_time} label="Est." onChange={(v) => set({ estimated_time: v ?? 0 })} />
             <AccPillNumber value={form.time_spent} label="Spent" onChange={(v) => set({ time_spent: v ?? 0 })} />
             <AccPillNumber value={form.prep_time} label="Prep" onChange={(v) => set({ prep_time: v ?? 0 })} />
-            <AccPillUrl value={form.slack_thread_url} onChange={(v) => set({ slack_thread_url: v })} />
+            <AccPillUrl
+              value={form.slack_thread_url}
+              onChange={(v) => { set({ slack_thread_url: v }); autosaveSlackLink(item, v, onUpdated); }}
+            />
           </div>
 
           {/* Assignee */}

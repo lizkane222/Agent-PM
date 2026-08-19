@@ -80,11 +80,18 @@ MIN_CONTAINMENT_LEN = 5
 
 _REPLY_PREFIX_RE = re.compile(r"^\s*(re|fwd?|fw)\s*:\s*", re.IGNORECASE)
 
-# Vendor subject boilerplate wrapped around the actual meeting name. Applied
-# repeatedly, so "Re: Gong Call Recap: Acme <> Twilio" reduces to "acme twilio".
+# Vendor subject boilerplate wrapped around the actual meeting name. Both ends are
+# stripped, repeatedly, so "Re: Meeting assets for Acme <> Twilio are ready!" reduces to
+# "acme twilio".
+#
+# These are the formats actually observed in the wild, which are not the ones the vendor
+# docs suggest — verify against a real mailbox before adding to this list:
+#   Gong: "<name>: Call recording and analysis is ready"   (name is a PREFIX)
+#   Zoom: "Meeting assets for <name> are ready!"           (name is in the MIDDLE)
 _VENDOR_PREFIX_RES = [
     re.compile(p, re.IGNORECASE)
     for p in (
+        r"^\s*meeting\s+assets\s+for\s+",
         r"^\s*gong\s*(call\s*)?(recap|summary|notes)\s*[:\-–—]\s*",
         r"^\s*your\s+(call|meeting)\s+(recap|summary)\s*(is\s+ready)?\s*[:\-–—]?\s*",
         r"^\s*(zoom\s+)?ai\s+companion\s*[:\-–—]\s*",
@@ -92,6 +99,32 @@ _VENDOR_PREFIX_RES = [
         r"^\s*(ai\s+)?(meeting|call)\s+(summary|recap|notes)\s*[:\-–—]\s*",
         r"^\s*(summary|recap|notes)\s+(for|of|from)\s+",
         r"^\s*(summary|recap|notes)\s*[:\-–—]\s*",
+    )
+]
+
+# Order matters: the Gong-specific patterns must be tried before the bare
+# "... is/are ready" catch-all, which would otherwise strip only the tail of
+# "…: Call recording and analysis is ready" and leave the boilerplate behind.
+_VENDOR_SUFFIX_RES = [
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\s*[:\-–—]\s*call\s+recording\b.*?\bis\s+ready[.!]*\s*$",
+        r"\s*[:\-–—]\s*(call\s+)?(recording|analysis|transcript)s?\b.*?\b(is|are)\s+ready[.!]*\s*$",
+        r"\s+(is|are)\s+ready[.!]*\s*$",
+    )
+]
+
+# Subjects that are notifications *about* a meeting rather than a recap of one. Without
+# this they sail through matching and their body — which has no summary — gets treated as
+# a candidate.
+_NON_RECAP_SUBJECT_RES = [
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bhas\s+been\s+(deleted|cancell?ed|removed)\b",
+        r"\bis\s+(cancell?ed|starting)\b",
+        r"\byou(r|'ve)?\s+(been\s+)?invited\b",
+        r"\bregistration\b",
+        r"\bpassword\b",
     )
 ]
 
@@ -114,13 +147,18 @@ def normalize_title(text: str) -> str:
     if not text:
         return ""
     cleaned = text.strip()
-    # Strip Re:/Fwd: and vendor boilerplate until nothing more comes off.
+    # Strip Re:/Fwd: and vendor boilerplate off both ends until nothing more comes off.
     changed = True
     while changed:
         changed = False
         stripped = _REPLY_PREFIX_RE.sub("", cleaned)
         if stripped != cleaned:
             cleaned, changed = stripped, True
+        for pattern in _VENDOR_SUFFIX_RES:
+            stripped = pattern.sub("", cleaned)
+            if stripped != cleaned:
+                cleaned, changed = stripped, True
+                break
         for pattern in _VENDOR_PREFIX_RES:
             stripped = pattern.sub("", cleaned)
             if stripped != cleaned:
@@ -190,15 +228,96 @@ def visible_meetings_for(user):
     )
 
 
-def candidate_meetings(user, days: int, account_name: str = ""):
-    """Past meetings inside the lookback window that could still need a summary."""
+def _event_has_matching_recap(probe, messages: list[dict]) -> bool:
+    """True when some message carries a real summary for this event's name and date.
+
+    Takes an unsaved AirtableMeeting-shaped probe so the name/date matching rules are
+    exactly the ones used for saved meetings. Only a message with an actual summary
+    counts — a bare recording notification is not worth creating a row for.
+    """
+    return any(
+        m["has_summary"]
+        and dates_match(probe.date, m["date"])
+        and titles_match(probe.name, m["subject"])
+        for m in messages
+    )
+
+
+def candidate_events(user, days: int, account_name: str = "", account: str = ""):
+    """Calendar events the user owns that have no AirtableMeeting behind them yet.
+
+    Events already linked to a meeting are excluded — that meeting is covered by
+    `candidate_meetings`, and importing twice would double-report it.
+
+    Account scoping is best-effort: an event is only kept in a *scoped* scan when its
+    account resolves to the requested one. Events with no account FK are therefore
+    scanned only in unscoped (profile / role page) runs — a scoped run must not quietly
+    import a meeting that doesn't belong to the account being viewed.
+    """
+    from accounts.models import Account as DjangoAccount
+    from airtable_sync.models import AirtableAccount
+    from scheduler.models import CalendarEvent
+
+    now = timezone.now()
+    # Empty airtable_ids are excluded from the subquery so events with no link at all
+    # (agentpm_airtable_id="") are kept rather than matching a blank.
+    linked_ids = AirtableMeeting.objects.exclude(airtable_id="").values_list(
+        "airtable_id", flat=True
+    )
+    qs = CalendarEvent.objects.filter(
+        owner=user,
+        start_datetime__gte=now - timedelta(days=days),
+        start_datetime__lte=now,
+    ).exclude(agentpm_airtable_id__in=linked_ids)
+
+    token = (account or "").strip()
+    if token:
+        # `account` is an AirtableAccount PK or rec* id; CalendarEvent points at a Django
+        # Account, so bridge the two on airtable_id.
+        if token.isdigit():
+            at_ids = list(
+                AirtableAccount.objects.filter(pk=int(token)).values_list(
+                    "airtable_id", flat=True
+                )
+            )
+        else:
+            at_ids = [token]
+        at_ids = [i for i in at_ids if i]
+        accounts = DjangoAccount.objects.filter(airtable_id__in=at_ids) if at_ids \
+            else DjangoAccount.objects.none()
+        qs = qs.filter(account_id__in=accounts.values_list("pk", flat=True))
+    elif account_name:
+        qs = qs.filter(account__company_name__iexact=account_name)
+
+    return qs.order_by("-start_datetime")
+
+
+def candidate_meetings(user, days: int, account_name: str = "", account: str = ""):
+    """Past meetings inside the lookback window that could still need a summary.
+
+    `account` narrows to one AirtableAccount and accepts either a numeric PK or an
+    Airtable `rec*` id, the same shape `AirtableMeetingViewSet` takes — the account
+    detail page already prefers the `rec*` id over the display name, and a Django
+    Account whose `company_name` has drifted from its AirtableAccount `name` would match
+    nothing by name. `account_name` stays as the fallback for accounts with no Airtable
+    link at all (notably per-user Admin workspaces) and for the agent, which knows names
+    rather than ids.
+
+    A present-but-unresolvable filter narrows to empty rather than falling through to
+    "every meeting the caller can see" — matching the convention in core/query_params.py.
+    """
     now = timezone.now()
     qs = visible_meetings_for(user).filter(
         date__isnull=False,
         date__gte=now - timedelta(days=days),
         date__lte=now,
     )
-    if account_name:
+    token = (account or "").strip()
+    if token:
+        qs = qs.filter(account_id=int(token)) if token.isdigit() else qs.filter(
+            account__airtable_id=token
+        )
+    elif account_name:
         qs = qs.filter(account__name__iexact=account_name)
     return qs.order_by("-date")
 
@@ -254,6 +373,10 @@ def fetch_vendor_messages(gmail, days: int, max_emails: int = MAX_EMAILS) -> lis
         source = _classify_source(header(msg, "from"))
         if not source:
             continue
+        subject = header(msg, "subject")
+        if any(pattern.search(subject) for pattern in _NON_RECAP_SUBJECT_RES):
+            # A cancellation or invite notice, not a recap.
+            continue
         raw_date = header(msg, "date")
         try:
             email_dt = parsedate_to_datetime(raw_date)
@@ -266,13 +389,17 @@ def fetch_vendor_messages(gmail, days: int, max_emails: int = MAX_EMAILS) -> lis
             # the server's local zone so the window check is deterministic.
             email_dt = timezone.make_aware(email_dt, dt_timezone.utc)
 
+        body = extract_plain_body(msg.get("payload", {}))
         out.append({
             "id": msg.get("id", ref.get("id", "")),
             "source": source,
-            "subject": header(msg, "subject"),
+            "subject": subject,
             "from": header(msg, "from"),
             "date": email_dt,
-            "body": extract_plain_body(msg.get("payload", {})),
+            "body": body,
+            # Computed once here so the matcher can tell a recap from a bare
+            # "your recording is ready" notification without re-scanning the body.
+            "has_summary": email_contains_summary(body),
         })
     return out
 
@@ -395,6 +522,36 @@ def summarize_email(body: str, meeting_name: str, source: str) -> str:
 
 _URL_RE = re.compile(r"https?://[^\s<>\"')]+")
 
+# A vendor "your recording is ready" notification and a vendor recap email look alike from
+# the outside — same sender, same subject shape — and only one of them contains anything
+# worth saving. Zoom in particular renders "Meeting summary" as a *link label*: the words
+# are in the email, the summary itself is only in the Zoom web app. Importing that gives a
+# meeting a set of notes made of link text, which is worse than leaving it empty.
+#
+# The discriminator is how much of the body is prose rather than labels and links. Measured
+# over a real mailbox (30 days, 28 emails): Gong recaps 3139–4505 chars of prose, Zoom
+# notifications 0–238. 400 sits in the gap with a wide margin on both sides.
+MIN_SUMMARY_CONTENT_CHARS = 400
+
+# Eight words is long enough to exclude labels and field rows ("Meeting summary", "Topic:
+# …", "Duration: 01:07:26", "The Zoom Team") without excluding a real bullet.
+_MIN_WORDS_PER_CONTENT_LINE = 8
+
+
+def summary_content_chars(body: str) -> int:
+    """Characters of prose in `body`, ignoring URLs and short label/field lines."""
+    total = 0
+    for line in _URL_RE.sub("", body or "").splitlines():
+        stripped = line.strip()
+        if len(stripped.split()) >= _MIN_WORDS_PER_CONTENT_LINE:
+            total += len(stripped)
+    return total
+
+
+def email_contains_summary(body: str) -> bool:
+    """True when the email actually carries a recap, not just links to one."""
+    return summary_content_chars(body) >= MIN_SUMMARY_CONTENT_CHARS
+
 
 def extract_provider_url(body: str, domains: tuple[str, ...]) -> str:
     """First URL in the email pointing at one of `domains`, or ''."""
@@ -410,11 +567,16 @@ def sync_meeting_notes_from_email(
     user,
     days: int = DEFAULT_LOOKBACK_DAYS,
     account_name: str = "",
+    account: str = "",
     max_emails: int = MAX_EMAILS,
     max_summaries: int = MAX_SUMMARIES,
     gmail=None,
 ) -> dict:
     """Match recap emails to the user's meetings and fill in missing summaries.
+
+    Pass `account` (or `account_name`) to scope the scan to one account — what the
+    account detail page does. Omit both to cover every meeting the caller can see, which
+    is what the profile and role pages do.
 
     Returns a report dict rather than raising on partial failure — a meeting whose
     summarisation blows up is recorded in `errors` and the rest still complete.
@@ -425,15 +587,23 @@ def sync_meeting_notes_from_email(
         raise GmailNotConnected("Gmail is not connected for this user.")
 
     from airtable_sync import write_back
+    from airtable_sync.meeting_stubs import get_or_create_meeting_for_event
 
     messages = fetch_vendor_messages(gmail, days, max_emails=max_emails)
-    meetings = list(candidate_meetings(user, days, account_name))
+    meetings = list(candidate_meetings(user, days, account_name, account))
+    events = list(candidate_events(user, days, account_name, account))
 
     report: dict = {
         "days": days,
         "account_name": account_name,
+        "account": account,
+        # True when the scan was narrowed to one account; the UI words its result
+        # differently for "this account" vs "all your accounts".
+        "scoped_to_account": bool(account or account_name),
         "scanned_emails": len(messages),
         "scanned_meetings": len(meetings),
+        # Calendar events with no meeting row behind them, considered in a second pass.
+        "scanned_unlinked_events": len(events),
         "updated": [],
         "skipped": [],
         "errors": [],
@@ -441,18 +611,22 @@ def sync_meeting_notes_from_email(
         "max_summaries": max_summaries,
     }
 
-    summaries_done = 0
-    for meeting in meetings:
+    state = {"summaries_done": 0}
+
+    def import_for_meeting(meeting) -> dict:
+        """Try every provider against `meeting`. Returns a per-meeting outcome dict.
+
+        Mutates `report["errors"]` / `report["summaries_truncated"]` directly; the caller
+        decides whether the outcome belongs in `updated` or `skipped`.
+        """
         matched_sources: list[str] = []
+        # Providers whose email matched but carried no recap, and those whose recording
+        # link we saved anyway. Both feed the skip reason so "nothing happened" is never
+        # reported without saying why.
+        matched_without_summary: set[str] = set()
+        linked_sources: list[str] = []
         hit_summary_cap = False
-        note: dict = {
-            "meeting_id": meeting.pk,
-            "airtable_id": meeting.airtable_id,
-            "meeting_name": meeting.name,
-            "date": meeting.date.isoformat() if meeting.date else None,
-            "account_name": meeting.account.name if meeting.account else None,
-            "sources": matched_sources,
-        }
+        email_subjects: dict[str, str] = {}
 
         for source in SOURCE_PRIORITY:
             provider = PROVIDERS[source]
@@ -474,7 +648,19 @@ def sync_meeting_notes_from_email(
             # Closest to the meeting time wins if the provider sent more than one.
             best = min(candidates, key=lambda m: abs(m["date"] - meeting.date))
 
-            if summaries_done >= max_summaries:
+            if not best["has_summary"]:
+                # A notification, not a recap: the summary lives in the provider's web
+                # app, not the email. Save the recording link if we can — that's the only
+                # thing of value in it — and record why no notes appeared.
+                matched_without_summary.add(source)
+                url = extract_provider_url(best["body"], provider["url_domains"])
+                if url and not getattr(meeting, provider["url_field"], ""):
+                    setattr(meeting, provider["url_field"], url)
+                    meeting.save(update_fields=[provider["url_field"]])
+                    linked_sources.append(source)
+                continue
+
+            if state["summaries_done"] >= max_summaries:
                 # A match was found but the per-request ceiling is spent. Surface it
                 # rather than reporting the meeting as unmatched — a silent cap reads
                 # as "nothing to import" when there was.
@@ -494,7 +680,7 @@ def sync_meeting_notes_from_email(
                 })
                 continue
 
-            summaries_done += 1
+            state["summaries_done"] += 1
             if not summary.strip():
                 continue
 
@@ -523,21 +709,89 @@ def sync_meeting_notes_from_email(
                 )
 
             matched_sources.append(source)
-            note.setdefault("email_subjects", {})[source] = best["subject"]
+            email_subjects[source] = best["subject"]
 
-        if matched_sources:
-            report["updated"].append(note)
-        else:
-            if hit_summary_cap:
-                reason = "summary_limit_reached"
-            elif meeting.gong_notes.strip() or meeting.zoom_notes.strip():
-                reason = "already_summarized"
-            else:
-                reason = "no_matching_email"
-            report["skipped"].append({
+        return {
+            "sources": matched_sources,
+            "linked_sources": linked_sources,
+            "without_summary": matched_without_summary,
+            "hit_summary_cap": hit_summary_cap,
+            "email_subjects": email_subjects,
+        }
+
+    def record(meeting, outcome, created_stub=False):
+        if outcome["sources"]:
+            note = {
                 "meeting_id": meeting.pk,
+                "airtable_id": meeting.airtable_id,
                 "meeting_name": meeting.name,
-                "reason": reason,
-            })
+                "date": meeting.date.isoformat() if meeting.date else None,
+                "account_name": meeting.account.name if meeting.account else None,
+                "sources": outcome["sources"],
+            }
+            if outcome["email_subjects"]:
+                note["email_subjects"] = outcome["email_subjects"]
+            if outcome["linked_sources"]:
+                note["linked_sources"] = outcome["linked_sources"]
+            if created_stub:
+                # The meeting row didn't exist until this import created it.
+                note["created_meeting"] = True
+            report["updated"].append(note)
+            return
 
+        if outcome["hit_summary_cap"]:
+            reason = "summary_limit_reached"
+        elif outcome["without_summary"]:
+            # The user can see these emails in their inbox, so "no matching email"
+            # would read as a bug. Name the real cause instead.
+            reason = "email_has_no_summary"
+        elif meeting.gong_notes.strip() or meeting.zoom_notes.strip():
+            reason = "already_summarized"
+        else:
+            reason = "no_matching_email"
+        entry = {
+            "meeting_id": meeting.pk,
+            "meeting_name": meeting.name,
+            "reason": reason,
+        }
+        if outcome["without_summary"]:
+            entry["sources_without_summary"] = sorted(outcome["without_summary"])
+        if outcome["linked_sources"]:
+            entry["linked_sources"] = outcome["linked_sources"]
+        report["skipped"].append(entry)
+
+    for meeting in meetings:
+        record(meeting, import_for_meeting(meeting))
+
+    # Second pass: calendar events with no AirtableMeeting behind them.
+    #
+    # Notes hang off AirtableMeeting, but most meetings only exist as a Google Calendar
+    # event — on a real account 3 of 11 Gong recaps had no row to attach to, so they were
+    # silently skipped while the user could plainly see the email. When a recap matches
+    # such an event we create the same `local-*` stub the manual paste path creates and
+    # import into it. A stub is only created when there is a real summary to store: a
+    # bare recording link isn't worth a new row.
+    for event in events:
+        stub = AirtableMeeting(
+            airtable_id="",
+            account=None,
+            name=event.title or "",
+            date=event.start_datetime,
+        )
+        if not _event_has_matching_recap(stub, messages):
+            continue
+        meeting = get_or_create_meeting_for_event(event)
+        record(meeting, import_for_meeting(meeting), created_stub=True)
+
+    # Rolled up so a caller doesn't have to walk `skipped` to explain a zero-import run.
+    report["no_summary_in_email"] = sum(
+        1 for s in report["skipped"] if s["reason"] == "email_has_no_summary"
+    )
+    report["meetings_created"] = sum(
+        1 for item in report["updated"] if item.get("created_meeting")
+    )
+    report["recordings_linked"] = sum(
+        len(item.get("linked_sources", []))
+        for item in (*report["updated"], *report["skipped"])
+    )
     return report
