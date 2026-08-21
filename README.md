@@ -26,7 +26,7 @@ cp .env.example .env
 # Fill in real values for every key — see Environment Variables section below
 ```
 
-### 2. Backend
+### 2. Backend — one-time setup
 
 ```bash
 cd app/backend
@@ -35,10 +35,55 @@ source .venv/bin/activate
 pip install -r requirements.txt
 python manage.py migrate
 python manage.py createsuperuser
-python manage.py runserver
 ```
 
-In a second terminal (Celery worker + beat):
+### 3. Frontend — one-time setup
+
+```bash
+cd app/frontend
+npm install
+```
+
+### 4. Run the app
+
+```bash
+cd app
+npm run start-agent-pm
+```
+
+This is the day-to-day way to run the app — one command, run from `app/`. It kills any
+stale `manage.py runserver` / `daphne` / `vite` / `ngrok` processes, then starts, concurrently:
+
+- **Django, via Daphne** (ASGI, required for WebSockets/Channels) on **http://localhost:8000**
+- **Vite** on **http://localhost:5173** (proxies `/api` to Django)
+- an **ngrok** tunnel (for OAuth/webhook callbacks that need a public URL)
+
+> ⚠️ **Daphne does not autoreload.** Vite hot-reloads the frontend, but any Python change
+> (new view, new `@action` route, serializer field, model) is invisible until the backend
+> process is restarted. Restart just the backend with:
+> ```bash
+> pkill -f daphne && (cd app/backend && .venv/bin/daphne -b 0.0.0.0 -p 8000 core.asgi:application &)
+> ```
+> Note `pkill -f daphne` also kills Vite and ngrok, since `start-agent-pm` runs all three
+> under one `concurrently` parent — if you kill any child, just re-run `npm run start-agent-pm`.
+
+<details>
+<summary>Running services individually (debugging one layer)</summary>
+
+```bash
+# Backend only
+cd app/backend && source .venv/bin/activate && python manage.py runserver
+
+# Frontend only
+cd app/frontend && npm run dev
+```
+
+Note `manage.py runserver` is WSGI and won't serve WebSocket connections (chat, realtime) —
+use it only for quick backend-only debugging, not as a substitute for Daphne.
+</details>
+
+Celery (Airtable sync every 30 min, due-reminder delivery every 60s) is **not** part of
+`start-agent-pm` and must be started separately if you need those background tasks:
 
 ```bash
 cd app/backend
@@ -46,16 +91,6 @@ source .venv/bin/activate
 celery -A core worker --loglevel=info &
 celery -A core beat --loglevel=info
 ```
-
-### 3. Frontend
-
-```bash
-cd app/frontend
-npm install
-npm run dev
-```
-
-The Vite dev server runs on **http://localhost:5173** and proxies `/api` to Django on port 8000.
 
 ## Services
 
@@ -66,6 +101,7 @@ The Vite dev server runs on **http://localhost:5173** and proxies `/api` to Djan
 | Django Admin | http://localhost:8000/admin/ |
 | OpenAPI Schema | http://localhost:8000/api/schema/ |
 | Swagger UI | http://localhost:8000/api/schema/swagger-ui/ |
+| ngrok tunnel / inspector | http://localhost:4040/ |
 
 ## Frontend Pages
 
