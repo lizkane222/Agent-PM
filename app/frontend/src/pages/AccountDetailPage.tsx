@@ -4995,7 +4995,10 @@ function AccountMeetingNotes({
   }
 
   return (
-    <div className="rounded-xl border border-gray-200 bg-white overflow-hidden">
+    // No `overflow-hidden` here: it clipped the composer's @/@# dropdown, which
+    // opens outside this box. The list below keeps its own clip so the rounded
+    // bottom corners still cut the row dividers.
+    <div className="rounded-xl border border-gray-200 bg-white">
       <div className={`relative flex items-start gap-2 px-3 py-2 ${notes.length > 0 ? "border-b border-gray-100" : ""}`}>
         <span className="mt-[7px] h-1.5 w-1.5 rounded-full bg-gray-300 shrink-0" />
         <div className="flex-1">
@@ -5016,7 +5019,7 @@ function AccountMeetingNotes({
         )}
       </div>
       {notes.length > 0 && (
-        <ul className="divide-y divide-gray-100">
+        <ul className="divide-y divide-gray-100 overflow-hidden rounded-b-xl">
           {notes.map((note) => (
             <AccountNoteRow
               key={note.id}

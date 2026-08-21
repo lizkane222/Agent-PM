@@ -48,6 +48,7 @@ export interface UserProfile {
   push_subscription_active: boolean;
   staff_view_override: boolean;
   calendar_colors?: CalendarColorPrefs;
+  gmail_watch_config?: GmailWatchConfig;
 }
 
 /**
@@ -59,4 +60,14 @@ export interface UserProfile {
 export interface CalendarColorPrefs {
   categories?: Record<string, string>;
   important?: Record<string, string>;
+}
+
+/**
+ * Gmail watch configuration: label name, keywords to match, and keywords to block.
+ * Keyword matching is fuzzy (SequenceMatcher ratio >= 0.7) to catch typos.
+ */
+export interface GmailWatchConfig {
+  label_name?: string; // Gmail label to watch (e.g., "Agent PM - Threads")
+  keywords?: string[];
+  block_keywords?: string[];
 }

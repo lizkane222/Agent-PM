@@ -1,9 +1,32 @@
 import React, { useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { useExport, type ExportItem } from "../context/ExportContext";
 import { addLog } from "../lib/appLog";
 
 // Key used on dataTransfer so any drop target can read the item
 export const EXPORT_ITEM_DRAG_KEY = "application/x-export-item";
+
+/**
+ * Handoff slot for "Send to Chat". The payload cannot travel on the event alone:
+ * only ChatPage listens, so from any other route the listener isn't mounted yet
+ * when the event fires and the send is silently lost. Writing it here first means
+ * ChatPage can pick it up when it mounts. Same pattern as MINI_CANVAS_HANDOFF_KEY.
+ */
+export const EXPORT_TO_CHAT_KEY = "agentpm_export_to_chat";
+
+/**
+ * Read-and-delete, so the event path and the on-mount path can both call this
+ * and exactly one of them wins — no double-send.
+ */
+export function consumeExportToChat(): string | null {
+  try {
+    const text = sessionStorage.getItem(EXPORT_TO_CHAT_KEY);
+    if (text) sessionStorage.removeItem(EXPORT_TO_CHAT_KEY);
+    return text;
+  } catch {
+    return null;
+  }
+}
 
 interface DraggablePillProps {
   item: ExportItem;
@@ -64,9 +87,14 @@ function DraggablePill({ item, onRemove }: DraggablePillProps) {
 }
 
 export default function ExportBar() {
-  const { items, clearItems, toggleItem } = useExport();
+  const { items, clearItems, toggleItem, exportMode, toggleMode } = useExport();
+  const navigate = useNavigate();
 
-  if (items.length === 0) return null;
+  // Visibility follows `exportMode` — the same flag the sidebar button toggles.
+  // Keying it off `items.length` instead (as it used to) meant the button and the
+  // tray were two disconnected truths: opening an empty tray showed nothing at
+  // all, and closing a full one couldn't hide it.
+  if (!exportMode) return null;
 
   function handleSendToChat() {
     const text = [
@@ -85,7 +113,13 @@ export default function ExportBar() {
       });
     });
 
-    window.dispatchEvent(new CustomEvent("export-to-chat", { detail: { text } }));
+    // Stash first, then announce, then navigate. On /agent the listener consumes
+    // it immediately; from anywhere else ChatPage picks it up on mount.
+    try {
+      sessionStorage.setItem(EXPORT_TO_CHAT_KEY, text);
+    } catch { /* storage full — the event path below may still catch it */ }
+    window.dispatchEvent(new CustomEvent("export-to-chat"));
+    navigate("/agent");
   }
 
   return (
@@ -132,13 +166,25 @@ export default function ExportBar() {
       }}
         className="hide-scrollbar"
       >
-        {items.map((item) => (
-          <DraggablePill key={item.id} item={item} onRemove={toggleItem} />
-        ))}
+        {items.length === 0 ? (
+          // The tray can now be opened before anything is picked, so it needs
+          // something to say — an empty red bar would read as a glitch.
+          <span style={{
+            fontSize: "0.75rem", color: "rgba(255,255,255,0.75)",
+            fontFamily: "var(--font-base)", whiteSpace: "nowrap",
+          }}>
+            Select records anywhere in the app to collect them here, then drag them onto a page.
+          </span>
+        ) : (
+          items.map((item) => (
+            <DraggablePill key={item.id} item={item} onRemove={toggleItem} />
+          ))
+        )}
       </div>
 
       {/* Right: action buttons */}
       <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+        {items.length > 0 && (
         <button
           onClick={handleSendToChat}
           style={{
@@ -157,6 +203,8 @@ export default function ExportBar() {
           </svg>
           Send to Chat
         </button>
+        )}
+        {items.length > 0 && (
         <button
           onClick={clearItems}
           style={{
@@ -171,6 +219,24 @@ export default function ExportBar() {
           onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
         >
           Clear
+        </button>
+        )}
+        <button
+          onClick={toggleMode}
+          title="Close export tray"
+          aria-label="Close export tray"
+          style={{
+            display: "flex", alignItems: "center", justifyContent: "center",
+            width: 24, height: 24, borderRadius: 6,
+            background: "transparent", color: "rgba(255,255,255,0.8)",
+            border: "1px solid rgba(255,255,255,0.2)", cursor: "pointer",
+            fontSize: "0.75rem", fontFamily: "var(--font-base)", padding: 0,
+            transition: "background 0.15s",
+          }}
+          onMouseEnter={(e) => (e.currentTarget.style.background = "rgba(255,255,255,0.1)")}
+          onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+        >
+          ✕
         </button>
       </div>
     </div>

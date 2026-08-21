@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
+import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { DndContext } from "@dnd-kit/core";
 import GlobalSearch from "./GlobalSearch";
 import { accountsApi, teamApi, agentApi, skillsApi } from "../lib/api";
@@ -146,9 +146,8 @@ export default function Layout() {
   const navAccounts = useNavAccounts();
   const rolePages = useRolePages(profile);
   const location = useLocation();
-  const navigate = useNavigate();
   const { pickMode } = useFeedback();
-  const { exportMode, toggleMode, count: exportCount, items: exportItems, clearItems } = useExport();
+  const { exportMode, toggleMode, count: exportCount } = useExport();
   const [feedbackOpen, setFeedbackOpen] = useState(false);
 
   // Lifetime token usage — fetched once on mount, re-fetched when a new agent
@@ -173,16 +172,8 @@ export default function Layout() {
     return () => window.removeEventListener("storage", onStorage);
   }, []);
 
-  function handleExportSend() {
-    const text = [
-      "I've selected the following content to export. Please ask me how I'd like to compile it:\n",
-      ...exportItems.map((item) => `## ${item.label} (${item.type})\n${item.content}`),
-    ].join("\n\n---\n\n");
-    window.dispatchEvent(new CustomEvent("export-to-chat", { detail: { text } }));
-    clearItems();
-    toggleMode();
-    navigate("/agent");
-  }
+  // "Send to chat" lives in the tray itself (ExportBar), not on this button —
+  // overloading the toggle with send is what stopped it closing the tray.
   const buildPaths = ["/skills", "/edit-preview", "/discover"];
   const [buildOpen, setBuildOpen] = useState(() => buildPaths.some(p => location.pathname.startsWith(p)));
   const [accountsOpen, setAccountsOpen] = useState(true);
@@ -536,8 +527,12 @@ export default function Layout() {
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-evenly", gap: 4 }}>
               {/* Export button */}
               <button
-                onClick={exportCount > 0 ? handleExportSend : toggleMode}
-                title={exportMode ? (exportCount > 0 ? `Send ${exportCount} item${exportCount !== 1 ? "s" : ""} to chat` : "Exit export mode") : "Enter export mode"}
+                onClick={toggleMode}
+                aria-label={exportMode ? "Close export tray" : "Open export tray"}
+                aria-expanded={exportMode}
+                title={exportMode
+                  ? `Close export tray${exportCount > 0 ? ` (${exportCount} item${exportCount !== 1 ? "s" : ""} kept)` : ""}`
+                  : `Open export tray${exportCount > 0 ? ` (${exportCount} item${exportCount !== 1 ? "s" : ""})` : ""}`}
                 style={{
                   position: "relative",
                   display: "flex", alignItems: "center", justifyContent: "center",

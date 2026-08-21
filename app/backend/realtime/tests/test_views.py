@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
+from django.test import override_settings
 from rest_framework.test import APITestCase
 
 from realtime.models import AgentActivityEvent, VoiceSession
@@ -150,6 +151,30 @@ class VoiceTwiMLViewTests(APITestCase):
             content_type="application/x-www-form-urlencoded",
         )
         self.assertIn(response.status_code, (403, 503))
+
+    # ------------------------------------------------------------------
+    # relay_token in the ConversationRelay URL (Bug 2 guard)
+    #
+    # ConversationRelayConsumer.connect() closes with code 4001 whenever
+    # VOICE_RELAY_TOKEN is set and the token is missing/wrong, so the TwiML must
+    # carry it as a query param or every production call's socket is rejected.
+    # ------------------------------------------------------------------
+
+    @override_settings(VOICE_RELAY_TOKEN="tok-123")
+    def test_twiml_includes_relay_token_when_set(self):
+        body = self._post().content.decode()
+        self.assertIn("relay_token=tok-123", body)
+
+    @override_settings(VOICE_RELAY_TOKEN="")
+    def test_twiml_omits_relay_token_when_unset(self):
+        body = self._post().content.decode()
+        self.assertNotIn("relay_token", body)
+
+    @override_settings(VOICE_RELAY_TOKEN="a b/c")
+    def test_twiml_url_encodes_relay_token(self):
+        # quote(token, safe="") → space becomes %20, "/" becomes %2F.
+        body = self._post().content.decode()
+        self.assertIn("relay_token=a%20b%2Fc", body)
 
 
 class AgentActivityEventViewSetTests(APITestCase):

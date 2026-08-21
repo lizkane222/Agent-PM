@@ -9,6 +9,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { agentApi, skillsApi } from "../lib/api";
+import { consumeExportToChat } from "../components/ExportBar";
 import ConversationIcon from "../assets/icons/Conversation.svg?react";
 import PageBuilder from "../components/pagebuilder/PageBuilder";
 import { getAccessToken, isTokenExpired, refreshAccessToken } from "../lib/auth";
@@ -998,18 +999,22 @@ export default function ChatPage() {
     return () => window.removeEventListener("storage", onFooterSession);
   }, []);
 
-  // Listen for export-to-chat events from the sidebar export button.
+  // Receive "Send to Chat" from the export tray. Two paths, one payload:
+  // the event fires when this page is already mounted, and the mount check below
+  // covers arriving here *because* of the send. `consumeExportToChat` deletes as
+  // it reads, so whichever path runs first is the only one that sends.
   useEffect(() => {
-    function onExportToChat(e: Event) {
-      const text = (e as CustomEvent<{ text: string }>).detail.text;
+    function deliver() {
+      const text = consumeExportToChat();
       if (!text) return;
       startNewSession();
       setShowExportBuilder(true);
       setBuilderExpanded(false);
       setTimeout(() => { void sendExportMessage(text); }, 80);
     }
-    window.addEventListener("export-to-chat", onExportToChat);
-    return () => window.removeEventListener("export-to-chat", onExportToChat);
+    deliver();
+    window.addEventListener("export-to-chat", deliver);
+    return () => window.removeEventListener("export-to-chat", deliver);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

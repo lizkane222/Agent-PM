@@ -34,6 +34,15 @@ const extraHandlers = [
   ...skillsHandlers,
 ];
 
+// TipTap's Placeholder extension calls document.elementFromPoint, which jsdom
+// does not implement — mounting a real RichTextMentionEditor throws without it.
+// Lives here rather than per-file because it's an environment gap: any page that
+// renders a note field needs it, and a missing local copy fails as an opaque
+// "elementFromPoint is not a function" from deep inside prosemirror-view.
+if (!document.elementFromPoint) {
+  document.elementFromPoint = () => document.body;
+}
+
 beforeAll(() => {
   server.listen({ onUnhandledRequest: "error" });
   server.use(...extraHandlers);

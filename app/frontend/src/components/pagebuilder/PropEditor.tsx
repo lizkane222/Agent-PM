@@ -77,6 +77,30 @@ function NumberInput({ value, onChange, min, max }: { value: number; onChange: (
   );
 }
 
+/** The editor had no boolean control; the Page lock is the first one to need it. */
+function ToggleInput({ value, onChange, onLabel, offLabel }: {
+  value: boolean;
+  onChange: (v: boolean) => void;
+  onLabel: string;
+  offLabel: string;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={value}
+      onClick={() => onChange(!value)}
+      className={`w-full rounded border px-2 py-1 text-xs font-semibold transition-colors ${
+        value
+          ? "border-[var(--twilio-blue)] bg-[#E4F7FF] text-[var(--twilio-blue)]"
+          : "border-gray-200 bg-white text-[var(--twilio-gray-60)] hover:border-gray-300"
+      }`}
+    >
+      {value ? onLabel : offLabel}
+    </button>
+  );
+}
+
 function SelectInput({ value, onChange, options }: { value: string; onChange: (v: string) => void; options: string[] }) {
   return (
     <select
@@ -103,7 +127,27 @@ export default function PropEditor({ node, onChange }: Props) {
           <TextInput value={p.text as string} onChange={(v) => set("text", v)} placeholder="Enter text…" />
         </Row>
       )}
-      {"label" in p && node.type !== "StatCard" && (
+      {/* Page owns `label` too, but as a page name rather than a button caption. */}
+      {node.type === "Page" && (
+        <>
+          <Row label="Page name">
+            <TextInput
+              value={(p.label as string) ?? ""}
+              onChange={(v) => set("label", v)}
+              placeholder="Page 1"
+            />
+          </Row>
+          <Row label="Grouping">
+            <ToggleInput
+              value={p.locked === true}
+              onChange={(v) => set("locked", v)}
+              onLabel="🔒 Locked — moves as one"
+              offLabel="🔓 Unlocked — edit contents"
+            />
+          </Row>
+        </>
+      )}
+      {"label" in p && node.type !== "StatCard" && node.type !== "Page" && (
         <Row label="Label">
           <TextInput value={p.label as string} onChange={(v) => set("label", v)} placeholder="Button label" />
         </Row>

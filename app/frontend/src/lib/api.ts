@@ -509,6 +509,10 @@ export const teamApi = {
     apiClient.get<PaginatedResponse<{ id: number; name: string; slug: string; description: string; created_at: string }>>("/team/teams/", { params }),
   listMemberships: (params?: Record<string, string>) =>
     apiClient.get<PaginatedResponse<{ id: number; user: number; user_display: string; team: number; team_name: string; role: string; created_at: string }>>("/team/memberships/", { params }),
+  getGmailKeywords: () =>
+    apiClient.get<{ keywords: string[] }>("/team/profiles/gmail-keywords/"),
+  setGmailKeywords: (keywords: string[]) =>
+    apiClient.put<{ keywords: string[] }>("/team/profiles/gmail-keywords/", { keywords }),
   getMember: (id: number) => apiClient.get<TeamMember>(`/team/members/${id}/`),
   createMember: (data: Partial<TeamMember>) =>
     apiClient.post<TeamMember>("/team/members/", data),

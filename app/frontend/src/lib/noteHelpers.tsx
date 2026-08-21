@@ -1,5 +1,6 @@
 import React from "react";
 import DOMPurify from "dompurify";
+import type { CommentReference } from "../types";
 
 // Escapes &, <, > so legacy plain text can be safely wrapped in HTML tags
 // without literal angle brackets being parsed as markup.
@@ -81,6 +82,83 @@ export function renderNoteInline(text: string): React.ReactNode[] {
   }
   if (last < text.length) parts.push(text.slice(last));
   return parts;
+}
+
+// Renders HTML note content with structured references as interactive links
+// References are lazy-loaded to avoid circular dependency with ReferenceLink component
+export function renderNoteWithReferences(
+  html: string,
+  references?: CommentReference[]
+): React.ReactNode {
+  if (!references || references.length === 0) {
+    // No references: render HTML as-is with dangerouslySetInnerHTML
+    return <div dangerouslySetInnerHTML={{ __html: sanitizeHtml(plainToHtml(html)) }} />;
+  }
+
+  // With references: parse HTML and replace href links with ReferenceLink components
+  // This is a simple implementation that finds <a> tags and matches them against references
+  const sanitized = sanitizeHtml(plainToHtml(html));
+  const parser = new DOMParser();
+  let doc: Document;
+  try {
+    doc = parser.parseFromString(`<div>${sanitized}</div>`, "text/html");
+  } catch {
+    // Fallback if parsing fails
+    return <div dangerouslySetInnerHTML={{ __html: sanitized }} />;
+  }
+
+  // Find all anchor tags and match against references by href
+  const root = doc.body.firstChild;
+  if (!root) return <div dangerouslySetInnerHTML={{ __html: sanitized }} />;
+
+  const renderNode = (node: Node): React.ReactNode[] => {
+    const result: React.ReactNode[] = [];
+    for (const child of node.childNodes) {
+      if (child.nodeType === 3) { // Text node
+        result.push(child.textContent);
+      } else if (child.nodeType === 1) { // Element node
+        const el = child as Element;
+        if (el.tagName === "A" && el.getAttribute("href")) {
+          const href = el.getAttribute("href")!;
+          const ref = references.find((r) => r.url === href);
+          if (ref) {
+            // Lazy-load ReferenceLink to avoid circular deps
+            const { ReferenceLink } = require("../components/shared/ReferenceLink");
+            result.push(
+              <ReferenceLink key={href} reference={ref}>
+                {el.textContent}
+              </ReferenceLink>
+            );
+          } else {
+            // Not in our references: render as regular link
+            result.push(
+              <a
+                key={href}
+                href={href}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-indigo-600 underline underline-offset-2 hover:text-indigo-700"
+              >
+                {el.textContent}
+              </a>
+            );
+          }
+        } else {
+          // Other elements: recurse
+          result.push(
+            React.createElement(
+              el.tagName.toLowerCase(),
+              { key: el.outerHTML },
+              renderNode(child)
+            )
+          );
+        }
+      }
+    }
+    return result;
+  };
+
+  return <div>{renderNode(root)}</div>;
 }
 
 // On paste: if text is selected and clipboard looks like a URL, wrap as [selection](url)

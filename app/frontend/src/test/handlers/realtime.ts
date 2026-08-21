@@ -1,5 +1,11 @@
 import { http, HttpResponse } from "msw";
-import type { AgentActivityEvent } from "../../types";
+import type { AgentActivityEvent, SyncToken } from "../../types";
+
+export const mockSyncToken: SyncToken = {
+  token: "fake-access-token",
+  identity: "1",
+  sync_service_sid: "IS" + "0".repeat(32),
+};
 
 export const mockReplyNotification: AgentActivityEvent = {
   id: 101,
@@ -24,4 +30,5 @@ export const realtimeHandlers = [
   http.get("/api/v1/realtime/activity/", () =>
     HttpResponse.json({ results: [], count: 0 })
   ),
+  http.get("/api/v1/realtime/sync-token/", () => HttpResponse.json(mockSyncToken)),
 ];

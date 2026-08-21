@@ -101,7 +101,48 @@ export const COMPONENT_REGISTRY: ComponentDef[] = [
     },
     canHaveChildren: false,
   },
+  {
+    // What an export-tray record becomes when dropped on the canvas. Deliberately
+    // ONE self-contained node with `canHaveChildren: false`: the previous shape was
+    // a Card plus four absolutely-positioned children at hardcoded y-offsets, and
+    // absolute children can't push each other down — a two-line title simply painted
+    // over the account name. With no children there is nothing to overlap.
+    type: "RecordCard",
+    label: "Record",
+    category: "AgentPM",
+    icon: "🔖",
+    defaultProps: {
+      typeLabel: "Record",
+      recordTitle: "Record title",
+      accountName: "",
+      summary: "",
+      url: "",
+      accentColor: "#6366f1",
+      background: "#ffffff",
+      borderRadius: 8,
+      width: 280,
+    },
+    canHaveChildren: false,
+  },
   // ── Layout ─────────────────────────────────────────────────────────────────
+  {
+    // A sheet other components sit on. `width`/`height` must always be present:
+    // getNodeRect in PageBuilder falls back to 120×40 for a node without them,
+    // which would make every hit test against a page wrong.
+    // 816×1056 is US Letter at 96dpi.
+    type: "Page",
+    label: "Page",
+    category: "Layout",
+    icon: "📄",
+    defaultProps: {
+      label: "Page 1",
+      locked: false,
+      background: "#ffffff",
+      width: 816,
+      height: 1056,
+    },
+    canHaveChildren: true,
+  },
   {
     type: "Container",
     label: "Container",

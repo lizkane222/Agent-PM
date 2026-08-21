@@ -15,6 +15,7 @@ import PropEditor from "./PropEditor";
 import SaveLayoutModal from "./SaveLayoutModal";
 import LayoutsLibrary from "./LayoutsLibrary";
 import CanvasContextMenu from "./CanvasContextMenu";
+import CanvasExportModal from "./CanvasExportModal";
 import SaveVariantModal from "./SaveVariantModal";
 import TeamMemberPicker, { type PickedMember } from "./TeamMemberPicker";
 import TimelineFetchModal from "./TimelineFetchModal";
@@ -23,12 +24,16 @@ import { useCurrentUser } from "../../context/CurrentUserContext";
 import type { Account, PageLayout } from "../../types";
 import { loadVariants, addVariant, updateVariant, deleteVariant, type ComponentVariant } from "./variantStore";
 import { useCanvasState, makeNode, removeNode, findNode, CANVAS_DRAFT_KEY } from "./useCanvasState";
+import { useCanvasViewport, wheelZoomFactor } from "./useCanvasViewport";
+import CanvasZoomSlider from "./CanvasZoomSlider";
+import CanvasViewContext from "./CanvasViewContext";
 import { EXPORT_ITEM_DRAG_KEY } from "../ExportBar";
 import type { CanvasNode } from "./types";
 import { COMPONENT_REGISTRY } from "./registry";
 import { layoutsApi } from "../../lib/api";
 
 const DEFAULT_SIZE: Record<string, { w: number; h: number }> = {
+  Page:       { w: 816, h: 1056 }, // US Letter @96dpi; absent = silent 200×60 fallback
   Container:  { w: 320, h: 120 },
   Row:        { w: 320, h: 48 },
   Column:     { w: 160, h: 120 },
@@ -82,6 +87,73 @@ function rectsIntersect(a: Rect, b: Rect) {
   return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
 }
 
+/**
+ * True if `id` sits inside a Page whose `locked` prop is set.
+ *
+ * A locked page's children are already unreachable by pointer (the sheet captures
+ * events and the children container goes inert), so this is a belt-and-braces
+ * guard for any path that doesn't go through the mouse.
+ */
+export function isInsideLockedPage(nodes: CanvasNode[], id: string): boolean {
+  const walk = (list: CanvasNode[], lockedAbove: boolean): boolean => {
+    for (const n of list) {
+      const locked = lockedAbove || (n.type === "Page" && n.props.locked === true);
+      if (n.id === id) return lockedAbove; // the page itself is movable when locked
+      if (n.children.length > 0 && walk(n.children, locked)) return true;
+    }
+    return false;
+  };
+  return walk(nodes, false);
+}
+
+/**
+ * Which nodes a rubber-band selection should grab.
+ *
+ * Rules, per the Page design:
+ *  - A **Page is never selected by marquee** — it is a sheet that sits underneath,
+ *    and is selected by clicking its title bar instead.
+ *  - An **unlocked** Page's children *are* candidates, so sweeping over a page
+ *    grabs the components on it. This is why the walk descends.
+ *  - A **locked** Page contributes nothing, itself or its children: locked means
+ *    the page and its contents are a single object, so there is nothing inside it
+ *    to select individually.
+ *
+ * Hit-testing reads live DOM rects rather than `props.x/y/width/height`, because
+ * a nested node's stored x/y are *parent-relative* (so comparing them against a
+ * canvas-space box is meaningless), and auto-height nodes like `RecordCard` carry
+ * no `height` prop at all — `getNodeRect` would score them as 120×40.
+ *
+ * `box` and the returned geometry are both in viewport pixels, so zoom and pan
+ * need no compensation: they are already baked into `getBoundingClientRect`.
+ */
+export function marqueeHits(nodes: CanvasNode[], box: Rect, viewportRect: { left: number; top: number }): string[] {
+  const hits: string[] = [];
+
+  const rectFor = (id: string): Rect | null => {
+    const el = document.querySelector(`[data-node-id="${id}"]`);
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    // jsdom (and a not-yet-laid-out node) reports all zeros; a zero-area rect
+    // would intersect nothing, so skip rather than score it as a hit at 0,0.
+    if (r.width === 0 && r.height === 0) return null;
+    return { x: r.left - viewportRect.left, y: r.top - viewportRect.top, w: r.width, h: r.height };
+  };
+
+  const walk = (list: CanvasNode[]) => {
+    for (const n of list) {
+      if (n.type === "Page") {
+        if (n.props.locked !== true) walk(n.children);
+        continue; // never the page itself
+      }
+      const r = rectFor(n.id);
+      if (r && rectsIntersect(r, box)) hits.push(n.id);
+    }
+  };
+
+  walk(nodes);
+  return hits;
+}
+
 // Snap guides: lines to draw when active node aligns with others
 type SnapLine = { kind: "h" | "v"; pos: number; from: number; to: number };
 
@@ -115,9 +187,27 @@ function computeSnapLines(activeId: string | null, nodes: CanvasNode[]): SnapLin
   return lines;
 }
 
-// Single droppable canvas — one div, no nested wrappers
+/**
+ * Screen-space dot spacing for the infinite grid.
+ *
+ * The content grid is 24px, so at zoom 0.1 the dots would be 2.4px apart
+ * (a grey moiré smear) and at zoom 5 they'd be 120px apart (a mostly empty
+ * page). Doubling/halving keeps the spacing between 12 and 96 screen px at
+ * every zoom, and because the factor is always a power of two the visible dots
+ * stay a subset — or superset — of the real 24px grid rather than drifting off it.
+ */
+export function gridSpacingFor(zoom: number): number {
+  let spacing = 24 * zoom;
+  if (!Number.isFinite(spacing) || spacing <= 0) return 24;
+  while (spacing < 12) spacing *= 2;
+  while (spacing > 96) spacing /= 2;
+  return spacing;
+}
+
+// Viewport (clips, paints the infinite grid, owns the gestures) wrapping a
+// zero-size transform layer (the content origin — pan/zoom live here).
 function CanvasArea({
-  nodes, selectedId, multiSelectedIds, onSelect, onDelete, onResizeLive, onResizeCommit, onUpdateProps, canvasRef, onDeselect, onMarqueeSelect, onExportItemDrop, onNodeContextMenu, onImportTeamMembers, onFetchTimelineMeetings,
+  nodes, selectedId, multiSelectedIds, onSelect, onDelete, onResizeLive, onResizeCommit, onUpdateProps, canvasRef, viewportRef, onDeselect, onMarqueeSelect, onExportItemDrop, onNodeContextMenu, onImportTeamMembers, onFetchTimelineMeetings, zoom, panX, panY, onZoomByAt, onPanBy,
 }: {
   nodes: CanvasNode[];
   selectedId: string | null;
@@ -128,53 +218,122 @@ function CanvasArea({
   onResizeCommit: (id: string, w: number | undefined, h: number | undefined, x?: number, y?: number) => void;
   onUpdateProps: (id: string, props: Record<string, unknown>) => void;
   canvasRef: React.RefObject<HTMLDivElement | null>;
+  viewportRef: React.RefObject<HTMLDivElement | null>;
   onDeselect: () => void;
   onMarqueeSelect: (ids: string[]) => void;
   onExportItemDrop: (item: ExportItem, x: number, y: number, targetNodeId: string | null) => void;
   onNodeContextMenu: (id: string, e: React.MouseEvent) => void;
   onImportTeamMembers: (anchorNodeId: string) => void;
   onFetchTimelineMeetings: (nodeId: string) => void;
+  zoom: number;
+  panX: number;
+  panY: number;
+  onZoomByAt: (factor: number, anchorX: number, anchorY: number) => void;
+  onPanBy: (dx: number, dy: number) => void;
 }) {
+  // The droppable is the viewport, not the transform layer: the transform layer
+  // is 0×0 (its children are absolutely positioned), so dnd-kit would measure
+  // an empty rect and `pointerWithin` would never resolve `drop:root`.
   const { setNodeRef, isOver } = useDroppable({ id: "drop:root" });
-  const scrollRef = useRef<HTMLDivElement | null>(null);
 
-  // Marquee state
-  const [marquee, setMarquee] = useState<{ startX: number; startY: number; x: number; y: number; w: number; h: number } | null>(null);
+  // Marquee is tracked in *screen* px relative to the viewport, so its border
+  // stays a hairline at every zoom; hit-testing converts to content space.
+  const [marquee, setMarquee] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
   const marqueeRef = useRef(marquee);
   marqueeRef.current = marquee;
+  const [isPanning, setIsPanning] = useState(false);
 
-  const mergedRef = useCallback((el: HTMLDivElement | null) => {
+  const mergedViewportRef = useCallback((el: HTMLDivElement | null) => {
     setNodeRef(el);
+    (viewportRef as React.MutableRefObject<HTMLDivElement | null>).current = el;
+  }, [setNodeRef, viewportRef]);
+
+  // Callback ref (not `ref={canvasRef}`) so the nullable ref object typechecks
+  // the same way `mergedViewportRef` does.
+  const setCanvasRef = useCallback((el: HTMLDivElement | null) => {
     (canvasRef as React.MutableRefObject<HTMLDivElement | null>).current = el;
-  }, [setNodeRef, canvasRef]);
+  }, [canvasRef]);
 
   // Snap guide computation (only while dragging selected node)
   const snapLines = useMemo(() => computeSnapLines(selectedId, nodes), [selectedId, nodes]);
 
-  // Marquee drag on canvas background
-  function onCanvasMouseDown(e: React.MouseEvent<HTMLDivElement>) {
+  // Screen (viewport-relative) → content coordinates.
+  const toContent = useCallback((clientX: number, clientY: number) => {
+    const el = viewportRef.current;
+    const rect = el?.getBoundingClientRect();
+    const vx = clientX - (rect?.left ?? 0);
+    const vy = clientY - (rect?.top ?? 0);
+    return { x: (vx - panX) / zoom, y: (vy - panY) / zoom };
+  }, [viewportRef, panX, panY, zoom]);
+
+  // ── Wheel: zoom the canvas, never the page ────────────────────────────────
+  // Registered natively with `passive: false`. React's onWheel is attached
+  // passively at the root, so preventDefault() there is ignored and ⌘/ctrl+wheel
+  // falls through to the browser's own page zoom.
+  useEffect(() => {
+    const el = viewportRef.current;
+    if (!el) return;
+
+    function onWheel(e: WheelEvent) {
+      e.preventDefault();
+      // ctrlKey is also how trackpad pinch arrives, so pinch zooms too.
+      if (e.ctrlKey || e.metaKey) {
+        const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+        onZoomByAt(wheelZoomFactor(e.deltaY, e.deltaMode), e.clientX - rect.left, e.clientY - rect.top);
+      } else {
+        onPanBy(-e.deltaX, -e.deltaY);
+      }
+    }
+
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [viewportRef, onZoomByAt, onPanBy]);
+
+  // ── Mouse down on the background: marquee (left) or pan (middle) ──────────
+  function onViewportMouseDown(e: React.MouseEvent<HTMLDivElement>) {
+    // Middle-drag pans, anywhere — including over a node.
+    if (e.button === 1) {
+      e.preventDefault();
+      setIsPanning(true);
+      let lastX = e.clientX;
+      let lastY = e.clientY;
+
+      const onMove = (ev: MouseEvent) => {
+        onPanBy(ev.clientX - lastX, ev.clientY - lastY);
+        lastX = ev.clientX;
+        lastY = ev.clientY;
+      };
+      const onUp = () => {
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+        setIsPanning(false);
+      };
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", onUp);
+      return;
+    }
+
     if (e.button !== 0) return;
+    // Only start a marquee on the background — the viewport itself or the
+    // (empty) transform layer, never on a node.
     const target = e.target as HTMLElement;
-    // Only start marquee when clicking the canvas background itself
-    if (target !== e.currentTarget) return;
+    if (target !== e.currentTarget && target !== canvasRef.current) return;
     e.preventDefault();
 
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
+    const rect = e.currentTarget.getBoundingClientRect();
     const sx = e.clientX - rect.left;
     const sy = e.clientY - rect.top;
-
-    setMarquee({ startX: sx, startY: sy, x: sx, y: sy, w: 0, h: 0 });
+    setMarquee({ x: sx, y: sy, w: 0, h: 0 });
 
     function onMove(ev: MouseEvent) {
       const mx = ev.clientX - rect.left;
       const my = ev.clientY - rect.top;
-      const x = Math.min(sx, mx);
-      const y = Math.min(sy, my);
-      const w = Math.abs(mx - sx);
-      const h = Math.abs(my - sy);
-      setMarquee({ startX: sx, startY: sy, x, y, w, h });
+      setMarquee({
+        x: Math.min(sx, mx),
+        y: Math.min(sy, my),
+        w: Math.abs(mx - sx),
+        h: Math.abs(my - sy),
+      });
     }
 
     function onUp() {
@@ -182,8 +341,9 @@ function CanvasArea({
       window.removeEventListener("mouseup", onUp);
       const m = marqueeRef.current;
       if (m && (m.w > 4 || m.h > 4)) {
-        const sel = nodes.filter((n) => rectsIntersect(getNodeRect(n), { x: m.x, y: m.y, w: m.w, h: m.h }));
-        onMarqueeSelect(sel.map((n) => n.id));
+        // The marquee box is already in viewport pixels, and so are the DOM rects
+        // we compare against, so no zoom/pan conversion is needed here at all.
+        onMarqueeSelect(marqueeHits(nodes, { x: m.x, y: m.y, w: m.w, h: m.h }, rect));
       } else {
         onDeselect();
       }
@@ -194,57 +354,82 @@ function CanvasArea({
     window.addEventListener("mouseup", onUp);
   }
 
+  const gridSpacing = gridSpacingFor(zoom);
+
   return (
-    <div ref={scrollRef} className="flex-1 overflow-auto relative">
+    <div
+      ref={mergedViewportRef}
+      onMouseDown={onViewportMouseDown}
+      onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; }}
+      onDrop={(e) => {
+        e.preventDefault();
+        const raw = e.dataTransfer.getData(EXPORT_ITEM_DRAG_KEY);
+        if (!raw) return;
+        try {
+          const item = JSON.parse(raw) as ExportItem;
+          const canvas = canvasRef.current;
+          if (!canvas) return;
+          // Walk up from the drop target to find if we landed on a canvas node
+          let targetNodeId: string | null = null;
+          let el = e.target as HTMLElement | null;
+          while (el && el !== canvas) {
+            const id = el.getAttribute("data-node-id");
+            if (id) { targetNodeId = id; break; }
+            el = el.parentElement;
+          }
+          const p = toContent(e.clientX, e.clientY);
+          // `|| 0` guards a drop event with no coordinates: NaN would otherwise be
+          // written into props.x/y, and a NaN position renders as no position at
+          // all (React drops the style), stranding the card at the origin with a
+          // corrupt value persisted into the saved layout.
+          const cx = Math.max(0, Math.round(p.x) || 0);
+          const cy = Math.max(0, Math.round(p.y) || 0);
+          onExportItemDrop(item, cx, cy, targetNodeId);
+        } catch { /* malformed payload */ }
+      }}
+      data-canvas-viewport
+      className="flex-1 relative"
+      style={{
+        overflow: "hidden",
+        backgroundColor: "var(--twilio-gray-10)",
+        // The grid is painted on the viewport, offset by the pan and scaled by
+        // the zoom, so it fills the visible area at every zoom and in every
+        // direction — there is no canvas edge to reach.
+        backgroundImage: "radial-gradient(circle, #AEBBC1 1px, transparent 1px)",
+        backgroundSize: `${gridSpacing}px ${gridSpacing}px`,
+        backgroundPosition: `${panX}px ${panY}px`,
+        userSelect: marquee || isPanning ? "none" : undefined,
+        cursor: isPanning ? "grabbing" : undefined,
+      }}
+    >
+      {isOver && (
+        <div className="absolute inset-0 pointer-events-none bg-indigo-50/30 z-0" />
+      )}
+      {nodes.length === 0 && !isOver && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center select-none pointer-events-none">
+          <p className="text-5xl mb-3 opacity-10">⬡</p>
+          <p className="text-sm text-[var(--twilio-gray-60)] font-medium">Drag components from the left panel</p>
+          <p className="text-xs text-[var(--twilio-gray-40)] mt-1">Components are placed where you drop them</p>
+        </div>
+      )}
+
+      {/* Transform layer — the content origin. Zero-size on purpose: every
+          child is absolutely positioned, so it needs no extent, and having none
+          is what makes the canvas unbounded in all four directions. */}
       <div
-        ref={mergedRef}
-        onMouseDown={onCanvasMouseDown}
-        onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; }}
-        onDrop={(e) => {
-          e.preventDefault();
-          const raw = e.dataTransfer.getData(EXPORT_ITEM_DRAG_KEY);
-          if (!raw) return;
-          try {
-            const item = JSON.parse(raw) as ExportItem;
-            const canvas = canvasRef.current;
-            if (!canvas) return;
-            const rect = canvas.getBoundingClientRect();
-            // Walk up from the drop target to find if we landed on a canvas node
-            let targetNodeId: string | null = null;
-            let el = e.target as HTMLElement | null;
-            while (el && el !== canvas) {
-              const id = el.getAttribute("data-node-id");
-              if (id) { targetNodeId = id; break; }
-              el = el.parentElement;
-            }
-            const x = Math.max(0, Math.round(e.clientX - rect.left));
-            const y = Math.max(0, Math.round(e.clientY - rect.top));
-            onExportItemDrop(item, x, y, targetNodeId);
-          } catch { /* malformed payload */ }
-        }}
+        ref={setCanvasRef}
         data-canvas
         style={{
-          position: "relative",
+          position: "absolute",
+          left: 0,
+          top: 0,
+          width: 0,
+          height: 0,
           overflow: "visible",
-          minWidth: 800,
-          minHeight: "100%",
-          background: "var(--twilio-gray-10)",
-          backgroundImage: "radial-gradient(circle, #AEBBC1 1px, transparent 1px)",
-          backgroundSize: "24px 24px",
-          padding: 20,
-          userSelect: marquee ? "none" : undefined,
+          transform: `translate(${panX}px, ${panY}px) scale(${zoom})`,
+          transformOrigin: "0 0",
         }}
       >
-        {isOver && (
-          <div className="absolute inset-0 pointer-events-none bg-indigo-50/30 z-0" />
-        )}
-        {nodes.length === 0 && !isOver && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center select-none pointer-events-none">
-            <p className="text-5xl mb-3 opacity-10">⬡</p>
-            <p className="text-sm text-[var(--twilio-gray-60)] font-medium">Drag components from the left panel</p>
-            <p className="text-xs text-[var(--twilio-gray-40)] mt-1">Components are placed where you drop them</p>
-          </div>
-        )}
         {nodes.map((node) => (
           <DraggableNode
             key={node.id}
@@ -263,33 +448,33 @@ function CanvasArea({
           />
         ))}
 
-        {/* Snap guides */}
+        {/* Snap guides — 1 screen px at any zoom */}
         {snapLines.map((line, i) =>
           line.kind === "v" ? (
             <div key={i} className="pointer-events-none absolute z-50" style={{
               left: line.pos, top: line.from,
-              width: 1, height: line.to - line.from,
+              width: 1 / zoom, height: line.to - line.from,
               background: "#F22F46", opacity: 0.8,
             }} />
           ) : (
             <div key={i} className="pointer-events-none absolute z-50" style={{
               top: line.pos, left: line.from,
-              height: 1, width: line.to - line.from,
+              height: 1 / zoom, width: line.to - line.from,
               background: "#F22F46", opacity: 0.8,
             }} />
           )
         )}
-
-        {/* Marquee selection rectangle */}
-        {marquee && marquee.w > 2 && marquee.h > 2 && (
-          <div className="pointer-events-none absolute z-50" style={{
-            left: marquee.x, top: marquee.y,
-            width: marquee.w, height: marquee.h,
-            border: "1.5px solid #0263E0",
-            background: "rgba(2,99,224,0.07)",
-          }} />
-        )}
       </div>
+
+      {/* Marquee — screen space, so the border stays a hairline */}
+      {marquee && marquee.w > 2 && marquee.h > 2 && (
+        <div className="pointer-events-none absolute z-50" data-testid="canvas-marquee" style={{
+          left: marquee.x, top: marquee.y,
+          width: marquee.w, height: marquee.h,
+          border: "1.5px solid #0263E0",
+          background: "rgba(2,99,224,0.07)",
+        }} />
+      )}
     </div>
   );
 }
@@ -315,8 +500,28 @@ export default function PageBuilder() {
     clearCanvas,
   } = useCanvasState();
 
+  const { zoom, panX, panY, zoomByAt, zoomToAt, panBy, resetView } = useCanvasViewport();
+
   const canvasRef = useRef<HTMLDivElement | null>(null);
+  const viewportRef = useRef<HTMLDivElement | null>(null);
+
+  // Slider and keyboard zoom have no pointer to anchor on, so they anchor on the
+  // middle of the viewport — whatever you are looking at stays centred.
+  const zoomAtViewportCenter = useCallback((next: number) => {
+    const rect = viewportRef.current?.getBoundingClientRect();
+    zoomToAt(next, (rect?.width ?? 0) / 2, (rect?.height ?? 0) / 2);
+  }, [zoomToAt]);
+
+  const zoomByAtViewportCenter = useCallback((factor: number) => {
+    const rect = viewportRef.current?.getBoundingClientRect();
+    zoomByAt(factor, (rect?.width ?? 0) / 2, (rect?.height ?? 0) / 2);
+  }, [zoomByAt]);
+
+  // Memoised so every node inside the canvas doesn't re-render on unrelated
+  // PageBuilder state changes (this context is read by every DraggableNode).
+  const canvasView = useMemo(() => ({ zoom }), [zoom]);
   const [showSaveModal, setShowSaveModal] = useState(false);
+  const [showExportModal, setShowExportModal] = useState(false);
   const [showLibrary, setShowLibrary] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [draftSaved, setDraftSaved] = useState(false);
@@ -537,10 +742,24 @@ export default function PageBuilder() {
         e.preventDefault();
         pasteNode();
       }
+      // Zoom shortcuts. preventDefault also stops the browser's own ⌘+/⌘-/⌘0
+      // page zoom, so these only ever move the canvas.
+      if (e.key === "=" || e.key === "+") {
+        e.preventDefault();
+        zoomByAtViewportCenter(1.2);
+      }
+      if (e.key === "-" || e.key === "_") {
+        e.preventDefault();
+        zoomByAtViewportCenter(1 / 1.2);
+      }
+      if (e.key === "0") {
+        e.preventDefault();
+        resetView();
+      }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [undo, redo, selectedId, deleteNode, duplicateNode, copyNode, pasteNode, nodes, commit, setSelectedId]);
+  }, [undo, redo, selectedId, deleteNode, duplicateNode, copyNode, pasteNode, nodes, commit, setSelectedId, zoomByAtViewportCenter, resetView]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } })
@@ -549,6 +768,12 @@ export default function PageBuilder() {
   const handleDragEnd = useCallback((event: DragEndEvent) => {
     const { active, over, delta } = event;
     if (!over) return;
+
+    // dnd-kit reports `delta` and every `rect` in *screen* pixels. The canvas
+    // stores content pixels, so each screen-space difference below is divided by
+    // `zoom` before it becomes an x/y. Sizes that are already content-space
+    // (`def.w`) are applied after that division, never before.
+    const s = 1 / zoom;
 
     const overId = over.id as string;
     const activeData = active.data.current as {
@@ -570,14 +795,16 @@ export default function PageBuilder() {
         const rect = canvas.getBoundingClientRect();
         const pointerX = (event.activatorEvent as PointerEvent).clientX + delta.x;
         const pointerY = (event.activatorEvent as PointerEvent).clientY + delta.y;
-        x = Math.max(0, pointerX - rect.left - def.w / 2);
-        y = Math.max(0, pointerY - rect.top  - def.h / 2);
+        x = Math.max(0, (pointerX - rect.left) * s - def.w / 2);
+        y = Math.max(0, (pointerY - rect.top)  * s - def.h / 2);
       }
       const newNode = makeNode(type);
       if (activeData.presetProps) Object.assign(newNode.props, activeData.presetProps);
       newNode.props.x = Math.round(x);
       newNode.props.y = Math.round(y);
-      commit([...nodes, newNode]);
+      // Pages go to the front of the array so paint order keeps them under
+      // everything else (equal z-index ties break on DOM order).
+      commit(type === "Page" ? [newNode, ...nodes] : [...nodes, newNode]);
       setSelectedId(newNode.id);
       return;
     }
@@ -591,8 +818,8 @@ export default function PageBuilder() {
       if (activeData.presetProps) Object.assign(newNode.props, activeData.presetProps);
       if (over.rect && event.activatorEvent instanceof PointerEvent) {
         const ptr = event.activatorEvent as PointerEvent;
-        newNode.props.x = Math.max(0, Math.round(ptr.clientX + delta.x - over.rect.left - def.w / 2));
-        newNode.props.y = Math.max(0, Math.round(ptr.clientY + delta.y - over.rect.top  - def.h / 2));
+        newNode.props.x = Math.max(0, Math.round((ptr.clientX + delta.x - over.rect.left) * s - def.w / 2));
+        newNode.props.y = Math.max(0, Math.round((ptr.clientY + delta.y - over.rect.top)  * s - def.h / 2));
       } else {
         newNode.props.x = 16;
         newNode.props.y = 16;
@@ -617,17 +844,45 @@ export default function PageBuilder() {
         const initialRect = active.rect.current?.initial;
         let nx = 16, ny = 16;
         if (initialRect && over.rect) {
-          nx = Math.max(0, Math.round(initialRect.left + delta.x - over.rect.left));
-          ny = Math.max(0, Math.round(initialRect.top  + delta.y - over.rect.top));
+          nx = Math.max(0, Math.round((initialRect.left + delta.x - over.rect.left) * s));
+          ny = Math.max(0, Math.round((initialRect.top  + delta.y - over.rect.top)  * s));
         }
         const nestedNode = { ...node, props: { ...node.props, x: nx, y: ny } };
         commit(addChildToTree(withoutNode, parentId, nestedNode));
         return;
       }
 
-      // Staying on canvas root — delta from original position is exact
-      const cx = Math.max(0, Math.round(((node.props.x as number) ?? 0) + delta.x));
-      const cy = Math.max(0, Math.round(((node.props.y as number) ?? 0) + delta.y));
+      // Staying on canvas root — delta from original position is exact.
+      // If the dragged node is part of a multi-selection, every selected node
+      // moves by the same delta. Without this, marquee selection is inert:
+      // selecting five components and dragging one moved that one and silently
+      // left the other four behind. One `commit` = one undo entry for the group.
+      if (multiSelectedIds.length > 1 && multiSelectedIds.includes(nodeId)) {
+        const moving = new Set(multiSelectedIds);
+        let next = nodes;
+        for (const n of nodes) {
+          if (!moving.has(n.id)) continue;
+          if (isInsideLockedPage(nodes, n.id)) continue;
+          const mx = Math.max(0, Math.round(((n.props.x as number) ?? 0) + delta.x * s));
+          const my = Math.max(0, Math.round(((n.props.y as number) ?? 0) + delta.y * s));
+          next = updateNodeXY(next, n.id, mx, my);
+        }
+        // Children of an unlocked page are selectable, so they can be in the
+        // selection too — they live deeper than the root list.
+        for (const id of moving) {
+          if (nodes.some((n) => n.id === id)) continue; // already handled above
+          const nested = findNode(nodes, id);
+          if (!nested || isInsideLockedPage(nodes, id)) continue;
+          const mx = Math.max(0, Math.round(((nested.props.x as number) ?? 0) + delta.x * s));
+          const my = Math.max(0, Math.round(((nested.props.y as number) ?? 0) + delta.y * s));
+          next = updateNodeXY(next, id, mx, my);
+        }
+        commit(next);
+        return;
+      }
+
+      const cx = Math.max(0, Math.round(((node.props.x as number) ?? 0) + delta.x * s));
+      const cy = Math.max(0, Math.round(((node.props.y as number) ?? 0) + delta.y * s));
       commit(updateNodeXY(nodes, nodeId, cx, cy));
       return;
     }
@@ -637,6 +892,26 @@ export default function PageBuilder() {
       const nodeId = activeData.nodeId;
       const movedNode = findNode(nodes, nodeId);
       if (!movedNode) return;
+      // A locked page and its contents are one object: nothing inside it moves
+      // on its own. Pointer-events already prevent this drag from starting, so
+      // this only catches non-pointer paths.
+      if (isInsideLockedPage(nodes, nodeId)) return;
+
+      // Group move for a marquee selection inside a page. Deliberately a move in
+      // place, not a re-nest: dragging a group is repositioning, and re-parenting
+      // several nodes at once has no obvious correct target.
+      if (multiSelectedIds.length > 1 && multiSelectedIds.includes(nodeId)) {
+        let next = nodes;
+        for (const id of multiSelectedIds) {
+          const sel = findNode(nodes, id);
+          if (!sel || isInsideLockedPage(nodes, id)) continue;
+          const mx = Math.max(0, Math.round(((sel.props.x as number) ?? 0) + delta.x * s));
+          const my = Math.max(0, Math.round(((sel.props.y as number) ?? 0) + delta.y * s));
+          next = updateNodeXY(next, id, mx, my);
+        }
+        commit(next);
+        return;
+      }
       const withoutNode = removeNode(nodes, nodeId);
       const initialRect = active.rect.current?.initial;
 
@@ -646,8 +921,8 @@ export default function PageBuilder() {
         let x = 100, y = 100;
         if (initialRect && canvas) {
           const canvasRect = canvas.getBoundingClientRect();
-          x = Math.max(0, Math.round(initialRect.left + delta.x - canvasRect.left));
-          y = Math.max(0, Math.round(initialRect.top  + delta.y - canvasRect.top));
+          x = Math.max(0, Math.round((initialRect.left + delta.x - canvasRect.left) * s));
+          y = Math.max(0, Math.round((initialRect.top  + delta.y - canvasRect.top)  * s));
         }
         commit([...withoutNode, { ...movedNode, props: { ...movedNode.props, x, y } }]);
         return;
@@ -657,80 +932,44 @@ export default function PageBuilder() {
       if (parentId === nodeId) return;
 
       // Move within same parent or into a different container
-      let nx = Math.max(0, (movedNode.props.x as number ?? 16) + delta.x);
-      let ny = Math.max(0, (movedNode.props.y as number ?? 16) + delta.y);
+      let nx = Math.max(0, (movedNode.props.x as number ?? 16) + delta.x * s);
+      let ny = Math.max(0, (movedNode.props.y as number ?? 16) + delta.y * s);
       if (initialRect && over.rect) {
-        nx = Math.max(0, Math.round(initialRect.left + delta.x - over.rect.left));
-        ny = Math.max(0, Math.round(initialRect.top  + delta.y - over.rect.top));
+        nx = Math.max(0, Math.round((initialRect.left + delta.x - over.rect.left) * s));
+        ny = Math.max(0, Math.round((initialRect.top  + delta.y - over.rect.top)  * s));
       }
       const placedNode = { ...movedNode, props: { ...movedNode.props, x: Math.round(nx), y: Math.round(ny) } };
       commit(addChildToTree(withoutNode, parentId, placedNode));
     }
 
-  }, [nodes, commit, setSelectedId]);
+  }, [nodes, commit, setSelectedId, zoom, multiSelectedIds]);
 
-  // ── Build a Card node from an ExportItem ─────────────────────────────────
+  // ── Build a RecordCard node from an ExportItem ────────────────────────────
+  // One self-contained node, no children and no `height`.
+  //
+  // This used to be a `Card` with a Badge/Text/Label/Text stack pinned at y
+  // offsets 0/24/46/62, with `height` derived from those same constants. Card
+  // children are absolutely positioned (DraggableNode), so nothing reflowed: a
+  // title that wrapped to two lines needed 42px in a 22px slot and painted
+  // straight over the account name, and an 80-char account-note title (three
+  // lines) covered the account name *and* the summary. The summary had a 36px
+  // budget for up to 140 chars — about 72px of text — so it also spilled out
+  // below the card border. None of those constants can be made correct without
+  // measuring text, hence a flow-layout node instead.
   const buildExportCard = useCallback((item: ExportItem, x: number, y: number): CanvasNode => {
-    const accent = item.accent || "#6366f1";
-    const cardW = 280;
-
-    const card = makeNode("Card");
+    const card = makeNode("RecordCard");
     card.props.x = x;
     card.props.y = y;
-    card.props.width = cardW;
-    card.props.background = `${accent}10`;
-    card.props.borderColor = accent;
-    card.props.borderRadius = 8;
-    card.props.padding = 10;
-
-    // Type badge
-    const badge = makeNode("Badge");
-    badge.props.text = item.typeLabel || item.type;
-    badge.props.x = 0; badge.props.y = 0;
-    badge.props.background = `${accent}22`;
-    badge.props.color = accent;
-    badge.props.fontSize = 11;
-
-    // Title
-    const heading = makeNode("Text");
-    heading.props.text = item.label;
-    heading.props.x = 0; heading.props.y = 24;
-    heading.props.color = accent;
-    heading.props.fontSize = 14;
-    heading.props.fontWeight = 700;
-    heading.props.width = cardW - 20;
-
-    // Account name (if present)
-    const accountName = item.accountName || "";
-    const acctNode = makeNode("Label");
-    acctNode.props.text = accountName;
-    acctNode.props.x = 0; acctNode.props.y = 46;
-    acctNode.props.color = "#888";
-    acctNode.props.fontSize = 10;
-    acctNode.props.fontWeight = 500;
-    acctNode.props.width = cardW - 20;
-
-    // Summary / body
-    const rawSummary = item.summary || item.detail || item.content || "";
-    const summary = rawSummary.length > 140 ? rawSummary.slice(0, 140).trimEnd() + "…" : rawSummary;
-    const body = makeNode("Text");
-    body.props.text = summary;
-    body.props.x = 0; body.props.y = accountName ? 62 : 46;
-    body.props.color = "#555";
-    body.props.fontSize = 12;
-    body.props.width = cardW - 20;
-
-    card.children = [
-      badge,
-      heading,
-      ...(accountName ? [acctNode] : []),
-      ...(summary ? [body] : []),
-    ];
-
-    // Auto-height: fit children
-    const lastY = summary ? (accountName ? 62 : 46) + 36 : (accountName ? 62 : 46);
-    card.props.height = lastY + 20;
-
+    card.props.width = 280;
+    card.props.accentColor = item.accent || "#6366f1";
+    // Prefer the human label ("Action Item") over the raw enum ("action_item"),
+    // which is all the non-search producers set.
+    card.props.typeLabel = item.typeLabel || item.type.replace(/_/g, " ");
+    card.props.recordTitle = item.label;
+    card.props.accountName = item.accountName || "";
+    // No truncation: the card grows to fit, so there is nothing to protect.
+    card.props.summary = item.summary || item.detail || item.content || "";
+    card.props.url = item.url || "";
     return card;
   }, []);
 
@@ -767,6 +1006,15 @@ export default function PageBuilder() {
         onClose={() => setShowSaveModal(false)}
       />
     )}
+    {showExportModal && (
+      <CanvasExportModal
+        nodes={nodes}
+        selectedId={selectedId}
+        viewportRef={viewportRef}
+        onClose={() => setShowExportModal(false)}
+        onDeselectAll={() => { setSelectedId(null); setMultiSelectedIds([]); }}
+      />
+    )}
     {showLibrary && (
       <LayoutsLibrary
         currentUserId={currentUser?.id ?? null}
@@ -785,6 +1033,17 @@ export default function PageBuilder() {
         y={contextMenu.y}
         nodeId={contextMenu.nodeId}
         nodeType={contextMenu.nodeType}
+        pageLocked={findNode(nodes, contextMenu.nodeId)?.props.locked === true}
+        onToggleLock={(id) => {
+          const page = findNode(nodes, id);
+          if (!page) return;
+          const nowLocked = page.props.locked !== true;
+          updateProps(id, { ...page.props, locked: nowLocked });
+          // Same reason as the title-bar toggle: don't leave a child selected
+          // inside a subtree that has just gone pointer-inert.
+          if (nowLocked) setSelectedId(id);
+          setContextMenu(null);
+        }}
         onClose={() => setContextMenu(null)}
         onDelete={(id) => { deleteNode(id); setContextMenu(null); }}
         onDuplicate={(id) => { duplicateNode(id); setContextMenu(null); }}
@@ -836,11 +1095,24 @@ export default function PageBuilder() {
           {saveSuccess && (
             <span className="text-xs text-emerald-600 font-medium">Layout saved!</span>
           )}
+          <CanvasZoomSlider
+            zoom={zoom}
+            onZoomTo={zoomAtViewportCenter}
+            onReset={resetView}
+          />
           <button
             onClick={() => setShowLibrary(true)}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border border-gray-200 text-[var(--twilio-gray-60)] hover:border-gray-300 hover:text-[var(--twilio-navy)] transition-colors"
           >
             <span>⬡</span> Layout Library
+          </button>
+          <button
+            onClick={() => nodes.length > 0 && setShowExportModal(true)}
+            disabled={nodes.length === 0}
+            title={nodes.length === 0 ? "Add components before exporting" : "Export pages or the whole canvas"}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border border-gray-200 text-[var(--twilio-gray-60)] hover:border-gray-300 hover:text-[var(--twilio-navy)] disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+          >
+            <span>⤓</span> Export
           </button>
           <button
             onClick={() => nodes.length > 0 && setShowSaveModal(true)}
@@ -869,33 +1141,41 @@ export default function PageBuilder() {
         </div>
 
         {/* ── Center: Free-position canvas ─────────────────────────────── */}
-        <CanvasArea
-          nodes={nodes}
-          selectedId={selectedId}
-          multiSelectedIds={multiSelectedIds}
-          onSelect={(id, shift) => {
-            if (shift) {
-              handleShiftSelect(id);
-            } else {
-              setMultiSelectedIds([]);
-              setSelectedId(id);
-            }
-          }}
-          onDelete={deleteNode}
-          onResizeLive={resizeLive}
-          onResizeCommit={resizeCommit}
-          onUpdateProps={updateProps}
-          canvasRef={canvasRef}
-          onDeselect={() => { setSelectedId(null); setMultiSelectedIds([]); }}
-          onMarqueeSelect={handleMarqueeSelect}
-          onExportItemDrop={handleExportItemDrop as (item: ExportItem, x: number, y: number, targetNodeId: string | null) => void}
-          onNodeContextMenu={(id, e) => {
-            const node = findNode(nodes, id);
-            if (node) setContextMenu({ x: e.clientX, y: e.clientY, nodeId: id, nodeType: node.type });
-          }}
-          onImportTeamMembers={(id) => setTeamPickerAnchorId(id)}
-          onFetchTimelineMeetings={(id) => setTimelineNodeId(id)}
-        />
+        <CanvasViewContext.Provider value={canvasView}>
+          <CanvasArea
+            nodes={nodes}
+            selectedId={selectedId}
+            multiSelectedIds={multiSelectedIds}
+            onSelect={(id, shift) => {
+              if (shift) {
+                handleShiftSelect(id);
+              } else {
+                setMultiSelectedIds([]);
+                setSelectedId(id);
+              }
+            }}
+            onDelete={deleteNode}
+            onResizeLive={resizeLive}
+            onResizeCommit={resizeCommit}
+            onUpdateProps={updateProps}
+            canvasRef={canvasRef}
+            onDeselect={() => { setSelectedId(null); setMultiSelectedIds([]); }}
+            onMarqueeSelect={handleMarqueeSelect}
+            onExportItemDrop={handleExportItemDrop as (item: ExportItem, x: number, y: number, targetNodeId: string | null) => void}
+            onNodeContextMenu={(id, e) => {
+              const node = findNode(nodes, id);
+              if (node) setContextMenu({ x: e.clientX, y: e.clientY, nodeId: id, nodeType: node.type });
+            }}
+            onImportTeamMembers={(id) => setTeamPickerAnchorId(id)}
+            onFetchTimelineMeetings={(id) => setTimelineNodeId(id)}
+            viewportRef={viewportRef}
+            zoom={zoom}
+            panX={panX}
+            panY={panY}
+            onZoomByAt={zoomByAt}
+            onPanBy={panBy}
+          />
+        </CanvasViewContext.Provider>
 
         {/* ── Right: Inspector panel ────────────────────────────────────── */}
         <div className="w-64 shrink-0 border-l border-gray-200 bg-white overflow-y-auto flex flex-col">

@@ -11,6 +11,12 @@ export function useExportTray() {
 
   useEffect(() => { exportModeRef.current = exportMode; }, [exportMode]);
 
+  // Without this the pending auto-close fires after unmount and toggles the tray
+  // from a tree that is gone.
+  useEffect(() => () => {
+    if (timerRef.current) clearTimeout(timerRef.current);
+  }, []);
+
   function addToTray(item: AirtableActionItem) {
     const wasOff = !exportModeRef.current;
     toggleItem({

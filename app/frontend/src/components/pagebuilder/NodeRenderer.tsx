@@ -93,6 +93,13 @@ function InlineText({
 interface Props {
   node: CanvasNode;
   selectedId: string | null;
+  /**
+   * Threaded down so *nested* nodes can show as multi-selected. Without it a
+   * marquee over a Page selected its children in state but nothing indicated it,
+   * because `childProps` never carried this and every nested DraggableNode fell
+   * back to an empty list.
+   */
+  multiSelectedIds?: string[];
   onSelect: (id: string, shift?: boolean) => void;
   onDelete: (id: string) => void;
   onResizeLive:   (id: string, w: number | undefined, h: number | undefined, x?: number, y?: number) => void;
@@ -139,7 +146,7 @@ function ChildDropZone({
   );
 }
 
-export default function NodeRenderer({ node, selectedId, onSelect, onDelete, onResizeLive, onResizeCommit, onUpdateProps, onImportTeamMembers, onFetchTimelineMeetings, depth = 0 }: Props) {
+export default function NodeRenderer({ node, selectedId, multiSelectedIds, onSelect, onDelete, onResizeLive, onResizeCommit, onUpdateProps, onImportTeamMembers, onFetchTimelineMeetings, depth = 0 }: Props) {
   const p = node.props;
   const isSelected = selectedId === node.id;
   const [showIconPicker, setShowIconPicker] = useState(false);
@@ -154,7 +161,7 @@ export default function NodeRenderer({ node, selectedId, onSelect, onDelete, onR
       : "hover:ring-1 hover:ring-[var(--twilio-blue)] hover:ring-opacity-40"
   }`;
 
-  const childProps = { selectedId, onSelect, onDelete, onResizeLive, onResizeCommit, onUpdateProps, onImportTeamMembers, onFetchTimelineMeetings };
+  const childProps = { selectedId, multiSelectedIds, onSelect, onDelete, onResizeLive, onResizeCommit, onUpdateProps, onImportTeamMembers, onFetchTimelineMeetings };
 
   const renderContent = () => {
     switch (node.type) {
@@ -227,6 +234,101 @@ export default function NodeRenderer({ node, selectedId, onSelect, onDelete, onR
         );
       }
 
+      /**
+       * A Page is a sheet that other components sit on. Two things make it behave
+       * like a background rather than a component, and both are done with
+       * pointer-events rather than special-casing every handler:
+       *
+       * - **Unlocked**: the sheet is pointer-transparent, so a click-drag over it
+       *   falls through to the canvas and starts a marquee exactly as it would on
+       *   bare background. Its children opt back in, so they stay individually
+       *   selectable. The page itself is therefore only selectable via its title
+       *   bar — which is what makes "marquee ignores the page" true by construction
+       *   instead of by a filter that could be forgotten.
+       * - **Locked**: the sheet captures pointer events and the children go inert,
+       *   so a click anywhere selects the whole page and a drag moves page and
+       *   contents together (children are nested, so they follow for free).
+       */
+      case "Page": {
+        const w = p.width as number | undefined;
+        const h = p.height as number | undefined;
+        const locked = p.locked === true;
+        const label = (p.label as string) || "Page";
+        return (
+          <div style={{ position: "relative", width: w ? `${w}px` : "100%" }} data-page-node={node.id}>
+            {/* Title bar — the click target for selecting the page. Sits outside
+                the sheet so it works in both locked and unlocked states. */}
+            <div
+              data-page-titlebar
+              style={{
+                display: "flex", alignItems: "center", gap: 6,
+                padding: "3px 8px",
+                background: locked ? "#E8EDF3" : "var(--twilio-gray-10, #F4F4F6)",
+                border: "1px solid #E1E3EA",
+                borderBottom: "none",
+                borderRadius: "6px 6px 0 0",
+                fontFamily: "var(--font-base)",
+                cursor: "grab",
+                userSelect: "none",
+              }}
+            >
+              <span style={{ fontSize: 10, opacity: 0.5 }}>📄</span>
+              <span style={{
+                fontSize: 11, fontWeight: 600, color: "var(--twilio-navy, #121C2D)",
+                overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1,
+              }}>
+                {label}
+              </span>
+              <button
+                // stopPropagation on pointerdown, or dnd-kit's PointerSensor claims
+                // the gesture and the click never lands.
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onUpdateProps?.(node.id, { ...p, locked: !locked });
+                  // Select the page on lock: a child that was selected would
+                  // otherwise keep its ring and resize handles while sitting in a
+                  // now pointer-inert subtree, so they'd be visible but dead.
+                  if (!locked) onSelect(node.id);
+                }}
+                title={locked ? "Unlock page (edit its contents)" : "Lock page (move it and its contents as one)"}
+                aria-label={locked ? "Unlock page" : "Lock page"}
+                aria-pressed={locked}
+                style={{
+                  background: "none", border: "none", cursor: "pointer",
+                  fontSize: 11, lineHeight: 1, padding: "1px 3px", borderRadius: 3,
+                  color: locked ? "var(--twilio-blue, #0263E0)" : "var(--twilio-gray-60, #606B85)",
+                }}
+              >
+                {locked ? "🔒" : "🔓"}
+              </button>
+            </div>
+
+            <div
+              data-page-surface={node.id}
+              style={{
+                background: (p.background as string) || "#FFFFFF",
+                border: `1px solid ${locked ? "#C3D3E0" : "#E1E3EA"}`,
+                borderRadius: "0 0 6px 6px",
+                boxShadow: "0 1px 4px rgba(0,0,0,0.08)",
+                // The whole mechanism, see the comment above this case.
+                pointerEvents: locked ? "auto" : "none",
+              }}
+            >
+              <ChildDropZone
+                nodeId={node.id}
+                isEmpty={node.children.length === 0}
+                width={w}
+                height={h}
+                style={{ pointerEvents: locked ? "none" : "auto", background: "transparent" }}
+              >
+                {node.children.map((c) => <DraggableNode key={c.id} node={c} {...childProps} depth={depth + 1} isNested />)}
+              </ChildDropZone>
+            </div>
+          </div>
+        );
+      }
+
       // ── Content ─────────────────────────────────────────────────────────────
       case "Heading": {
         const Tag = (`h${p.level ?? 1}`) as keyof JSX.IntrinsicElements;
@@ -266,6 +368,11 @@ export default function NodeRenderer({ node, selectedId, onSelect, onDelete, onR
               letterSpacing: (p.letterSpacing as string) || "0em",
               lineHeight: (p.lineHeight as number) ?? 1.5,
               margin: 0, whiteSpace: "pre-wrap",
+              // A URL or long_snake_case_filename offers no break opportunity, so
+              // without this it runs straight out past the node's width — every
+              // container up the chain is `overflow: visible`, so it doesn't clip,
+              // it just paints over whatever is beside it.
+              overflowWrap: "anywhere",
             }}
           />
         );
@@ -294,6 +401,7 @@ export default function NodeRenderer({ node, selectedId, onSelect, onDelete, onR
               letterSpacing: (p.letterSpacing as string) || "0.08em",
               lineHeight: (p.lineHeight as number) ?? 1.2,
               textTransform: "uppercase",
+              overflowWrap: "anywhere",
             }}
           />
         );
@@ -1097,6 +1205,83 @@ export default function NodeRenderer({ node, selectedId, onSelect, onDelete, onR
               >
                 <span style={{ fontSize: 13 }}>＋</span> Import team members
               </button>
+            )}
+          </div>
+        );
+      }
+
+      case "RecordCard": {
+        const accent = (p.accentColor as string) || "#6366f1";
+        const summary = (p.summary as string) || "";
+        const url = (p.url as string) || "";
+        return (
+          <div style={{
+            background: (p.background as string) || "#fff",
+            borderRadius: (p.borderRadius as number) || 8,
+            border: `1.5px solid ${accent}33`,
+            borderLeft: `4px solid ${accent}`,
+            padding: "10px 12px",
+            fontFamily: "var(--font-base)",
+            // Auto height, flow layout: each row pushes the next one down, so the
+            // card grows to fit its content instead of the content escaping the card.
+            width: "100%",
+            display: "flex", flexDirection: "column", gap: 5,
+            boxSizing: "border-box",
+          }}>
+            <span style={{
+              alignSelf: "flex-start",
+              fontSize: 10, fontWeight: 700, letterSpacing: "0.04em",
+              textTransform: "uppercase",
+              color: accent, background: `${accent}18`,
+              padding: "1px 6px", borderRadius: 99,
+              // The badge must never be the thing that forces the card wider.
+              maxWidth: "100%", overflowWrap: "anywhere",
+            }}>
+              {(p.typeLabel as string) || "Record"}
+            </span>
+            <div style={{
+              fontSize: 13, fontWeight: 700, color: "#121C2D", lineHeight: 1.35,
+              // `anywhere` rather than `break-word`: record titles carry URLs and
+              // long_snake_case_filenames, which have no break opportunity and would
+              // otherwise run straight out of the card.
+              overflowWrap: "anywhere",
+            }}>
+              {(p.recordTitle as string) || "Record title"}
+            </div>
+            {(p.accountName as string) && (
+              <span style={{
+                alignSelf: "flex-start",
+                fontSize: 10, color: "#6B7280", background: "#F3F4F6",
+                padding: "1px 6px", borderRadius: 99,
+                maxWidth: "100%", overflowWrap: "anywhere",
+              }}>
+                {p.accountName as string}
+              </span>
+            )}
+            {summary && (
+              <div style={{
+                fontSize: 11, color: "#4B5563", lineHeight: 1.45,
+                // Honour newlines in note excerpts, and show all of them — the
+                // card is auto-height, so there is no budget to blow.
+                whiteSpace: "pre-wrap", overflowWrap: "anywhere",
+              }}>
+                {summary}
+              </div>
+            )}
+            {url && (
+              <a
+                href={url}
+                target="_blank"
+                rel="noreferrer"
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => e.stopPropagation()}
+                style={{
+                  fontSize: 10, color: accent, textDecoration: "underline",
+                  overflowWrap: "anywhere",
+                }}
+              >
+                {url}
+              </a>
             )}
           </div>
         );

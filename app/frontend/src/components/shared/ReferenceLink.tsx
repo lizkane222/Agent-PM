@@ -12,7 +12,7 @@ interface Props {
   children?: React.ReactNode;
 }
 
-export function ReferenceLink({ reference, children }: Props) {
+export default function ReferenceLink({ reference, children }: Props) {
   const [showPreview, setShowPreview] = useState(false);
   const navigate = useNavigate();
 
@@ -83,3 +83,5 @@ export function ReferenceLink({ reference, children }: Props) {
     </>
   );
 }
+
+export { ReferenceLink };

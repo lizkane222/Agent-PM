@@ -9,6 +9,7 @@ import { logout } from "../lib/auth";
 import SettingsIcon from "../assets/icons/Settings.svg?react";
 import { useNotificationDefaults } from "../context/NotificationDefaultsContext";
 import type { OAuthCredential, UserProfile } from "../types";
+import TagInput from "../components/shared/TagInput";
 
 function _urlBase64ToUint8Array(base64String: string): Uint8Array {
   const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
@@ -165,6 +166,81 @@ function ConnectionCard({
   );
 }
 
+function StaffGmailKeywordsSection() {
+  const [keywords, setKeywords] = useState<string[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
+  const [saveSuccess, setSaveSuccess] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const { data } = await teamApi.getGmailKeywords();
+        setKeywords(data.keywords);
+      } catch {
+        setError("Failed to load Gmail keywords");
+      } finally {
+        setIsLoading(false);
+      }
+    })();
+  }, []);
+
+  const handleSave = async () => {
+    setIsSaving(true);
+    setError(null);
+    try {
+      const { data } = await teamApi.setGmailKeywords(keywords);
+      setKeywords(data.keywords);
+      setSaveSuccess(true);
+      setTimeout(() => setSaveSuccess(false), 4000);
+    } catch {
+      setError("Failed to save Gmail keywords");
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  if (isLoading) return null;
+
+  return (
+    <section className="bg-white rounded-lg border border-amber-200 shadow-sm">
+      <div className="px-6 py-4 border-b border-amber-100 flex items-center gap-2">
+        <svg viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4 text-amber-500 shrink-0">
+          <path fillRule="evenodd" d="M8.485 2.495c.673-1.167 2.357-1.167 3.03 0l6.28 10.875c.673 1.167-.17 2.625-1.516 2.625H3.72c-1.347 0-2.189-1.458-1.515-2.625L8.485 2.495zM10 5a.75.75 0 01.75.75v3.5a.75.75 0 01-1.5 0v-3.5A.75.75 0 0110 5zm0 9a1 1 0 100-2 1 1 0 000 2z" clipRule="evenodd" />
+        </svg>
+        <div>
+          <h2 className="text-sm font-semibold text-amber-900">Gmail Default Keywords</h2>
+          <p className="text-xs text-amber-700 mt-0.5">These keywords are used as defaults for all users' Gmail sync filters.</p>
+        </div>
+      </div>
+      <div className="px-6 py-5 space-y-4">
+        <TagInput
+          tags={keywords}
+          onChange={setKeywords}
+          label="Default Keywords"
+          hint="Add keywords that will be suggested to all users as Gmail sync filters. All users' keyword lists merge with these defaults."
+          placeholder="Add keyword and press Enter…"
+          maxTags={100}
+        />
+        <button
+          onClick={handleSave}
+          disabled={isSaving}
+          className="rounded-md bg-amber-600 px-4 py-2 text-sm font-medium text-white hover:bg-amber-700 disabled:opacity-50"
+        >
+          {isSaving ? "Saving…" : "Save Keywords"}
+        </button>
+        {saveSuccess && (
+          <p className="text-sm text-green-600 font-medium">Default keywords saved.</p>
+        )}
+        {error && (
+          <p className="text-sm text-red-600">{error}</p>
+        )}
+      </div>
+    </section>
+  );
+}
+
 export default function SettingsPage() {
   const [credentials, setCredentials] = useState<OAuthCredential[]>([]);
   const [profile, setProfile] = useState<UserProfile | null>(null);
@@ -174,6 +250,9 @@ export default function SettingsPage() {
   const [airtableSynced, setAirtableSynced] = useState(false);
   const [pushStatus, setPushStatus] = useState<"idle" | "requesting" | "registered" | "denied" | "unsupported">("idle");
   const [gmailWatchState, setGmailWatchState] = useState<"idle" | "registering" | "success" | "error">("idle");
+  const [gmailConfig, setGmailConfig] = useState<{ label_name?: string; keywords?: string[]; block_keywords?: string[] }>({});
+  const [gmailConfigIsSaving, setGmailConfigIsSaving] = useState(false);
+  const [gmailConfigSaveSuccess, setGmailConfigSaveSuccess] = useState(false);
   const [scraperStatus, setScraperStatus] = useState<{ confluence: boolean; jira: boolean; zendesk: boolean; gong: boolean; notion: boolean } | null>(null);
   const pushRegistered = useRef(false);
   const { defaults: notifDefaults, setDefaults: setNotifDefaults } = useNotificationDefaults();
@@ -189,6 +268,10 @@ export default function SettingsPage() {
         setCredentials(statusRes.data.connected);
         setProfile(profileRes.data);
         setScraperStatus(scraperRes.data);
+        // Load Gmail config from profile
+        if (profileRes.data.gmail_watch_config) {
+          setGmailConfig(profileRes.data.gmail_watch_config);
+        }
         if (profileRes.data.push_subscription_active) {
           setPushStatus("registered");
           pushRegistered.current = true;
@@ -303,6 +386,24 @@ export default function SettingsPage() {
       setTimeout(() => setGmailWatchState("idle"), 4000);
     }
   }, []);
+
+  const handleSaveGmailConfig = useCallback(async () => {
+    if (!profile) return;
+    setGmailConfigIsSaving(true);
+    try {
+      const { data } = await teamApi.updateMyProfile({
+        gmail_watch_config: gmailConfig,
+      });
+      setProfile(data);
+      setGmailConfig(data.gmail_watch_config || {});
+      setGmailConfigSaveSuccess(true);
+      setTimeout(() => setGmailConfigSaveSuccess(false), 4000);
+    } catch {
+      alert("Failed to save Gmail config.");
+    } finally {
+      setGmailConfigIsSaving(false);
+    }
+  }, [profile, gmailConfig]);
 
   const handleSignOut = useCallback(async () => {
     await logout();
@@ -476,6 +577,63 @@ export default function SettingsPage() {
               ) : undefined
             }
           />
+          {isConnected("gmail") && (
+            <div className="py-4 border-b border-gray-100">
+              <details className="group">
+                <summary className="cursor-pointer flex items-center justify-between">
+                  <p className="text-sm font-medium text-[var(--twilio-navy)]">Gmail Sync Filters</p>
+                  <span className="text-gray-400 group-open:rotate-180 transition-transform">▼</span>
+                </summary>
+                <div className="mt-4 space-y-4">
+                  <div>
+                    <label className="block text-xs font-semibold text-gray-700 mb-2">
+                      Gmail Label to Watch (optional)
+                    </label>
+                    <input
+                      type="text"
+                      value={gmailConfig.label_name ?? ""}
+                      onChange={(e) =>
+                        setGmailConfig((prev) => ({ ...prev, label_name: e.target.value }))
+                      }
+                      placeholder="e.g., Agent PM - Threads"
+                      className="w-full rounded-md border border-gray-300 px-3 py-2 text-sm placeholder-gray-400 focus:border-indigo-500 focus:outline-none"
+                    />
+                    <p className="text-xs text-gray-500 mt-1">
+                      Leave blank to watch all INBOX emails. If set, only emails in this label are synced.
+                    </p>
+                  </div>
+                  <TagInput
+                    tags={gmailConfig.keywords ?? []}
+                    onChange={(keywords) => setGmailConfig((prev) => ({ ...prev, keywords }))}
+                    label="Keywords to Match"
+                    hint="Add keywords to filter emails. Fuzzy matching catches typos. Leave empty to match all (unless blocked)."
+                    placeholder="Add keyword and press Enter…"
+                    maxTags={100}
+                  />
+                  <TagInput
+                    tags={gmailConfig.block_keywords ?? []}
+                    onChange={(block_keywords) =>
+                      setGmailConfig((prev) => ({ ...prev, block_keywords }))
+                    }
+                    label="Block Keywords"
+                    hint="Emails matching these keywords are skipped, even if they match keywords above."
+                    placeholder="Add keyword to block and press Enter…"
+                    maxTags={100}
+                  />
+                  <button
+                    onClick={() => void handleSaveGmailConfig()}
+                    disabled={gmailConfigIsSaving}
+                    className="rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
+                  >
+                    {gmailConfigIsSaving ? "Saving…" : "Save Gmail Filters"}
+                  </button>
+                  {gmailConfigSaveSuccess && (
+                    <p className="text-sm text-green-600 font-medium">Gmail filters saved.</p>
+                  )}
+                </div>
+              </details>
+            </div>
+          )}
           <ConnectionCard
             name="Slack"
             description="Read messages and threads from your workspace."
@@ -908,6 +1066,11 @@ export default function SettingsPage() {
             </p>
           </div>
         </section>
+      )}
+
+      {/* Staff Gmail Keywords — only visible to staff users */}
+      {profile?.is_staff && (
+        <StaffGmailKeywordsSection />
       )}
 
       {/* Edit App */}

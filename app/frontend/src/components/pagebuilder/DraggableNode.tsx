@@ -1,7 +1,7 @@
 import { useDraggable } from "@dnd-kit/core";
-import { CSS } from "@dnd-kit/utilities";
 import type { CanvasNode } from "./types";
 import NodeRenderer from "./NodeRenderer";
+import { useCanvasView } from "./CanvasViewContext";
 
 interface Props {
   node: CanvasNode;
@@ -34,20 +34,36 @@ export default function DraggableNode({
   const y = (node.props.y as number) ?? 16;
   const isMultiSelected = multiSelectedIds.includes(node.id);
 
+  // dnd-kit's translate is screen pixels, but this element sits inside the
+  // canvas's scaled transform layer — so applying it raw makes the drag preview
+  // travel `zoom`× further than the cursor. Divide it back out.
+  const { zoom } = useCanvasView();
+  const dragTransform = transform
+    ? `translate3d(${transform.x / zoom}px, ${transform.y / zoom}px, 0)`
+    : undefined;
+
+  // A Page is a sheet other components sit on, so it must never rise above them.
+  // The default `selected ? 10 : 1` would lift it over its own contents the moment
+  // it was clicked, which reads as the page swallowing everything on it.
+  const isPage = node.type === "Page";
+  const zIndex = isPage
+    ? (isDragging ? 100 : 0)
+    : (isDragging ? 100 : selectedId === node.id ? 10 : 1);
+
   const style: React.CSSProperties = (isRoot || isNested)
     ? {
         position: "absolute",
         left: x,
         top: y,
-        transform: CSS.Translate.toString(transform),
+        transform: dragTransform,
         opacity: isDragging ? 0.45 : 1,
-        zIndex: isDragging ? 100 : selectedId === node.id ? 10 : 1,
+        zIndex,
         width: node.props.width ? `${node.props.width}px` : undefined,
         minWidth: 40,
         cursor: isDragging ? "grabbing" : "default",
       }
     : {
-        transform: CSS.Translate.toString(transform),
+        transform: dragTransform,
         opacity: isDragging ? 0.45 : 1,
         position: "relative",
         cursor: isDragging ? "grabbing" : "default",
@@ -62,8 +78,8 @@ export default function DraggableNode({
       style={{
         ...style,
         overflow: "visible",
-        outline: isMultiSelected && selectedId !== node.id ? "2px solid #818CF8" : undefined,
-        outlineOffset: isMultiSelected && selectedId !== node.id ? "2px" : undefined,
+        outline: isMultiSelected && selectedId !== node.id ? `${2 / zoom}px solid #818CF8` : undefined,
+        outlineOffset: isMultiSelected && selectedId !== node.id ? `${2 / zoom}px` : undefined,
       }}
       className="group"
       onClick={(e) => {
@@ -83,6 +99,7 @@ export default function DraggableNode({
       <NodeRenderer
         node={node}
         selectedId={selectedId}
+        multiSelectedIds={multiSelectedIds}
         onSelect={(id) => onSelect(id, false)}
         onDelete={onDelete}
         onResizeLive={onResizeLive}

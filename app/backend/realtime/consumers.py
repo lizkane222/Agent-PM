@@ -218,6 +218,11 @@ class VoiceTranscriptConsumer(AsyncJsonWebsocketConsumer):
 
         await self.channel_layer.group_add(self.group_name, self.channel_name)
         await self.accept()
+        # Tell the relay consumer (also in this group) that a browser subscriber
+        # is now listening, so it flushes any turns buffered before we joined.
+        await self.channel_layer.group_send(
+            self.group_name, {"type": "transcript.subscriber_ready"}
+        )
         logger.info("VoiceTranscriptConsumer connected: call_sid=%s user=%s", self.call_sid, user.pk)
 
     async def disconnect(self, close_code):
@@ -234,6 +239,11 @@ class VoiceTranscriptConsumer(AsyncJsonWebsocketConsumer):
             "content": event["content"],
         })
 
+    async def transcript_subscriber_ready(self, event):
+        # This consumer is a group member, so it receives the readiness ping it
+        # sends on connect. Nothing to do here — the ping is for the relay consumer.
+        pass
+
 
 class ConversationRelayConsumer(AsyncWebsocketConsumer):
     """
@@ -242,10 +252,12 @@ class ConversationRelayConsumer(AsyncWebsocketConsumer):
     Twilio connects here after the browser initiates a Voice SDK call and our
     TwiML returns <Connect><ConversationRelay>. The protocol is JSON frames:
 
-    Inbound (Twilio → us):
-      {"event": "prompt", "voicePrompt": "<transcribed utterance>"}
-      {"event": "interrupt"}
-      {"event": "setup", "callSid": "...", ...}
+    Inbound (Twilio → us) — every frame is keyed on "type":
+      {"type": "setup", "callSid": "...", "customParameters": {...}, ...}
+      {"type": "prompt", "voicePrompt": "<transcribed utterance>", "lang": "en-US", "last": true}
+      {"type": "dtmf", "digit": "1"}
+      {"type": "interrupt", "utteranceUntilInterrupt": "...", "durationUntilInterruptMs": 460}
+      {"type": "error", "description": "..."}
 
     Outbound (us → Twilio):
       {"type": "text", "token": "<text chunk>", "last": false}
@@ -273,9 +285,11 @@ class ConversationRelayConsumer(AsyncWebsocketConsumer):
         self._call_sid: str = ""
         self._group: str = ""
         self._conversation_sid: str = ""
-        # Turns that arrive before the browser WS has joined the group are
-        # buffered here and flushed on the next group_send so nothing is lost.
+        # Turns that arrive before the browser transcript WS has joined the group
+        # are buffered here and flushed once it announces itself via
+        # transcript_subscriber_ready, so early turns are never dropped.
         self._pending_turns: list[dict] = []
+        self._subscriber_ready: bool = False
         logger.info("ConversationRelay connected")
 
     async def disconnect(self, close_code):
@@ -296,9 +310,10 @@ class ConversationRelayConsumer(AsyncWebsocketConsumer):
         except json.JSONDecodeError:
             return
 
-        event = msg.get("event", "")
+        # Twilio ConversationRelay keys every inbound frame on "type".
+        msg_type = msg.get("type", "")
 
-        if event == "setup":
+        if msg_type == "setup":
             self._call_sid = msg.get("callSid", "")
             self._group = f"voice_transcript_{self._call_sid}"
             await self.channel_layer.group_add(self._group, self.channel_name)
@@ -314,25 +329,50 @@ class ConversationRelayConsumer(AsyncWebsocketConsumer):
                     self._call_sid, exc,
                 )
 
-        elif event == "prompt":
+        elif msg_type == "prompt":
             utterance = msg.get("voicePrompt", "").strip()
             if not utterance:
                 return
             logger.info("ConversationRelay prompt [%s]: %r", self._call_sid, utterance)
             await self._handle_prompt(utterance)
 
-        elif event == "interrupt":
-            pass
+        elif msg_type == "interrupt":
+            # Caller talked over TTS playback. Nothing to unwind server-side —
+            # Twilio stops playback for us; we just note it.
+            logger.info("ConversationRelay interrupt [%s]", self._call_sid)
+
+        elif msg_type == "dtmf":
+            # dtmfDetection isn't enabled in our TwiML, so this is unexpected;
+            # ignore gracefully rather than crash.
+            logger.info("ConversationRelay dtmf [%s]: %s", self._call_sid, msg.get("digit", ""))
+
+        elif msg_type == "error":
+            logger.warning(
+                "ConversationRelay error [%s]: %s", self._call_sid, msg.get("description", "")
+            )
 
     async def _push_turn(self, role: str, content: str) -> None:
-        """Broadcast a transcript turn to browser subscribers."""
+        """Broadcast a transcript turn to browser subscribers.
+
+        If no browser has joined the transcript group yet, buffer the turn until
+        one announces itself via transcript_subscriber_ready — group_send is
+        silently dropped when the group has no members, so sending eagerly would
+        lose every turn that precedes the browser's connection.
+        """
         if not self._group:
             return
         turn = {"type": "voice.turn", "role": role, "content": content}
-        self._pending_turns.append(turn)
-        for queued in self._pending_turns:
-            await self.channel_layer.group_send(self._group, queued)
-        self._pending_turns.clear()
+        if not self._subscriber_ready:
+            self._pending_turns.append(turn)
+            return
+        await self.channel_layer.group_send(self._group, turn)
+
+    async def transcript_subscriber_ready(self, event):
+        """A browser transcript socket joined the group — flush buffered turns."""
+        self._subscriber_ready = True
+        pending, self._pending_turns = self._pending_turns, []
+        for turn in pending:
+            await self.channel_layer.group_send(self._group, turn)
 
     async def _handle_prompt(self, utterance: str) -> None:
         """Stream a Claude Bedrock response for the utterance, push transcript to browser."""

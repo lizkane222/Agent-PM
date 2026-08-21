@@ -10,7 +10,11 @@ import { Extension } from "@tiptap/core";
 import StarterKit from "@tiptap/starter-kit";
 import Link from "@tiptap/extension-link";
 import { BulletList, OrderedList, ListItem, TaskList, TaskItem } from "@tiptap/extension-list";
-import Placeholder from "@tiptap/extension-placeholder";
+// TipTap v3 moved Placeholder into @tiptap/extensions (named export). The old
+// `@tiptap/extension-placeholder` package was never declared in package.json — it
+// only existed as a stray folder in node_modules, so the build worked locally but
+// any clean `npm ci` would have failed on it.
+import { Placeholder } from "@tiptap/extensions";
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import { teamApi, searchApi, type SearchResult } from "../../lib/api";
 import { plainToHtml } from "../../lib/noteHelpers";
@@ -80,6 +84,11 @@ function LinkPopover({ onSet, onClose }: { onSet: (url: string) => void; onClose
 
 // ── Mention / reference dropdown ──────────────────────────────────────────────
 
+/** `search/views.py::global_search` short-circuits to [] below this length. */
+const REF_MIN_QUERY = 2;
+/** Rough dropdown height, used only to pick above/below placement. */
+const MENU_EST_HEIGHT = 240;
+
 interface UserItem { kind: "user"; id: number; label: string; member: TeamMember }
 interface RefItem { kind: "ref"; id: string; label: string; href: string; result: SearchResult }
 type MentionItem = UserItem | RefItem;
@@ -90,22 +99,40 @@ function MentionDropdown({
   onSelect,
   selectedIds,
   multiHeader,
+  statusNode,
+  placement,
 }: {
   items: MentionItem[];
   activeIdx: number;
   onSelect: (item: MentionItem) => void;
   selectedIds?: Set<string>;
   multiHeader?: React.ReactNode;
+  /** Shown instead of / above the list: "Searching…", "Type to search", "No
+   * results". Without it a query that matches nothing renders nothing at all,
+   * which reads as "@# is broken" rather than "nothing matched". */
+  statusNode?: React.ReactNode;
+  placement: "above" | "below";
 }) {
   const listRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const el = listRef.current?.querySelector(`[data-idx="${activeIdx}"]`);
-    el?.scrollIntoView({ block: "nearest" });
+    // Optional call: scrollIntoView is absent in jsdom, and keeping the arrow
+    // keys working matters more than the scroll.
+    el?.scrollIntoView?.({ block: "nearest" });
   }, [activeIdx]);
-  if (!items.length && !multiHeader) return null;
+  if (!items.length && !multiHeader && !statusNode) return null;
   return (
-    <div className="absolute bottom-full left-0 mb-1 z-50 bg-white border border-gray-200 rounded-lg shadow-xl min-w-[220px]">
+    <div
+      data-mention-dropdown
+      data-placement={placement}
+      // z-[100] rather than z-50: this editor is mounted inside modals and side
+      // panels that establish their own stacking contexts at z-50.
+      className={`absolute left-0 z-[100] bg-white border border-gray-200 rounded-lg shadow-xl min-w-[220px] ${
+        placement === "above" ? "bottom-full mb-1" : "top-full mt-1"
+      }`}
+    >
       {multiHeader}
+      {statusNode}
       <div ref={listRef} className="max-h-44 overflow-y-auto">
         {items.map((item, i) => {
           const selected = selectedIds?.has(String(item.id));
@@ -162,6 +189,10 @@ export interface RichTextMentionEditorProps {
   /** When true, @# opens a multiselect picker (Comments UX): pick several
    * records, then confirm to insert them all as bullet lines at once. */
   refMultiSelect?: boolean;
+  /** Fired when the editor loses focus. Used by the notepads, which autosave on
+   * blur. Picking a mention does NOT blur: the dropdown items preventDefault on
+   * mousedown, so focus never leaves the contenteditable. */
+  onBlur?: () => void;
   /** Fired when a user mention is inserted into the content. */
   onMentionSelect?: (member: TeamMember) => void;
   /** Fired once per record reference inserted (single mode: on select;
@@ -174,7 +205,7 @@ export interface RichTextMentionEditorProps {
 
 const RichTextMentionEditor = forwardRef<RichTextMentionEditorHandle, RichTextMentionEditorProps>(
   function RichTextMentionEditor(
-    { value, onChange, placeholder, autoFocus, minHeightClassName, onKeyDownCapture, onSubmit, refMultiSelect, onMentionSelect, onReferenceSelect, onReferenceInsert },
+    { value, onChange, placeholder, autoFocus, minHeightClassName, onKeyDownCapture, onSubmit, onBlur, refMultiSelect, onMentionSelect, onReferenceSelect, onReferenceInsert },
     ref
   ) {
     const [showLink, setShowLink] = useState(false);
@@ -187,7 +218,12 @@ const RichTextMentionEditor = forwardRef<RichTextMentionEditorHandle, RichTextMe
     const [mentionActiveIdx, setMentionActiveIdx] = useState(0);
     const [allMembers, setAllMembers] = useState<TeamMember[]>([]);
     const [refResults, setRefResults] = useState<SearchResult[]>([]);
+    const [refLoading, setRefLoading] = useState(false);
     const [pendingRefs, setPendingRefs] = useState<SearchResult[]>([]);
+    // The dropdown opens upward by default, but an editor near the top of a
+    // scroll container has no room there — flip it rather than render offscreen.
+    const [placement, setPlacement] = useState<"above" | "below">("above");
+    const editorAreaRef = useRef<HTMLDivElement>(null);
 
     // Load team members once
     useEffect(() => {
@@ -211,17 +247,36 @@ const RichTextMentionEditor = forwardRef<RichTextMentionEditorHandle, RichTextMe
 
     useEffect(() => { setMentionActiveIdx(0); }, [mentionMode, mentionQuery]);
 
-    // Debounced record reference search
+    // Debounced record reference search. `search/views.py::global_search`
+    // returns an empty list for a term under 2 characters, so gate here rather
+    // than spending a request that can only come back empty.
     const refQueryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     useEffect(() => {
-      if (mentionMode !== "ref") { setRefResults([]); return; }
+      if (mentionMode !== "ref") { setRefResults([]); setRefLoading(false); return; }
+      if (mentionQuery.trim().length < REF_MIN_QUERY) {
+        setRefResults([]);
+        setRefLoading(false);
+        return;
+      }
       if (refQueryRef.current) clearTimeout(refQueryRef.current);
+      setRefLoading(true);
       refQueryRef.current = setTimeout(() => {
         searchApi.search(mentionQuery)
           .then((r) => setRefResults(r.data.results ?? []))
-          .catch(() => {});
+          .catch(() => setRefResults([]))
+          .finally(() => setRefLoading(false));
       }, 200);
       return () => { if (refQueryRef.current) clearTimeout(refQueryRef.current); };
+    }, [mentionMode, mentionQuery]);
+
+    // Flip the dropdown below the editor when there isn't room above it.
+    useEffect(() => {
+      if (!mentionMode) return;
+      const rect = editorAreaRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      const spaceAbove = rect.top;
+      const spaceBelow = window.innerHeight - rect.bottom;
+      setPlacement(spaceAbove < MENU_EST_HEIGHT && spaceBelow > spaceAbove ? "below" : "above");
     }, [mentionMode, mentionQuery]);
 
     const dismissMention = useCallback(() => {
@@ -235,6 +290,8 @@ const RichTextMentionEditor = forwardRef<RichTextMentionEditorHandle, RichTextMe
     // through refs rather than closing over a stale render.
     const submitRef = useRef(onSubmit);
     useEffect(() => { submitRef.current = onSubmit; }, [onSubmit]);
+    const blurRef = useRef(onBlur);
+    useEffect(() => { blurRef.current = onBlur; }, [onBlur]);
     const mentionOpenRef = useRef(false);
     useEffect(() => { mentionOpenRef.current = mentionMode !== null; }, [mentionMode]);
 
@@ -279,6 +336,9 @@ const RichTextMentionEditor = forwardRef<RichTextMentionEditorHandle, RichTextMe
       ],
       content: plainToHtml(value),
       autofocus: autoFocus ?? false,
+      onBlur() {
+        blurRef.current?.();
+      },
       onUpdate({ editor }) {
         // Empty TipTap docs serialize to "<p></p>", which is truthy — send ""
         // so existing `if (value.task_details)`-style guards stay accurate.
@@ -447,6 +507,20 @@ const RichTextMentionEditor = forwardRef<RichTextMentionEditorHandle, RichTextMe
       </div>
     ) : undefined;
 
+    // @# always reports what it is doing. Without this the dropdown rendered
+    // nothing until a query matched, so typing "@#" looked like a dead key.
+    const refStatusNode = mentionMode === "ref" ? (
+      refLoading ? (
+        <p className="text-xs text-gray-400 px-3 py-2">Searching…</p>
+      ) : mentionQuery.trim().length < REF_MIN_QUERY ? (
+        <p className="text-xs text-gray-400 px-3 py-2">
+          Type at least {REF_MIN_QUERY} characters to search records…
+        </p>
+      ) : refItems.length === 0 ? (
+        <p className="text-xs text-gray-400 px-3 py-2">No results for “{mentionQuery}”</p>
+      ) : undefined
+    ) : undefined;
+
     return (
       // Deliberately no focus-within ring/border on the wrapper: the blue box
       // was painted here rather than on the contenteditable, so the index.css
@@ -499,19 +573,21 @@ const RichTextMentionEditor = forwardRef<RichTextMentionEditorHandle, RichTextMe
         </div>
 
         {/* Editor */}
-        <div className="relative" onKeyDown={handleKeyDown}>
+        <div ref={editorAreaRef} className="relative" onKeyDown={handleKeyDown}>
           <EditorContent
             editor={editor}
             className={`prose prose-sm max-w-none px-3 py-2.5 text-sm text-[var(--twilio-navy)] [&_.is-empty::before]:text-gray-400 [&_.is-empty::before]:italic [&_.is-empty::before]:float-left [&_.is-empty::before]:pointer-events-none [&_.is-empty::before]:content-[attr(data-placeholder)] [&_ul[data-type=taskList]]:list-none [&_ul[data-type=taskList]]:pl-0 [&_li[data-type=taskItem]]:flex [&_li[data-type=taskItem]]:items-start [&_li[data-type=taskItem]]:gap-1.5 ${minHeightClassName ?? "min-h-[80px]"}`}
           />
 
           {/* Mention dropdown */}
-          {mentionMode && (activeItems.length > 0 || multiHeader) && (
+          {mentionMode && (activeItems.length > 0 || multiHeader || refStatusNode) && (
             <MentionDropdown
               items={activeItems}
               activeIdx={mentionActiveIdx}
               selectedIds={selectedIds}
               multiHeader={multiHeader}
+              statusNode={refStatusNode}
+              placement={placement}
               onSelect={(item) => {
                 if (item.kind === "user") insertMentionUser(item);
                 else selectRefItem(item);

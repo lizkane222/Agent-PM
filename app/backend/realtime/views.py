@@ -1,6 +1,7 @@
 """API views for the realtime app."""
 
 import logging
+import urllib.parse
 
 from django.conf import settings
 from django.http import HttpResponse
@@ -11,7 +12,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from twilio.jwt.access_token import AccessToken
 from twilio.jwt.access_token.grants import SyncGrant, VoiceGrant
-from twilio.twiml.voice_response import Connect, ConversationRelay, VoiceResponse
+from twilio.twiml.voice_response import Connect, VoiceResponse
 
 from .models import AgentActivityEvent, VoiceSession
 from .serializers import (
@@ -82,6 +83,15 @@ class VoiceTwiMLView(TwilioSignatureRequiredMixin, APIView):
         scheme = "wss" if request.is_secure() else "ws"
         host = request.get_host()
         relay_url = f"{scheme}://{host}/ws/voice-relay/"
+
+        # Append the pre-shared VOICE_RELAY_TOKEN as a query param so the consumer
+        # accepts the incoming Twilio connection. Without it, ConversationRelayConsumer
+        # closes every socket with code 4001 whenever VOICE_RELAY_TOKEN is configured
+        # (i.e. in production).
+        relay_token = getattr(settings, "VOICE_RELAY_TOKEN", "")
+        if relay_token:
+            relay_url = f"{relay_url}?relay_token={urllib.parse.quote(relay_token, safe='')}"
+
         response = VoiceResponse()
         connect = Connect()
         connect.conversation_relay(

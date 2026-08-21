@@ -133,6 +133,48 @@ class UserProfileViewSet(viewsets.ModelViewSet):
         profile.save(update_fields=["push_subscription"])
         return Response({"push_subscription_active": True})
 
+    @action(detail=False, methods=["get", "put"], url_path="gmail-keywords", permission_classes=[IsAuthenticated])
+    def gmail_keywords(self, request):
+        """
+        Get/set global Gmail default keywords (staff only).
+
+        GET /api/v1/team/profiles/gmail-keywords/
+        Returns: { keywords: [str] }
+
+        PUT /api/v1/team/profiles/gmail-keywords/
+        Body: { keywords: [str] }
+        Returns: { keywords: [str] }
+        """
+        if not request.user.is_staff:
+            raise PermissionDenied("Staff only.")
+
+        from django.conf import settings
+
+        if request.method == "GET":
+            keywords = getattr(settings, "GMAIL_DEFAULT_KEYWORDS", [])
+            return Response({"keywords": keywords})
+
+        # PUT — update settings (in-memory only for this session; would need env var persistence for prod)
+        keywords = request.data.get("keywords", [])
+        if not isinstance(keywords, list):
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError("keywords must be a list")
+        if not all(isinstance(k, str) for k in keywords):
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError("All keywords must be strings")
+        if len(keywords) > 100:
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError("Too many keywords (max 100)")
+
+        # In production, this would write to a database setting or env var
+        # For now, update the settings object in-memory (won't persist across restarts)
+        settings.GMAIL_DEFAULT_KEYWORDS = keywords
+        import logging
+        logging.getLogger(__name__).info(
+            "Gmail default keywords updated by %s: %s", request.user.email, keywords
+        )
+        return Response({"keywords": keywords})
+
 
 class TeamViewSet(viewsets.ReadOnlyModelViewSet):
     """Teams the current user belongs to. Scoped by TeamMembership."""

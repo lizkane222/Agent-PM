@@ -257,3 +257,57 @@ class CalendarColorsTest(APITestCase):
         resp = self.client.get(PROFILE_ME_URL)
         self.assertEqual(resp.data["display_name"], "Liz")
         self.assertEqual(resp.data["calendar_colors"]["categories"]["meeting"], "#C3D3E0")
+
+
+# ── Gmail Keywords (staff-only) ──────────────────────────────────────────────────
+
+GMAIL_KEYWORDS_URL = "/api/v1/team/profiles/gmail-keywords/"
+
+
+class GmailKeywordsTest(APITestCase):
+    """GET/PUT /api/v1/team/profiles/gmail-keywords/ — staff-only global keywords."""
+
+    def setUp(self):
+        self.staff = _make_user("staff", is_staff=True)
+        self.user = _make_user("user")
+
+    def test_unauthenticated_returns_401(self):
+        self.assertEqual(self.client.get(GMAIL_KEYWORDS_URL).status_code, 401)
+        self.assertEqual(self.client.put(GMAIL_KEYWORDS_URL, {}, format="json").status_code, 401)
+
+    def test_non_staff_returns_403(self):
+        self.client.force_authenticate(user=self.user)
+        self.assertEqual(self.client.get(GMAIL_KEYWORDS_URL).status_code, 403)
+        self.assertEqual(self.client.put(GMAIL_KEYWORDS_URL, {}, format="json").status_code, 403)
+
+    def test_staff_can_get_keywords(self):
+        self.client.force_authenticate(user=self.staff)
+        resp = self.client.get(GMAIL_KEYWORDS_URL)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("keywords", resp.data)
+        self.assertIsInstance(resp.data["keywords"], list)
+
+    def test_staff_can_set_keywords(self):
+        self.client.force_authenticate(user=self.staff)
+        keywords = ["meeting notes", "gong", "zoom"]
+        resp = self.client.put(GMAIL_KEYWORDS_URL, {"keywords": keywords}, format="json")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["keywords"], keywords)
+
+    def test_rejects_non_list_keywords(self):
+        self.client.force_authenticate(user=self.staff)
+        resp = self.client.put(GMAIL_KEYWORDS_URL, {"keywords": "not-a-list"}, format="json")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_rejects_non_string_items(self):
+        self.client.force_authenticate(user=self.staff)
+        resp = self.client.put(
+            GMAIL_KEYWORDS_URL, {"keywords": ["valid", 123, "also-valid"]}, format="json"
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_rejects_oversized_list(self):
+        self.client.force_authenticate(user=self.staff)
+        keywords = [f"keyword-{i}" for i in range(101)]
+        resp = self.client.put(GMAIL_KEYWORDS_URL, {"keywords": keywords}, format="json")
+        self.assertEqual(resp.status_code, 400)

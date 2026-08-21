@@ -18,10 +18,14 @@ interface Props {
   onDuplicate: (id: string) => void;
   onCopy: (id: string) => void;
   onSaveVariant: (nodeId: string) => void;
+  /** Present only for a Page; reflects its current `locked` prop. */
+  pageLocked?: boolean;
+  onToggleLock?: (nodeId: string) => void;
 }
 
 export default function CanvasContextMenu({
   x, y, nodeId, nodeType, onClose, onDelete, onDuplicate, onCopy, onSaveVariant,
+  pageLocked, onToggleLock,
 }: Props) {
   const menuRef = useRef<HTMLDivElement | null>(null);
 
@@ -69,6 +73,22 @@ export default function CanvasContextMenu({
         zIndex: 9999,
       }}
     >
+      {nodeType === "Page" && onToggleLock && (
+        <>
+          <button
+            style={btnStyle}
+            onMouseEnter={(e) => (e.currentTarget.style.background = "#F3F4F6")}
+            onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+            onClick={() => onToggleLock(nodeId)}
+          >
+            {pageLocked ? "🔓 Unlock page" : "🔒 Lock page"}
+            <span style={{ float: "right", opacity: 0.5, fontSize: 11 }}>
+              {pageLocked ? "edit contents" : "move as one"}
+            </span>
+          </button>
+          <div style={dividerStyle} />
+        </>
+      )}
       <button
         style={btnStyle}
         onMouseEnter={(e) => (e.currentTarget.style.background = "#F3F4F6")}

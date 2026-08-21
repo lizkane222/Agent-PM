@@ -14,6 +14,8 @@ import {
 } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
 import { GetMeetingNotesButton } from "../components/shared/GetMeetingNotesButton";
+import RichTextMentionEditor from "../components/shared/RichTextMentionEditor";
+import { htmlToPreviewText } from "../lib/noteHelpers";
 import {
   agentSkillsApi, skillsApi, accountsApi, teamApi,
   schedulerApi, commentsApi, layoutsApi,
@@ -24,6 +26,7 @@ import type {
   ActionItem, Reminder, Comment, PageLayout,
   UserPageNote, WorkingSession, ExportItemSnapshot,
 } from "../types";
+import { acceptExportItemDragOver, readExportItem } from "../lib/exportDrop";
 import { ROLE_META, SLUG_TO_ROLE, ROLED_PAGES } from "../lib/titleRoles";
 import type { TitleRole } from "../lib/titleRoles";
 import { useLogGlow } from "../hooks/useLogGlow";
@@ -373,6 +376,12 @@ interface MiniNode {
   h: number;
   fields?: Record<string, string>;
   children?: MiniNode[];
+  /**
+   * Set when the node came from the export tray rather than the sketch palette.
+   * Such a node renders as a full record card and takes its height from its
+   * content — `h` becomes a minimum, not a fixed box, so nothing is clipped.
+   */
+  record?: ExportItemSnapshot;
 }
 
 // ── Mini-canvas field catalog (spans all entity types in the app) ─────────────
@@ -767,6 +776,48 @@ function MiniPaletteItem({ type, label, icon }: { type: string; label: string; i
   );
 }
 
+/**
+ * A record dropped onto the mini-canvas from the export tray. Flow layout with
+ * wrapping everywhere, so every field stays readable however long it is and
+ * nothing can sit on top of anything else.
+ */
+function MiniRecordBody({ record }: { record: ExportItemSnapshot }) {
+  const accent = record.accent || "#6366f1";
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 3, width: "100%" }}>
+      <span style={{
+        alignSelf: "flex-start",
+        fontSize: "0.5rem", fontWeight: 700, letterSpacing: "0.05em",
+        textTransform: "uppercase", color: accent,
+        background: `${accent}18`, borderRadius: 3, padding: "1px 4px",
+        maxWidth: "100%", overflowWrap: "anywhere",
+      }}>
+        {record.type.replace(/_/g, " ")}
+      </span>
+      <span style={{
+        fontWeight: 700, fontSize: "0.6875rem", lineHeight: 1.3,
+        color: "var(--text-primary, #111)", overflowWrap: "anywhere",
+      }}>
+        {record.label}
+      </span>
+      {record.accountName && (
+        <span style={{ fontSize: "0.5625rem", color: "var(--text-secondary, #888)", overflowWrap: "anywhere" }}>
+          {record.accountName}
+        </span>
+      )}
+      {record.summary && (
+        <span style={{
+          fontSize: "0.5625rem", lineHeight: 1.45,
+          color: "var(--text-secondary, #888)",
+          whiteSpace: "pre-wrap", overflowWrap: "anywhere",
+        }}>
+          {record.summary}
+        </span>
+      )}
+    </div>
+  );
+}
+
 function MiniCanvasNode({
   node, selected, onSelect, onDelete, onResize, onOpenEdit, depth,
 }: {
@@ -821,7 +872,9 @@ function MiniCanvasNode({
         left: node.x,
         top: node.y,
         width: node.w,
-        height: node.h,
+        // A record card grows with its text; a sketch box keeps its exact size.
+        height: node.record ? undefined : node.h,
+        minHeight: node.record ? node.h : undefined,
         transform: CSS.Translate.toString(transform),
         zIndex: isDragging ? 50 : selected ? 10 : (1 + (depth ?? 0)),
         opacity: isDragging ? 0.5 : 1,
@@ -833,19 +886,26 @@ function MiniCanvasNode({
       onContextMenu={e => { e.preventDefault(); e.stopPropagation(); onOpenEdit(node.id); }}
     >
       <div style={{
-        width: "100%", height: "100%",
+        width: "100%",
+        height: node.record ? "auto" : "100%",
         borderRadius: 6,
         border: `1.5px solid ${selected ? "#0263E0" : "rgba(0,0,0,0.12)"}`,
+        borderLeft: node.record ? `4px solid ${node.record.accent || "#6366f1"}` : undefined,
         boxShadow: selected ? "0 0 0 2px rgba(2,99,224,0.2)" : "0 1px 4px rgba(0,0,0,0.07)",
         background: "var(--surface, #fff)",
         display: "flex", flexDirection: "column",
-        alignItems: "flex-start", justifyContent: "flex-start", gap: 2,
-        padding: "5px 6px",
+        alignItems: "flex-start", justifyContent: "flex-start", gap: node.record ? 4 : 2,
+        padding: node.record ? "7px 9px" : "5px 6px",
         fontSize: "0.5625rem", color: "var(--text-secondary, #888)",
-        overflow: "hidden",
+        // Records must not clip — their height is content-driven.
+        overflow: node.record ? "visible" : "hidden",
         position: "relative",
         boxSizing: "border-box",
       }}>
+        {node.record ? (
+          <MiniRecordBody record={node.record} />
+        ) : (
+        <>
         {/* Header row: icon + label */}
         <div style={{ display: "flex", alignItems: "center", gap: 4, width: "100%" }}>
           <span style={{ fontSize: "0.875rem", flexShrink: 0 }}>{node.icon}</span>
@@ -893,6 +953,8 @@ function MiniCanvasNode({
             {child.icon} {child.label}
           </div>
         ))}
+        </>
+        )}
       </div>
 
       {/* Delete button */}
@@ -931,7 +993,7 @@ function MiniCanvasNode({
 }
 
 function MiniCanvasDropArea({
-  nodes, selectedId, onSelect, onDelete, onResize, onOpenEdit, canvasRef, accentColor,
+  nodes, selectedId, onSelect, onDelete, onResize, onOpenEdit, canvasRef, accentColor, onDropExportItem,
 }: {
   nodes: MiniNode[];
   selectedId: string | null;
@@ -941,8 +1003,12 @@ function MiniCanvasDropArea({
   onOpenEdit: (id: string) => void;
   canvasRef: React.RefObject<HTMLDivElement | null>;
   accentColor: string;
+  onDropExportItem: (item: ExportItemSnapshot, x: number, y: number) => void;
 }) {
   const { setNodeRef, isOver } = useDroppable({ id: "mini-canvas-drop" });
+  // HTML5 drags (the export tray) are invisible to dnd-kit's `isOver`.
+  const [isPillOver, setIsPillOver] = useState(false);
+  const showDropState = isOver || isPillOver;
 
   const mergedRef = useCallback((el: HTMLDivElement | null) => {
     setNodeRef(el);
@@ -953,20 +1019,37 @@ function MiniCanvasDropArea({
     <div
       ref={mergedRef}
       onClick={() => onSelect(null)}
+      onDragOver={(e) => {
+        if (acceptExportItemDragOver(e)) setIsPillOver(true);
+      }}
+      onDragLeave={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setIsPillOver(false);
+      }}
+      onDrop={(e) => {
+        const item = readExportItem(e);
+        setIsPillOver(false);
+        if (!item) return;
+        e.preventDefault();
+        e.stopPropagation();
+        // Drop where the cursor is, in canvas coordinates.
+        const rect = e.currentTarget.getBoundingClientRect();
+        onDropExportItem(item, Math.max(4, Math.round(e.clientX - rect.left - 90)), Math.max(4, Math.round(e.clientY - rect.top - 20)));
+      }}
       style={{
         position: "relative",
         flex: 1,
         minHeight: 200,
-        background: isOver ? `${accentColor}06` : "var(--bg, #f9f9f9)",
+        background: showDropState ? `${accentColor}06` : "var(--bg, #f9f9f9)",
         backgroundImage: "radial-gradient(circle, #AEBBC1 1px, transparent 1px)",
         backgroundSize: "20px 20px",
-        border: `1.5px dashed ${isOver ? accentColor : "var(--border, rgba(0,0,0,0.12))"}`,
+        border: `1.5px dashed ${showDropState ? accentColor : "var(--border, rgba(0,0,0,0.12))"}`,
         borderRadius: 8,
-        overflow: "hidden",
+        // Record cards are content-height and can extend past the estimate.
+        overflow: "visible",
         transition: "all 0.15s",
       }}
     >
-      {nodes.length === 0 && !isOver && (
+      {nodes.length === 0 && !showDropState && (
         <div style={{
           position: "absolute", inset: 0,
           display: "flex", flexDirection: "column",
@@ -974,7 +1057,7 @@ function MiniCanvasDropArea({
           pointerEvents: "none",
         }}>
           <p style={{ margin: 0, fontSize: "0.6875rem", color: "var(--text-secondary, #ccc)", fontWeight: 600, letterSpacing: "0.08em", textTransform: "uppercase" }}>
-            Drag components here
+            Drag components or export-tray records here
           </p>
         </div>
       )}
@@ -1002,6 +1085,22 @@ function MiniCanvasPanel({ accentColor, textColor }: { accentColor: string; text
   const navigate = useNavigate();
 
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
+
+  // An export-tray record dropped on the canvas. `w` is a starting width and `h`
+  // only a minimum — MiniCanvasNode gives a record node content-driven height.
+  const handleDropExportItem = useCallback((item: ExportItemSnapshot, x: number, y: number) => {
+    setNodes(prev => {
+      if (prev.some(n => n.record?.id === item.id)) return prev;
+      return [...prev, {
+        id: mkMiniId(),
+        type: "record",
+        icon: "🔖",
+        label: item.label,
+        x, y, w: 200, h: 72,
+        record: item,
+      }];
+    });
+  }, []);
 
   const handleDragEnd = useCallback((e: DragEndEvent) => {
     const { active, over, delta } = e;
@@ -1118,6 +1217,7 @@ function MiniCanvasPanel({ accentColor, textColor }: { accentColor: string; text
               onOpenEdit={id => { setSelectedId(id); setEditNodeId(id); }}
               canvasRef={canvasRef}
               accentColor={accentColor}
+              onDropExportItem={handleDropExportItem}
             />
           </div>
         </div>
@@ -1139,6 +1239,46 @@ function MiniCanvasPanel({ accentColor, textColor }: { accentColor: string; text
 // ─────────────────────────────────────────────────────────────────────────────
 
 type AnnotatedRef = ExportItemSnapshot & { _note?: string; _x?: number; _y?: number };
+
+// Session-canvas card grid. ROW_PITCH has to clear a card showing a wrapped title
+// plus an account name plus a summary plus the 2-row note box.
+const SESSION_CARD_ORIGIN = 16;
+const SESSION_COL_PITCH = 240; // 220px card + 20px gutter
+const SESSION_ROW_PITCH = 210;
+const SESSION_COLS = 3;
+
+/**
+ * First grid slot not already occupied, so a dropped card can never land on top
+ * of one that's already there.
+ *
+ * The old version used `refs.length` as the slot index, which is a count, not a
+ * position: add 3 cards, delete the middle one, and the next drop computed index
+ * 2 — the slot the third card is still sitting in. The new card landed exactly on
+ * top of it and only the higher z-index was visible. Reading the occupied slots
+ * instead also means a deletion leaves a hole that gets refilled.
+ */
+export function nextFreeSlot(refs: AnnotatedRef[]): { _x: number; _y: number } {
+  const slotOf = (r: AnnotatedRef) => {
+    const col = Math.round(((r._x ?? SESSION_CARD_ORIGIN) - SESSION_CARD_ORIGIN) / SESSION_COL_PITCH);
+    const row = Math.round(((r._y ?? SESSION_CARD_ORIGIN) - SESSION_CARD_ORIGIN) / SESSION_ROW_PITCH);
+    return `${col}:${row}`;
+  };
+  const taken = new Set(refs.map(slotOf));
+
+  for (let row = 0; row < 500; row++) {
+    for (let col = 0; col < SESSION_COLS; col++) {
+      if (!taken.has(`${col}:${row}`)) {
+        return {
+          _x: SESSION_CARD_ORIGIN + col * SESSION_COL_PITCH,
+          _y: SESSION_CARD_ORIGIN + row * SESSION_ROW_PITCH,
+        };
+      }
+    }
+  }
+  // Unreachable in practice (1500 slots); place below everything rather than overlap.
+  const maxY = refs.reduce((m, r) => Math.max(m, r._y ?? 0), 0);
+  return { _x: SESSION_CARD_ORIGIN, _y: maxY + SESSION_ROW_PITCH };
+}
 
 const TYPE_COLORS: Record<string, string> = {
   action_item: "#f97316", account: "#3b82f6", meeting: "#8b5cf6",
@@ -1200,19 +1340,32 @@ function SessionRecordCard({
             }}>
               {item.type.replace(/_/g, " ")}
             </span>
+            {/* Wraps instead of `nowrap` + ellipsis, which showed ~23 characters
+                in the 220px card — an 80-char account-note title was 70% hidden
+                with no way to read the rest. */}
             {item.url ? (
               <a href={item.url} target="_blank" rel="noopener noreferrer"
-                style={{ display: "block", fontSize: "0.8125rem", fontWeight: 600, color: "var(--text-primary, #111)", textDecoration: "none", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                style={{ display: "block", fontSize: "0.8125rem", fontWeight: 600, color: "var(--text-primary, #111)", textDecoration: "none", lineHeight: 1.35, overflowWrap: "anywhere" }}>
                 {item.label}
               </a>
             ) : (
-              <p style={{ margin: 0, fontSize: "0.8125rem", fontWeight: 600, color: "var(--text-primary, #111)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              <p style={{ margin: 0, fontSize: "0.8125rem", fontWeight: 600, color: "var(--text-primary, #111)", lineHeight: 1.35, overflowWrap: "anywhere" }}>
                 {item.label}
               </p>
             )}
             {item.accountName && (
-              <p style={{ margin: "2px 0 0", fontSize: "0.6875rem", color: "var(--text-secondary, #aaa)" }}>
+              <p style={{ margin: "2px 0 0", fontSize: "0.6875rem", color: "var(--text-secondary, #aaa)", overflowWrap: "anywhere" }}>
                 {item.accountName}
+              </p>
+            )}
+            {/* The summary was carried on every ref and never rendered. */}
+            {item.summary && (
+              <p style={{
+                margin: "3px 0 0", fontSize: "0.6875rem",
+                color: "var(--text-secondary, #888)", lineHeight: 1.45,
+                whiteSpace: "pre-wrap", overflowWrap: "anywhere",
+              }}>
+                {item.summary}
               </p>
             )}
           </div>
@@ -1252,19 +1405,25 @@ function SessionCanvas({
   session,
   scratchRefs,
   onRefsChange,
+  onDropExportItem,
   accentColor,
 }: {
   session: WorkingSession | null;
   scratchRefs?: AnnotatedRef[];
   onRefsChange: (refs: AnnotatedRef[]) => void;
+  onDropExportItem: (item: ExportItemSnapshot) => void;
   accentColor: string;
 }) {
   const { setNodeRef, isOver } = useDroppable({ id: "session-canvas-drop" });
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Tray pills arrive over HTML5 drag, which dnd-kit's `isOver` cannot see — so
+  // the drop highlight needs its own state.
+  const [isPillOver, setIsPillOver] = useState(false);
   const refs: AnnotatedRef[] = scratchRefs ?? ((session?.record_refs ?? []) as AnnotatedRef[]);
 
-  // Compute canvas height to fit all cards + some padding
-  const maxY = refs.reduce((m, r) => Math.max(m, (r._y ?? 0) + 160), 280);
+  // Compute canvas height to fit all cards + some padding. The reserve matches
+  // SESSION_ROW_PITCH so a full row of tall cards still fits inside the frame.
+  const maxY = refs.reduce((m, r) => Math.max(m, (r._y ?? 0) + SESSION_ROW_PITCH), 280);
   const canvasH = Math.max(280, maxY + 40);
 
   function removeRef(id: string) {
@@ -1281,23 +1440,44 @@ function SessionCanvas({
     ));
   }
 
+  const showDropState = isOver || isPillOver;
+
   return (
     <div
       ref={setNodeRef}
       onClick={() => setSelectedId(null)}
+      data-session-canvas
+      onDragOver={(e) => {
+        if (acceptExportItemDragOver(e)) setIsPillOver(true);
+      }}
+      onDragLeave={(e) => {
+        // dragleave bubbles from every child boundary; ignore the ones that are
+        // still inside this canvas or the highlight strobes.
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setIsPillOver(false);
+      }}
+      onDrop={(e) => {
+        const item = readExportItem(e);
+        setIsPillOver(false);
+        if (!item) return;
+        e.preventDefault();
+        e.stopPropagation();
+        onDropExportItem(item);
+      }}
       style={{
         position: "relative",
         height: canvasH,
-        background: isOver ? `${accentColor}06` : "var(--bg, #f9f9f9)",
+        background: showDropState ? `${accentColor}06` : "var(--bg, #f9f9f9)",
         backgroundImage: "radial-gradient(circle, #AEBBC1 1px, transparent 1px)",
         backgroundSize: "20px 20px",
-        border: `1.5px dashed ${isOver ? accentColor : "var(--border, rgba(0,0,0,0.12))"}`,
+        border: `1.5px dashed ${showDropState ? accentColor : "var(--border, rgba(0,0,0,0.12))"}`,
         borderRadius: 8,
-        overflow: "hidden",
+        // Not `hidden`: a card taller than the height estimate would be clipped
+        // with no way to scroll to it.
+        overflow: "visible",
         transition: "all 0.15s",
       }}
     >
-      {refs.length === 0 && !isOver && (
+      {refs.length === 0 && !showDropState && (
         <div style={{
           position: "absolute", inset: 0,
           display: "flex", flexDirection: "column",
@@ -1308,7 +1488,7 @@ function SessionCanvas({
             Drop records here
           </p>
           <p style={{ margin: 0, fontSize: "0.6875rem", color: "var(--text-secondary, #ccc)" }}>
-            Drag from the export tray or search modal
+            Drag them from the export tray
           </p>
         </div>
       )}
@@ -1499,23 +1679,13 @@ function WorkingSessionsArea({
     if (activeId === id) setActiveId(sessions.find(s => s.id !== id)?.id ?? "scratch");
   }
 
-  // Called by parent DndContext when export-pill is dropped onto session canvas
+  // Called when an export-tray pill is dropped onto the session canvas
   const addRef = useCallback(async (item: ExportItemSnapshot) => {
-    const newRef: AnnotatedRef = {
-      ...item,
-      _note: "",
-      _x: 16 + (Math.random() * 60 | 0),
-      _y: 16 + (Math.random() * 40 | 0),
-    };
-
     if (activeId === "scratch") {
       // Auto-create session on first drop into scratch
       const existing = scratchRefs;
       if (existing.some(r => r.id === item.id)) return;
-      const staggered = existing.map((r, i) => ({ ...r, _x: 16 + (i % 3) * 240, _y: 16 + Math.floor(i / 3) * 180 }));
-      const idx = existing.length;
-      const positioned: AnnotatedRef = { ...newRef, _x: 16 + (idx % 3) * 240, _y: 16 + Math.floor(idx / 3) * 180 };
-      const all = [...staggered, positioned];
+      const all = [...existing, { ...item, _note: "", ...nextFreeSlot(existing) }];
       setScratchRefs(all);
       // Persist automatically on first item
       await ensureSession(all);
@@ -1525,9 +1695,7 @@ function WorkingSessionsArea({
     if (!activeSession) return;
     const refs = (activeSession.record_refs ?? []) as AnnotatedRef[];
     if (refs.some(r => r.id === item.id)) return;
-    const idx = refs.length;
-    const positioned: AnnotatedRef = { ...newRef, _x: 16 + (idx % 3) * 240, _y: 16 + Math.floor(idx / 3) * 180 };
-    const updated = [...refs, positioned];
+    const updated = [...refs, { ...item, _note: "", ...nextFreeSlot(refs) }];
     setSessions(prev => prev.map(s => s.id === activeSession.id ? { ...s, record_refs: updated as ExportItemSnapshot[] } : s));
     scheduleSave(activeSession.id, updated);
   }, [activeId, activeSession, scratchRefs, setSessions]);
@@ -1642,6 +1810,7 @@ function WorkingSessionsArea({
           session={activeId === "scratch" ? null : activeSession}
           scratchRefs={activeId === "scratch" ? scratchRefs : undefined}
           onRefsChange={handleRefsChange}
+          onDropExportItem={addRef}
           accentColor={accentColor}
         />
       </div>
@@ -1855,7 +2024,9 @@ function NotepadSection({ meta, accounts }: { meta: typeof ROLE_META[TitleRole];
           {notes.map(n => (
             <div key={n.id} style={{ display: "flex", alignItems: "center" }}>
               <button onClick={() => selectNote(n)} style={{ padding: "3px 8px", borderRadius: "4px 0 0 4px", border: `1px solid ${activeNoteId === n.id ? meta.border : "var(--border, rgba(0,0,0,0.1))"}`, background: activeNoteId === n.id ? `${meta.border}12` : "transparent", color: activeNoteId === n.id ? meta.text : "var(--text-secondary, #888)", fontSize: "0.75rem", fontFamily: "var(--font-base)", cursor: "pointer", maxWidth: 100, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                {n.account_ref_label || n.content.slice(0, 20) || "Note"}
+                {/* content is HTML now, so strip tags before slicing or the tab
+                    reads "<p>Hello" instead of "Hello". */}
+                {n.account_ref_label || htmlToPreviewText(n.content).slice(0, 20) || "Note"}
               </button>
               <button onClick={() => void deleteNote(n.id)} style={{ padding: "3px 5px", borderRadius: "0 4px 4px 0", border: `1px solid ${activeNoteId === n.id ? meta.border : "var(--border, rgba(0,0,0,0.1))"}`, borderLeft: "none", background: "transparent", color: "var(--text-secondary, #ccc)", fontSize: "0.625rem", cursor: "pointer" }}>×</button>
             </div>
@@ -1868,8 +2039,15 @@ function NotepadSection({ meta, accounts }: { meta: typeof ROLE_META[TitleRole];
         <option value="">For my page (general note)</option>
         {accounts.map(a => <option key={a.id} value={a.company_name}>{a.company_name}</option>)}
       </select>
-      <textarea value={content} onChange={e => setContent(e.target.value)} onBlur={() => void handleBlur()} placeholder="Your notes…"
-        style={{ flex: 1, minHeight: 140, width: "100%", boxSizing: "border-box", resize: "vertical", padding: 10, borderRadius: 8, border: "1px solid var(--border, rgba(0,0,0,0.1))", background: "var(--bg, #f9f9f9)", fontFamily: "var(--font-base)", fontSize: "0.8125rem", lineHeight: 1.6, outline: "none", color: "var(--text-primary, #111)" }} />
+      {/* Rich text so the notepad gets the same @mention / @#record picker the
+          rest of the app's note fields have. Still autosaves on blur. */}
+      <RichTextMentionEditor
+        value={content}
+        onChange={setContent}
+        onBlur={() => void handleBlur()}
+        placeholder="Your notes… (@name to mention, @# to reference a record)"
+        minHeightClassName="min-h-[140px]"
+      />
     </div>
   );
 }

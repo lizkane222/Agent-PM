@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { NavLink } from "react-router-dom";
 import { DndContext, useDroppable } from "@dnd-kit/core";
+import { acceptExportItemDragOver, readExportItem } from "../lib/exportDrop";
 import { GetMeetingNotesButton } from "../components/shared/GetMeetingNotesButton";
+import RichTextMentionEditor from "../components/shared/RichTextMentionEditor";
 import {
   accountsApi,
   agentSkillsApi,
@@ -425,25 +427,14 @@ function NotepadSection() {
         {saveStatus === "saving" && <span style={{ fontSize: "0.75rem", color: "#9ca3af" }}>Saving…</span>}
         {saveStatus === "saved" && <span style={{ fontSize: "0.75rem", color: "#22c55e" }}>Saved</span>}
       </div>
-      <textarea
+      {/* Rich text so the notepad gets the same @mention / @#record picker the
+          rest of the app's note fields have. Still autosaves on blur. */}
+      <RichTextMentionEditor
         value={content}
-        onChange={e => setContent(e.target.value)}
-        onBlur={handleBlur}
-        placeholder="Jot down notes, links, ideas…"
-        style={{
-          width: "100%",
-          minHeight: 120,
-          resize: "vertical",
-          border: "1px solid var(--border-color, #e5e7eb)",
-          borderRadius: 6,
-          padding: "8px 10px",
-          fontSize: "0.875rem",
-          fontFamily: "var(--font-base)",
-          background: "var(--input-bg, #f9fafb)",
-          color: "var(--text-primary, #111827)",
-          outline: "none",
-          boxSizing: "border-box",
-        }}
+        onChange={setContent}
+        onBlur={() => void handleBlur()}
+        placeholder="Jot down notes, links, ideas… (@name to mention, @# to reference a record)"
+        minHeightClassName="min-h-[120px]"
       />
     </div>
   );
@@ -550,20 +541,25 @@ function RecordRefCard({
       marginBottom: 8,
     }}>
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 2 }}>
+        <div style={{ display: "flex", alignItems: "flex-start", gap: 6, marginBottom: 2, flexWrap: "wrap" }}>
           <span style={{
             fontSize: "0.6875rem", fontWeight: 600, padding: "1px 6px",
             borderRadius: 10, background: (item.accent ?? "#9ca3af") + "22",
             color: item.accent ?? "#9ca3af",
+            // Without this the badge shrinks and the raw enum wraps mid-word.
+            flexShrink: 0,
           }}>
-            {item.type}
+            {item.type.replace(/_/g, " ")}
           </span>
-          <span style={{ fontSize: "0.875rem", fontWeight: 600, color: "var(--text-primary, #111827)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {/* These wrap rather than ellipsing to one line: this card sits in a
+              flow container with unlimited vertical room, so truncating a 140-char
+              summary to its first clause cost data for nothing. */}
+          <span style={{ fontSize: "0.875rem", fontWeight: 600, color: "var(--text-primary, #111827)", lineHeight: 1.35, overflowWrap: "anywhere" }}>
             {item.label}
           </span>
         </div>
         {item.summary && (
-          <p style={{ margin: 0, fontSize: "0.75rem", color: "#6b7280", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          <p style={{ margin: 0, fontSize: "0.75rem", color: "#6b7280", lineHeight: 1.45, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
             {item.summary}
           </p>
         )}
@@ -581,18 +577,34 @@ function RecordRefCard({
 
 function DroppableArea({ children, onDrop }: { children: React.ReactNode; onDrop: (item: ExportItemSnapshot) => void }) {
   const { setNodeRef, isOver } = useDroppable({ id: "freeform-drop" });
-
-  // Listen for drag-end from parent DndContext — we use a local DndContext below
-  void onDrop; // handled via local context
+  // The export tray drags with the HTML5 API, which dnd-kit's `isOver` cannot
+  // observe — hence a second highlight flag. `onDrop` used to be accepted and
+  // then discarded (`void onDrop`), which is why nothing could be dropped here.
+  const [isPillOver, setIsPillOver] = useState(false);
+  const active = isOver || isPillOver;
 
   return (
     <div
       ref={setNodeRef}
+      onDragOver={(e) => {
+        if (acceptExportItemDragOver(e)) setIsPillOver(true);
+      }}
+      onDragLeave={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setIsPillOver(false);
+      }}
+      onDrop={(e) => {
+        const item = readExportItem(e);
+        setIsPillOver(false);
+        if (!item) return;
+        e.preventDefault();
+        e.stopPropagation();
+        onDrop(item);
+      }}
       style={{
         minHeight: 80,
         borderRadius: 6,
-        border: `2px dashed ${isOver ? "var(--twilio-navy, #001489)" : "var(--border-color, #e5e7eb)"}`,
-        background: isOver ? "rgba(0,20,137,0.04)" : "transparent",
+        border: `2px dashed ${active ? "var(--twilio-navy, #001489)" : "var(--border-color, #e5e7eb)"}`,
+        background: active ? "rgba(0,20,137,0.04)" : "transparent",
         padding: 8,
         transition: "all 0.15s",
       }}
@@ -639,19 +651,37 @@ function FreeformSection({ sessions, setSessions }: FreeformSectionProps) {
     } catch { /* ignore */ }
   }
 
-  function handleLocalDragEnd(event: import("@dnd-kit/core").DragEndEvent) {
-    if (event.over?.id !== "freeform-drop") return;
-    const dragged = event.active.data.current as { item?: ExportItemSnapshot } | undefined;
-    if (!dragged?.item) return;
-    if (!activeSession) return;
-    const already = getSessionRefs(activeSession).some(r => r.id === dragged.item!.id);
-    if (already) return;
-    const updated = [...getSessionRefs(activeSession), dragged.item];
+  /**
+   * Append a dropped record to the active session, creating one if the user has
+   * none yet — otherwise the very first drop would have nowhere to land and would
+   * look like the drag had failed.
+   */
+  async function addRef(item: ExportItemSnapshot) {
+    if (!activeSession) {
+      try {
+        const { data } = await workingSessionApi.create({
+          name: `Session ${sessions.length + 1}`,
+          record_refs: [item],
+        });
+        setSessions(prev => [...prev, data]);
+        setActiveSessionId(data.id);
+      } catch { /* surface nothing; the tray still holds the item */ }
+      return;
+    }
+    if (getSessionRefs(activeSession).some(r => r.id === item.id)) return;
+    const updated = [...getSessionRefs(activeSession), item];
     setSessions(prev => prev.map(s => s.id === activeSession.id ? { ...s, record_refs: updated } : s));
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(async () => {
       await workingSessionApi.update(activeSession.id, { record_refs: updated });
     }, 1000);
+  }
+
+  function handleLocalDragEnd(event: import("@dnd-kit/core").DragEndEvent) {
+    if (event.over?.id !== "freeform-drop") return;
+    const dragged = event.active.data.current as { item?: ExportItemSnapshot } | undefined;
+    if (!dragged?.item) return;
+    void addRef(dragged.item);
   }
 
   return (
@@ -698,7 +728,7 @@ function FreeformSection({ sessions, setSessions }: FreeformSectionProps) {
       {/* Active session content */}
       <DndContext onDragEnd={handleLocalDragEnd}>
         {activeSession ? (
-          <DroppableArea onDrop={() => {}}>
+          <DroppableArea onDrop={(item) => void addRef(item)}>
             {getSessionRefs(activeSession).length === 0 && (
               <p style={{ fontSize: "0.8125rem", color: "#9ca3af", margin: 0 }}>
                 Drop export items here, or add records to this session.

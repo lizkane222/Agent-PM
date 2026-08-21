@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useState } from "react";
+import { createContext, useCallback, useContext, useRef, useState } from "react";
 import type { SearchResult } from "../lib/api";
 
 export interface ExportItem {
@@ -63,6 +63,11 @@ export function ExportProvider({ children }: { children: React.ReactNode }) {
   const [exportMode, setExportMode] = useState(() => loadPersistedItems().length > 0);
   const [items, setItems] = useState<ExportItem[]>(loadPersistedItems);
 
+  // Mirror of `items` so `toggleItem` can decide add-vs-remove without depending
+  // on a captured render value (two picks in the same tick would otherwise make
+  // the second one read a stale list).
+  const itemsRef = useRef(items);
+
   function persist(next: ExportItem[]) {
     try {
       if (next.length > 0) localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
@@ -70,23 +75,27 @@ export function ExportProvider({ children }: { children: React.ReactNode }) {
     } catch { /* storage full */ }
   }
 
-  const toggleMode = useCallback(() => {
-    setExportMode((v) => {
-      if (v) {
-        setItems([]);
-        persist([]);
-      }
-      return !v;
-    });
-  }, []);
+  function commitItems(next: ExportItem[]) {
+    itemsRef.current = next;
+    setItems(next);
+    persist(next);
+  }
+
+  /**
+   * Open/close the tray. Deliberately does NOT empty it: closing is a view
+   * action, and the tray is the user's collected work. `clearItems` (the tray's
+   * own "Clear" button) is the only thing that discards.
+   */
+  const toggleMode = useCallback(() => setExportMode((v) => !v), []);
 
   const toggleItem = useCallback((item: ExportItem) => {
-    setItems((prev) => {
-      const exists = prev.some((i) => i.id === item.id);
-      const next = exists ? prev.filter((i) => i.id !== item.id) : [...prev, item];
-      persist(next);
-      return next;
-    });
+    const exists = itemsRef.current.some((i) => i.id === item.id);
+    commitItems(
+      exists ? itemsRef.current.filter((i) => i.id !== item.id) : [...itemsRef.current, item]
+    );
+    // Picking something must reveal where it went — otherwise the item lands in
+    // a tray the user can't see.
+    if (!exists) setExportMode(true);
   }, []);
 
   const isSelected = useCallback(
@@ -94,7 +103,7 @@ export function ExportProvider({ children }: { children: React.ReactNode }) {
     [items]
   );
 
-  const clearItems = useCallback(() => { setItems([]); persist([]); }, []);
+  const clearItems = useCallback(() => { commitItems([]); }, []);
 
   return (
     <ExportContext.Provider
