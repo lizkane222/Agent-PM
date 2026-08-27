@@ -683,3 +683,120 @@ class CalendarEventGooglePushTest(APITestCase):
             )
         self.assertEqual(resp.status_code, 200)
         push.assert_called_once()
+
+
+class CalendarEventGoogleBodyFormatTest(APITestCase):
+    """`_push_to_google` / `_update_in_google` build the actual request body sent to
+    Google. Every prior test in this file mocks these methods away entirely, so the
+    two real bugs inside them — `_push_to_google` crashing on every call (a raw
+    datetime.datetime is not subscriptable and has no len()), and both methods
+    formatting `dateTime` as "...20 10:00:00+00:00" (a space, from str(datetime))
+    instead of RFC3339's required "...20T10:00:00+00:00" — went undetected. Google's
+    Calendar API rejects the space form with a generic 400 and no field-level detail.
+
+    These call the real methods directly (not through perform_create/perform_update,
+    which swallow the exception and log it) so a regression fails loudly here instead
+    of silently in production.
+    """
+
+    def setUp(self):
+        self.user = _make_user("google_body_user")
+        from integrations.models import OAuthCredential
+
+        OAuthCredential.objects.create(
+            user=self.user,
+            provider="google",
+            access_token="tok",
+            refresh_token="ref",
+            scopes="https://www.googleapis.com/auth/calendar",
+        )
+
+    def _build_mock_service(self):
+        """Returns (mock_build, captured) — captured['body'] holds the last insert/patch body."""
+        from unittest.mock import MagicMock
+
+        captured = {}
+
+        def _insert(calendarId, body):
+            captured["body"] = body
+            call = MagicMock()
+            call.execute.return_value = {"id": "g-new-1"}
+            return call
+
+        def _patch(calendarId, eventId, body):
+            captured["body"] = body
+            call = MagicMock()
+            call.execute.return_value = {}
+            return call
+
+        events = MagicMock()
+        events.insert.side_effect = _insert
+        events.patch.side_effect = _patch
+        service = MagicMock()
+        service.events.return_value = events
+        return service, captured
+
+    def test_push_to_google_sends_rfc3339_datetimes_for_a_new_event(self):
+        """Regression for both bugs: this used to crash with TypeError on every call."""
+        from unittest.mock import patch as mock_patch
+
+        event = CalendarEvent.objects.create(
+            owner=self.user,
+            title="Brand New",
+            start_datetime="2026-08-20T10:00:00+00:00",
+            end_datetime="2026-08-20T11:00:00+00:00",
+        )
+        # DRF's serializer would already have parsed these into real datetime
+        # objects before .save() — a raw ORM .create() with a string does not,
+        # so pull it back from the DB to match what perform_create actually sees.
+        event.refresh_from_db()
+        service, captured = self._build_mock_service()
+        viewset = CalendarEventViewSet()
+        with mock_patch("googleapiclient.discovery.build", return_value=service):
+            viewset._push_to_google(event)
+
+        self.assertEqual(captured["body"]["start"]["dateTime"], "2026-08-20T10:00:00+00:00")
+        self.assertEqual(captured["body"]["end"]["dateTime"], "2026-08-20T11:00:00+00:00")
+        event.refresh_from_db()
+        self.assertEqual(event.google_event_id, "g-new-1")
+        self.assertTrue(event.is_synced)
+
+    def test_push_to_google_sends_a_date_only_value_for_an_all_day_event(self):
+        from unittest.mock import patch as mock_patch
+
+        event = CalendarEvent.objects.create(
+            owner=self.user,
+            title="All Day",
+            start_datetime="2026-08-20T00:00:00+00:00",
+            end_datetime="2026-08-21T00:00:00+00:00",
+            all_day=True,
+        )
+        event.refresh_from_db()
+        service, captured = self._build_mock_service()
+        viewset = CalendarEventViewSet()
+        with mock_patch("googleapiclient.discovery.build", return_value=service):
+            viewset._push_to_google(event)
+
+        self.assertEqual(captured["body"]["start"], {"date": "2026-08-20"})
+        self.assertEqual(captured["body"]["end"], {"date": "2026-08-21"})
+
+    def test_update_in_google_sends_rfc3339_datetimes(self):
+        from unittest.mock import patch as mock_patch
+
+        event = CalendarEvent.objects.create(
+            owner=self.user,
+            title="Existing",
+            start_datetime="2026-08-20T16:00:00+00:00",
+            end_datetime="2026-08-20T17:00:00+00:00",
+            google_event_id="g-existing-1",
+            is_synced=True,
+        )
+        event.refresh_from_db()
+        service, captured = self._build_mock_service()
+        viewset = CalendarEventViewSet()
+        with mock_patch("googleapiclient.discovery.build", return_value=service):
+            viewset._update_in_google(event)
+
+        self.assertEqual(captured["body"]["start"]["dateTime"], "2026-08-20T16:00:00+00:00")
+        self.assertEqual(captured["body"]["end"]["dateTime"], "2026-08-20T17:00:00+00:00")
+        self.assertNotIn(" ", captured["body"]["start"]["dateTime"])

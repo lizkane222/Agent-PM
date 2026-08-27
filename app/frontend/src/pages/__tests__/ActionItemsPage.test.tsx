@@ -1256,6 +1256,41 @@ describe("ActionItemsPage", () => {
       expect(fieldPatches).toHaveLength(0);
     });
 
+    it("dragging from Stage Today onto another account's row in the Views grid does not reassign it", async () => {
+      localStorage.setItem("actionItemZones", JSON.stringify({ recAAA001: "today" }));
+      await renderPageStable();
+      await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
+
+      // Acme owns this card; drop it on Beta's row instead — an easy accident, since
+      // unstaging and re-filing land on the same grid.
+      const betaRow = rowContaining(screen.getByTitle(/Collapse Beta Inc/i), "border-b border-gray-100");
+      dragCardOnto(cardFor("Fix billing issue"), betaRow);
+
+      await new Promise((r) => setTimeout(r, 20));
+      expect(fieldPatches).toHaveLength(0);
+      // Unstaged into Views — it lands under its own account (Acme), not the row it was
+      // dropped on. The account picker in the modal is the only way to actually reassign it.
+      const acmeRow = rowContaining(screen.getByTitle(/Collapse Acme Corp/i), "border-b border-gray-100");
+      await waitFor(() => expect(within(acmeRow).getByText("Fix billing issue")).toBeInTheDocument());
+      expect(within(betaRow).queryByText("Fix billing issue")).not.toBeInTheDocument();
+      expect(JSON.parse(localStorage.getItem("actionItemZones") ?? "{}").recAAA001).toBe("accounts");
+    });
+
+    it("dragging from Currently Tracking onto another account's row in the Views grid does not reassign it", async () => {
+      localStorage.setItem("actionItemZones", JSON.stringify({ recAAA001: "active" }));
+      await renderPageStable();
+      await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
+
+      const betaRow = rowContaining(screen.getByTitle(/Collapse Beta Inc/i), "border-b border-gray-100");
+      dragCardOnto(cardFor("Fix billing issue"), betaRow);
+
+      await new Promise((r) => setTimeout(r, 20));
+      expect(fieldPatches).toHaveLength(0);
+      const acmeRow = rowContaining(screen.getByTitle(/Collapse Acme Corp/i), "border-b border-gray-100");
+      await waitFor(() => expect(within(acmeRow).getByText("Fix billing issue")).toBeInTheDocument());
+      expect(JSON.parse(localStorage.getItem("actionItemZones") ?? "{}").recAAA001).toBe("accounts");
+    });
+
     it("keeps the row highlight while the cursor crosses the row's own children", async () => {
       await collapseGroups("beta inc");
       await renderPageStable();
@@ -1382,8 +1417,8 @@ describe("ActionItemsPage", () => {
       expect(fieldPatches[0]).toMatchObject({ account_name: "Beta Inc", account: 2, __id: "recAAA001" });
     });
 
-    it("a Projects-view drop reassigns the account without moving the card out of its zone", async () => {
-      localStorage.setItem("actionItemZones", JSON.stringify({ recAAA001: "today" }));
+    it("a Projects-view drop from Views/Projects itself still reassigns the account without moving the card out of its zone", async () => {
+      localStorage.setItem("actionItemZones", JSON.stringify({ recAAA001: "accounts" }));
       await renderPageStable();
       await waitFor(() => expect(screen.getByTitle(/Collapse Acme Corp/i)).toBeInTheDocument());
       await switchToProjects();
@@ -1394,8 +1429,57 @@ describe("ActionItemsPage", () => {
 
       await waitFor(() => expect(fieldPatches).toHaveLength(1));
       // Projects renders every real item whatever its zone, so a drop there must not
-      // silently yank the card out of Stage Today.
+      // silently yank the card out of its zone.
+      expect(JSON.parse(localStorage.getItem("actionItemZones") ?? "{}").recAAA001).toBe("accounts");
+    });
+
+    it("a Projects-view drop from Stage Today does not reassign the account", async () => {
+      localStorage.setItem("actionItemZones", JSON.stringify({ recAAA001: "today" }));
+      await renderPageStable();
+      await waitFor(() => expect(screen.getByTitle(/Collapse Acme Corp/i)).toBeInTheDocument());
+      await switchToProjects();
+      await waitFor(() => expect(screen.getByText("Beta Inc")).toBeInTheDocument());
+
+      const betaGroup = screen.getByTestId("project-group-beta inc");
+      dragCardOnto(screen.getByText("Fix billing issue").closest("[draggable='true']") as HTMLElement, betaGroup);
+
+      // An accidental drop on the wrong group while unstaging must not reassign the
+      // account — only the modal reassigns an account for a card coming out of Stage
+      // Today / Currently Tracking. Zone is untouched too, same as the reassign case.
+      await new Promise((r) => setTimeout(r, 20));
+      expect(fieldPatches).toHaveLength(0);
       expect(JSON.parse(localStorage.getItem("actionItemZones") ?? "{}").recAAA001).toBe("today");
+    });
+
+    it("a Projects-view drop from Currently Tracking does not reassign the account", async () => {
+      localStorage.setItem("actionItemZones", JSON.stringify({ recAAA001: "active" }));
+      await renderPageStable();
+      await waitFor(() => expect(screen.getByTitle(/Collapse Acme Corp/i)).toBeInTheDocument());
+      await switchToProjects();
+      await waitFor(() => expect(screen.getByText("Beta Inc")).toBeInTheDocument());
+
+      const betaGroup = screen.getByTestId("project-group-beta inc");
+      dragCardOnto(screen.getByText("Fix billing issue").closest("[draggable='true']") as HTMLElement, betaGroup);
+
+      await new Promise((r) => setTimeout(r, 20));
+      expect(fieldPatches).toHaveLength(0);
+      expect(JSON.parse(localStorage.getItem("actionItemZones") ?? "{}").recAAA001).toBe("active");
+    });
+
+    it("still reassigns the account when dropped from Unstaged", async () => {
+      localStorage.setItem("actionItemZones", JSON.stringify({ recAAA001: "unstaged" }));
+      await renderPageStable();
+      await waitFor(() => expect(screen.getByTitle(/Collapse Acme Corp/i)).toBeInTheDocument());
+      await switchToProjects();
+      await waitFor(() => expect(screen.getByText("Beta Inc")).toBeInTheDocument());
+
+      const betaGroup = screen.getByTestId("project-group-beta inc");
+      dragCardOnto(screen.getByText("Fix billing issue").closest("[draggable='true']") as HTMLElement, betaGroup);
+
+      // Assigning a blank's first account is the one Unstaged interaction that must
+      // still work — it's how a brand-new item gets filed in the first place.
+      await waitFor(() => expect(fieldPatches).toHaveLength(1));
+      expect(fieldPatches[0]).toMatchObject({ account_name: "Beta Inc", account: 2, __id: "recAAA001" });
     });
 
     it("a drop on another group's status column sets both the account and the status", async () => {

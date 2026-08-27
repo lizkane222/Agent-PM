@@ -162,18 +162,18 @@ class CalendarEventViewSet(RequireAccountMembershipMixin, viewsets.ModelViewSet)
         )
         service = build("calendar", "v3", credentials=google_creds, cache_discovery=False)
 
-        def _fmt(dt_str):
-            # Ensure RFC3339 — add Z if bare local string without offset
-            if dt_str and len(dt_str) == 19:
-                return dt_str + "Z"
-            return dt_str
+        def _fmt(dt):
+            # `dt` is the real datetime.datetime from the model field, not a
+            # string — it is never subscriptable and has no len(). RFC3339
+            # needs a literal "T" separator, which only .isoformat() produces.
+            return dt.isoformat()
 
         body = {
             "summary": event.title,
             "description": event.description or "",
             "location": event.location or "",
-            "start": {"date": event.start_datetime[:10]} if event.all_day else {"dateTime": _fmt(event.start_datetime)},
-            "end":   {"date": event.end_datetime[:10]}   if event.all_day else {"dateTime": _fmt(event.end_datetime)},
+            "start": {"date": event.start_datetime.date().isoformat()} if event.all_day else {"dateTime": _fmt(event.start_datetime)},
+            "end":   {"date": event.end_datetime.date().isoformat()}   if event.all_day else {"dateTime": _fmt(event.end_datetime)},
             "status": event.status,
         }
         if event.attendees:
@@ -208,17 +208,18 @@ class CalendarEventViewSet(RequireAccountMembershipMixin, viewsets.ModelViewSet)
         )
         service = build("calendar", "v3", credentials=google_creds, cache_discovery=False)
 
-        def _fmt(dt_str):
-            if dt_str and len(str(dt_str)) == 19:
-                return str(dt_str) + "Z"
-            return str(dt_str)
+        def _fmt(dt):
+            # Same RFC3339 fix as _push_to_google above: .isoformat() on the
+            # real datetime, not str(dt) (which uses a space, not "T", and
+            # Google rejects with a generic 400 Bad Request).
+            return dt.isoformat()
 
         body = {
             "summary": event.title,
             "description": event.description or "",
             "location": event.location or "",
-            "start": {"date": str(event.start_datetime)[:10]} if event.all_day else {"dateTime": _fmt(str(event.start_datetime))},
-            "end":   {"date": str(event.end_datetime)[:10]}   if event.all_day else {"dateTime": _fmt(str(event.end_datetime))},
+            "start": {"date": event.start_datetime.date().isoformat()} if event.all_day else {"dateTime": _fmt(event.start_datetime)},
+            "end":   {"date": event.end_datetime.date().isoformat()}   if event.all_day else {"dateTime": _fmt(event.end_datetime)},
             "status": event.status,
         }
         service.events().patch(

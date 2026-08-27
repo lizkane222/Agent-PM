@@ -46,6 +46,23 @@ def _can_reach(source_pk: int, target_pk: int, visited: set | None = None) -> bo
     return False
 
 
+def _display_account_name(account) -> str:
+    """Normalize the shared Airtable "ADMIN" row's name to "Admin" for display.
+
+    CalendarEventAccountLink can only FK to AirtableAccount, so a calendar event dragged
+    onto the sidebar's per-user "Admin" pill (an accounts.Account) still ends up stored
+    against the shared AirtableAccount literally named "ADMIN" (set_manual_categorization's
+    name__iexact fallback). Without this, the mismatched case broke the round-trip: the
+    frontend's exact-string account-name filter never matched the sidebar's "Admin" label,
+    so the event silently vanished from that account's view. Mirrors the same
+    ADMIN_ACCOUNT_NAME comparison `_resolve_scheduler_account` already uses for action items.
+    """
+    from accounts.models import ADMIN_ACCOUNT_NAME
+    if account and (account.name or "").strip().lower() == ADMIN_ACCOUNT_NAME.lower():
+        return ADMIN_ACCOUNT_NAME
+    return account.name if account else ""
+
+
 ACTION_ITEM_WRITE_DENIED = "You can only modify action items assigned to you."
 
 
@@ -787,11 +804,15 @@ def match_event(request):
     # This is what the Meeting Summary panel should read/write — NOT meetings[0].
     this_meeting = _resolve_this_meeting(d["event_uid"])
 
+    acct_data = AirtableAccountSerializer(account).data if account else None
+    if acct_data:
+        acct_data["name"] = _display_account_name(account)
+
     return Response({
         "needs_categorization": False,
         "match_method": link.match_method,
         "categorization": link.categorization,
-        "account": AirtableAccountSerializer(account).data if account else None,
+        "account": acct_data,
         "action_items": AirtableActionItemSerializer(action_items, many=True).data,
         "meetings": AirtableMeetingSerializer(meetings, many=True).data,
         "this_meeting": AirtableMeetingSerializer(this_meeting).data if this_meeting else None,
@@ -818,11 +839,15 @@ def categorize_event(request):
     meetings = AirtableMeeting.objects.filter(account=account).order_by("-date")[:10] if account else []
     this_meeting = _resolve_this_meeting(d["event_uid"])
 
+    acct_data = AirtableAccountSerializer(account).data if account else None
+    if acct_data:
+        acct_data["name"] = _display_account_name(account)
+
     return Response({
         "needs_categorization": False,
         "match_method": link.match_method,
         "categorization": link.categorization,
-        "account": AirtableAccountSerializer(account).data if account else None,
+        "account": acct_data,
         "action_items": AirtableActionItemSerializer(action_items, many=True).data,
         "meetings": AirtableMeetingSerializer(meetings, many=True).data,
         "this_meeting": AirtableMeetingSerializer(this_meeting).data if this_meeting else None,
@@ -844,10 +869,8 @@ def update_action_item_status(request, airtable_id):
     if not item:
         return Response({"error": "not found"}, status=status.HTTP_404_NOT_FOUND)
 
-    # Ownership check: only the assigned user or staff may update status.
-    user_collab_id = getattr(getattr(request.user, "profile", None), "airtable_collaborator_id", None)
-    if not request.user.is_staff and (not user_collab_id or item.assignee_airtable_id != user_collab_id):
-        return Response({"error": "forbidden"}, status=status.HTTP_403_FORBIDDEN)
+    if not _can_write_action_item(request.user, item):
+        return Response({"error": ACTION_ITEM_WRITE_DENIED}, status=status.HTTP_403_FORBIDDEN)
 
     STATUS_TO_AT = {
         "Open": "Not Started", "In Progress": "In Progress",
@@ -890,10 +913,8 @@ def update_action_item_fields(request, airtable_id):
     if not item:
         return Response({"error": "not found"}, status=status.HTTP_404_NOT_FOUND)
 
-    # Ownership check: only the assigned user or staff may edit an item.
-    user_collab_id = getattr(getattr(request.user, "profile", None), "airtable_collaborator_id", None)
-    if not request.user.is_staff and (not user_collab_id or item.assignee_airtable_id != user_collab_id):
-        return Response({"error": "forbidden"}, status=status.HTTP_403_FORBIDDEN)
+    if not _can_write_action_item(request.user, item):
+        return Response({"error": ACTION_ITEM_WRITE_DENIED}, status=status.HTTP_403_FORBIDDEN)
 
     FIELD_MAP = {
         "task": "Task",
@@ -1058,10 +1079,8 @@ def log_time(request):
     if not item:
         return Response({"error": "not found"}, status=status.HTTP_404_NOT_FOUND)
 
-    # Ownership check: only the assigned user or staff may log time.
-    user_collab_id = getattr(getattr(request.user, "profile", None), "airtable_collaborator_id", None)
-    if not request.user.is_staff and (not user_collab_id or item.assignee_airtable_id != user_collab_id):
-        return Response({"error": "forbidden"}, status=status.HTTP_403_FORBIDDEN)
+    if not _can_write_action_item(request.user, item):
+        return Response({"error": ACTION_ITEM_WRITE_DENIED}, status=status.HTTP_403_FORBIDDEN)
 
     with transaction.atomic():
         AirtableActionItem.objects.filter(airtable_id=airtable_id).select_for_update().update(
@@ -1099,7 +1118,7 @@ def get_event_link(request):
         "linked": True,
         "airtable_account_id": link.account.id,
         "airtable_id": link.account.airtable_id,
-        "account_name": link.account.name,
+        "account_name": _display_account_name(link.account),
     })
 
 
@@ -1130,7 +1149,7 @@ def batch_event_links(request):
             "linked": True,
             "airtable_account_id": lnk.account.id,
             "airtable_id": lnk.account.airtable_id,
-            "account_name": lnk.account.name,
+            "account_name": _display_account_name(lnk.account),
         }
         for lnk in links
     }

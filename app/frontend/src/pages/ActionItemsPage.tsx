@@ -4246,13 +4246,20 @@ export default function ActionItemsPage() {
    * for a real recXXX, and the Projects view never renders blanks in the first place — the
    * only way one reaches here is a drag out of Unstaged, where the Views grid is the path
    * that owns promotion.
+   *
+   * A card dragged out of Stage Today or Currently Tracking is a zone-only move here (see
+   * the matching guard in `handleDrop`'s "accounts" branch) — Projects already renders every
+   * real item regardless of account, so an accidental drop on the wrong group must not
+   * reassign it.
    */
   async function handleAccountGroupDrop(e: React.DragEvent, accountKey: string) {
     e.preventDefault();
     if (!dragId) return;
     const item = allItems.find((i) => i.airtable_id === dragId);
+    const prevZone = zones[dragId] ?? "today";
     setDragId(null);
     if (!item || item.airtable_id.startsWith("local-")) return;
+    if (prevZone === "today" || prevZone === "active") return;
     await assignItemToAccount(item.airtable_id, item, accountKey);
   }
 
@@ -4298,8 +4305,15 @@ export default function ActionItemsPage() {
       // non-promote drops (setZones is idempotent).
       setZones((prev) => ({ ...prev, [resolvedId]: "accounts" }));
 
-      // Always update account assignment when dropped into a specific bucket.
-      await assignItemToAccount(resolvedId, item, accountKey);
+      // Coming from Stage Today or Currently Tracking, a drop anywhere in the Views
+      // grid just unstages the card — it lands back under its own existing account
+      // (the row grouping below already keys off account_name), never the row it
+      // happened to land on. That protects against an unintentional cross-account
+      // drop. Dropping from Unstaged (assigning a blank's first account) or from
+      // within Views/Projects itself (a deliberate re-file) still reassigns.
+      if (prevZoneAccounts !== "today" && prevZoneAccounts !== "active") {
+        await assignItemToAccount(resolvedId, item, accountKey);
+      }
 
       // Top up blanks if the item came from Unstaged
       if (prevZoneAccounts === "unstaged") {
@@ -4316,9 +4330,12 @@ export default function ActionItemsPage() {
     }
 
     if (targetZone === "done-accounts" && accountKey != null) {
-      // Dropped onto an account's Done deck — mark Done, assign account, move to accounts zone
+      // Dropped onto an account's Done deck — mark Done, move to accounts zone, and
+      // (unless coming from Stage Today/Currently Tracking — see the "accounts" branch
+      // above for why) assign the account whose deck was dropped on.
       setZones((prev) => ({ ...prev, [resolvedId]: "accounts" }));
-      const acc = accountKey !== "none" ? accounts.find((a) => a.key === accountKey) : null;
+      const reassign = prevZoneGlobal !== "today" && prevZoneGlobal !== "active";
+      const acc = reassign && accountKey !== "none" ? accounts.find((a) => a.key === accountKey) : null;
       const updates: Partial<AirtableActionItem> = {
         status: "Done",
         ...(acc ? { account_name: acc.name, account: acc.source === "airtable" ? acc.id : null } : {}),

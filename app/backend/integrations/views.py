@@ -52,6 +52,17 @@ def _scrub_headers(headers: dict) -> dict:
 
 
 def _build_google_flow(scopes=None):
+    # PKCE deliberately off. The init view (authorization_url) and the callback
+    # view (fetch_token) each build their own short-lived Flow instance — there is
+    # no session/cache carrying state between the two requests, so a code_verifier
+    # generated during init can never reach the callback. With
+    # autogenerate_code_verifier=True, init sent a code_challenge that promised
+    # PKCE, and the callback's fresh Flow had no verifier to answer it, so every
+    # exchange failed with "(invalid_grant) Missing code verifier" — surfaced to
+    # users as a misleading "Authorization code expired" message. This client is
+    # confidential (client_secret is presented at token exchange), so PKCE is not
+    # required for security here; omitting it is what makes the two-request-two-Flow
+    # shape actually work.
     return Flow.from_client_config(
         {
             "web": {
@@ -63,7 +74,63 @@ def _build_google_flow(scopes=None):
             }
         },
         scopes=scopes or GOOGLE_SCOPES,
-        autogenerate_code_verifier=True,
+        autogenerate_code_verifier=False,
+    )
+
+
+def _categorize_oauth_error(exc: Exception) -> tuple[str, str]:
+    """
+    Analyze an OAuth token exchange exception and return (category, user_message).
+
+    Returns a tuple of (category_key, user_friendly_message) that helps the user
+    understand what went wrong and how to fix it. Sensitive details are kept out
+    of the user message.
+
+    Args:
+        exc: The exception from flow.fetch_token() or similar.
+
+    Returns:
+        (category_key, user_friendly_message)
+    """
+    error_text = str(exc).lower()
+
+    # Redirect URI mismatch — most common during initial setup
+    if any(x in error_text for x in ["redirect_uri", "redirect_url", "mismatch"]):
+        return (
+            "redirect_uri_mismatch",
+            "Redirect URI mismatch. Verify that GOOGLE_REDIRECT_URI in your .env file "
+            "exactly matches what's registered in Google Cloud Console under "
+            "APIs & Services → Credentials → your OAuth 2.0 Client ID.",
+        )
+
+    # Expired authorization code — user took too long or hit browser back button
+    if "invalid_grant" in error_text:
+        return (
+            "code_expired",
+            "Authorization code expired. This usually means you took too long to authorize, "
+            "or clicked the browser back button. Close this popup and try connecting again.",
+        )
+
+    # Invalid client credentials
+    if any(x in error_text for x in ["invalid_client", "unauthorized_client"]):
+        return (
+            "invalid_credentials",
+            "Invalid Google credentials. Verify that GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET "
+            "in your .env file are correct (from Google Cloud Console → APIs & Services → Credentials).",
+        )
+
+    # Network or certificate issues
+    if any(x in error_text for x in ["ssl", "certificate", "connection", "timeout"]):
+        return (
+            "network_error",
+            "Network error connecting to Google. Check your internet connection and try again.",
+        )
+
+    # Default fallback
+    return (
+        "unknown",
+        "Token exchange failed. Verify your Google credentials and try again. "
+        "Check server logs for more details.",
     )
 
 
@@ -78,8 +145,84 @@ GOOGLE_EVENT_TYPE_TO_CATEGORY = {
 }
 
 
+def _push_event_to_google(event, creds):
+    """Push a single CalendarEvent's editable fields to Google Calendar.
+
+    Failures are logged but not raised — the local row is authoritative. This
+    matches the pattern in CalendarEventViewSet._push_update_if_needed().
+    """
+    from django.conf import settings
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
+    import time as _time
+
+    if not (event.is_synced and event.google_event_id):
+        return
+
+    google_creds = Credentials(
+        token=creds.token,
+        refresh_token=creds.refresh_token,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=settings.GOOGLE_CLIENT_ID,
+        client_secret=settings.GOOGLE_CLIENT_SECRET,
+        # `creds` here is always a google.oauth2.credentials.Credentials instance
+        # (flow.credentials in the OAuth callback, or a freshly-built Credentials in
+        # GoogleCalendarSyncView) — .scopes is already a list. `hasattr(creds, "scopes")`
+        # is true for both, so the old check always took the .split() branch and crashed
+        # with AttributeError: 'list' object has no attribute 'split'.
+        scopes=creds.scopes.split() if isinstance(creds.scopes, str) else creds.scopes,
+    )
+    service = build("calendar", "v3", credentials=google_creds, cache_discovery=False)
+
+    def _fmt(dt):
+        # `dt` is the real datetime.datetime from the model field. RFC3339
+        # requires a literal "T" between date and time; str(dt) uses a space
+        # (Python's default datetime repr), which Google's Calendar API rejects
+        # with an unhelpful generic 400 "Bad Request" and no field-level detail.
+        # .isoformat() is the one that actually produces "...T...".
+        return dt.isoformat()
+
+    body = {
+        "summary": event.title,
+        "description": event.description or "",
+        "location": event.location or "",
+        "start": {"date": event.start_datetime.date().isoformat()} if event.all_day else {"dateTime": _fmt(event.start_datetime)},
+        "end": {"date": event.end_datetime.date().isoformat()} if event.all_day else {"dateTime": _fmt(event.end_datetime)},
+        "status": event.status,
+    }
+
+    delay = 1
+    for attempt in range(5):
+        try:
+            service.events().patch(
+                calendarId="primary",
+                eventId=event.google_event_id,
+                body=body,
+            ).execute()
+            return
+        except HttpError as exc:
+            if exc.status_code == 429 and attempt < 4:
+                logger.warning(
+                    "Google Calendar rate limited (429) pushing event '%s'; retrying in %ds",
+                    event.title,
+                    delay,
+                )
+                _time.sleep(delay)
+                delay = min(delay * 2, 16)
+            else:
+                logger.exception("Failed to push event '%s' to Google Calendar", event.title)
+                return
+
+
 def _sync_google_calendar(user, creds):
-    """Pull the upcoming 90 days of events from Google Calendar into CalendarEvent."""
+    """Bi-directional sync: push recent edits to Google, then pull from Google.
+
+    PHASE 1: Push any synced events that were modified since the last sync.
+             This ensures local edits reach Google before the pull overwrites them.
+
+    PHASE 2: Pull the upcoming 90 days of events from Google Calendar into CalendarEvent.
+    """
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
     from django.utils import timezone
@@ -89,6 +232,30 @@ def _sync_google_calendar(user, creds):
     from scheduler.models import CalendarEvent
     from airtable_sync.models import AirtableMeeting
 
+    # Get or initialize sync state to determine what to push
+    sync_state, _ = SyncState.objects.get_or_create(
+        user=user,
+        provider="google",
+        resource="calendar",
+    )
+
+    # PHASE 1: Push recently-modified synced events to Google
+    # Only push if this isn't the first sync (last_synced_at exists)
+    if sync_state.last_synced_at:
+        recent_edits = CalendarEvent.objects.filter(
+            owner=user,
+            is_synced=True,
+            google_event_id__gt="",  # Must have a Google ID to push
+            updated_at__gt=sync_state.last_synced_at,
+        )
+        pushed_count = 0
+        for event in recent_edits:
+            _push_event_to_google(event, creds)
+            pushed_count += 1
+        if pushed_count > 0:
+            logger.info("Google Calendar sync: pushed %d recently-edited events for %s", pushed_count, user)
+
+    # PHASE 2: Pull from Google Calendar
     service = build("calendar", "v3", credentials=creds, cache_discovery=False)
     now = timezone.now()
     time_min = (now - datetime.timedelta(days=90)).isoformat()
@@ -291,9 +458,15 @@ class GoogleOAuthCallbackView(APIView):
         try:
             flow.fetch_token(code=code)
         except Exception as exc:
-            logger.exception("Google OAuth token exchange failed: %s", exc)
+            category, user_message = _categorize_oauth_error(exc)
+            logger.exception(
+                "Google OAuth token exchange failed [%s] for user %s: %s",
+                category,
+                user.id if user else "unknown",
+                exc,
+            )
             return Response(
-                {"detail": "Token exchange failed."},
+                {"detail": user_message},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 

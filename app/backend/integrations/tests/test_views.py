@@ -549,6 +549,342 @@ class GoogleCalendarSyncCategoryTest(APITestCase):
         self.assertTrue(set(GOOGLE_EVENT_TYPE_TO_CATEGORY.values()).issubset(valid))
 
 
+class GoogleCalendarBiDirectionalSyncTest(APITestCase):
+    """Test that `_sync_google_calendar` pushes local edits before pulling.
+
+    This ensures that a user's edits in the app don't get overwritten by Google's
+    old version when the sync button is clicked.
+    """
+
+    def setUp(self):
+        from django.utils import timezone
+        self.user = User.objects.create_user(username="bi_sync_user", password="pass")
+        self.now = timezone.now()
+
+    def test_sync_pushes_recent_edits_before_pulling(self):
+        """Edited events are pushed to Google before the pull happens.
+
+        Scenario:
+        1. User edits event title "Sync" → "Sync Updated"
+        2. User clicks "Sync Google Calendar"
+        3. Expect push to Google with new title
+        4. Then pull from Google should bring back the new title
+        5. No flicker or overwrite
+        """
+        from django.utils import timezone
+        from datetime import timedelta
+        from scheduler.models import CalendarEvent
+        from integrations.models import SyncState
+
+        # Create a synced event
+        event = CalendarEvent.objects.create(
+            owner=self.user,
+            google_event_id="existing-event-123",
+            title="Sync",
+            description="Old description",
+            location="Room A",
+            start_datetime=self.now + timedelta(hours=1),
+            end_datetime=self.now + timedelta(hours=2),
+            status="confirmed",
+            is_synced=True,
+            calendar_id="primary",
+        )
+
+        # Record a prior sync so we have a baseline
+        SyncState.objects.update_or_create(
+            user=self.user,
+            provider="google",
+            resource="calendar",
+            defaults={"last_synced_at": self.now - timedelta(minutes=5)},
+        )
+
+        # User edits the event
+        event.title = "Sync Updated"
+        event.location = "Room B"
+        event.save()
+
+        # Verify the event was modified after the last sync
+        self.assertGreater(event.updated_at, self.now - timedelta(minutes=5))
+
+        # Run the sync with mocked Google API
+        from integrations import views as integrations_views
+
+        service_mock = MagicMock()
+        service_mock.events.return_value.list.return_value.execute.return_value = {
+            "items": [
+                {
+                    "id": "existing-event-123",
+                    "summary": "Sync Updated",  # Should come back with the new title we pushed
+                    "description": "Old description",
+                    "location": "Room B",
+                    "status": "confirmed",
+                    "start": {"dateTime": str(event.start_datetime)},
+                    "end": {"dateTime": str(event.end_datetime)},
+                }
+            ],
+            "nextPageToken": None,
+        }
+
+        with patch("googleapiclient.discovery.build", return_value=service_mock):
+            integrations_views._sync_google_calendar(self.user, MagicMock())
+
+        # Verify that patch() was called (push happened)
+        service_mock.events.return_value.patch.assert_called_once()
+        patch_call_kwargs = service_mock.events.return_value.patch.call_args.kwargs
+        self.assertEqual(patch_call_kwargs["eventId"], "existing-event-123")
+        self.assertEqual(patch_call_kwargs["body"]["summary"], "Sync Updated")
+        self.assertEqual(patch_call_kwargs["body"]["location"], "Room B")
+
+        # Verify the event is still there with the new title
+        event.refresh_from_db()
+        self.assertEqual(event.title, "Sync Updated")
+        self.assertEqual(event.location, "Room B")
+        self.assertTrue(event.is_synced)
+
+    def test_sync_does_not_push_unsynced_events(self):
+        """Only synced events (is_synced=True) are pushed."""
+        from django.utils import timezone
+        from datetime import timedelta
+        from scheduler.models import CalendarEvent
+        from integrations.models import SyncState
+
+        # Create an unsynced event
+        event = CalendarEvent.objects.create(
+            owner=self.user,
+            google_event_id="",  # No Google ID
+            title="Local Only",
+            start_datetime=self.now + timedelta(hours=1),
+            end_datetime=self.now + timedelta(hours=2),
+            status="confirmed",
+            is_synced=False,  # Not synced
+            calendar_id="primary",
+        )
+
+        # Record a prior sync
+        SyncState.objects.update_or_create(
+            user=self.user,
+            provider="google",
+            resource="calendar",
+            defaults={"last_synced_at": self.now - timedelta(minutes=5)},
+        )
+
+        # Run the sync
+        from integrations import views as integrations_views
+
+        service_mock = MagicMock()
+        service_mock.events.return_value.list.return_value.execute.return_value = {
+            "items": [],
+            "nextPageToken": None,
+        }
+
+        with patch("googleapiclient.discovery.build", return_value=service_mock):
+            integrations_views._sync_google_calendar(self.user, MagicMock())
+
+        # Verify patch was NOT called (unsynced events are not pushed)
+        service_mock.events.return_value.patch.assert_not_called()
+
+    def test_sync_skips_push_phase_on_first_sync(self):
+        """First sync has no prior last_synced_at, so nothing is pushed."""
+        from datetime import timedelta
+        from scheduler.models import CalendarEvent
+        from integrations.models import SyncState
+
+        # Create a synced event
+        event = CalendarEvent.objects.create(
+            owner=self.user,
+            google_event_id="first-sync-event",
+            title="Existing",
+            start_datetime=self.now + timedelta(hours=1),
+            end_datetime=self.now + timedelta(hours=2),
+            status="confirmed",
+            is_synced=True,
+            calendar_id="primary",
+        )
+
+        # No prior sync state yet (first sync)
+        SyncState.objects.filter(
+            user=self.user,
+            provider="google",
+            resource="calendar",
+        ).delete()
+
+        # Run the sync
+        from integrations import views as integrations_views
+
+        service_mock = MagicMock()
+        service_mock.events.return_value.list.return_value.execute.return_value = {
+            "items": [
+                {
+                    "id": "first-sync-event",
+                    "summary": "Existing",
+                    "status": "confirmed",
+                    "start": {"dateTime": str(event.start_datetime)},
+                    "end": {"dateTime": str(event.end_datetime)},
+                }
+            ],
+            "nextPageToken": None,
+        }
+
+        with patch("googleapiclient.discovery.build", return_value=service_mock):
+            integrations_views._sync_google_calendar(self.user, MagicMock())
+
+        # Verify patch was NOT called (no prior sync to establish push boundary)
+        service_mock.events.return_value.patch.assert_not_called()
+
+    def test_push_failure_does_not_block_pull(self):
+        """If pushing an event fails, the pull still proceeds."""
+        from django.utils import timezone
+        from datetime import timedelta
+        from scheduler.models import CalendarEvent
+        from integrations.models import SyncState
+        from googleapiclient.errors import HttpError
+
+        # Create a synced event
+        event = CalendarEvent.objects.create(
+            owner=self.user,
+            google_event_id="failing-event",
+            title="Will Fail Push",
+            start_datetime=self.now + timedelta(hours=1),
+            end_datetime=self.now + timedelta(hours=2),
+            status="confirmed",
+            is_synced=True,
+            calendar_id="primary",
+        )
+
+        # Record a prior sync
+        SyncState.objects.update_or_create(
+            user=self.user,
+            provider="google",
+            resource="calendar",
+            defaults={"last_synced_at": self.now - timedelta(minutes=5)},
+        )
+
+        # Run the sync with a failing patch
+        from integrations import views as integrations_views
+
+        service_mock = MagicMock()
+        service_mock.events.return_value.patch.return_value.execute.side_effect = HttpError(
+            MagicMock(status=500), b"Server error"
+        )
+        service_mock.events.return_value.list.return_value.execute.return_value = {
+            "items": [
+                {
+                    "id": "failing-event",
+                    "summary": "Will Fail Push",
+                    "status": "confirmed",
+                    "start": {"dateTime": str(event.start_datetime)},
+                    "end": {"dateTime": str(event.end_datetime)},
+                }
+            ],
+            "nextPageToken": None,
+        }
+
+        with patch("googleapiclient.discovery.build", return_value=service_mock):
+            # Should not raise, pull should still complete
+            integrations_views._sync_google_calendar(self.user, MagicMock())
+
+        # Verify that list (pull) was still called despite patch (push) failure
+        service_mock.events.return_value.list.assert_called_once()
+
+
+class GoogleCalendarSyncViewEndpointTest(APITestCase):
+    """`POST /api/v1/integrations/google/sync/` — the manual "Sync Google Calendar"
+    button. Regression coverage for two real bugs that made every click 500:
+
+    1. `_push_event_to_google` built its Credentials with
+       `creds.scopes.split() if hasattr(creds, "scopes") else creds.scopes`. `creds`
+       here is always a real google.oauth2.credentials.Credentials, whose .scopes is
+       already a list — hasattr() is true regardless, so it always took the
+       .split() branch and crashed with `AttributeError: 'list' object has no
+       attribute 'split'`. (Earlier tests in this file pass a bare MagicMock() as
+       creds, which never surfaces this: Mock attribute access/methods never raise
+       AttributeError, so the bug went undetected.)
+    2. Even past that, the pushed `dateTime` was built from `str(a_datetime)`
+       ("2026-05-28 20:00:00+00:00" — a space) instead of `.isoformat()`
+       ("...T20:00:00+00:00"). Google's Calendar API requires the RFC3339 "T"
+       separator and rejects the space form with a generic 400 and no field-level
+       detail, so every push silently failed after bug 1 was fixed.
+    """
+
+    def setUp(self):
+        from django.utils import timezone
+        from datetime import timedelta
+        from scheduler.models import CalendarEvent
+        from integrations.models import OAuthCredential, SyncState
+
+        self.user = User.objects.create_user(username="sync_btn_user", password="pass")
+        self.client.force_authenticate(user=self.user)
+        self.now = timezone.now()
+
+        OAuthCredential.objects.create(
+            user=self.user,
+            provider="google",
+            access_token="tok",
+            refresh_token="ref",
+            # A real (space-separated string) OAuthCredential.scopes, exactly as
+            # stored in the DB — not a list and not a MagicMock. This is what
+            # actually exposed both bugs above.
+            scopes="https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/calendar.events",
+            is_active=True,
+        )
+        self.event = CalendarEvent.objects.create(
+            owner=self.user,
+            google_event_id="synced-event-1",
+            title="Weekly Sync",
+            start_datetime=self.now + timedelta(hours=1),
+            end_datetime=self.now + timedelta(hours=2),
+            status="confirmed",
+            is_synced=True,
+            calendar_id="primary",
+        )
+        SyncState.objects.update_or_create(
+            user=self.user,
+            provider="google",
+            resource="calendar",
+            defaults={"last_synced_at": self.now - timedelta(minutes=5)},
+        )
+        # An edit after the last sync, so PHASE 1 (push) attempts this event.
+        self.event.title = "Weekly Sync Updated"
+        self.event.save()
+
+    def _mock_service(self):
+        service_mock = MagicMock()
+        service_mock.events.return_value.list.return_value.execute.return_value = {
+            "items": [
+                {
+                    "id": "synced-event-1",
+                    "summary": "Weekly Sync Updated",
+                    "status": "confirmed",
+                    "start": {"dateTime": self.event.start_datetime.isoformat()},
+                    "end": {"dateTime": self.event.end_datetime.isoformat()},
+                }
+            ],
+            "nextPageToken": None,
+        }
+        return service_mock
+
+    def test_sync_no_longer_500s(self):
+        service_mock = self._mock_service()
+        with patch("googleapiclient.discovery.build", return_value=service_mock):
+            resp = self.client.post("/api/v1/integrations/google/sync/")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["detail"], "Sync complete.")
+
+    def test_sync_pushes_an_rfc3339_datetime_with_a_t_separator(self):
+        service_mock = self._mock_service()
+        with patch("googleapiclient.discovery.build", return_value=service_mock):
+            resp = self.client.post("/api/v1/integrations/google/sync/")
+
+        self.assertEqual(resp.status_code, 200)
+        service_mock.events.return_value.patch.assert_called_once()
+        body = service_mock.events.return_value.patch.call_args.kwargs["body"]
+        self.assertIn("T", body["start"]["dateTime"])
+        self.assertIn("T", body["end"]["dateTime"])
+        self.assertNotIn(" ", body["start"]["dateTime"])
+        self.assertNotIn(" ", body["end"]["dateTime"])
+
+
 # ── Meeting notes from email ────────────────────────────────────────────────────
 
 class MeetingNotesFromEmailViewTest(APITestCase):
@@ -726,3 +1062,170 @@ class GmailWatchViewTest(APITestCase):
             resp.json()["detail"],
             "Failed to register watch. Check that Celery is running.",
         )
+
+
+# ── Google Calendar OAuth (Init + Callback) ─────────────────────────────────────
+
+GOOGLE_SETTINGS = {
+    "GOOGLE_CLIENT_ID": "g-id",
+    "GOOGLE_CLIENT_SECRET": "g-secret",
+    "GOOGLE_REDIRECT_URI": "http://localhost:8000/api/v1/integrations/google/callback/",
+}
+
+
+class GoogleOAuthPKCERegressionTest(APITestCase):
+    """
+    Regression coverage for a real bug: GoogleOAuthInitView and GoogleOAuthCallbackView
+    each build their own short-lived Flow via _build_google_flow() — nothing persists
+    state between the two requests. With autogenerate_code_verifier=True, init attached
+    a PKCE code_challenge to the authorization URL, promising Google a code_verifier
+    that only ever existed on that discarded Flow instance. The callback's fresh Flow
+    had no verifier to answer it, so every real exchange failed with
+    "(invalid_grant) Missing code verifier" — surfaced to users as a misleading
+    "Authorization code expired" message, independent of ngrok/localhost or any
+    redirect URI configuration.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="alice", password="pass")
+
+    @override_settings(**GOOGLE_SETTINGS)
+    def test_build_google_flow_disables_pkce(self):
+        from integrations.views import _build_google_flow
+
+        flow = _build_google_flow()
+        self.assertFalse(flow.autogenerate_code_verifier)
+        self.assertIsNone(getattr(flow, "code_verifier", None))
+
+    @override_settings(**GOOGLE_SETTINGS)
+    def test_authorization_url_makes_no_pkce_promise(self):
+        from urllib.parse import parse_qs, urlparse
+
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.get("/api/v1/integrations/google/connect/")
+
+        self.assertEqual(resp.status_code, 200)
+        qs = parse_qs(urlparse(resp.json()["authorization_url"]).query)
+        self.assertNotIn("code_challenge", qs)
+        self.assertNotIn("code_challenge_method", qs)
+
+    @override_settings(**GOOGLE_SETTINGS)
+    @patch("integrations.views._sync_google_calendar")
+    def test_callback_exchanges_code_via_a_fresh_flow_with_no_carried_over_verifier(
+        self, mock_sync
+    ):
+        """
+        Drives GoogleOAuthInitView then GoogleOAuthCallbackView as two independent
+        requests — the same shape Google's real redirect produces. The token
+        endpoint's HTTP transport (not the OAuth library) is faked, so the real
+        fetch_token / oauthlib parsing code runs exactly as it does in production.
+        """
+        import json
+
+        from integrations.views import GOOGLE_SCOPES
+        from requests.adapters import HTTPAdapter
+        from requests.models import Response
+
+        self.client.force_authenticate(user=self.user)
+        init_resp = self.client.get("/api/v1/integrations/google/connect/")
+        self.assertEqual(init_resp.status_code, 200)
+
+        captured_bodies = []
+
+        def fake_send(self, request, **kwargs):
+            body = request.body or ""
+            captured_bodies.append(body.decode() if isinstance(body, bytes) else body)
+            resp = Response()
+            resp.status_code = 200
+            resp._content = json.dumps(
+                {
+                    "access_token": "fake-access-token",
+                    "refresh_token": "fake-refresh-token",
+                    "expires_in": 3599,
+                    "scope": " ".join(GOOGLE_SCOPES),
+                    "token_type": "Bearer",
+                }
+            ).encode()
+            resp.headers["content-type"] = "application/json"
+            resp.request = request
+            return resp
+
+        state = signing.dumps({"uid": self.user.pk}, salt="google-oauth")
+        with patch.object(HTTPAdapter, "send", fake_send):
+            resp = self.client.get(
+                "/api/v1/integrations/google/callback/",
+                {"code": "authcode", "state": state},
+            )
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b"Google Calendar connected", resp.content)
+        self.assertTrue(captured_bodies, "token endpoint was never called")
+        self.assertNotIn("code_verifier", captured_bodies[0])
+
+        from integrations.models import OAuthCredential
+
+        cred = OAuthCredential.objects.get(user=self.user, provider="google")
+        self.assertEqual(cred.access_token, "fake-access-token")
+        self.assertTrue(cred.is_active)
+        mock_sync.assert_called_once()
+
+
+# ── Google OAuth Error Categorization ──────────────────────────────────────────
+
+
+class GoogleOAuthErrorCategorization(APITestCase):
+    """Test that OAuth errors are categorized into helpful messages."""
+
+    def test_redirect_uri_mismatch_error(self):
+        """Detects redirect URI mismatches and suggests the fix."""
+        from integrations.views import _categorize_oauth_error
+
+        exc = Exception("redirect_uri_mismatch: The redirect_uri parameter does not match")
+        category, message = _categorize_oauth_error(exc)
+
+        self.assertEqual(category, "redirect_uri_mismatch")
+        self.assertIn("Redirect URI mismatch", message)
+        self.assertIn("Google Cloud Console", message)
+        self.assertIn(".env", message)
+
+    def test_expired_code_error(self):
+        """Detects expired authorization codes."""
+        from integrations.views import _categorize_oauth_error
+
+        exc = Exception("invalid_grant: The authorization code is invalid or expired.")
+        category, message = _categorize_oauth_error(exc)
+
+        self.assertEqual(category, "code_expired")
+        self.assertIn("expired", message.lower())
+        self.assertIn("try connecting again", message)
+
+    def test_invalid_credentials_error(self):
+        """Detects invalid client credentials."""
+        from integrations.views import _categorize_oauth_error
+
+        exc = Exception("invalid_client: The OAuth client was not recognized.")
+        category, message = _categorize_oauth_error(exc)
+
+        self.assertEqual(category, "invalid_credentials")
+        self.assertIn("GOOGLE_CLIENT_ID", message)
+        self.assertIn("GOOGLE_CLIENT_SECRET", message)
+
+    def test_network_error(self):
+        """Detects network and SSL errors."""
+        from integrations.views import _categorize_oauth_error
+
+        exc = Exception("SSL: CERTIFICATE_VERIFY_FAILED")
+        category, message = _categorize_oauth_error(exc)
+
+        self.assertEqual(category, "network_error")
+        self.assertIn("Network error", message)
+
+    def test_unknown_error_fallback(self):
+        """Falls back to generic message for unknown errors."""
+        from integrations.views import _categorize_oauth_error
+
+        exc = Exception("Something weird happened")
+        category, message = _categorize_oauth_error(exc)
+
+        self.assertEqual(category, "unknown")
+        self.assertIn("Token exchange failed", message)

@@ -16,7 +16,7 @@ from django.utils import timezone
 from rest_framework.test import APIClient, APITestCase
 from django.test import TestCase
 
-from .models import AirtableAccount, AirtableActionItem, AirtableMeeting
+from .models import AirtableAccount, AirtableActionItem, AirtableMeeting, CalendarEventAccountLink
 
 User = get_user_model()
 
@@ -834,6 +834,117 @@ class ActionItemAttachmentUploadTests(APITestCase):
         self.assertEqual(item.attachments.count(), 0)
 
 
+class ActionItemWriteEndpointPermissionParityTests(APITestCase):
+    """PATCH .../fields/, PATCH .../status/, POST /time-logs/ — ownership parity.
+
+    Regression: these three function-based views each had their own inline ownership
+    check (`assignee_airtable_id != user_collab_id`, denying whenever the item had no
+    assignee) instead of the shared `_can_write_action_item` — the exact divergence
+    `_can_write_action_item`'s docstring says was fixed for attachments/steps but never
+    was here. Reassigning the account of an unassigned item (the common case) through
+    the Edit Action Item modal — which PATCHes /fields/ — silently 403'd: the optimistic
+    UI update showed the new account, then a background reload re-fetched the
+    never-persisted old value and the card appeared to "revert".
+    """
+
+    def setUp(self):
+        cache.clear()
+        from team.models import UserProfile
+        # Mirrors the real dev user: is_staff, but staff_view_override off, so
+        # _staff_sees_all() is False and the assignee rule actually applies.
+        self.user = User.objects.create_user("editor", password="pass", is_staff=True)
+        UserProfile.objects.create(user=self.user, airtable_collaborator_id="usrMINE", staff_view_override=False)
+        self.client.force_authenticate(user=self.user)
+        self.account_a = AirtableAccount.objects.create(airtable_id="recACCTA", name="Acme Corp")
+        self.account_b = AirtableAccount.objects.create(airtable_id="recACCTB", name="Globex")
+
+    def _item(self, assignee, airtable_id, **extra):
+        return AirtableActionItem.objects.create(
+            airtable_id=airtable_id, account=self.account_a, task="Task",
+            assignee_airtable_id=assignee, **extra,
+        )
+
+    @patch("airtable_sync.views.get_table")
+    def test_reassigning_the_account_of_an_unassigned_item_is_allowed(self, mock_get_table):
+        """The regression: nobody owns an unassigned item, so anyone who sees it may re-file it."""
+        mock_get_table.return_value = MagicMock()
+        item = self._item("", "recUnassigned")
+        resp = self.client.patch(
+            f"/api/v1/airtable/action-items/{item.airtable_id}/fields/",
+            {"account": self.account_b.pk, "account_name": self.account_b.name},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.data)
+        item.refresh_from_db()
+        self.assertEqual(item.account_id, self.account_b.pk)
+        self.assertEqual(resp.data["account_name"], "Globex")
+
+    @patch("airtable_sync.views.get_table")
+    def test_editing_own_item_fields_is_allowed(self, mock_get_table):
+        mock_get_table.return_value = MagicMock()
+        item = self._item("usrMINE", "recMine")
+        resp = self.client.patch(
+            f"/api/v1/airtable/action-items/{item.airtable_id}/fields/", {"task": "Renamed"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        item.refresh_from_db()
+        self.assertEqual(item.task, "Renamed")
+
+    def test_editing_another_users_item_fields_is_denied(self):
+        """Unchanged boundary — an assigned item still belongs to its assignee."""
+        item = self._item("usrOTHER", "recTheirs")
+        resp = self.client.patch(
+            f"/api/v1/airtable/action-items/{item.airtable_id}/fields/", {"task": "Hijacked"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 403)
+        item.refresh_from_db()
+        self.assertEqual(item.task, "Task")
+
+    @patch("airtable_sync.views.get_table")
+    def test_setting_status_on_an_unassigned_item_is_allowed(self, mock_get_table):
+        mock_get_table.return_value = MagicMock()
+        item = self._item("", "recUnassignedStatus")
+        resp = self.client.patch(
+            f"/api/v1/airtable/action-items/{item.airtable_id}/status/", {"status": "Done"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.data)
+        item.refresh_from_db()
+        self.assertEqual(item.status, "Done")
+
+    def test_setting_status_on_another_users_item_is_denied(self):
+        item = self._item("usrOTHER", "recTheirsStatus")
+        resp = self.client.patch(
+            f"/api/v1/airtable/action-items/{item.airtable_id}/status/", {"status": "Done"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 403)
+        item.refresh_from_db()
+        self.assertEqual(item.status, "Open")
+
+    @patch("airtable_sync.views.get_table")
+    def test_logging_time_on_an_unassigned_item_is_allowed(self, mock_get_table):
+        mock_get_table.return_value = MagicMock()
+        item = self._item("", "recUnassignedTime")
+        resp = self.client.post(
+            "/api/v1/airtable/time-logs/",
+            {"airtable_id": item.airtable_id, "seconds": 60},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.data)
+        item.refresh_from_db()
+        self.assertEqual(item.time_spent, 60)
+
+    def test_logging_time_on_another_users_item_is_denied(self):
+        item = self._item("usrOTHER", "recTheirsTime")
+        resp = self.client.post(
+            "/api/v1/airtable/time-logs/",
+            {"airtable_id": item.airtable_id, "seconds": 60},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 403)
+        item.refresh_from_db()
+        self.assertEqual(item.time_spent, 0)
+
+
 class AirtableMeetingAccountNameFilterTests(APITestCase):
     """AirtableMeetingViewSet ?account_name= — the fallback used by unlinked accounts.
 
@@ -1454,3 +1565,77 @@ class SyncMeetingsZoomFieldTests(TestCase):
         self.assertEqual(meeting.gong_notes, "Locally imported Gong recap")
         self.assertEqual(meeting.zoom_notes, "Locally imported Zoom recap")
         self.assertEqual(meeting.zoom_url, "")
+
+
+class CalendarEventAccountLinkAdminDisplayNameTests(APITestCase):
+    """categorize_event / get_event_link / batch_event_links must display "Admin", never
+    the shared Airtable "ADMIN" row's literal casing.
+
+    CalendarEventAccountLink can only FK to AirtableAccount, so an event dragged onto the
+    sidebar's per-user "Admin" pill (an accounts.Account) still ends up stored against the
+    shared AirtableAccount named "ADMIN" — set_manual_categorization's name__iexact fallback.
+    The frontend then does an exact-string compare against the sidebar's "Admin" label, so
+    the mismatched case made the event disappear from that account's view entirely.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(username="admindisplayuser", password="pass")
+        self.client.force_authenticate(user=self.user)
+        self.admin_account = AirtableAccount.objects.create(airtable_id="recADMINDISP", name="ADMIN")
+        self.acme_account = AirtableAccount.objects.create(airtable_id="recACMEDISP", name="Acme Corp")
+
+    def test_categorize_event_returns_admin_not_all_caps(self):
+        # Mirrors the real drag flow: the sidebar's "Admin" pill is a Django
+        # accounts.Account, so account_id is that PK — a different sequence than
+        # AirtableAccount's, hence a value guaranteed not to collide with either
+        # AirtableAccount created in setUp.
+        resp = self.client.post(
+            "/api/v1/airtable/categorize/",
+            {"event_uid": "evt-admin-1", "account_id": 999999, "account_name": "Admin"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["account"]["name"], "Admin")
+
+    def test_categorize_event_leaves_ordinary_account_name_untouched(self):
+        resp = self.client.post(
+            "/api/v1/airtable/categorize/",
+            {"event_uid": "evt-acme-1", "account_id": self.acme_account.id, "account_name": "Acme Corp"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["account"]["name"], "Acme Corp")
+
+    def test_get_event_link_returns_admin_not_all_caps(self):
+        CalendarEventAccountLink.objects.create(
+            calendar_event_uid="evt-admin-2", account=self.admin_account, match_method="manual"
+        )
+        resp = self.client.get("/api/v1/airtable/event-link/", {"event_uid": "evt-admin-2"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["account_name"], "Admin")
+
+    def test_get_event_link_leaves_ordinary_account_name_untouched(self):
+        CalendarEventAccountLink.objects.create(
+            calendar_event_uid="evt-acme-2", account=self.acme_account, match_method="manual"
+        )
+        resp = self.client.get("/api/v1/airtable/event-link/", {"event_uid": "evt-acme-2"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["account_name"], "Acme Corp")
+
+    def test_batch_event_links_returns_admin_not_all_caps(self):
+        CalendarEventAccountLink.objects.create(
+            calendar_event_uid="evt-admin-3", account=self.admin_account, match_method="manual"
+        )
+        CalendarEventAccountLink.objects.create(
+            calendar_event_uid="evt-acme-3", account=self.acme_account, match_method="manual"
+        )
+        resp = self.client.post(
+            "/api/v1/airtable/event-links/batch/",
+            {"event_uids": ["evt-admin-3", "evt-acme-3"]},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["evt-admin-3"]["account_name"], "Admin")
+        self.assertEqual(body["evt-acme-3"]["account_name"], "Acme Corp")
