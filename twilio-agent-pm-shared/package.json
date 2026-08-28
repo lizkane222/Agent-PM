@@ -1,0 +1,36 @@
+{
+  "name": "twilio-agent-pm-shared",
+  "version": "0.1.0",
+  "description": "Framework-free core logic for twilio-agent-pm — pure functions, contracts, and fixture matrices",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "bin": {
+    "agentpm-cli": "./dist/adapters/cli/entry.js"
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc && node -e \"import('node:fs').then(fs => fs.chmodSync('./dist/adapters/cli/entry.js', '755'))\"",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-vm-modules node_modules/.bin/jest",
+    "test:fixtures": "node --experimental-vm-modules node_modules/.bin/jest --testPathPattern=fixtures"
+  },
+  "dependencies": {
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.14.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.5",
+    "typescript": "^5.5.3"
+  }
+}

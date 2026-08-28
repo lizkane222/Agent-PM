@@ -9,7 +9,7 @@ export default defineConfig({
   resolve: {
     alias: {
       "twilio-agent-pm-shared": fileURLToPath(
-        new URL("../../../twilio-agent-pm-shared/dist/index.js", import.meta.url)
+        new URL("../../twilio-agent-pm-shared/dist/index.js", import.meta.url)
       ),
     },
   },

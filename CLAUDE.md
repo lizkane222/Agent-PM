@@ -17,7 +17,7 @@ Same stack, same API contracts, same UI — cleaner internal organization.
 
 - **Frontend:** React 18 + TypeScript, Vite 5, Tailwind CSS
 - **Backend:** Django / Django REST Framework, SQLite (dev), PostgreSQL (prod via `DATABASE_URL`)
-- **Shared package:** `twilio-agent-pm-shared` (aliased in vitest and vite configs)
+- **Shared package:** `twilio-agent-pm-shared` (vendored at the repo root; aliased in vitest and vite configs — see 2026-08-28 session log entry)
 - **Frontend tests:** Vitest + React Testing Library + MSW v2
 - **Backend tests:** Django `APITestCase` (DRF)
 
@@ -177,6 +177,11 @@ from core.mixins import _staff_sees_all
 All commands run from `app/frontend/` (frontend) or `app/backend/` (backend) unless noted.
 
 ```bash
+# One-time setup after a fresh clone (or after pulling changes to twilio-agent-pm-shared/):
+#   cd twilio-agent-pm-shared && npm install   # installs its runtime dep (zod) — required for
+#                                               # app/frontend's Vite/Vitest alias to resolve
+#   cd app/frontend && npm install
+
 # Start the app (from app/)
 npm run start-agent-pm
 # → Django/Daphne on :8000, Vite on :5173
@@ -196,8 +201,8 @@ npm run test              # watch mode
 npx vitest run            # single run
 npx vitest run --coverage # with coverage report
 
-# Backend tests
-source "/Users/lizkane/Desktop/TWILIO - Agent PM/app/backend/.venv/bin/activate"
+# Backend tests (from app/backend/)
+source .venv/bin/activate
 python manage.py test                        # all apps
 python manage.py test <app>.tests            # single app
 
@@ -1870,3 +1875,221 @@ Backend-restore fixes (older activity never returned after a localStorage clear)
   related to logging.
 - The helper's field set is fixed; a new user-facing field needs adding to `LOGGED_FIELDS` +
   `clauseFor`.
+
+---
+
+### 2026-08-27 — "New Project" modal: full Salesforce field set, per-project team, SF fetch
+
+**Why**
+The account page's "+ New Project" button opened a single text input. It created an
+`AccountProject` row with only `name`/`description` — every other model column
+(`url`, `action_ids`, `meeting_ids`, `goal_ids`, `resources`, `sf_data`, `kind`) was
+silently dropped on every reload. The user wanted the button to open a large modal
+covering every field from three Salesforce/Cloud-Coach project screenshots, collapsible
+per section, with a Salesforce fetch action, per-project team membership (a member can
+be on several projects under one account), and goals whose linked artifacts render above
+meetings/action items.
+
+**Key discovery — most of it already existed, unwired.**
+`components/account/ProjectGoals.tsx` was a fully-built prototype — `ProjectDetailsModal`
+with 13 matching collapsible SF sections, `SalesforceProjectData`/`GoalSection` types in
+`types/accounts.ts` already covering ~140 fields — but nothing imported it.
+`AccountDetailPage.tsx` rendered its own separate, much simpler inline `ProjectGoals` with
+the single-input flow. The work was mostly: wire the real component in, fix the
+persistence bug, add the one missing section (System Information), and add the two things
+that didn't exist anywhere — per-project team membership and a live Salesforce fetch.
+
+**What changed**
+
+Backend (`accounts` app):
+- `AccountProject.sf_project_id` (new column) — the required key for the SF fetch, kept as
+  a real column rather than buried in the `sf_data` blob because it's looked up by.
+- New `ProjectMember` model (`project` FK, `team_member` FK, `role`, `unique_together`) —
+  mirrors the existing `AccountRole` pattern at the project level instead of the account
+  level, since nothing previously scoped membership below Account.
+- `accounts/sf_project_fields.py` (new) — `SF_PROJECT_FIELD_MAP`, our internal key →
+  `(guessed Cloud Coach API name, datatype)` for all ~140 fields, mirroring the frontend's
+  `SF_SECTIONS` key-for-key.
+- `AccountProjectViewSet.fetch_salesforce` (`POST /accounts/projects/fetch-salesforce/`) —
+  stateless, no DB write. Describes the connected org's `{ns}__Project__c` object first and
+  only queries fields that actually exist there, returning `fields_skipped` for guessed
+  names absent from the org, so a wrong guess degrades instead of erroring.
+- `ProjectMemberViewSet` (`/accounts/project-members/`) — list scoped by `?project=` or
+  batched `?project__in=`, same account-membership guard as `AccountProjectViewSet`
+  (promoted to a shared `_assert_account_membership` helper).
+- Migration `accounts/0019`.
+
+Frontend:
+- `types/accounts.ts` — `AccountProject.sf_project_id`/`sf_data`/`kind` (the TS interface
+  had drifted from the serializer), `GoalSection.sfProjectId`, new `ProjectMember`
+  interface, and the missing **System Information** fields on `SalesforceProjectData`.
+- `components/account/ProjectGoals.tsx` — added the System Information section to
+  `SF_SECTIONS`; the modal gained an SF Project ID field + "Fetch from Salesforce" button
+  (merges into the in-memory draft, manual edits win over the fetch) and a collapsible
+  **Team Members** block (distinct from the existing "Project Team" *text-field* SF
+  section) with add/remove backed by the new endpoints; project cards show member avatars.
+- `pages/AccountDetailPage.tsx` — deleted the dead inline `GoalResource`/`GoalSection`/
+  `ProjectGoals` (kept the shared `uid()` helper, still used elsewhere on the page) in favor
+  of importing the real component. Fixed the actual persistence bug: `handleGoalsChange`
+  now sends the full field set on create/update (was `name`/`description` only), and the
+  load effect populates `url`/`resources`/`sfData`/etc. from the response instead of
+  hardcoding them empty. Batch-loads `ProjectMember`s for the account's projects
+  (`?project__in=`, not one request per card).
+- `lib/api.ts` — `fetchProjectSalesforceData`, `listProjectMembers` (batched),
+  `addProjectMember`, `removeProjectMember`.
+
+**Key decisions**
+- **No new `Goal` model.** A Goal is still an `AccountProject` row with `kind="goal"`,
+  linked into a parent project's `goal_ids` — that's what the orphaned component already
+  did, and the backend model already had `kind`.
+- **Action items/meetings/artifacts stay JSON id arrays**, not new FK tables. The actual
+  bug was that they were never round-tripped to the backend; fixing that alone makes
+  "artifacts appear at top of a goal when linked" real, since `resources` already renders
+  before meetings/action items in `renderGoalItems`.
+- **The ~140 SF fields stay in the existing `sf_data` JSONField**, validated against a
+  fixed key→type map mirrored on both sides, rather than 140 DB columns.
+- **The SF fetch is a stateless pre-save action.** The modal already keeps an unsaved
+  `newGoalDraft` in memory until Save is clicked, so there's no need to create a
+  placeholder row first — fetch just fills the draft.
+- **The SF field→API-name map is an educated guess**, not verified against a live org
+  (this repo's own Zoom/Gong email-parsing session hit the same kind of gap). `describe`-
+  gating plus `fields_skipped` means a wrong guess is reported, not silently wrong.
+
+**A bug introduced and caught mid-session, worth noting**
+Inserting `ProjectMemberViewSet` between `AccountRoleViewSet.get_queryset` and its
+`perform_create`/`destroy` (an `Edit` whose `old_string` ended right at `get_queryset`)
+spliced the new class in *before* those methods rather than after — since both blocks sit
+at the same 4-space indent, Python silently reattached `AccountRoleViewSet`'s staff-only
+`perform_create`/`destroy` as **extra methods on `ProjectMemberViewSet`** instead of
+leaving them on `AccountRoleViewSet`. Every non-staff `AccountRoleViewSet` test still
+passed in isolation but failed identically with real DB rows; two full-suite runs and a
+sandboxed `APIClient` repro (outside the test runner, careful to clean up the rows it
+created in the dev DB) pinned it to that exact splice before it was fixed. Lesson: an
+`Edit` whose insertion point sits between two same-indentation blocks needs the boundary
+re-verified by grep/read after the fact, not assumed from the diff.
+
+**Verified**
+- 707/707 backend (18 new: `AccountProjectSalesforceFetchTests`, `ProjectMemberViewSetTests`,
+  `AccountProjectSfProjectIdTest`).
+- 1152/1153 frontend (33 new: 12 `ProjectGoals.test.tsx` — this component had zero tests
+  before, since it was never wired in — 4 new in `AccountDetailPage.test.tsx`, 6 in
+  `batchApi.test.ts`). The 1 failure is pre-existing full-suite-only flakiness unrelated to
+  this change — confirmed by `git stash` against clean `AccountDetailPage.tsx` (same
+  failure) and by two consecutive full runs failing on two *different* unrelated tests
+  (`AccountDetailPage`'s drag-order test, then `RolePage`'s tray-drop test).
+- `npm run build` and `tsc -p tsconfig.app.json` clean.
+- Dev DB migrated (`accounts.0019`); backend restart needed before manually exercising the
+  two new routes live (`/accounts/projects/fetch-salesforce/`, `/accounts/project-members/`).
+
+**Left open**
+- The SF field→API-name map needs verification against a real connected Cloud Coach org —
+  today only `sync_projects`' original 6 fields are known-correct.
+- `GoalSection.goalIds` referencing a just-created goal go stale if that goal's own id swaps
+  from a client `uid()` to its real numeric id before the referencing project is saved —
+  pre-existing behavior, not touched here.
+- The "Project Team" SF text-field section (free-text names from Salesforce) and the new
+  "Team Members" `ProjectMember` picker are deliberately separate concepts; nothing
+  reconciles a name typed in one with a person added in the other.
+
+---
+
+### 2026-08-28 — Single-owner action items/artifacts, per-project aggregate views
+
+**Why**
+A project's action items/artifacts and its nested goals' action items/artifacts were
+never mutually exclusive: `handleItemDrop` only ever *added* the dropped id to the
+target's array, so dragging a card that was already displayed under a project onto one
+of its own goals (or between goals) left it in both places at once. Separately, the user
+wanted a way to search/browse across every goal under a project without expanding each
+one — all artifacts, all Open/Pending/Closed/Blocked action items, plus a search bar.
+
+**Single-owner fix — `components/account/ProjectGoals.tsx`**
+- `handleItemDrop` now strips the dropped action item / meeting id (or artifact resource
+  id) from every *other* project/goal before adding it to the drop target — the same
+  single-parent rule `assignGoalToProject` already applies to goal→project, extended to
+  items. A drop is a **move**, not a copy.
+- `renderProjectCard` also computes `projectOwnItems` — the project's own `actionIds`/
+  `meetingIds`/`resources` with anything already claimed by a nested goal filtered out —
+  as a display-time backstop against stale/duplicate data, independent of the drag fix.
+
+**Per-project aggregate views**
+- New tab row on every project card: **Goals** (the existing nested-goals tree, default),
+  **Artifacts**, **Open**, **Pending**, **Closed**, **Blocked/Backlogged** — plus a search
+  input. `collectClusterEntries` flattens the project's own items and every nested goal's
+  items into one list, tagging each with its owning name ("Project" or the goal's name,
+  rendered as a chip on every row so origin isn't lost once flattened).
+- Status→tab mapping (confirmed with the user, since the model's five statuses don't split
+  evenly into three buckets): **Open** = `Open` only, **Pending** = `In Progress` only,
+  **Closed** = `Done` only, **Blocked/Backlogged** = `Blocked` + `Backlogged` — its own
+  tab rather than folded into Pending or Closed.
+- Search behavior: typing while a status/Artifacts tab is active filters within that tab;
+  typing from the default **Goals** tab searches everything (every status bucket +
+  artifacts) at once, matching against action-item task text / artifact label.
+- Row actions (remove ✕, open action item, open artifact link) still operate through the
+  existing `removeAction`/`removeResource`/`onSelectAction`, addressed by the entry's real
+  owning id — so removing from the aggregate view mutates the correct underlying
+  project/goal, not a synthetic copy.
+
+**Verified**
+- 1167/1167 frontend (24 new: 3 single-owner move tests — including one that drives an
+  actual `fireEvent.drop` with a hand-built `DataTransfer` stub, per the existing
+  `makeDataTransfer`-style pattern this repo uses for drag tests — and 9 new aggregate-view
+  tests, both sabotage-checked by reverting the fix/mapping and confirming the relevant
+  tests go red). `npm run build` and `tsc -p tsconfig.app.json` clean. No backend changes.
+
+---
+
+### 2026-08-28 — Vendored `twilio-agent-pm-shared` into the repo
+
+**Why**
+The frontend's `twilio-agent-pm-shared` dependency was `file:../../../twilio-agent-pm-shared`
+— resolving to `/Users/lizkane/Desktop/twilio-agent-pm-shared`, a folder **outside this repo
+entirely**, with no `.git` of its own. Cloning just this repo (e.g. sharing it with a
+colleague) left that folder missing, so `npm install` would break. Investigating it turned up
+a wrong assumption: this package is not old-app leftovers the migration forgot to bring over.
+The old app (`TWILIO - Agent PM`) depends on the exact same external folder, via the identical
+`file:../../../twilio-agent-pm-shared` path and the same imports — it's a third, independent
+sibling package (framework-free "brain" logic + Zod schemas + fixtures + a CLI adapter + a
+Swift bridge, `src/adapters/swift/AgentPMBridge.swift` — evidently meant to be shared across
+more than one front-end), not a dependency *of* the old app *on* this one or vice versa.
+
+**What changed**
+- Copied the package's `src/`, `dist/`, `package.json`, `package-lock.json`, `tsconfig.json`,
+  `jest.config.js` into a new **`twilio-agent-pm-shared/` at this repo's root** (sibling to
+  `app/`, not inside it) — `dist/` is what Vite/Vitest alias directly to, and `app/.gitignore`
+  has a blanket `dist/` rule (line 85) that would have silently swallowed the vendored output;
+  the root `.gitignore` has no such rule.
+- Updated the four places that hardcoded the 3-levels-up path to the new 2-levels-up one:
+  `app/frontend/package.json` (`file:` dependency), `vite.config.ts` and `vitest.config.ts`
+  (alias `URL`), `tsconfig.app.json` (`paths` mapping). Removed a now-stale
+  `"../../../twilio-agent-pm-shared"` entry `npm install` left behind in `package-lock.json`
+  marked `"extraneous": true`.
+- The external original at `/Users/lizkane/Desktop/twilio-agent-pm-shared` is untouched (copied
+  from, never written to) — the old app still resolves its own copy of the same relative path
+  there, and the old app must never be modified.
+
+**Key decision — the vendored package needs its own `node_modules`, not just source+dist**
+Initially skipped copying `node_modules` (68 MB, assumed only needed for the package's *own*
+build/test scripts). Wrong: `dist/schemas.js` has a real runtime import, `import { z } from
+"zod"`, and Vite resolves a symlinked package by its **real path** then walks up from there
+looking for `node_modules` — so it needed `zod` sitting next to the vendored package, not
+hoisted into `app/frontend/node_modules` (confirmed no `node_modules/zod` entry exists anywhere
+in `app/frontend/package-lock.json`; that dependency has always lived inside the shared
+package's own install, exactly as it does in the external original). Fixed by running
+`npm install` inside the new `twilio-agent-pm-shared/` directory — added as a required one-time
+setup step in "Key commands," since that directory's `node_modules` is (correctly) covered by
+the root `.gitignore` and won't survive a fresh clone.
+
+**Verified**
+- 1167/1167 frontend (100/100 files), 707/707 backend, `npm run build` clean. Confirmed via
+  `git status` in both this repo and the old app's repo, plus unchanged mtimes on the external
+  original's `dist/index.js` / `package.json`, that neither was modified — only read from.
+
+**Left open**
+- The vendored package's `src/adapters/cli/` and `src/adapters/swift/` are carried over as-is,
+  unused by this app (kept per the "vendor the whole package" decision — the architecture may
+  matter for a future CLI or Swift client).
+- ~~Unrelated, noticed in passing: "Key commands" still instructs activating the **old app's**
+  backend venv for tests.~~ Fixed same session, on request: "Key commands" now sources
+  `.venv/bin/activate` relative to `app/backend/` (this app's own venv, confirmed Django
+  5.2.15 installed) instead of the old app's path.
