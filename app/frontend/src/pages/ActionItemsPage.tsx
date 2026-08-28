@@ -2628,7 +2628,7 @@ function DropZone({
                 className={`flex flex-col border-b border-gray-100 transition-colors ${isAccOver ? "bg-indigo-50" : "hover:bg-gray-50"}`}
                 onDragOver={(e) => { e.stopPropagation(); onDragOver(e, zoneKey); }}
                 onDragLeave={(e) => { if (leftElement(e)) onDragLeave(); }}
-                onDrop={(e) => { e.stopPropagation(); console.log("[DRAG-DEBUG] No Account row onDrop fired"); onDrop(e, "accounts", "none"); }}
+                onDrop={(e) => { e.stopPropagation(); onDrop(e, "accounts", "none"); }}
               >
                 <div className="flex items-stretch">
                   <div className="w-36 shrink-0 px-3 py-2 border-r border-gray-100 flex flex-col justify-center">
@@ -2740,7 +2740,7 @@ function DropZone({
                 className={`flex flex-col border-b border-gray-100 transition-colors ${isAccOver ? "bg-indigo-50" : "hover:bg-gray-50"}`}
                 onDragOver={(e) => { e.stopPropagation(); onDragOver(e, zoneKey); }}
                 onDragLeave={(e) => { if (leftElement(e)) onDragLeave(); }}
-                onDrop={(e) => { e.stopPropagation(); console.log("[DRAG-DEBUG] account row onDrop fired", acc.key, acc.name); onDrop(e, "accounts", acc.key); }}
+                onDrop={(e) => { e.stopPropagation(); onDrop(e, "accounts", acc.key); }}
               >
                 <div className="flex items-stretch">
                   {/* Account label column. The star and the collapse toggle are siblings —
@@ -3752,7 +3752,6 @@ function ProjectsView({
 type PageView = "kanban" | "status" | "due" | "projects";
 
 export default function ActionItemsPage() {
-  console.log("[DRAG-DEBUG] ActionItemsPage render, build marker: drag-debug-v1");
   const { reportError } = useAppError();
   const [allItems, setAllItems] = useState<AirtableActionItem[]>([]);
   const [accounts, setAccounts] = useState<KanbanAccount[]>([]);
@@ -4080,7 +4079,6 @@ export default function ActionItemsPage() {
    * parallel requests reads as a glitch rather than as progress.
    */
   const load = useCallback(async (opts?: { silent?: boolean }) => {
-    console.log("[DRAG-DEBUG] load() called", { silent: !!opts?.silent, stack: new Error().stack?.split("\n").slice(1, 4).join(" | ") });
     if (!opts?.silent) setIsLoading(true);
     try {
       const [itemsRes, atAccountsRes, appAccountsRes, profileRes] = await Promise.all([
@@ -4193,20 +4191,12 @@ export default function ActionItemsPage() {
 
   // Clear drag state whenever any drag ends (cancel or drop) so stale dragId never blocks next drag
   useEffect(() => {
-    const onDragEnd = (e: DragEvent) => {
-      console.log("[DRAG-DEBUG] window dragend", { dropEffect: e.dataTransfer?.dropEffect, target: (e.target as HTMLElement)?.tagName, targetClass: (e.target as HTMLElement)?.className });
+    const onDragEnd = () => {
       setDragId(null); setDragOverZone(null); setDropHint(null);
     };
-    // Capture-phase, page-wide: tells us definitively whether "drop" fires ANYWHERE at
-    // all on mouseup, even outside every React onDrop handler below.
-    const onWindowDrop = (e: DragEvent) => {
-      console.log("[DRAG-DEBUG] window drop (capture)", { target: (e.target as HTMLElement)?.tagName, targetClass: (e.target as HTMLElement)?.className, defaultPrevented: e.defaultPrevented });
-    };
     window.addEventListener("dragend", onDragEnd);
-    window.addEventListener("drop", onWindowDrop, { capture: true });
     return () => {
       window.removeEventListener("dragend", onDragEnd);
-      window.removeEventListener("drop", onWindowDrop, { capture: true });
     };
   }, [setDropHint]);
 
@@ -4323,7 +4313,6 @@ export default function ActionItemsPage() {
   function handleDragOver(e: React.DragEvent, zone: Zone) {
     e.preventDefault();
     e.dataTransfer.dropEffect = "move";
-    if (zone !== dragOverZone) console.log("[DRAG-DEBUG] hovering zone ->", zone);
     setDragOverZone(zone);
     // Hovering the zone's own padding (not a card) means "append to the end".
     if (isReorderableZone(zone)) setDropHint({ zone, beforeId: null });
@@ -4358,7 +4347,6 @@ export default function ActionItemsPage() {
    * already filed under is free rather than a redundant write plus a misleading log line.
    */
   async function assignItemToAccount(resolvedId: string, item: AirtableActionItem, accountKey: string) {
-    console.log("[DRAG-DEBUG] assignItemToAccount called", { resolvedId, accountKey, currentAccountName: item.account_name });
     const acc = accountKey === "none" ? null : accounts.find((a) => a.key === accountKey);
     // An unresolvable key would otherwise silently clear the account.
     if (accountKey !== "none" && !acc) return;
@@ -4431,14 +4419,12 @@ export default function ActionItemsPage() {
 
   async function handleDrop(e: React.DragEvent, targetZoneArg: Zone, accountKey?: string) {
     e.preventDefault();
-    console.log("[DRAG-DEBUG] handleDrop called", { dragId, targetZoneArg, accountKey, currentZoneForDragId: dragId ? zones[dragId] : undefined });
     setDragOverZone(null);
-    if (!dragId) { console.log("[DRAG-DEBUG] bailing: no dragId"); return; }
+    if (!dragId) return;
     let targetZone = targetZoneArg;
 
     // Promote blank to a real Airtable record when leaving Unstaged
     const prevZoneGlobal = zones[dragId] ?? (dragId.startsWith("local-") ? "unstaged" : "today");
-    console.log("[DRAG-DEBUG] prevZoneGlobal", prevZoneGlobal);
     const dragSnapshot = allItems.find((i) => i.airtable_id === dragId);
     if (!dragSnapshot) return;
 
@@ -4469,14 +4455,9 @@ export default function ActionItemsPage() {
 
     if (targetZone === "accounts" && accountKey != null) {
       const prevZoneAccounts = prevZoneGlobal;
-      console.log("[DRAG-DEBUG] entered accounts branch", { resolvedId, prevZoneAccounts, accountKey });
       // Zone already set atomically above for the promote path; this is a no-op for
       // non-promote drops (setZones is idempotent).
-      setZones((prev) => {
-        const next = { ...prev, [resolvedId]: "accounts" as Zone };
-        console.log("[DRAG-DEBUG] setZones ->", { resolvedId, newZoneForItem: next[resolvedId] });
-        return next;
-      });
+      setZones((prev) => ({ ...prev, [resolvedId]: "accounts" as Zone }));
 
       // Coming from Stage Today or Currently Tracking, a drop anywhere in the Views
       // grid just unstages the card — it lands back under its own existing account
@@ -4485,10 +4466,7 @@ export default function ActionItemsPage() {
       // drop. Dropping from Unstaged (assigning a blank's first account) or from
       // within Views/Projects itself (a deliberate re-file) still reassigns.
       if (prevZoneAccounts !== "today" && prevZoneAccounts !== "active") {
-        console.log("[DRAG-DEBUG] reassigning account (prevZone was not today/active)");
         await assignItemToAccount(resolvedId, item, accountKey);
-      } else {
-        console.log("[DRAG-DEBUG] skipping reassignment (prevZone was", prevZoneAccounts, ") — should just unstage");
       }
 
       // Top up blanks if the item came from Unstaged
