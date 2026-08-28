@@ -110,6 +110,24 @@ export interface AccountProject {
   meeting_ids: string[];
   goal_ids: string[];
   resources: GoalResource[];
+  sf_data: SalesforceProjectData;
+  sf_project_id: string;
+  kind: "project" | "goal";
+  created_at: string;
+}
+
+// A team.TeamMember linked to a specific AccountProject — a member can be on
+// several projects under the same account, which Account.team_members alone
+// cannot express.
+export interface ProjectMember {
+  id: number;
+  project: number;
+  team_member: number;
+  team_member_name: string;
+  team_member_email: string;
+  team_member_avatar_url: string;
+  role: string;
+  added_by: number | null;
   created_at: string;
 }
 
@@ -200,6 +218,13 @@ export interface SalesforceProjectData {
   surveyDoNotSendReason?: string; allowUnassignedTimeEntry?: string;
   surveyEligibleStakeholders?: string; selfAssignable?: string;
   daysBeforeSurvey?: string; surveyOptOuts?: string;
+  // System Information
+  createdBy?: string; resourcingMode?: string; recurringService?: string;
+  lastModifiedBy?: string; calculatedStartDate?: string; calculatedEndDate?: string;
+  weeklyTimeBasedAssignments?: string; projectTemplate?: string; clonedFrom?: string;
+  lastSurveySentDate?: string; daysSinceLastTimeLogged?: string;
+  segmentSideId?: string; segmentStatusCustom?: string;
+  desiredStartDate?: string; desiredEndDate?: string;
 }
 
 export interface GoalSection {
@@ -213,6 +238,7 @@ export interface GoalSection {
   goalIds: string[]; // for projects: IDs of nested goals
   resources: GoalResource[];
   sfData?: SalesforceProjectData;
+  sfProjectId?: string;
 }
 
 // ── Account RBAC roles ────────────────────────────────────────────────────────

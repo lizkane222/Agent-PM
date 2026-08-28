@@ -18,10 +18,23 @@ from realtime.sync import publish_activity_event
 from scheduler.models import Reminder
 from scheduler.serializers import ActionItemSerializer, CalendarEventSerializer, ReminderSerializer
 
-from .models import Account, AccountArtifact, AccountNote, AccountProject, AccountQuickLink, AccountRole, CustomerContact, CustomerContactNote
-from .serializers import AccountArtifactSerializer, AccountNoteSerializer, AccountProjectSerializer, AccountQuickLinkSerializer, AccountRoleSerializer, AccountSerializer, CustomerContactNoteSerializer, CustomerContactSerializer
+from .models import Account, AccountArtifact, AccountNote, AccountProject, AccountQuickLink, AccountRole, CustomerContact, CustomerContactNote, ProjectMember
+from .serializers import AccountArtifactSerializer, AccountNoteSerializer, AccountProjectSerializer, AccountQuickLinkSerializer, AccountRoleSerializer, AccountSerializer, CustomerContactNoteSerializer, CustomerContactSerializer, ProjectMemberSerializer
 
 logger = logging.getLogger(__name__)
+
+
+def _assert_account_membership(user, account):
+    """Raise PermissionDenied unless `user` may attach records to `account`."""
+    if account is None or _staff_sees_all(user):
+        return
+    from django.db.models import Q
+    allowed = Account.objects.filter(
+        Q(pk=account.pk) & (Q(team_members__user=user) | Q(admin_owner=user))
+    ).exists()
+    if not allowed:
+        from rest_framework.exceptions import PermissionDenied
+        raise PermissionDenied("You do not have access to this account.")
 
 
 class AccountViewSet(viewsets.ModelViewSet):
@@ -695,33 +708,97 @@ class AccountProjectViewSet(viewsets.ModelViewSet):
             qs = qs.filter(account__id=account_id)
         return qs
 
-    def _require_account_membership(self, target_account):
-        """Raise PermissionDenied unless the caller can attach projects to this account."""
-        if target_account is None:
-            return
-        user = self.request.user
-        if _staff_sees_all(user):
-            return
-        from django.db.models import Q
-        allowed = Account.objects.filter(
-            Q(pk=target_account.pk) & (
-                Q(team_members__user=user) | Q(admin_owner=user)
-            )
-        ).exists()
-        if not allowed:
-            from rest_framework.exceptions import PermissionDenied
-            raise PermissionDenied("You cannot attach projects to this account.")
-
     def perform_create(self, serializer):
         # Prevent attaching a project to an account the caller isn't on.
-        self._require_account_membership(serializer.validated_data.get("account"))
+        _assert_account_membership(self.request.user, serializer.validated_data.get("account"))
         serializer.save()
 
     def perform_update(self, serializer):
         # Guard against re-parenting a project to an account the caller isn't on.
         target = serializer.validated_data.get("account") or serializer.instance.account
-        self._require_account_membership(target)
+        _assert_account_membership(self.request.user, target)
         serializer.save()
+
+    @action(detail=False, methods=["post"], url_path="fetch-salesforce")
+    def fetch_salesforce(self, request):
+        """
+        POST {"sf_project_id": "a0B..."}
+
+        Stateless lookup — queries the connected org for a Cloud Coach project and
+        returns `{name, sf_data, fields_skipped}`. Does not touch the database; the
+        caller merges the result into an in-progress (possibly unsaved) project draft.
+        """
+        sf_project_id = (request.data.get("sf_project_id") or "").strip()
+        if not sf_project_id:
+            return Response({"detail": "sf_project_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        from salesforce_sync.client import get_client, discover_namespace
+        from .sf_project_fields import SF_PROJECT_FIELD_MAP
+
+        try:
+            sf = get_client(request.user)
+        except PermissionError:
+            return Response({"detail": "Salesforce is not connected for this user."}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception:
+            logger.exception("Salesforce client setup failed")
+            return Response({"detail": "Could not reach Salesforce."}, status=status.HTTP_502_BAD_GATEWAY)
+
+        ns = discover_namespace(sf)
+        sobject = f"{ns}__Project__c"
+
+        try:
+            describe = sf.restful(f"sobjects/{sobject}/describe")
+        except Exception:
+            logger.exception("Salesforce describe failed for %s", sobject)
+            return Response({"detail": "Could not read the Salesforce project object."}, status=status.HTTP_502_BAD_GATEWAY)
+
+        available = {f["name"] for f in describe.get("fields", [])}
+
+        def _qualify(api_name: str) -> str:
+            return f"{ns}__{api_name}" if api_name.endswith("__c") else api_name
+
+        soql_fields = ["Id", "Name"]
+        key_by_soql_field = {}
+        fields_skipped = []
+        for key, (api_name, _dtype) in SF_PROJECT_FIELD_MAP.items():
+            qualified = _qualify(api_name)
+            bare_check = qualified.split(".")[0]  # relationship fields (CreatedBy.Name) describe under the base field
+            if bare_check not in available and qualified not in available:
+                fields_skipped.append(key)
+                continue
+            soql_fields.append(qualified)
+            key_by_soql_field[qualified] = key
+
+        query = (
+            f"SELECT {', '.join(soql_fields)} FROM {sobject} "
+            f"WHERE Id = '{sf_project_id}' LIMIT 1"
+        )
+        try:
+            result = sf.query(query)
+        except Exception:
+            logger.exception("Salesforce project query failed")
+            return Response({"detail": "Could not query Salesforce."}, status=status.HTTP_502_BAD_GATEWAY)
+
+        records = result.get("records", [])
+        if not records:
+            return Response({"detail": "No matching Salesforce project found."}, status=status.HTTP_404_NOT_FOUND)
+
+        rec = records[0]
+        sf_data = {}
+        for qualified, key in key_by_soql_field.items():
+            value = rec
+            for part in qualified.split("."):
+                value = (value or {}).get(part) if isinstance(value, dict) else None
+            if value is not None:
+                # Frontend checkboxes read the literal strings "true"/"false"
+                # (ProjectDetailsModal.renderFieldInput's checkbox case).
+                sf_data[key] = ("true" if value else "false") if isinstance(value, bool) else str(value)
+
+        return Response({
+            "name": rec.get("Name") or "",
+            "sf_data": sf_data,
+            "fields_skipped": fields_skipped,
+        })
 
 
 class AccountRoleViewSet(
@@ -751,3 +828,43 @@ class AccountRoleViewSet(
             from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied("Only staff can remove account roles.")
         return super().destroy(request, *args, **kwargs)
+
+
+class ProjectMemberViewSet(
+    mixins.ListModelMixin,
+    mixins.CreateModelMixin,
+    mixins.DestroyModelMixin,
+    viewsets.GenericViewSet,
+):
+    """Per-project team membership — a TeamMember can be on several projects under one account."""
+
+    serializer_class = ProjectMemberSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        from django.db.models import Q
+        user = self.request.user
+        if _staff_sees_all(user):
+            qs = ProjectMember.objects.select_related("team_member", "project__account")
+        else:
+            qs = ProjectMember.objects.select_related("team_member", "project__account").filter(
+                Q(project__account__team_members__user=user) | Q(project__account__admin_owner=user)
+            ).distinct()
+
+        project_ids = csv_int_params(self.request.query_params.get("project__in"))
+        if project_ids:
+            qs = qs.filter(project_id__in=project_ids)
+        else:
+            project_id = self.request.query_params.get("project")
+            if project_id:
+                qs = qs.filter(project_id=project_id)
+        return qs
+
+    def perform_create(self, serializer):
+        project = serializer.validated_data.get("project")
+        _assert_account_membership(self.request.user, project.account if project else None)
+        serializer.save(added_by=self.request.user)
+
+    def perform_destroy(self, instance):
+        _assert_account_membership(self.request.user, instance.project.account)
+        instance.delete()

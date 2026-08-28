@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import type { AirtableActionItem, AirtableMeeting, GoalSection, SalesforceProjectData } from "../../types";
+import type { AccountTeamMember, AirtableActionItem, AirtableMeeting, GoalResource, GoalSection, ProjectMember, SalesforceProjectData } from "../../types";
+import { accountsApi } from "../../lib/api";
 import { ArtifactIconImg, CATALOG_BY_KEY, getAutoIconKey } from "./ArtifactIcon";
 import { ActionItemCard } from "./ActionItemCard";
 
@@ -190,12 +191,63 @@ const SF_SECTIONS: SFSection[] = [
     { key: "daysBeforeSurvey",             label: "Days before Survey Sent/Proj Start Date",   fieldType: "number" },
     { key: "surveyOptOuts",                label: "# of Survey Opt Outs",                      fieldType: "number" },
   ]},
+  { label: "System Information", fields: [
+    { key: "createdBy",                 label: "Created By",                       fieldType: "text" },
+    { key: "resourcingMode",             label: "Resourcing Mode",                  fieldType: "picklist", options: ["Time Based", "Unit Based"] },
+    { key: "recurringService",           label: "Recurring Service",                fieldType: "checkbox" },
+    { key: "lastModifiedBy",             label: "Last Modified By",                 fieldType: "text" },
+    { key: "calculatedStartDate",        label: "Calculated Start Date",            fieldType: "date" },
+    { key: "calculatedEndDate",          label: "Calculated End Date",              fieldType: "date" },
+    { key: "weeklyTimeBasedAssignments", label: "Weekly Time Based Assignments",    fieldType: "checkbox" },
+    { key: "projectTemplate",            label: "Project Template",                 fieldType: "checkbox" },
+    { key: "clonedFrom",                 label: "Cloned From",                      fieldType: "text" },
+    { key: "lastSurveySentDate",         label: "Last Survey Sent Date",            fieldType: "date" },
+    { key: "daysSinceLastTimeLogged",    label: "Days Since Last Time Logged",      fieldType: "number" },
+    { key: "segmentSideId",              label: "Segment Side Id",                  fieldType: "text" },
+    { key: "segmentStatusCustom",        label: "Segment Status Custom",            fieldType: "text" },
+    { key: "desiredStartDate",           label: "Desired Start Date",               fieldType: "date" },
+    { key: "desiredEndDate",             label: "Desired End Date",                 fieldType: "date" },
+  ]},
 ];
 
 // All fields flattened for search
 const ALL_FIELDS: (SFField & { sectionLabel: string })[] = SF_SECTIONS.flatMap((s) =>
   s.fields.map((f) => ({ ...f, sectionLabel: s.label }))
 );
+
+// ── Project-level aggregate views ───────────────────────────────────────────────
+// A project's "Goals" tab shows its nested-goals tree (the default). The other tabs
+// flatten every action item / artifact across the project *and* all of its goals into
+// one searchable list, grouped by status for action items.
+
+type ClusterView = "tree" | "artifacts" | "open" | "pending" | "closed" | "blocked";
+
+const CLUSTER_VIEW_TABS: { key: ClusterView; label: string }[] = [
+  { key: "tree", label: "Goals" },
+  { key: "artifacts", label: "Artifacts" },
+  { key: "open", label: "Open" },
+  { key: "pending", label: "Pending" },
+  { key: "closed", label: "Closed" },
+  { key: "blocked", label: "Blocked/Backlogged" },
+];
+
+// Open → Open, In Progress → Pending, Done → Closed, Blocked/Backlogged → their own
+// bucket (they don't read as "pending" or "closed"). Any other/unknown status has no
+// bucket, so it simply doesn't appear in a status tab — still visible in the tree view.
+function statusBucket(status: string): ClusterView | null {
+  switch (status) {
+    case "Open": return "open";
+    case "In Progress": return "pending";
+    case "Done": return "closed";
+    case "Blocked":
+    case "Backlogged": return "blocked";
+    default: return null;
+  }
+}
+
+type ClusterActionEntry = { kind: "action"; ownerId: string; ownerName: string; item: AirtableActionItem };
+type ClusterResourceEntry = { kind: "resource"; ownerId: string; ownerName: string; resource: GoalResource };
+type ClusterEntry = ClusterActionEntry | ClusterResourceEntry;
 
 // ── Health dot ─────────────────────────────────────────────────────────────────
 
@@ -212,21 +264,53 @@ function HealthDot({ value }: { value?: string }) {
 
 function ProjectDetailsModal({
   goal,
+  members,
+  accountTeamMembers,
   onClose,
   onSave,
+  onAddMember,
+  onRemoveMember,
 }: {
   goal: GoalSection;
+  members: ProjectMember[];
+  accountTeamMembers: AccountTeamMember[];
   onClose: () => void;
   onSave: (updated: Partial<GoalSection>) => void;
+  onAddMember?: (teamMemberId: number) => void;
+  onRemoveMember?: (projectMemberId: number) => void;
 }) {
   const [name, setName] = useState(goal.name);
   const [url, setUrl] = useState(goal.url ?? "");
   const [sfData, setSfData] = useState<SalesforceProjectData>(goal.sfData ?? {});
+  const [sfProjectId, setSfProjectId] = useState(goal.sfProjectId ?? "");
+  const [sfFetchState, setSfFetchState] = useState<"idle" | "loading" | "error">("idle");
+  const [sfFieldsSkipped, setSfFieldsSkipped] = useState<string[] | null>(null);
   const [search, setSearch] = useState("");
   const [expandedSections, setExpandedSections] = useState<Set<string>>(new Set());
   const [highlightKey, setHighlightKey] = useState<string | null>(null);
   const highlightTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fieldRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const [addingMember, setAddingMember] = useState(false);
+
+  // A brand-new project only exists as an in-memory draft (see `newGoalDraft` in
+  // ProjectGoals) until Save is clicked — there's no id to attach members to yet.
+  const isSaved = !Number.isNaN(Number(goal.id));
+
+  async function handleFetchFromSalesforce() {
+    if (!sfProjectId.trim()) return;
+    setSfFetchState("loading");
+    setSfFieldsSkipped(null);
+    try {
+      const { data } = await accountsApi.fetchProjectSalesforceData(sfProjectId.trim());
+      // Manual edits win — only fill fields the user hasn't already typed into.
+      setSfData((prev) => ({ ...data.sf_data, ...prev }));
+      if (!name.trim() && data.name) setName(data.name);
+      setSfFieldsSkipped(data.fields_skipped);
+      setSfFetchState("idle");
+    } catch {
+      setSfFetchState("error");
+    }
+  }
 
   function toggleSection(label: string) {
     setExpandedSections((prev) => {
@@ -269,7 +353,7 @@ function ProjectDetailsModal({
   }, [onClose]);
 
   function handleSave() {
-    onSave({ name: name.trim() || goal.name, url: url.trim(), sfData });
+    onSave({ name: name.trim() || goal.name, url: url.trim(), sfData, sfProjectId: sfProjectId.trim() });
     onClose();
   }
 
@@ -432,6 +516,7 @@ function ProjectDetailsModal({
 
   return (
     <div
+      data-testid="project-details-modal"
       style={{ position: "fixed", inset: 0, zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.35)" }}
       onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
     >
@@ -464,6 +549,105 @@ function ProjectDetailsModal({
             </div>
           </div>
           <button onClick={onClose} style={{ fontSize: 18, color: "#9ca3af", background: "none", border: "none", cursor: "pointer", padding: "0 4px", lineHeight: 1 }}>✕</button>
+        </div>
+
+        {/* Salesforce fetch row */}
+        <div style={{ display: "flex", alignItems: "flex-end", gap: 8, padding: "0 16px 10px", flexShrink: 0 }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 4, flex: "1 1 200px", minWidth: 0 }}>
+            <label style={{ fontSize: "0.625rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em", color: "#6b7280" }}>
+              Salesforce Project ID
+            </label>
+            <input
+              value={sfProjectId}
+              onChange={(e) => setSfProjectId(e.target.value)}
+              placeholder="a0B…"
+              style={{ fontSize: "0.8125rem", color: "var(--twilio-navy)", border: "1px solid rgba(0,0,0,0.1)", borderRadius: 5, outline: "none", background: "#fafafa", padding: "4px 8px" }}
+            />
+          </div>
+          <button
+            onClick={handleFetchFromSalesforce}
+            disabled={!sfProjectId.trim() || sfFetchState === "loading"}
+            title="Fetch the remaining fields from Salesforce"
+            style={{
+              fontSize: "0.75rem", fontWeight: 600, padding: "6px 12px", borderRadius: 6, whiteSpace: "nowrap",
+              border: "1px solid var(--twilio-red,#e22)", background: "transparent", color: "var(--twilio-red,#e22)",
+              cursor: sfProjectId.trim() && sfFetchState !== "loading" ? "pointer" : "not-allowed",
+              opacity: sfProjectId.trim() ? 1 : 0.5,
+            }}
+          >
+            {sfFetchState === "loading" ? "Fetching…" : "Fetch from Salesforce"}
+          </button>
+        </div>
+        {sfFetchState === "error" && (
+          <div style={{ padding: "0 16px 8px", fontSize: "0.75rem", color: "#dc2626", flexShrink: 0 }}>
+            Could not fetch from Salesforce. Check the project ID and your connection.
+          </div>
+        )}
+        {sfFieldsSkipped && sfFieldsSkipped.length > 0 && (
+          <div style={{ padding: "0 16px 8px", fontSize: "0.75rem", color: "#9ca3af", flexShrink: 0 }}>
+            {sfFieldsSkipped.length} field{sfFieldsSkipped.length === 1 ? "" : "s"} not found on the connected org and left as-is.
+          </div>
+        )}
+
+        {/* Team Members */}
+        <div style={{ padding: "0 16px 8px", flexShrink: 0 }}>
+          <button
+            onClick={() => toggleSection("__members__")}
+            style={{ width: "100%", display: "flex", alignItems: "center", gap: 8, padding: "7px 12px", background: "#f8f8fb", border: "none", cursor: "pointer", borderRadius: 7 }}
+          >
+            <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" style={{ width: 10, height: 10, color: "#9ca3af", flexShrink: 0, transition: "transform 0.15s", transform: expandedSections.has("__members__") ? "rotate(90deg)" : "rotate(0deg)" }}>
+              <path d="M4 2l4 4-4 4"/>
+            </svg>
+            <span style={{ fontSize: "0.6875rem", fontWeight: 600, color: "var(--twilio-navy)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+              Team Members {members.length > 0 ? `(${members.length})` : ""}
+            </span>
+          </button>
+          {expandedSections.has("__members__") && (
+            <div style={{ padding: "8px 12px 4px", display: "flex", flexDirection: "column", gap: 6 }}>
+              {!isSaved ? (
+                <p style={{ fontSize: "0.75rem", color: "#9ca3af" }}>Save the project first to add team members.</p>
+              ) : (
+                <>
+                  {members.map((m) => (
+                    <div key={m.id} className="group" style={{ display: "flex", alignItems: "center", gap: 8, fontSize: "0.8125rem" }}>
+                      <span style={{ width: 20, height: 20, borderRadius: "50%", background: "#ede9fe", color: "#6366f1", fontSize: "0.625rem", fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                        {m.team_member_name.slice(0, 1).toUpperCase()}
+                      </span>
+                      <span style={{ color: "var(--twilio-navy)", flex: 1 }}>{m.team_member_name}{m.role ? ` — ${m.role}` : ""}</span>
+                      {onRemoveMember && (
+                        <button onClick={() => onRemoveMember(m.id)} style={{ color: "#9ca3af", background: "none", border: "none", cursor: "pointer", fontSize: 12 }}>✕</button>
+                      )}
+                    </div>
+                  ))}
+                  {members.length === 0 && <p style={{ fontSize: "0.75rem", color: "#9ca3af" }}>No team members yet.</p>}
+                  {addingMember ? (
+                    <select
+                      autoFocus
+                      defaultValue=""
+                      onChange={(e) => {
+                        const id = Number(e.target.value);
+                        if (id && onAddMember) onAddMember(id);
+                        setAddingMember(false);
+                      }}
+                      onBlur={() => setAddingMember(false)}
+                      style={{ fontSize: "0.8125rem", border: "1px solid rgba(0,0,0,0.1)", borderRadius: 5, padding: "3px 8px" }}
+                    >
+                      <option value="" disabled>Choose a team member…</option>
+                      {accountTeamMembers
+                        .filter((tm) => !members.some((m) => m.team_member === tm.id))
+                        .map((tm) => (
+                          <option key={tm.id} value={tm.id}>{tm.full_name}</option>
+                        ))}
+                    </select>
+                  ) : (
+                    <button onClick={() => setAddingMember(true)} style={{ fontSize: "0.75rem", color: "#6366f1", background: "none", border: "none", cursor: "pointer", textAlign: "left", padding: 0 }}>
+                      + Add team member
+                    </button>
+                  )}
+                </>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Search bar */}
@@ -572,6 +756,10 @@ export function ProjectGoals({
   onChange,
   onSelectAction,
   onNoteDropped,
+  accountTeamMembers = [],
+  projectMembers = [],
+  onAddProjectMember,
+  onRemoveProjectMember,
 }: {
   goals: GoalSection[];
   actionItems: AirtableActionItem[];
@@ -579,6 +767,12 @@ export function ProjectGoals({
   onChange: (g: GoalSection[]) => void;
   onSelectAction?: (i: AirtableActionItem) => void;
   onNoteDropped?: (noteText: string, goalId: string) => void;
+  /** The account's own roster — the pool a project's Team Members are picked from. */
+  accountTeamMembers?: AccountTeamMember[];
+  /** Every ProjectMember for every project on this account (filtered per-card by project id). */
+  projectMembers?: ProjectMember[];
+  onAddProjectMember?: (projectId: number, teamMemberId: number) => void;
+  onRemoveProjectMember?: (projectMemberId: number) => void;
 }) {
   const [itemDropTarget, setItemDropTarget] = useState<string | null>(null);
   const [goalDropTarget, setGoalDropTarget] = useState<string | null>(null); // project accepting a dragged goal
@@ -588,6 +782,10 @@ export function ProjectGoals({
   const [editingGoalId, setEditingGoalId] = useState<string | null>(null);
   const [newResourceTarget, setNewResourceTarget] = useState<string | null>(null);
   const [resourceForm, setResourceForm] = useState({ label: "", url: "" });
+  // Per-project aggregate view (across all of a project's goals) — keyed by project id
+  // since renderProjectCard is a plain function called from a .map, not a component.
+  const [clusterViewByProject, setClusterViewByProject] = useState<Record<string, ClusterView>>({});
+  const [clusterSearchByProject, setClusterSearchByProject] = useState<Record<string, string>>({});
 
   const actionMap = Object.fromEntries(actionItems.map((a) => [a.airtable_id, a]));
   const meetingMap = Object.fromEntries(meetings.map((m) => [m.airtable_id, m]));
@@ -645,6 +843,11 @@ export function ProjectGoals({
   }
 
   // Drop items (action items, meetings, artifacts, notes) onto a card
+  // Action items, meetings and artifacts have exactly one owning project/goal at a time —
+  // the same single-parent rule assignGoalToProject already applies to goal→project. A drop
+  // therefore MOVES the item: it's stripped from every other goal/project before being added
+  // to the target, so dragging a card from a project onto one of its goals (or vice versa, or
+  // across two unrelated projects) can't leave it displayed in two places at once.
   function handleItemDrop(e: React.DragEvent, targetId: string) {
     e.preventDefault();
     setItemDropTarget(null);
@@ -658,18 +861,29 @@ export function ProjectGoals({
         const art = JSON.parse(artifactRaw) as { id: number; name: string; url: string; iconKey?: string };
         const resourceId = `artifact-${art.id}`;
         onChange(goals.map((g) => {
-          if (g.id !== targetId) return g;
-          if (g.resources.some((r) => r.id === resourceId)) return g;
-          return { ...g, resources: [...g.resources, { id: resourceId, label: art.name, url: art.url || "", iconKey: art.iconKey || getAutoIconKey(art.url || "") }] };
+          if (g.id === targetId) {
+            if (g.resources.some((r) => r.id === resourceId)) return g;
+            return { ...g, resources: [...g.resources, { id: resourceId, label: art.name, url: art.url || "", iconKey: art.iconKey || getAutoIconKey(art.url || "") }] };
+          }
+          if (g.resources.some((r) => r.id === resourceId)) {
+            return { ...g, resources: g.resources.filter((r) => r.id !== resourceId) };
+          }
+          return g;
         }));
       } catch { /* ignore */ }
       return;
     }
     onChange(goals.map((g) => {
-      if (g.id !== targetId) return g;
-      if (actionId && !g.actionIds.includes(actionId)) return { ...g, actionIds: [...g.actionIds, actionId] };
-      if (meetingId && !g.meetingIds.includes(meetingId)) return { ...g, meetingIds: [...g.meetingIds, meetingId] };
-      return g;
+      if (g.id === targetId) {
+        let next = g;
+        if (actionId && !next.actionIds.includes(actionId)) next = { ...next, actionIds: [...next.actionIds, actionId] };
+        if (meetingId && !next.meetingIds.includes(meetingId)) next = { ...next, meetingIds: [...next.meetingIds, meetingId] };
+        return next;
+      }
+      let next = g;
+      if (actionId && next.actionIds.includes(actionId)) next = { ...next, actionIds: next.actionIds.filter((x) => x !== actionId) };
+      if (meetingId && next.meetingIds.includes(meetingId)) next = { ...next, meetingIds: next.meetingIds.filter((x) => x !== meetingId) };
+      return next;
     }));
   }
 
@@ -841,6 +1055,80 @@ export function ProjectGoals({
     );
   }
 
+  // ── Project-level aggregate views ───────────────────────────────────────────
+
+  // Every action item / artifact directly on the project or on any of its nested goals,
+  // tagged with which one actually owns it (for the goal-name chip and so remove buttons
+  // still target the right record).
+  function collectClusterEntries(project: GoalSection, nestedGoals: GoalSection[]): ClusterEntry[] {
+    const owners = [{ section: project, name: "Project" }, ...nestedGoals.map((g) => ({ section: g, name: g.name || "Untitled" }))];
+    const entries: ClusterEntry[] = [];
+    for (const { section, name } of owners) {
+      for (const aid of section.actionIds) {
+        const item = actionMap[aid];
+        if (item) entries.push({ kind: "action", ownerId: section.id, ownerName: name, item });
+      }
+      for (const resource of section.resources) {
+        entries.push({ kind: "resource", ownerId: section.id, ownerName: name, resource });
+      }
+    }
+    return entries;
+  }
+
+  function renderClusterEntry(entry: ClusterEntry) {
+    if (entry.kind === "resource") {
+      const r = entry.resource;
+      return (
+        <div key={`r-${r.id}`} className="group flex items-center gap-1.5 bg-white rounded px-2 py-1 border border-gray-200 text-[11px]">
+          {r.iconKey ? <ArtifactIconImg entry={CATALOG_BY_KEY[r.iconKey] ?? CATALOG_BY_KEY["link"]} size={10} /> : (
+            <svg viewBox="0 0 16 16" fill="currentColor" className="w-2.5 h-2.5 text-blue-400 shrink-0"><path d="M7.293 1.293a1 1 0 011.414 0l6 6a1 1 0 010 1.414l-6 6a1 1 0 01-1.414-1.414L11.586 9H2a1 1 0 110-2h9.586L7.293 2.707a1 1 0 010-1.414z"/></svg>
+          )}
+          {r.url ? <a href={r.url} target="_blank" rel="noreferrer" className="flex-1 underline truncate" style={{ color: "var(--twilio-red,#e22)" }}>{r.label}</a>
+            : <span className="flex-1 text-[var(--twilio-navy)] truncate">{r.label}</span>}
+          <span className="shrink-0 text-[9px] px-1.5 py-0.5 rounded-full bg-indigo-50 text-indigo-500">{entry.ownerName}</span>
+          <button onClick={() => removeResource(entry.ownerId, r.id)} className="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-red-400 transition-all shrink-0">✕</button>
+        </div>
+      );
+    }
+    const { item } = entry;
+    return (
+      <div key={`a-${item.airtable_id}`} className="group relative">
+        <div className="cursor-pointer" onClick={() => onSelectAction?.(item)}>
+          <ActionItemCard item={item} projectName={entry.ownerName} onDragStart={(e) => { e.dataTransfer.setData("goalActionId", item.airtable_id); e.dataTransfer.setData("timelineActionId", item.airtable_id); }} />
+        </div>
+        <span className="absolute top-1 right-6 text-[9px] px-1.5 py-0.5 rounded-full bg-indigo-50 text-indigo-500" style={{ background: "rgba(255,255,255,0.9)" }}>{entry.ownerName}</span>
+        <button onClick={() => removeAction(entry.ownerId, item.airtable_id)} className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 transition-opacity text-gray-300 hover:text-red-400 text-xs leading-none" style={{ background: "rgba(255,255,255,0.9)", borderRadius: 3, padding: "1px 3px" }}>✕</button>
+      </div>
+    );
+  }
+
+  function renderClusterView(project: GoalSection, nestedGoals: GoalSection[], view: ClusterView, search: string) {
+    const all = collectClusterEntries(project, nestedGoals);
+    let entries: ClusterEntry[];
+    if (view === "artifacts") {
+      entries = all.filter((e) => e.kind === "resource");
+    } else if (view === "tree") {
+      // Searching from the default view searches everything, not just one bucket.
+      entries = all;
+    } else {
+      entries = all.filter((e) => e.kind === "action" && statusBucket(e.item.status) === view);
+    }
+    const q = search.trim().toLowerCase();
+    if (q) {
+      entries = entries.filter((e) => (e.kind === "resource" ? e.resource.label : e.item.task || "").toLowerCase().includes(q));
+    }
+    return (
+      <div className="flex flex-col gap-1.5">
+        {entries.length === 0 && (
+          <p className="text-[10px] text-center py-3" style={{ color: "#9ca3af" }}>
+            {q ? "No matches." : "Nothing here yet."}
+          </p>
+        )}
+        {entries.map(renderClusterEntry)}
+      </div>
+    );
+  }
+
   // ── Project card with nested goals ─────────────────────────────────────────
 
   function renderProjectCard(project: GoalSection) {
@@ -848,10 +1136,29 @@ export function ProjectGoals({
     const nestedGoals = (project.goalIds ?? []).map((id) => goals.find((g) => g.id === id)).filter(Boolean) as GoalSection[];
     const isGoalDrop = goalDropTarget === project.id;
     const isItemDrop = itemDropTarget === project.id;
+    const members = projectMembers.filter((m) => m.project === Number(project.id));
+    // An action item / meeting / artifact belongs to exactly one place. handleItemDrop
+    // already enforces that on every move, but this is a display-time backstop against
+    // stale data ever rendering the same item under both the project and one of its goals.
+    const claimedByGoals = {
+      actionIds: new Set(nestedGoals.flatMap((g) => g.actionIds)),
+      meetingIds: new Set(nestedGoals.flatMap((g) => g.meetingIds)),
+      resourceIds: new Set(nestedGoals.flatMap((g) => g.resources.map((r) => r.id))),
+    };
+    const projectOwnItems: GoalSection = {
+      ...project,
+      actionIds: project.actionIds.filter((id) => !claimedByGoals.actionIds.has(id)),
+      meetingIds: project.meetingIds.filter((id) => !claimedByGoals.meetingIds.has(id)),
+      resources: project.resources.filter((r) => !claimedByGoals.resourceIds.has(r.id)),
+    };
+    const clusterView = clusterViewByProject[project.id] ?? "tree";
+    const clusterSearch = clusterSearchByProject[project.id] ?? "";
+    const showClusterView = clusterView !== "tree" || clusterSearch.trim().length > 0;
 
     return (
       <div
         key={project.id}
+        data-testid={`project-row-${project.id}`}
         onDragOver={(e) => {
           e.preventDefault();
           if (e.dataTransfer.types.includes("goalitemid")) {
@@ -900,6 +1207,21 @@ export function ProjectGoals({
                 <HealthDot value={sf.health} />
                 {sf.remainingHours && <span className="text-[10px] text-[var(--twilio-gray-60)]">{sf.remainingHours} hrs left</span>}
               </div>
+              {members.length > 0 && (
+                <div className="flex items-center -space-x-1 mt-1" title={members.map((m) => m.team_member_name).join(", ")}>
+                  {members.slice(0, 5).map((m) => (
+                    <span
+                      key={m.id}
+                      style={{ width: 16, height: 16, borderRadius: "50%", background: "#ede9fe", color: "#6366f1", fontSize: "0.5625rem", fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", border: "1.5px solid var(--surface,#fff)" }}
+                    >
+                      {m.team_member_name.slice(0, 1).toUpperCase()}
+                    </span>
+                  ))}
+                  {members.length > 5 && (
+                    <span style={{ fontSize: "0.5625rem", color: "#9ca3af", marginLeft: 4 }}>+{members.length - 5}</span>
+                  )}
+                </div>
+              )}
             </div>
             <button onClick={() => setModalGoalId(project.id)} title="Project details" className="shrink-0 hover:opacity-70 transition-opacity" style={{ color: "#9ca3af" }}>
               <svg viewBox="0 0 16 16" fill="currentColor" className="w-3 h-3"><path d="M8 1a7 7 0 100 14A7 7 0 008 1zm0 1a6 6 0 110 12A6 6 0 018 2zm0 4a.75.75 0 100 1.5A.75.75 0 008 6zm-.75 2.25a.75.75 0 011.5 0v3.5a.75.75 0 01-1.5 0v-3.5z"/></svg>
@@ -913,7 +1235,36 @@ export function ProjectGoals({
           </div>
         </div>
 
-        {/* Nested goals */}
+        {/* Aggregate-view tabs — search across this project and every one of its goals */}
+        <div className="flex flex-col gap-1 px-2.5 pt-2" style={{ borderBottom: "1px solid rgba(0,0,0,0.05)" }}>
+          <div className="flex items-center gap-1 flex-wrap">
+            {CLUSTER_VIEW_TABS.map((tab) => (
+              <button
+                key={tab.key}
+                onClick={() => setClusterViewByProject((prev) => ({ ...prev, [project.id]: tab.key }))}
+                className="text-[9px] font-semibold px-1.5 py-0.5 rounded-full transition-colors"
+                style={clusterView === tab.key
+                  ? { background: "#6366f1", color: "#fff" }
+                  : { background: "rgba(99,102,241,0.08)", color: "#6366f1" }}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+          <input
+            value={clusterSearch}
+            onChange={(e) => setClusterSearchByProject((prev) => ({ ...prev, [project.id]: e.target.value }))}
+            placeholder="Search this project's goals…"
+            className="w-full text-[10px] rounded px-2 py-1 mb-1.5 focus:outline-none"
+            style={{ border: "1px solid rgba(0,0,0,0.08)", background: "#fff" }}
+          />
+        </div>
+
+        {showClusterView ? (
+          <div className="flex-1 overflow-y-auto px-2.5 pt-2 pb-2.5" style={{ scrollbarWidth: "thin" }}>
+            {renderClusterView(project, nestedGoals, clusterView, clusterSearch)}
+          </div>
+        ) : (
         <div className="flex-1 overflow-y-auto px-2.5 pt-2 pb-1" style={{ scrollbarWidth: "thin" }}>
           {nestedGoals.length > 0 && (
             <div className="flex flex-col gap-1.5 mb-2">
@@ -925,6 +1276,7 @@ export function ProjectGoals({
                 return (
                   <div
                     key={goal.id}
+                    data-testid={`goal-row-${goal.id}`}
                     onDragOver={(e) => {
                       if (!e.dataTransfer.types.includes("goalitemid")) {
                         e.preventDefault();
@@ -1016,16 +1368,18 @@ export function ProjectGoals({
             </div>
           ) : null}
 
-          {/* Project-level items (legacy / direct drops) */}
-          {(project.actionIds.length > 0 || project.resources.length > 0 || project.meetingIds.length > 0 || isItemDrop) && (
+          {/* Project-level items (legacy / direct drops) — excludes anything already
+              owned by a nested goal, so a moved item never renders in both places. */}
+          {(projectOwnItems.actionIds.length > 0 || projectOwnItems.resources.length > 0 || projectOwnItems.meetingIds.length > 0 || isItemDrop) && (
             <div className="mt-2">
               <p className="text-[9px] font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide mb-1">Project Items</p>
-              {renderGoalItems(project)}
+              {renderGoalItems(projectOwnItems)}
             </div>
           )}
 
           {renderAddResource(project.id)}
         </div>
+        )}
 
         {/* Footer */}
         <div className="shrink-0 px-2.5 pb-2.5 pt-1" style={{ borderTop: "1px solid rgba(0,0,0,0.05)" }}>
@@ -1093,7 +1447,15 @@ export function ProjectGoals({
 
       {/* Project details modal */}
       {modalGoal && (
-        <ProjectDetailsModal goal={modalGoal} onClose={handleModalClose} onSave={handleModalSave} />
+        <ProjectDetailsModal
+          goal={modalGoal}
+          members={projectMembers.filter((m) => m.project === Number(modalGoal.id))}
+          accountTeamMembers={accountTeamMembers}
+          onClose={handleModalClose}
+          onSave={handleModalSave}
+          onAddMember={onAddProjectMember ? (teamMemberId) => onAddProjectMember(Number(modalGoal.id), teamMemberId) : undefined}
+          onRemoveMember={onRemoveProjectMember}
+        />
       )}
     </div>
   );

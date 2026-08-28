@@ -590,7 +590,7 @@ export default function AccountsPage() {
   }, [fetchAccounts]);
 
   useEffect(() => {
-    teamApi.listMembers().then(({ data }) => setMembers(data.results)).catch(() => {});
+    teamApi.listMembers({ page_size: "500" }).then(({ data }) => setMembers(data.results)).catch(() => {});
     teamApi.getMyProfile().then(({ data }) => setMyProfile(data)).catch(() => {});
   }, []);
 

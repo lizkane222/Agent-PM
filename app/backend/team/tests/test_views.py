@@ -138,6 +138,36 @@ class TeamMemberWriteTest(APITestCase):
         self.assertFalse(TeamMember.objects.filter(pk=self.member.id).exists())
 
 
+class TeamMemberPaginationTest(APITestCase):
+    """?page_size= on /team/members/ — must be honoured, not silently dropped.
+
+    The project default is bare PageNumberPagination with PAGE_SIZE=50 and no
+    page_size_query_param, so a page of 51+ team members was truncated with no
+    way for a caller to ask for more — several frontend call sites (the account
+    page's "add team member" sidebar, @mention pickers) already passed
+    ?page_size= assuming it worked.
+    """
+
+    def setUp(self):
+        self.staff = _make_user("pagestaff", is_staff=True)
+        for i in range(60):
+            _make_member(full_name=f"Member {i:02d}")
+
+    def test_default_page_size_is_fifty(self):
+        self.client.force_authenticate(user=self.staff)
+        resp = self.client.get(MEMBERS_URL)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["count"], 60)
+        self.assertEqual(len(resp.data["results"]), 50)
+
+    def test_page_size_param_widens_the_page(self):
+        self.client.force_authenticate(user=self.staff)
+        resp = self.client.get(MEMBERS_URL, {"page_size": "200"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["count"], 60)
+        self.assertEqual(len(resp.data["results"]), 60)
+
+
 # ── Calendar color preferences ────────────────────────────────────────────────
 
 PROFILE_ME_URL = "/api/v1/team/profiles/me/"

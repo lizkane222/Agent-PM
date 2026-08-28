@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import axios from "axios";
 import CorporateIcon from "../assets/icons/Corporate.svg?react";
 import TeamIcon from "../assets/icons/Team.svg?react";
 import { accountsApi } from "../lib/api";
@@ -26,6 +27,19 @@ const EMPTY_FORM: Partial<TeamMember> = {
   slack_handle: "",
   avatar_url: "",
 };
+
+// DRF validation errors come back as {field: ["message", ...]} or {detail: "message"}.
+function apiErrorMessage(err: unknown, fallback: string): string {
+  if (axios.isAxiosError(err)) {
+    const data = err.response?.data;
+    if (data && typeof data === "object") {
+      const [firstValue] = Object.values(data as Record<string, unknown>);
+      if (Array.isArray(firstValue) && typeof firstValue[0] === "string") return firstValue[0];
+      if (typeof firstValue === "string") return firstValue;
+    }
+  }
+  return fallback;
+}
 
 type RoleMeta = { border: string; bg: string; text: string; label: string; slug: string };
 type CustomGroup = RoleMeta & { key: string };
@@ -306,6 +320,7 @@ function MemberModal({
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const firstInput = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -319,8 +334,11 @@ function MemberModal({
 
   async function handleSave() {
     setSaving(true);
+    setError(null);
     try {
       await onSave(form);
+    } catch (err) {
+      setError(apiErrorMessage(err, "Couldn't save this team member. Double-check the fields and try again."));
     } finally {
       setSaving(false);
     }
@@ -346,10 +364,17 @@ function MemberModal({
           {isNew ? "Add Team Member" : "Edit Member"}
         </h2>
 
+        {error && (
+          <div className="mb-4 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+            {error}
+          </div>
+        )}
+
         <div className="grid grid-cols-2 gap-4">
           <div className="col-span-2">
-            <label className="block text-sm font-medium text-[var(--twilio-navy)] mb-1">Full name *</label>
+            <label htmlFor="member-full-name" className="block text-sm font-medium text-[var(--twilio-navy)] mb-1">Full name *</label>
             <input
+              id="member-full-name"
               ref={firstInput}
               value={form.full_name ?? ""}
               onChange={(e) => set("full_name", e.target.value)}
@@ -357,8 +382,9 @@ function MemberModal({
             />
           </div>
           <div className="col-span-2">
-            <label className="block text-sm font-medium text-[var(--twilio-navy)] mb-1">Email *</label>
+            <label htmlFor="member-email" className="block text-sm font-medium text-[var(--twilio-navy)] mb-1">Email *</label>
             <input
+              id="member-email"
               type="email"
               value={form.email ?? ""}
               onChange={(e) => set("email", e.target.value)}

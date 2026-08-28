@@ -46,6 +46,8 @@ import type {
   PaginatedResponse,
   Reminder,
   AccountProject,
+  ProjectMember,
+  SalesforceProjectData,
   LogTimeDayAssignment,
   SalesforceConnectionStatus,
   SalesforceProject,
@@ -624,12 +626,33 @@ export const accountsApi = {
     apiClient.get<Account>("/accounts/admin-account/", freshConfig(opts)),
   listProjectsByAccount: (accountName: string) =>
     apiClient.get<PaginatedResponse<AccountProject>>("/accounts/projects/", { params: { account_name: accountName } }),
-  createProject: (data: { account: number; name: string; description?: string; position?: number }) =>
+  createProject: (data: Partial<AccountProject> & { account: number; name: string }) =>
     apiClient.post<AccountProject>("/accounts/projects/", data),
-  updateProject: (id: number, data: { name?: string; description?: string; position?: number }) =>
+  updateProject: (id: number, data: Partial<AccountProject>) =>
     apiClient.patch<AccountProject>(`/accounts/projects/${id}/`, data),
   deleteProject: (id: number) =>
     apiClient.delete(`/accounts/projects/${id}/`),
+  /**
+   * Stateless lookup against the connected org — does not touch the database.
+   * Callers merge the returned sf_data into an in-progress (possibly unsaved) draft.
+   */
+  fetchProjectSalesforceData: (sfProjectId: string) =>
+    apiClient.post<{ name: string; sf_data: SalesforceProjectData; fields_skipped: string[] }>(
+      "/accounts/projects/fetch-salesforce/", { sf_project_id: sfProjectId }
+    ),
+  /** Batched — one request for every project card on the page, not one per card. */
+  listProjectMembers: (projectIds: number[]) => {
+    if (projectIds.length === 0) return Promise.resolve(emptyPage<ProjectMember>());
+    return apiClient.get<PaginatedResponse<ProjectMember>>("/accounts/project-members/", {
+      params: { project__in: projectIds.join(",") },
+    });
+  },
+  addProjectMember: (projectId: number, teamMemberId: number, role?: string) =>
+    apiClient.post<ProjectMember>("/accounts/project-members/", {
+      project: projectId, team_member: teamMemberId, role: role ?? "",
+    }),
+  removeProjectMember: (id: number) =>
+    apiClient.delete(`/accounts/project-members/${id}/`),
 };
 
 export const accountFeedApi = {

@@ -101,6 +101,7 @@ export type {
   AccountQuickLink,
   AccountArtifact,
   AccountProject,
+  ProjectMember,
   GoalResource,
   SalesforceProjectData,
   GoalSection,

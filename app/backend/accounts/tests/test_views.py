@@ -498,3 +498,208 @@ class AccountArtifactsBatchTest(APITestCase):
         empty.team_members.add(self.member)
         names = self._names(f"{self.acct1.id},{empty.id}")
         self.assertEqual(names, {"Acme Doc"})
+
+
+# ── sf_project_id round trip ────────────────────────────────────────────────────
+
+
+class AccountProjectSfProjectIdTest(APITestCase):
+    def setUp(self):
+        self.user = _make_user("sf_id_owner")
+        self.acct = _make_account("Acme", admin_owner=self.user)
+        self.project = _make_project(self.acct, "Alpha")
+
+    def test_defaults_blank(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.get(f"{PROJECTS_URL}{self.project.id}/")
+        self.assertEqual(resp.data["sf_project_id"], "")
+
+    def test_patch_persists(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.patch(
+            f"{PROJECTS_URL}{self.project.id}/", {"sf_project_id": "a0B000001abcXYZ"}, format="json"
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.sf_project_id, "a0B000001abcXYZ")
+
+    def test_create_with_sf_project_id(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post(PROJECTS_URL, {
+            "account": self.acct.id, "name": "New", "sf_project_id": "a0B000001abcXYZ",
+        })
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["sf_project_id"], "a0B000001abcXYZ")
+
+
+# ── AccountProjectViewSet.fetch_salesforce ──────────────────────────────────────
+
+from unittest.mock import patch, MagicMock
+
+FETCH_SF_URL = f"{PROJECTS_URL}fetch-salesforce/"
+
+
+class AccountProjectSalesforceFetchTests(APITestCase):
+    def setUp(self):
+        self.user = _make_user("sf_fetch_user")
+
+    def test_requires_auth(self):
+        resp = self.client.post(FETCH_SF_URL, {"sf_project_id": "a0B1"}, format="json")
+        self.assertEqual(resp.status_code, 401)
+
+    def test_requires_sf_project_id(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post(FETCH_SF_URL, {}, format="json")
+        self.assertEqual(resp.status_code, 400)
+
+    @patch("salesforce_sync.client.get_client")
+    def test_not_connected_returns_400(self, mock_get_client):
+        mock_get_client.side_effect = PermissionError("Salesforce not connected for this user.")
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post(FETCH_SF_URL, {"sf_project_id": "a0B1"}, format="json")
+        self.assertEqual(resp.status_code, 400)
+
+    @patch("salesforce_sync.client.discover_namespace")
+    @patch("salesforce_sync.client.get_client")
+    def test_unknown_id_returns_404(self, mock_get_client, mock_discover_ns):
+        mock_discover_ns.return_value = "cc4sf"
+        sf = MagicMock()
+        sf.restful.return_value = {"fields": [{"name": "Name"}, {"name": "cc4sf__Status__c"}]}
+        sf.query.return_value = {"records": []}
+        mock_get_client.return_value = sf
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post(FETCH_SF_URL, {"sf_project_id": "a0Bmissing"}, format="json")
+        self.assertEqual(resp.status_code, 404)
+
+    @patch("salesforce_sync.client.discover_namespace")
+    @patch("salesforce_sync.client.get_client")
+    def test_happy_path_maps_available_fields_and_skips_missing(self, mock_get_client, mock_discover_ns):
+        mock_discover_ns.return_value = "cc4sf"
+        sf = MagicMock()
+        # The org only actually has a couple of the guessed fields — most of the
+        # ~140-field map should come back in fields_skipped, not error out.
+        sf.restful.return_value = {
+            "fields": [
+                {"name": "Name"},
+                {"name": "cc4sf__Status__c"},
+                {"name": "cc4sf__On_Hold__c"},
+                {"name": "CreatedBy"},
+            ]
+        }
+        sf.query.return_value = {
+            "records": [{
+                "Id": "a0B1",
+                "Name": "Segment Data Deletion",
+                "cc4sf__Status__c": "In Progress",
+                "cc4sf__On_Hold__c": False,
+                "CreatedBy": {"Name": "Ashley Shadday"},
+            }]
+        }
+        mock_get_client.return_value = sf
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post(FETCH_SF_URL, {"sf_project_id": "a0B1"}, format="json")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["name"], "Segment Data Deletion")
+        self.assertEqual(resp.data["sf_data"]["projectStatus"], "In Progress")
+        self.assertEqual(resp.data["sf_data"]["onHold"], "false")
+        self.assertEqual(resp.data["sf_data"]["createdBy"], "Ashley Shadday")
+        # A field that wasn't in the describe result must be reported, not guessed at.
+        self.assertIn("projectSummary", resp.data["fields_skipped"])
+        self.assertNotIn("projectStatus", resp.data["fields_skipped"])
+
+
+# ── ProjectMemberViewSet ────────────────────────────────────────────────────────
+
+PROJECT_MEMBERS_URL = "/api/v1/accounts/project-members/"
+
+
+class ProjectMemberViewSetTests(APITestCase):
+    def setUp(self):
+        self.user = _make_user("pm_owner")
+        self.acct = _make_account("Acme", admin_owner=self.user)
+        self.project = _make_project(self.acct, "Alpha")
+        self.member = _make_team_member(self.user)
+        self.acct.team_members.add(self.member)
+
+    def test_requires_auth(self):
+        resp = self.client.get(PROJECT_MEMBERS_URL)
+        self.assertEqual(resp.status_code, 401)
+
+    def test_list_scoped_by_project(self):
+        self.client.force_authenticate(user=self.user)
+        self.client.post(PROJECT_MEMBERS_URL, {"project": self.project.id, "team_member": self.member.id})
+        resp = self.client.get(PROJECT_MEMBERS_URL, {"project": self.project.id})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data["results"]), 1)
+        self.assertEqual(resp.data["results"][0]["team_member_name"], self.member.full_name)
+
+    def test_list_scoped_by_project_in_batch(self):
+        other_project = _make_project(self.acct, "Beta")
+        other_member = _make_team_member(_make_user("pm_other_member"))
+        self.acct.team_members.add(other_member)
+        self.client.force_authenticate(user=self.user)
+        self.client.post(PROJECT_MEMBERS_URL, {"project": self.project.id, "team_member": self.member.id})
+        self.client.post(PROJECT_MEMBERS_URL, {"project": other_project.id, "team_member": other_member.id})
+        resp = self.client.get(PROJECT_MEMBERS_URL, {"project__in": f"{self.project.id},{other_project.id}"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data["results"]), 2)
+
+    def test_create_adds_member(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post(PROJECT_MEMBERS_URL, {
+            "project": self.project.id, "team_member": self.member.id, "role": "Lead",
+        })
+        self.assertEqual(resp.status_code, 201)
+        self.assertTrue(
+            self.project.members.filter(team_member=self.member, role="Lead").exists()
+        )
+
+    def test_cannot_add_member_to_unrelated_account_project(self):
+        other = _make_user("pm_other")
+        other_acct = _make_account("Other Corp", admin_owner=other)
+        other_project = _make_project(other_acct, "Theirs")
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post(PROJECT_MEMBERS_URL, {
+            "project": other_project.id, "team_member": self.member.id,
+        })
+        self.assertIn(resp.status_code, [403, 404])
+
+    def test_duplicate_add_is_rejected(self):
+        self.client.force_authenticate(user=self.user)
+        self.client.post(PROJECT_MEMBERS_URL, {"project": self.project.id, "team_member": self.member.id})
+        resp = self.client.post(PROJECT_MEMBERS_URL, {"project": self.project.id, "team_member": self.member.id})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_delete_removes_member(self):
+        self.client.force_authenticate(user=self.user)
+        create = self.client.post(PROJECT_MEMBERS_URL, {"project": self.project.id, "team_member": self.member.id})
+        resp = self.client.delete(f"{PROJECT_MEMBERS_URL}{create.data['id']}/")
+        self.assertEqual(resp.status_code, 204)
+        self.assertFalse(self.project.members.filter(team_member=self.member).exists())
+
+    def test_delete_on_unrelated_account_project_denied(self):
+        other = _make_user("pm_other2")
+        other_acct = _make_account("Other Corp 2", admin_owner=other)
+        other_project = _make_project(other_acct, "Theirs2")
+        other_member = _make_team_member(other)
+        other_acct.team_members.add(other_member)
+        from accounts.models import ProjectMember
+        pm = ProjectMember.objects.create(project=other_project, team_member=other_member)
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.delete(f"{PROJECT_MEMBERS_URL}{pm.id}/")
+        self.assertIn(resp.status_code, [403, 404])
+
+    def test_staff_sees_all_project_members(self):
+        staff = _make_staff("pm_staff")
+        other = _make_user("pm_other3")
+        other_acct = _make_account("Other Corp 3", admin_owner=other)
+        other_project = _make_project(other_acct, "Theirs3")
+        other_member = _make_team_member(other)
+        other_acct.team_members.add(other_member)
+        from accounts.models import ProjectMember
+        ProjectMember.objects.create(project=self.project, team_member=self.member)
+        ProjectMember.objects.create(project=other_project, team_member=other_member)
+        self.client.force_authenticate(user=staff)
+        resp = self.client.get(PROJECT_MEMBERS_URL)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["count"], 2)

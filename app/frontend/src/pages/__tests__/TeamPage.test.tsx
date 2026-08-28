@@ -91,4 +91,35 @@ describe("TeamPage", () => {
       expect(screen.getByText("Edit Member")).toBeInTheDocument()
     );
   });
+
+  it("shows the backend validation message instead of crashing when create fails with 400", async () => {
+    server.use(
+      http.post("/api/v1/team/members/", () =>
+        HttpResponse.json(
+          { email: ["team member with this email already exists."] },
+          { status: 400 }
+        )
+      )
+    );
+    await renderPage();
+    await waitFor(() => screen.getByText(mockTeamMembers[0].full_name));
+
+    fireEvent.click(screen.getByText("+ Add member"));
+    fireEvent.change(screen.getByLabelText("Full name *"), {
+      target: { value: "Dup Test" },
+    });
+    fireEvent.change(screen.getByLabelText("Email *"), {
+      target: { value: mockTeamMembers[0].email },
+    });
+    fireEvent.click(screen.getByText("Add member"));
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("team member with this email already exists.")
+      ).toBeInTheDocument()
+    );
+    // The modal stays open so the user can correct the email, rather than
+    // silently closing on a failed save.
+    expect(screen.getByText("Add Team Member")).toBeInTheDocument();
+  });
 });

@@ -1268,10 +1268,15 @@ describe("ActionItemsPage", () => {
 
       await new Promise((r) => setTimeout(r, 20));
       expect(fieldPatches).toHaveLength(0);
-      // Unstaged into Views — it lands under its own account (Acme), not the row it was
-      // dropped on. The account picker in the modal is the only way to actually reassign it.
+      // It must actually leave Stage Today — a ghost placeholder in the Views grid renders
+      // the same task text as the real card, so checking only for text in the Acme row
+      // would pass even if the zone update silently failed and the item stayed in Stage
+      // Today (rendered there for real, and as a ghost in Views).
+      await waitFor(() => expect(screen.queryByDisplayValue("Fix billing issue")).not.toBeInTheDocument());
+      // Unstaged into Views — it lands under its own account (Acme) as a real card, not the
+      // row it was dropped on. The account picker in the modal is the only way to reassign it.
       const acmeRow = rowContaining(screen.getByTitle(/Collapse Acme Corp/i), "border-b border-gray-100");
-      await waitFor(() => expect(within(acmeRow).getByText("Fix billing issue")).toBeInTheDocument());
+      expect(within(acmeRow).getByText("Fix billing issue")).toBeInTheDocument();
       expect(within(betaRow).queryByText("Fix billing issue")).not.toBeInTheDocument();
       expect(JSON.parse(localStorage.getItem("actionItemZones") ?? "{}").recAAA001).toBe("accounts");
     });
@@ -1289,6 +1294,38 @@ describe("ActionItemsPage", () => {
       const acmeRow = rowContaining(screen.getByTitle(/Collapse Acme Corp/i), "border-b border-gray-100");
       await waitFor(() => expect(within(acmeRow).getByText("Fix billing issue")).toBeInTheDocument());
       expect(JSON.parse(localStorage.getItem("actionItemZones") ?? "{}").recAAA001).toBe("accounts");
+    });
+
+    it("dropping on the Views panel itself (not a specific row) still moves the card out of Stage Today", async () => {
+      // Every row/deck in the panel calls stopPropagation on its own drop — this is the
+      // panel-level fallback for a drop that lands on the header, the padding, or between
+      // rows, none of which have their own drop target. Without it, a drop that misses
+      // every row silently did nothing and the card never left Stage Today.
+      localStorage.setItem("actionItemZones", JSON.stringify({ recAAA001: "today" }));
+      await renderPageStable();
+      await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
+
+      const viewsPanel = screen.getByText("Views").closest("div.shadow-blue-md") as HTMLElement;
+      dragCardOnto(cardFor("Fix billing issue"), viewsPanel);
+
+      expect(fieldPatches).toHaveLength(0);
+      const acmeRow = rowContaining(screen.getByTitle(/Collapse Acme Corp/i), "border-b border-gray-100");
+      await waitFor(() => expect(within(acmeRow).getByText("Fix billing issue")).toBeInTheDocument());
+      expect(JSON.parse(localStorage.getItem("actionItemZones") ?? "{}").recAAA001).toBe("accounts");
+    });
+
+    it("dropping directly on an account row does not also trigger the panel-level fallback", async () => {
+      // Regression guard for the stopPropagation added alongside the panel fallback above —
+      // a row drop must fire exactly once, not once specifically and once generically.
+      await renderPageStable();
+      await waitFor(() => expect(screen.getByTitle(/Collapse Acme Corp/i)).toBeInTheDocument());
+
+      const betaRow = rowContaining(screen.getByTitle(/Collapse Beta Inc/i), "border-b border-gray-100");
+      dragCardOnto(gridCardFor("Fix billing issue"), betaRow);
+
+      await waitFor(() => expect(fieldPatches).toHaveLength(1));
+      await new Promise((r) => setTimeout(r, 20));
+      expect(fieldPatches).toHaveLength(1);
     });
 
     it("keeps the row highlight while the cursor crosses the row's own children", async () => {
@@ -1445,10 +1482,11 @@ describe("ActionItemsPage", () => {
 
       // An accidental drop on the wrong group while unstaging must not reassign the
       // account — only the modal reassigns an account for a card coming out of Stage
-      // Today / Currently Tracking. Zone is untouched too, same as the reassign case.
+      // Today / Currently Tracking. It still leaves Stage Today, though: the whole
+      // point of the drag was to unstage, and Projects has no other way to do that.
       await new Promise((r) => setTimeout(r, 20));
       expect(fieldPatches).toHaveLength(0);
-      expect(JSON.parse(localStorage.getItem("actionItemZones") ?? "{}").recAAA001).toBe("today");
+      expect(JSON.parse(localStorage.getItem("actionItemZones") ?? "{}").recAAA001).toBe("accounts");
     });
 
     it("a Projects-view drop from Currently Tracking does not reassign the account", async () => {
@@ -1463,7 +1501,7 @@ describe("ActionItemsPage", () => {
 
       await new Promise((r) => setTimeout(r, 20));
       expect(fieldPatches).toHaveLength(0);
-      expect(JSON.parse(localStorage.getItem("actionItemZones") ?? "{}").recAAA001).toBe("active");
+      expect(JSON.parse(localStorage.getItem("actionItemZones") ?? "{}").recAAA001).toBe("accounts");
     });
 
     it("still reassigns the account when dropped from Unstaged", async () => {

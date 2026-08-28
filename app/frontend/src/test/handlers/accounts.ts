@@ -8,6 +8,7 @@ import type {
   AirtableAccount,
   AirtableMeeting,
   CustomerContact,
+  ProjectMember,
 } from "../../types";
 
 export const mockAccount: Account = {
@@ -66,6 +67,21 @@ export const mockProject: AccountProject = {
   meeting_ids: [],
   goal_ids: [],
   resources: [],
+  sf_data: {},
+  sf_project_id: "",
+  kind: "project",
+  created_at: "2026-01-01T00:00:00Z",
+};
+
+export const mockProjectMember: ProjectMember = {
+  id: 1,
+  project: 1,
+  team_member: 1,
+  team_member_name: "Bob Smith",
+  team_member_email: "bob@acme.com",
+  team_member_avatar_url: "",
+  role: "",
+  added_by: 1,
   created_at: "2026-01-01T00:00:00Z",
 };
 
@@ -191,6 +207,26 @@ export const accountHandlers = [
     return HttpResponse.json({ ...mockProject, ...body });
   }),
   http.delete("/api/v1/accounts/projects/:id/", () =>
+    new HttpResponse(null, { status: 204 })
+  ),
+  http.post("/api/v1/accounts/projects/fetch-salesforce/", async ({ request }) => {
+    const body = await request.json() as { sf_project_id?: string };
+    if (!body.sf_project_id) return HttpResponse.json({ detail: "sf_project_id is required." }, { status: 400 });
+    return HttpResponse.json({
+      name: "Segment Data Deletion",
+      sf_data: { projectStatus: "In Progress", health: "Green" },
+      fields_skipped: ["projectSummary"],
+    });
+  }),
+  // Project members
+  http.get("/api/v1/accounts/project-members/", () =>
+    HttpResponse.json({ results: [mockProjectMember], count: 1, next: null, previous: null })
+  ),
+  http.post("/api/v1/accounts/project-members/", async ({ request }) => {
+    const body = await request.json() as Partial<ProjectMember>;
+    return HttpResponse.json({ ...mockProjectMember, id: 99, ...body }, { status: 201 });
+  }),
+  http.delete("/api/v1/accounts/project-members/:id/", () =>
     new HttpResponse(null, { status: 204 })
   ),
   // Artifacts

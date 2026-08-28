@@ -228,6 +228,10 @@ class AccountProject(models.Model):
     goal_ids = models.JSONField(default=list)
     resources = models.JSONField(default=list)
     sf_data = models.JSONField(blank=True, default=dict)
+    # Salesforce Cloud Coach project Id (e.g. "a0B..."). Required key for the
+    # "fetch remaining fields from Salesforce" action — kept as a real column
+    # (rather than inside sf_data) because it's looked up by, not just stored.
+    sf_project_id = models.CharField(max_length=32, blank=True, default="", db_index=True)
     kind = models.CharField(max_length=20, choices=KIND_CHOICES, default="project")
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -236,6 +240,32 @@ class AccountProject(models.Model):
 
     def __str__(self):
         return f"{self.name} ({self.account.company_name})"
+
+
+class ProjectMember(models.Model):
+    """A team member linked to a specific project (not just its account).
+
+    A `team.TeamMember` can be assigned to multiple `AccountProject`s under the
+    same account — that per-project scoping doesn't exist anywhere else in the
+    schema, so this is its own join table rather than reusing `Account.team_members`.
+    """
+
+    project = models.ForeignKey(AccountProject, on_delete=models.CASCADE, related_name="members")
+    team_member = models.ForeignKey(
+        "team.TeamMember", on_delete=models.CASCADE, related_name="project_memberships"
+    )
+    role = models.CharField(max_length=150, blank=True, default="")
+    added_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at"]
+        unique_together = [("project", "team_member")]
+
+    def __str__(self):
+        return f"{self.team_member.full_name} on {self.project.name}"
 
 
 class AccountRole(models.Model):

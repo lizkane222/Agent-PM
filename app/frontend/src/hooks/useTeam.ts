@@ -4,7 +4,7 @@ import { useResource } from "./useResource";
 import type { TeamMember } from "../types/team";
 
 export function useTeam({ search }: { search?: string } = {}) {
-  const params: Record<string, string> = {};
+  const params: Record<string, string> = { page_size: "500" };
   if (search) params["search"] = search;
 
   const resource = useResource<TeamMember>(

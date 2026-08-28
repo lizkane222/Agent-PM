@@ -9,6 +9,7 @@ from rest_framework.response import Response
 
 
 from core.mixins import _staff_sees_all
+from core.pagination import ClientPageSizePagination
 from .models import Tag, Team, TeamMember, TeamMembership, UserProfile
 from .serializers import (
     TagSerializer,
@@ -228,6 +229,7 @@ class TeamMemberViewSet(viewsets.ModelViewSet):
 
     serializer_class = TeamMemberSerializer
     permission_classes = [IsAuthenticated]
+    pagination_class = ClientPageSizePagination
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ["full_name", "email", "title", "department", "slack_handle"]
     ordering_fields = ["full_name", "joined_at", "department", "status"]

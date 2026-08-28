@@ -4,7 +4,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { http, HttpResponse } from "msw";
 import { server } from "../../test/msw-server";
-import { mockAccount, mockAccountNote, mockAirtableAccount } from "../../test/handlers/accounts";
+import { mockAccount, mockAccountNote, mockAirtableAccount, mockProject, mockProjectMember } from "../../test/handlers/accounts";
 import type { Account } from "../../types";
 import { mockTeamMembers } from "../../test/handlers/team";
 
@@ -187,6 +187,81 @@ function getViewBar(section: HTMLElement) {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+describe("AccountDetailPage — Project Goals", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    localStorage.clear();
+    registerHandlers();
+  });
+
+  it("New Project opens the full Salesforce-field modal, not a single input", async () => {
+    await renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: /new project/i }));
+    expect(screen.getByText("Project Name")).toBeInTheDocument();
+    expect(screen.getByText("Salesforce Project ID")).toBeInTheDocument();
+    expect(screen.getByText("Overview")).toBeInTheDocument();
+    expect(screen.getByText("System Information")).toBeInTheDocument();
+    // The old flow was a bare text input with no other fields.
+    expect(screen.queryByPlaceholderText("Project name…")).not.toBeInTheDocument();
+  });
+
+  it("sends the full field set on create — url and sf_data are no longer dropped", async () => {
+    let createdBody: Record<string, unknown> | null = null;
+    server.use(
+      http.post("/api/v1/accounts/projects/", async ({ request }) => {
+        createdBody = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json({ ...mockProject, id: 42, ...createdBody }, { status: 201 });
+      }),
+    );
+    await renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: /new project/i }));
+    const modal = await screen.findByTestId("project-details-modal");
+    const [nameInput, urlInput] = within(modal).getAllByRole("textbox");
+    fireEvent.change(nameInput, { target: { value: "Segment Data Deletion" } });
+    fireEvent.change(urlInput, { target: { value: "https://salesforce.example.com/proj" } });
+    fireEvent.click(within(modal).getByRole("button", { name: /^save$/i }));
+
+    await waitFor(() => expect(createdBody).not.toBeNull());
+    expect(createdBody!.url).toBe("https://salesforce.example.com/proj");
+    expect(createdBody!.action_ids).toEqual([]);
+    expect(createdBody!.sf_data).toEqual({});
+    expect(createdBody!.kind).toBe("project");
+  });
+
+  it("restores url, resources and sf_data on reload instead of blanking them", async () => {
+    server.use(
+      http.get("/api/v1/accounts/projects/", () => HttpResponse.json({
+        results: [{
+          ...mockProject, id: 7, name: "Segment Data Deletion",
+          url: "https://sf.example.com/proj7",
+          resources: [{ id: "artifact-1", label: "Design Doc", url: "https://docs.example.com" }],
+          sf_data: { health: "Green" }, sf_project_id: "a0B777",
+        }],
+        count: 1,
+      })),
+    );
+    await renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: /Segment Data Deletion/i }));
+    expect(screen.getByDisplayValue("https://sf.example.com/proj7")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("a0B777")).toBeInTheDocument();
+  });
+
+  it("shows a project's team members as avatars on its card without opening the modal", async () => {
+    server.use(
+      http.get("/api/v1/accounts/projects/", () => HttpResponse.json({
+        results: [{ ...mockProject, id: 7, name: "Segment Data Deletion" }], count: 1,
+      })),
+      http.get("/api/v1/accounts/project-members/", () => HttpResponse.json({
+        results: [{ ...mockProjectMember, id: 1, project: 7, team_member_name: "Ashley Shadday" }],
+        count: 1, next: null, previous: null,
+      })),
+    );
+    await renderPage();
+    await screen.findByRole("button", { name: /Segment Data Deletion/i });
+    expect(await screen.findByTitle("Ashley Shadday")).toBeInTheDocument();
+  });
+});
 
 describe("AccountDetailPage — kanban views", () => {
   beforeEach(() => {

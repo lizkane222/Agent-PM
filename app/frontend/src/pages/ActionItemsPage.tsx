@@ -2409,6 +2409,45 @@ function DropZone({
   const { isCollapsed, toggle: toggleCollapse, setAll: setAllCollapsed, allCollapsed } = useAccountGroupCollapse();
   const { exportMode, toggleItem, isSelected } = useExport();
 
+  // Panel-level fallback for the "accounts" (Views) DropZone: a drop that lands anywhere
+  // other than a specific row/deck/group (header, padding, between rows, an unmatched or
+  // non-drop-target Projects group) unstages the card without reassigning its account —
+  // same protection as a miss on the wrong row. A React onDrop prop on the panel's root
+  // div is NOT reliable here: dropping directly on a native <button> (e.g. a Projects
+  // group header) can fail to bubble a synthetic "drop" up through React's delegated
+  // listeners in some browsers — confirmed by a window-level capture listener seeing the
+  // native drop event while no onDrop prop anywhere in the tree ever fired. A native,
+  // capture-phase listener on the panel's own root sidesteps that entirely: capture runs
+  // on the way down, before any interactive-element quirk in the bubble phase can eat it.
+  const panelRef = useRef<HTMLDivElement>(null);
+  const onDropRef = useRef(onDrop);
+  onDropRef.current = onDrop;
+  const onDragOverRef = useRef(onDragOver);
+  onDragOverRef.current = onDragOver;
+  useEffect(() => {
+    const el = panelRef.current;
+    if (!el) return; // not the "accounts" instance of DropZone
+    function isHandledElsewhere(target: EventTarget | null): boolean {
+      return target instanceof HTMLElement && !!target.closest("[data-drop-specific]");
+    }
+    function onNativeDragOver(e: DragEvent) {
+      if (isHandledElsewhere(e.target)) return;
+      e.preventDefault();
+      onDragOverRef.current(e as unknown as React.DragEvent, "accounts");
+    }
+    function onNativeDrop(e: DragEvent) {
+      if (isHandledElsewhere(e.target)) return;
+      e.preventDefault();
+      onDropRef.current(e as unknown as React.DragEvent, "accounts");
+    }
+    el.addEventListener("dragover", onNativeDragOver, { capture: true });
+    el.addEventListener("drop", onNativeDrop, { capture: true });
+    return () => {
+      el.removeEventListener("dragover", onNativeDragOver, { capture: true });
+      el.removeEventListener("drop", onNativeDrop, { capture: true });
+    };
+  }, []);
+
   if (zone === "accounts") {
     // Exclude Done items from the active list — they live in the completed deck
     const activeItems = items.filter((i) => i.status !== "Done");
@@ -2452,7 +2491,11 @@ function DropZone({
     const allGroupsCollapsed = allCollapsed(visibleGroupKeys);
 
     return (
-      <div className={`flex flex-col bg-white rounded-lg shadow-blue-md ${className ?? ""}`} style={style}>
+      <div
+        ref={panelRef}
+        className={`flex flex-col bg-white rounded-lg shadow-blue-md ${className ?? ""}`}
+        style={style}
+      >
         {/* Header: title left, controls right */}
         <div className="px-5 py-3 shrink-0 flex items-center gap-3 flex-wrap border-b border-gray-100">
           <p className="text-sm font-semibold text-[var(--twilio-navy)] shrink-0">{label}</p>
@@ -2581,10 +2624,11 @@ function DropZone({
             const rowCollapsed = isCollapsed(groupKey);
             return (
               <div
+                data-drop-specific="true"
                 className={`flex flex-col border-b border-gray-100 transition-colors ${isAccOver ? "bg-indigo-50" : "hover:bg-gray-50"}`}
-                onDragOver={(e) => onDragOver(e, zoneKey)}
+                onDragOver={(e) => { e.stopPropagation(); onDragOver(e, zoneKey); }}
                 onDragLeave={(e) => { if (leftElement(e)) onDragLeave(); }}
-                onDrop={(e) => onDrop(e, "accounts", "none")}
+                onDrop={(e) => { e.stopPropagation(); console.log("[DRAG-DEBUG] No Account row onDrop fired"); onDrop(e, "accounts", "none"); }}
               >
                 <div className="flex items-stretch">
                   <div className="w-36 shrink-0 px-3 py-2 border-r border-gray-100 flex flex-col justify-center">
@@ -2615,11 +2659,12 @@ function DropZone({
                   {/* Done drop target + completed deck trigger */}
                   <div className="flex items-center shrink-0">
                     <div
+                      data-drop-specific="true"
                       className={`flex flex-col items-center justify-center w-14 self-stretch transition-colors cursor-default ${dragOverZone === "done-accounts-none" ? "bg-emerald-100" : "hover:bg-emerald-50"}`}
                       style={{ borderLeft: "1px solid #e5e7eb" }}
-                      onDragOver={(e) => onDragOver(e, "done-accounts-none" as Zone)}
+                      onDragOver={(e) => { e.stopPropagation(); onDragOver(e, "done-accounts-none" as Zone); }}
                       onDragLeave={onDragLeave}
-                      onDrop={(e) => onDrop(e, "done-accounts", "none")}
+                      onDrop={(e) => { e.stopPropagation(); onDrop(e, "done-accounts", "none"); }}
                       title="Drop here to mark Done"
                     >
                       <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" className={`w-3.5 h-3.5 transition-colors ${dragOverZone === "done-accounts-none" ? "text-emerald-600" : "text-emerald-400"}`}>
@@ -2642,11 +2687,12 @@ function DropZone({
                 {/* Expanded completed row */}
                 {!rowCollapsed && openDeckKey === "none" && noAccCompleted.length > 0 && onPin && (
                   <div
+                    data-drop-specific="true"
                     className="flex gap-2 px-3 pb-2 overflow-x-auto transition-colors"
                     style={{ borderTop: "1px solid #f0fdf4", background: dragOverZone === "done-accounts-none" ? "#dcfce7" : "#f0fdf4", scrollbarWidth: "thin" }}
-                    onDragOver={(e) => onDragOver(e, "done-accounts-none" as Zone)}
+                    onDragOver={(e) => { e.stopPropagation(); onDragOver(e, "done-accounts-none" as Zone); }}
                     onDragLeave={onDragLeave}
-                    onDrop={(e) => onDrop(e, "done-accounts", "none")}
+                    onDrop={(e) => { e.stopPropagation(); onDrop(e, "done-accounts", "none"); }}
                   >
                     <p className="text-[10px] font-semibold text-emerald-600 uppercase tracking-wide self-center shrink-0 mr-1">
                       {dragOverZone === "done-accounts-none" ? "Drop to mark Done" : "Completed"}
@@ -2690,10 +2736,11 @@ function DropZone({
             return (
               <div
                 key={acc.key}
+                data-drop-specific="true"
                 className={`flex flex-col border-b border-gray-100 transition-colors ${isAccOver ? "bg-indigo-50" : "hover:bg-gray-50"}`}
-                onDragOver={(e) => onDragOver(e, zoneKey)}
+                onDragOver={(e) => { e.stopPropagation(); onDragOver(e, zoneKey); }}
                 onDragLeave={(e) => { if (leftElement(e)) onDragLeave(); }}
-                onDrop={(e) => onDrop(e, "accounts", acc.key)}
+                onDrop={(e) => { e.stopPropagation(); console.log("[DRAG-DEBUG] account row onDrop fired", acc.key, acc.name); onDrop(e, "accounts", acc.key); }}
               >
                 <div className="flex items-stretch">
                   {/* Account label column. The star and the collapse toggle are siblings —
@@ -2773,11 +2820,12 @@ function DropZone({
                   {/* Done drop target + completed deck trigger */}
                   <div className="flex items-center shrink-0">
                     <div
+                      data-drop-specific="true"
                       className={`flex flex-col items-center justify-center w-14 self-stretch transition-colors cursor-default ${dragOverZone === `done-accounts-${acc.key}` ? "bg-emerald-100" : "hover:bg-emerald-50"}`}
                       style={{ borderLeft: "1px solid #e5e7eb" }}
-                      onDragOver={(e) => onDragOver(e, `done-accounts-${acc.key}` as Zone)}
+                      onDragOver={(e) => { e.stopPropagation(); onDragOver(e, `done-accounts-${acc.key}` as Zone); }}
                       onDragLeave={onDragLeave}
-                      onDrop={(e) => onDrop(e, "done-accounts", acc.key)}
+                      onDrop={(e) => { e.stopPropagation(); onDrop(e, "done-accounts", acc.key); }}
                       title="Drop here to mark Done"
                     >
                       <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" className={`w-3.5 h-3.5 transition-colors ${dragOverZone === `done-accounts-${acc.key}` ? "text-emerald-600" : "text-emerald-400"}`}>
@@ -2800,11 +2848,12 @@ function DropZone({
                 {/* Expanded completed row */}
                 {!rowCollapsed && openDeckKey === acc.key && accCompleted.length > 0 && onPin && (
                   <div
+                    data-drop-specific="true"
                     className="flex gap-2 px-3 pb-2 overflow-x-auto transition-colors"
                     style={{ borderTop: "1px solid #f0fdf4", background: dragOverZone === `done-accounts-${acc.key}` ? "#dcfce7" : "#f0fdf4", scrollbarWidth: "thin" }}
-                    onDragOver={(e) => onDragOver(e, `done-accounts-${acc.key}` as Zone)}
+                    onDragOver={(e) => { e.stopPropagation(); onDragOver(e, `done-accounts-${acc.key}` as Zone); }}
                     onDragLeave={onDragLeave}
-                    onDrop={(e) => onDrop(e, "done-accounts", acc.key)}
+                    onDrop={(e) => { e.stopPropagation(); onDrop(e, "done-accounts", acc.key); }}
                   >
                     <p className="text-[10px] font-semibold text-emerald-600 uppercase tracking-wide self-center shrink-0 mr-1">
                       {dragOverZone === `done-accounts-${acc.key}` ? "Drop to mark Done" : "Completed"}
@@ -3118,6 +3167,7 @@ function StatusBoardView({
             key={col}
             className={`flex flex-col rounded-lg shrink-0 flex-1 transition-colors ${isOver ? "bg-indigo-50" : "bg-white"}`}
             style={{ minWidth: 280, border: isOver ? "1.5px solid #818cf8" : "1px solid #e5e7eb", maxHeight: "calc(100vh - 200px)" }}
+            data-drop-specific="true"
             onDragOver={(e) => { e.preventDefault(); setOverCol(col); }}
             onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setOverCol(null); }}
             onDrop={(e) => { e.stopPropagation(); void handleDrop(col, e); }}
@@ -3202,6 +3252,7 @@ function StatusBoardView({
                 borderRadius: i === 0 ? "8px 8px 0 0" : "0 0 8px 8px",
                 marginTop: i === 1 ? "-1px" : 0,
               }}
+              data-drop-specific="true"
               onDragOver={(e) => { e.preventDefault(); setOverCol(col); }}
               onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setOverCol(null); }}
               onDrop={(e) => { e.stopPropagation(); void handleDrop(col, e); }}
@@ -3536,12 +3587,72 @@ function ProjectsView({
   // button and the user's per-group choices carry across views and navigation.
   const { isCollapsed: isGroupCollapsed, toggle: toggleGroup } = useAccountGroupCollapse();
 
+  // A drop that lands on a group's header — the only drop target for a *collapsed*
+  // group — can land on the header <button> (or its icon/name <span> children). A
+  // React onDrop prop on the group's own div does not reliably see that: dropping on a
+  // native <button> can fail to bubble a synthetic "drop" up through React's delegated
+  // listeners in some browsers (confirmed with a window-level capture listener seeing
+  // the native event while no onDrop prop anywhere in the tree ever fired — see the
+  // matching fallback on the "accounts" DropZone panel for the fuller writeup). A
+  // native, capture-phase listener on this component's own root sidesteps it: capture
+  // fires on the way down, before the button's own bubble-phase quirk gets a chance.
+  // This is now the ONLY drop path for a group — the group div below carries no onDrop
+  // of its own, so there is nothing to double-fire against.
+  const rootRef = useRef<HTMLDivElement>(null);
+  // testid -> { key: the group's own identity, used for the isOver highlight match;
+  //             accountKey: what gets passed to onAccountDrop }
+  const dropTargetsRef = useRef<Map<string, { key: string; accountKey: string }>>(new Map());
+  dropTargetsRef.current = new Map(
+    accountGroups
+      .filter((g) => !!g.accountKey && !!onAccountDrop)
+      .map((g) => [`project-group-${g.groupKey}`, { key: g.key, accountKey: g.accountKey! }])
+  );
+  const onAccountDropRef = useRef(onAccountDrop);
+  onAccountDropRef.current = onAccountDrop;
+  useEffect(() => {
+    const el = rootRef.current;
+    if (!el) return;
+    function findGroup(target: EventTarget | null): { key: string; accountKey: string } | null {
+      if (!(target instanceof HTMLElement)) return null;
+      const groupEl = target.closest<HTMLElement>("[data-testid^='project-group-']");
+      if (!groupEl) return null;
+      // A status column inside an expanded group is itself marked data-drop-specific and
+      // has its own (already-working, non-button) bubble handler — defer to it rather
+      // than treating the drop as a whole-group reassignment.
+      const specificEl = target.closest<HTMLElement>("[data-drop-specific]");
+      if (specificEl && specificEl !== groupEl) return null;
+      const testid = groupEl.dataset.testid;
+      if (!testid) return null;
+      return dropTargetsRef.current.get(testid) ?? null;
+    }
+    function onNativeDragOver(e: DragEvent) {
+      const found = findGroup(e.target);
+      if (!found) { setOverGroupKey(null); return; }
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+      setOverGroupKey(found.key);
+    }
+    function onNativeDrop(e: DragEvent) {
+      const found = findGroup(e.target);
+      if (!found) return;
+      e.preventDefault();
+      setOverGroupKey(null);
+      void onAccountDropRef.current?.(e as unknown as React.DragEvent, found.accountKey);
+    }
+    el.addEventListener("dragover", onNativeDragOver, { capture: true });
+    el.addEventListener("drop", onNativeDrop, { capture: true });
+    return () => {
+      el.removeEventListener("dragover", onNativeDragOver, { capture: true });
+      el.removeEventListener("drop", onNativeDrop, { capture: true });
+    };
+  }, []);
+
   if (items.length === 0) {
     return <p className="text-sm text-[var(--twilio-gray-60)] text-center py-12">No items match</p>;
   }
 
   return (
-    <div className="flex flex-col gap-4">
+    <div ref={rootRef} className="flex flex-col gap-4">
       {accountGroups.map((group) => {
         const { key, displayName, groupKey, accountKey, items: groupItems } = group;
         const isCollapsed = isGroupCollapsed(groupKey);
@@ -3559,11 +3670,11 @@ function ProjectsView({
           <div
             key={key}
             data-testid={`project-group-${groupKey}`}
+            data-drop-specific={isDropTarget ? "true" : undefined}
             className={`bg-white rounded-lg overflow-hidden transition-colors ${isOver ? "bg-indigo-50 shadow-blue-lg" : "shadow-blue-md"}`}
             style={isOver ? { outline: "2px solid #818cf8", outlineOffset: -1 } : undefined}
-            onDragOver={isDropTarget ? (e) => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; setOverGroupKey(key); } : undefined}
-            onDragLeave={isDropTarget ? (e) => { if (leftElement(e)) setOverGroupKey(null); } : undefined}
-            onDrop={isDropTarget ? (e) => { setOverGroupKey(null); void onAccountDrop!(e, accountKey!); } : undefined}
+            // Handled entirely by the capture-phase listener on this component's root
+            // (see the effect above) — a bubble-phase onDrop here would double-fire.
           >
             {/* Group header. Doubles as the drop target for a collapsed group, which is the
                 only part of it on screen. */}
@@ -3641,6 +3752,7 @@ function ProjectsView({
 type PageView = "kanban" | "status" | "due" | "projects";
 
 export default function ActionItemsPage() {
+  console.log("[DRAG-DEBUG] ActionItemsPage render, build marker: drag-debug-v1");
   const { reportError } = useAppError();
   const [allItems, setAllItems] = useState<AirtableActionItem[]>([]);
   const [accounts, setAccounts] = useState<KanbanAccount[]>([]);
@@ -3740,6 +3852,37 @@ export default function ActionItemsPage() {
   }
   const pageRef = useRef<HTMLDivElement>(null);
   useLogGlow(pageRef);
+
+  // Auto-scroll the page while a card is dragged near the top/bottom edge of the
+  // viewport. `pageRef` (below) is the page's own overflow-auto root — the whole
+  // scrollable surface, not the browser window — so native HTML5 drag auto-scroll
+  // (which only scrolls the document) never engages here. Without this, an account
+  // row below the fold in the Views grid is simply unreachable by drag: the drop just
+  // never lands on it, which reads as "dragging out of Stage Today does nothing".
+  // A native listener in the capture phase, not a React onDragOver prop: every
+  // row/deck in the Views grid stops propagation on its own dragover so a per-row
+  // hover highlight can't be stomped by an ancestor handler, and a capture-phase
+  // listener on the scroll root runs before that stopPropagation takes effect.
+  useEffect(() => {
+    const el = pageRef.current;
+    // `pageRef` isn't attached yet on the very first commit — that render is the
+    // `isLoading` early-return div below, which has no ref at all. Re-run once loading
+    // flips to false and the real (ref-bearing) tree mounts, or this listener never
+    // attaches for the lifetime of the page.
+    if (!el) return;
+    const EDGE_PX = 72;
+    const STEP_PX = 22;
+    function onNativeDragOver(e: DragEvent) {
+      const rect = el!.getBoundingClientRect();
+      if (e.clientY - rect.top < EDGE_PX) {
+        el!.scrollTop = Math.max(0, el!.scrollTop - STEP_PX);
+      } else if (rect.bottom - e.clientY < EDGE_PX) {
+        el!.scrollTop += STEP_PX;
+      }
+    }
+    el.addEventListener("dragover", onNativeDragOver, { capture: true });
+    return () => el.removeEventListener("dragover", onNativeDragOver, { capture: true });
+  }, [isLoading]);
   const unstagedWrapRef = useRef<HTMLDivElement>(null);
   const [row1Height, setRow1Height] = useState<number | null>(null);
   // Re-measure whenever items change so the height is always current
@@ -3937,6 +4080,7 @@ export default function ActionItemsPage() {
    * parallel requests reads as a glitch rather than as progress.
    */
   const load = useCallback(async (opts?: { silent?: boolean }) => {
+    console.log("[DRAG-DEBUG] load() called", { silent: !!opts?.silent, stack: new Error().stack?.split("\n").slice(1, 4).join(" | ") });
     if (!opts?.silent) setIsLoading(true);
     try {
       const [itemsRes, atAccountsRes, appAccountsRes, profileRes] = await Promise.all([
@@ -4049,9 +4193,21 @@ export default function ActionItemsPage() {
 
   // Clear drag state whenever any drag ends (cancel or drop) so stale dragId never blocks next drag
   useEffect(() => {
-    const onDragEnd = () => { setDragId(null); setDragOverZone(null); setDropHint(null); };
+    const onDragEnd = (e: DragEvent) => {
+      console.log("[DRAG-DEBUG] window dragend", { dropEffect: e.dataTransfer?.dropEffect, target: (e.target as HTMLElement)?.tagName, targetClass: (e.target as HTMLElement)?.className });
+      setDragId(null); setDragOverZone(null); setDropHint(null);
+    };
+    // Capture-phase, page-wide: tells us definitively whether "drop" fires ANYWHERE at
+    // all on mouseup, even outside every React onDrop handler below.
+    const onWindowDrop = (e: DragEvent) => {
+      console.log("[DRAG-DEBUG] window drop (capture)", { target: (e.target as HTMLElement)?.tagName, targetClass: (e.target as HTMLElement)?.className, defaultPrevented: e.defaultPrevented });
+    };
     window.addEventListener("dragend", onDragEnd);
-    return () => window.removeEventListener("dragend", onDragEnd);
+    window.addEventListener("drop", onWindowDrop, { capture: true });
+    return () => {
+      window.removeEventListener("dragend", onDragEnd);
+      window.removeEventListener("drop", onWindowDrop, { capture: true });
+    };
   }, [setDropHint]);
 
   // Pick up zone changes made on the Calendar page (drag-to-stage)
@@ -4167,6 +4323,7 @@ export default function ActionItemsPage() {
   function handleDragOver(e: React.DragEvent, zone: Zone) {
     e.preventDefault();
     e.dataTransfer.dropEffect = "move";
+    if (zone !== dragOverZone) console.log("[DRAG-DEBUG] hovering zone ->", zone);
     setDragOverZone(zone);
     // Hovering the zone's own padding (not a card) means "append to the end".
     if (isReorderableZone(zone)) setDropHint({ zone, beforeId: null });
@@ -4201,6 +4358,7 @@ export default function ActionItemsPage() {
    * already filed under is free rather than a redundant write plus a misleading log line.
    */
   async function assignItemToAccount(resolvedId: string, item: AirtableActionItem, accountKey: string) {
+    console.log("[DRAG-DEBUG] assignItemToAccount called", { resolvedId, accountKey, currentAccountName: item.account_name });
     const acc = accountKey === "none" ? null : accounts.find((a) => a.key === accountKey);
     // An unresolvable key would otherwise silently clear the account.
     if (accountKey !== "none" && !acc) return;
@@ -4257,20 +4415,30 @@ export default function ActionItemsPage() {
     if (!dragId) return;
     const item = allItems.find((i) => i.airtable_id === dragId);
     const prevZone = zones[dragId] ?? "today";
+    const resolvedId = dragId;
     setDragId(null);
     if (!item || item.airtable_id.startsWith("local-")) return;
-    if (prevZone === "today" || prevZone === "active") return;
+    if (prevZone === "today" || prevZone === "active") {
+      // Zone-only move: unstage the card without reassigning its account (see the
+      // matching guard in `handleDrop`'s "accounts" branch). This was previously a
+      // silent no-op — leaving the card stuck in Stage Today — because this function's
+      // only other job is reassignment, which is exactly what must NOT happen here.
+      setZones((prev) => ({ ...prev, [resolvedId]: "accounts" }));
+      return;
+    }
     await assignItemToAccount(item.airtable_id, item, accountKey);
   }
 
   async function handleDrop(e: React.DragEvent, targetZoneArg: Zone, accountKey?: string) {
     e.preventDefault();
+    console.log("[DRAG-DEBUG] handleDrop called", { dragId, targetZoneArg, accountKey, currentZoneForDragId: dragId ? zones[dragId] : undefined });
     setDragOverZone(null);
-    if (!dragId) return;
+    if (!dragId) { console.log("[DRAG-DEBUG] bailing: no dragId"); return; }
     let targetZone = targetZoneArg;
 
     // Promote blank to a real Airtable record when leaving Unstaged
     const prevZoneGlobal = zones[dragId] ?? (dragId.startsWith("local-") ? "unstaged" : "today");
+    console.log("[DRAG-DEBUG] prevZoneGlobal", prevZoneGlobal);
     const dragSnapshot = allItems.find((i) => i.airtable_id === dragId);
     if (!dragSnapshot) return;
 
@@ -4301,9 +4469,14 @@ export default function ActionItemsPage() {
 
     if (targetZone === "accounts" && accountKey != null) {
       const prevZoneAccounts = prevZoneGlobal;
+      console.log("[DRAG-DEBUG] entered accounts branch", { resolvedId, prevZoneAccounts, accountKey });
       // Zone already set atomically above for the promote path; this is a no-op for
       // non-promote drops (setZones is idempotent).
-      setZones((prev) => ({ ...prev, [resolvedId]: "accounts" }));
+      setZones((prev) => {
+        const next = { ...prev, [resolvedId]: "accounts" as Zone };
+        console.log("[DRAG-DEBUG] setZones ->", { resolvedId, newZoneForItem: next[resolvedId] });
+        return next;
+      });
 
       // Coming from Stage Today or Currently Tracking, a drop anywhere in the Views
       // grid just unstages the card — it lands back under its own existing account
@@ -4312,7 +4485,10 @@ export default function ActionItemsPage() {
       // drop. Dropping from Unstaged (assigning a blank's first account) or from
       // within Views/Projects itself (a deliberate re-file) still reassigns.
       if (prevZoneAccounts !== "today" && prevZoneAccounts !== "active") {
+        console.log("[DRAG-DEBUG] reassigning account (prevZone was not today/active)");
         await assignItemToAccount(resolvedId, item, accountKey);
+      } else {
+        console.log("[DRAG-DEBUG] skipping reassignment (prevZone was", prevZoneAccounts, ") — should just unstage");
       }
 
       // Top up blanks if the item came from Unstaged

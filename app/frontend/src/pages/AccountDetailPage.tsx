@@ -10,7 +10,8 @@ import { accountsApi, airtableApi, teamApi, skillsApi, schedulerApi, integration
 import type { GmailThread, MeetingNotesSource, SearchResult } from "../lib/api";
 import { MeetingSummarySourceToggle, preferredMeetingSource } from "../components/account/MeetingSummarySourceToggle";
 import { GetMeetingNotesButton } from "../components/shared/GetMeetingNotesButton";
-import type { Account, AccountArtifact, AccountNote, AccountQuickLink, ActionItemAttachment, AirtableAccount, AirtableActionItem, AirtableMeeting, Attendee, CalendarEvent, CustomerContact, CustomerContactNote, MeetingNote, Reminder, TeamMember } from "../types";
+import type { Account, AccountArtifact, AccountNote, AccountQuickLink, ActionItemAttachment, AirtableAccount, AirtableActionItem, AirtableMeeting, Attendee, CalendarEvent, CustomerContact, CustomerContactNote, GoalSection, MeetingNote, ProjectMember, Reminder, TeamMember } from "../types";
+import { ProjectGoals } from "../components/account/ProjectGoals";
 import { ROLE_META, getTitleRole } from "../lib/titleRoles";
 import { useLogGlow } from "../hooks/useLogGlow";
 import { addLog } from "../lib/appLog";
@@ -3208,458 +3209,8 @@ function AccountTimeline({
   );
 }
 
-// ── Project Goals ─────────────────────────────────────────────────────────────
-
-interface GoalResource { id: string; label: string; url: string }
-interface GoalSection {
-  id: string;
-  name: string;
-  description?: string;
-  url?: string;           // hyperlink for the project itself
-  actionIds: string[];    // airtable_id refs
-  meetingIds: string[];   // airtable_id refs
-  goalIds: string[];      // linked goal column IDs
-  resources: GoalResource[];
-}
-
 function uid() { return Math.random().toString(36).slice(2, 9); }
 
-function ProjectGoals({
-  goals,
-  actionItems,
-  meetings,
-  onChange,
-  onSelectAction,
-  onNoteDropped,
-}: {
-  goals: GoalSection[];
-  actionItems: AirtableActionItem[];
-  meetings: AirtableMeeting[];
-  onChange: (g: GoalSection[]) => void;
-  onSelectAction?: (i: AirtableActionItem) => void;
-  onNoteDropped?: (noteText: string, goalId: string) => void;
-}) {
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [editingUrlId, setEditingUrlId] = useState<string | null>(null);
-  const [dropTarget, setDropTarget] = useState<string | null>(null);
-  const [newResourceGoal, setNewResourceGoal] = useState<string | null>(null);
-  const [resourceForm, setResourceForm] = useState({ label: "", url: "" });
-  const [linkingGoalId, setLinkingGoalId] = useState<string | null>(null);
-  const [creatingProject, setCreatingProject] = useState(false);
-  const [newProjectName, setNewProjectName] = useState("");
-  const newProjectInputRef = useRef<HTMLInputElement>(null);
-
-  const actionMap = Object.fromEntries(actionItems.map((a) => [a.airtable_id, a]));
-  const meetingMap = Object.fromEntries(meetings.map((m) => [m.airtable_id, m]));
-
-  function addGoal() {
-    const name = newProjectName.trim() || "New Project";
-    const newGoal = { id: uid(), name, url: "", actionIds: [], meetingIds: [], goalIds: [], resources: [] };
-    onChange([...goals, newGoal]);
-    setCreatingProject(false);
-    setNewProjectName("");
-  }
-
-  function updateName(id: string, name: string) {
-    onChange(goals.map((g) => g.id === id ? { ...g, name } : g));
-  }
-
-  function removeGoal(id: string) {
-    onChange(goals.filter((g) => g.id !== id));
-  }
-
-  function removeAction(goalId: string, airtableId: string) {
-    onChange(goals.map((g) => g.id === goalId ? { ...g, actionIds: g.actionIds.filter((x) => x !== airtableId) } : g));
-  }
-
-  function removeMeeting(goalId: string, airtableId: string) {
-    onChange(goals.map((g) => g.id === goalId ? { ...g, meetingIds: g.meetingIds.filter((x) => x !== airtableId) } : g));
-  }
-
-  function addResource(goalId: string) {
-    if (!resourceForm.label.trim()) return;
-    onChange(goals.map((g) => g.id === goalId
-      ? { ...g, resources: [...g.resources, { id: uid(), label: resourceForm.label.trim(), url: resourceForm.url.trim() }] }
-      : g));
-    setResourceForm({ label: "", url: "" });
-    setNewResourceGoal(null);
-  }
-
-  function removeResource(goalId: string, resourceId: string) {
-    onChange(goals.map((g) => g.id === goalId ? { ...g, resources: g.resources.filter((r) => r.id !== resourceId) } : g));
-  }
-
-  function updateUrl(id: string, url: string) {
-    onChange(goals.map((g) => g.id === id ? { ...g, url } : g));
-  }
-
-  function linkGoal(projectId: string, linkedGoalId: string) {
-    onChange(goals.map((g) => {
-      if (g.id !== projectId) return g;
-      const already = (g.goalIds ?? []).includes(linkedGoalId);
-      return already ? g : { ...g, goalIds: [...(g.goalIds ?? []), linkedGoalId] };
-    }));
-    setLinkingGoalId(null);
-  }
-
-  function unlinkGoal(projectId: string, linkedGoalId: string) {
-    onChange(goals.map((g) => g.id === projectId ? { ...g, goalIds: (g.goalIds ?? []).filter((x) => x !== linkedGoalId) } : g));
-  }
-
-  function handleDragOver(e: React.DragEvent, goalId: string) {
-    e.preventDefault();
-    setDropTarget(goalId);
-  }
-
-  function handleDrop(e: React.DragEvent, goalId: string) {
-    e.preventDefault();
-    setDropTarget(null);
-    const actionId = e.dataTransfer.getData("goalActionId");
-    const meetingId = e.dataTransfer.getData("goalMeetingId");
-    const noteText = e.dataTransfer.getData("noteText");
-    if (noteText && onNoteDropped) {
-      onNoteDropped(noteText, goalId);
-      return;
-    }
-    onChange(goals.map((g) => {
-      if (g.id !== goalId) return g;
-      if (actionId && !g.actionIds.includes(actionId)) return { ...g, actionIds: [...g.actionIds, actionId] };
-      if (meetingId && !g.meetingIds.includes(meetingId)) return { ...g, meetingIds: [...g.meetingIds, meetingId] };
-      return g;
-    }));
-  }
-
-  return (
-    <div>
-      {/* Horizontally-scrolling column board */}
-      <div
-        className="flex flex-row gap-3 overflow-x-auto pb-3"
-        style={{ scrollbarWidth: "thin" }}
-      >
-        {goals.map((goal) => (
-          <div
-            key={goal.id}
-            onDragOver={(e) => handleDragOver(e, goal.id)}
-            onDragLeave={() => setDropTarget(null)}
-            onDrop={(e) => handleDrop(e, goal.id)}
-            className="flex flex-col rounded-lg transition-all shrink-0"
-            style={{
-              width: 220,
-              minHeight: 120,
-              ...(dropTarget === goal.id
-                ? { border: "1px solid var(--twilio-red, #e22)", background: "rgba(226,34,34,0.04)", boxShadow: "0 4px 12px rgba(0,0,0,0.1)" }
-                : { border: "1px solid var(--border, rgba(0,0,0,0.08))", background: "var(--bg, #f5f5f5)" }),
-            }}
-          >
-            {/* Column header */}
-            <div
-              className="flex flex-col rounded-t-lg shrink-0"
-              style={{ borderBottom: "1px solid var(--border, rgba(0,0,0,0.08))", background: "var(--surface, #fff)" }}
-            >
-              <div className="flex items-center gap-1.5 px-3 pt-2.5 pb-1.5">
-                {editingId === goal.id ? (
-                  <input
-                    autoFocus
-                    value={goal.name}
-                    onChange={(e) => updateName(goal.id, e.target.value)}
-                    onBlur={() => setEditingId(null)}
-                    onKeyDown={(e) => { if (e.key === "Enter") setEditingId(null); }}
-                    className="flex-1 text-xs font-semibold rounded px-1.5 py-0.5 focus:outline-none min-w-0"
-                    style={{ background: "var(--bg, #f5f5f5)", border: "1px solid var(--twilio-red, #e22)", color: "var(--text-primary, #111)" }}
-                  />
-                ) : (
-                  <button
-                    onClick={() => setEditingId(goal.id)}
-                    className="flex-1 text-left text-xs font-semibold leading-tight transition-colors hover:opacity-70 min-w-0 truncate"
-                    style={{ color: "var(--text-primary, #111)" }}
-                    title={goal.description ? `${goal.name}\n\n${goal.description}` : goal.name}
-                  >
-                    {goal.name}
-                  </button>
-                )}
-                {/* Open URL if set */}
-                {goal.url && (
-                  <a href={goal.url} target="_blank" rel="noreferrer" title={goal.url} className="shrink-0 text-blue-400 hover:text-blue-600 transition-colors" onClick={(e) => e.stopPropagation()}>
-                    <svg viewBox="0 0 16 16" fill="currentColor" className="w-3 h-3"><path d="M8.636 3.5a.5.5 0 00-.5-.5H1.5A1.5 1.5 0 000 4.5v10A1.5 1.5 0 001.5 16h10a1.5 1.5 0 001.5-1.5V7.864a.5.5 0 00-1 0V14.5a.5.5 0 01-.5.5h-10a.5.5 0 01-.5-.5v-10a.5.5 0 01.5-.5h6.636a.5.5 0 00.5-.5z"/><path d="M16 .5a.5.5 0 00-.5-.5h-5a.5.5 0 000 1h3.793L6.146 9.146a.5.5 0 10.708.708L15 1.707V5.5a.5.5 0 001 0v-5z"/></svg>
-                  </a>
-                )}
-                {/* Edit URL button */}
-                <button
-                  onClick={() => setEditingUrlId(editingUrlId === goal.id ? null : goal.id)}
-                  className="shrink-0 transition-colors"
-                  title={goal.url ? "Edit link" : "Add link"}
-                  style={{ color: goal.url ? "#6366f1" : "var(--twilio-gray-60)", lineHeight: 1 }}
-                >
-                  <svg viewBox="0 0 16 16" fill="currentColor" className="w-3 h-3 hover:opacity-70"><path d="M4.715 6.542L3.343 7.914a3 3 0 104.243 4.243l1.828-1.829A3 3 0 008.586 8.4l-.7.7a2 2 0 11-2.83-2.83l1.37-1.37A2 2 0 014.716 6.54zm8.485-2.828a3 3 0 00-4.243 0L7.13 5.542a3 3 0 00.826 4.913l.7-.7a2 2 0 11.83-2.83l1.828-1.828a2 2 0 010 2.828z"/></svg>
-                </button>
-                <button
-                  onClick={() => removeGoal(goal.id)}
-                  className="shrink-0 text-[var(--twilio-gray-60)] hover:text-red-500 text-xs transition-colors leading-none"
-                >✕</button>
-              </div>
-              {/* URL input row */}
-              {editingUrlId === goal.id && (
-                <div className="flex items-center gap-1.5 px-3 pb-2">
-                  <input
-                    autoFocus
-                    type="url"
-                    value={goal.url ?? ""}
-                    onChange={(e) => updateUrl(goal.id, e.target.value)}
-                    onBlur={() => setEditingUrlId(null)}
-                    onKeyDown={(e) => { if (e.key === "Enter" || e.key === "Escape") setEditingUrlId(null); }}
-                    placeholder="https://…"
-                    className="flex-1 text-[11px] rounded px-2 py-0.5 focus:outline-none min-w-0"
-                    style={{ border: "1px solid #c7d2fe", background: "#f5f3ff", color: "var(--text-primary, #111)" }}
-                  />
-                </div>
-              )}
-            </div>
-
-            {/* Column body — scrollable */}
-            <div className="flex-1 overflow-y-auto px-2.5 py-2.5 flex flex-col gap-2" style={{ scrollbarWidth: "thin" }}>
-
-              {/* Resources */}
-              {goal.resources.length > 0 && (
-                <div className="flex flex-col gap-1">
-                  <p className="text-[9px] font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide">Resources</p>
-                  {goal.resources.map((r) => (
-                    <div key={r.id} className="group flex items-center gap-1.5 bg-white rounded px-2 py-1 border border-gray-200 text-[11px]">
-                      <svg viewBox="0 0 16 16" fill="currentColor" className="w-2.5 h-2.5 text-blue-400 shrink-0"><path d="M7.293 1.293a1 1 0 011.414 0l6 6a1 1 0 010 1.414l-6 6a1 1 0 01-1.414-1.414L11.586 9H2a1 1 0 110-2h9.586L7.293 2.707a1 1 0 010-1.414z"/></svg>
-                      {r.url ? (
-                        <a href={r.url} target="_blank" rel="noreferrer" className="flex-1 underline truncate" style={{ color: "var(--twilio-red, #e22)" }}>{r.label}</a>
-                      ) : (
-                        <span className="flex-1 text-[var(--twilio-navy)] truncate">{r.label}</span>
-                      )}
-                      <button onClick={() => removeResource(goal.id, r.id)} className="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-red-400 transition-all shrink-0">✕</button>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {/* Linked goals */}
-              {(goal.goalIds ?? []).length > 0 && (
-                <div className="flex flex-col gap-1">
-                  <p className="text-[9px] font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide">Goals</p>
-                  {(goal.goalIds ?? []).map((gid) => {
-                    const linked = goals.find((g) => g.id === gid);
-                    if (!linked) return null;
-                    return (
-                      <div key={gid} className="group flex items-center gap-1.5 bg-white rounded px-2 py-1 border border-indigo-100 text-[11px]">
-                        <svg viewBox="0 0 16 16" fill="currentColor" className="w-2.5 h-2.5 text-indigo-400 shrink-0"><circle cx="8" cy="8" r="3"/><path d="M8 1a7 7 0 100 14A7 7 0 008 1zm0 1a6 6 0 110 12A6 6 0 018 2z"/></svg>
-                        <span className="flex-1 text-[var(--twilio-navy)] truncate font-medium">{linked.name}</span>
-                        <button onClick={() => unlinkGoal(goal.id, gid)} className="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-red-400 transition-all shrink-0">✕</button>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-              {/* Link goal picker */}
-              {linkingGoalId === goal.id && (
-                <div className="flex flex-col gap-1">
-                  <p className="text-[9px] font-semibold text-indigo-500 uppercase tracking-wide">Link a goal</p>
-                  {goals.filter((g) => g.id !== goal.id && !(goal.goalIds ?? []).includes(g.id)).map((g) => (
-                    <button
-                      key={g.id}
-                      onClick={() => linkGoal(goal.id, g.id)}
-                      className="text-left text-[11px] rounded px-2 py-1 border border-indigo-100 bg-white hover:bg-indigo-50 transition-colors text-[var(--twilio-navy)] truncate"
-                    >
-                      {g.name}
-                    </button>
-                  ))}
-                  {goals.filter((g) => g.id !== goal.id && !(goal.goalIds ?? []).includes(g.id)).length === 0 && (
-                    <p className="text-[10px] text-[var(--twilio-gray-60)] italic">No other goals to link.</p>
-                  )}
-                  <button onClick={() => setLinkingGoalId(null)} className="text-[10px] text-[var(--twilio-gray-60)] hover:text-red-400 text-left mt-0.5">Cancel</button>
-                </div>
-              )}
-
-              {/* Linked meetings */}
-              {goal.meetingIds.length > 0 && (
-                <div className="flex flex-col gap-1">
-                  <p className="text-[9px] font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide">Meetings</p>
-                  {goal.meetingIds.map((mid) => {
-                    const m = meetingMap[mid];
-                    if (!m) return null;
-                    return (
-                      <div key={mid} className="group flex items-center gap-1.5 bg-white rounded px-2 py-1 border border-gray-200 text-[11px] text-[var(--twilio-navy)]">
-                        <svg viewBox="0 0 16 16" fill="currentColor" className="w-2.5 h-2.5 shrink-0" style={{ color: "var(--twilio-red, #e22)", opacity: 0.6 }}><path d="M2 3a2 2 0 012-2h8a2 2 0 012 2v10a2 2 0 01-2 2H4a2 2 0 01-2-2V3zm8 1H6v1h4V4zM6 7h4v1H6V7zm0 3h3v1H6v-1z"/></svg>
-                        <span className="flex-1 truncate">{m.name || "Meeting"}</span>
-                        {m.date && <span className="text-[var(--twilio-gray-60)] shrink-0 text-[10px]">{new Date(m.date).toLocaleDateString(undefined, { month: "short", day: "numeric" })}</span>}
-                        <button onClick={() => removeMeeting(goal.id, mid)} className="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-red-400 transition-all shrink-0">✕</button>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-
-              {/* Linked action items */}
-              {goal.actionIds.length > 0 && (
-                <div className="flex flex-col gap-1.5">
-                  <p className="text-[9px] font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide">Action Items</p>
-                  {goal.actionIds.map((aid) => {
-                    const item = actionMap[aid];
-                    if (!item) return null;
-                    return (
-                      <div key={aid} className="group relative">
-                        <div className="cursor-pointer" onClick={() => onSelectAction?.(item)}>
-                          <ActionItemCard
-                            item={item}
-                            onDragStart={(e) => {
-                              e.dataTransfer.setData("goalActionId", aid);
-                              e.dataTransfer.setData("timelineActionId", aid);
-                            }}
-                          />
-                        </div>
-                        <button
-                          onClick={() => removeAction(goal.id, aid)}
-                          className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 transition-opacity text-gray-300 hover:text-red-400 text-xs leading-none"
-                          style={{ background: "rgba(255,255,255,0.9)", borderRadius: 3, padding: "1px 3px" }}
-                        >✕</button>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-
-              {/* Drop target hint */}
-              {dropTarget === goal.id && (
-                <div className="rounded-md py-3 text-center text-[11px]" style={{ border: "1px dashed var(--twilio-red, #e22)", color: "var(--twilio-red, #e22)", background: "rgba(226,34,34,0.03)" }}>
-                  Drop here
-                </div>
-              )}
-
-              {/* Empty column placeholder */}
-              {goal.actionIds.length === 0 && goal.meetingIds.length === 0 && goal.resources.length === 0 && (goal.goalIds ?? []).length === 0 && linkingGoalId !== goal.id && dropTarget !== goal.id && (
-                <div className="rounded-md py-4 text-center text-[11px] text-[var(--twilio-gray-60)]" style={{ border: "1px dashed var(--border, rgba(0,0,0,0.15))" }}>
-                  Drag items here
-                </div>
-              )}
-            </div>
-
-            {/* Column footer — add resource */}
-            <div className="shrink-0 px-2.5 pb-2.5">
-              {newResourceGoal === goal.id ? (
-                <div className="flex flex-col gap-1.5 mt-1">
-                  <input
-                    autoFocus
-                    placeholder="Label"
-                    value={resourceForm.label}
-                    onChange={(e) => setResourceForm((f) => ({ ...f, label: e.target.value }))}
-                    className="w-full text-[11px] rounded px-2 py-1 focus:outline-none"
-                    style={{ border: "1px solid var(--border, rgba(0,0,0,0.08))", background: "var(--surface, #fff)" }}
-                  />
-                  <input
-                    placeholder="URL (optional)"
-                    value={resourceForm.url}
-                    onChange={(e) => setResourceForm((f) => ({ ...f, url: e.target.value }))}
-                    onKeyDown={(e) => { if (e.key === "Enter") addResource(goal.id); }}
-                    className="w-full text-[11px] rounded px-2 py-1 focus:outline-none"
-                    style={{ border: "1px solid var(--border, rgba(0,0,0,0.08))", background: "var(--surface, #fff)" }}
-                  />
-                  <div className="flex gap-1">
-                    <button onClick={() => addResource(goal.id)} className="flex-1 text-[11px] px-2 py-1 rounded hover:opacity-90 transition-opacity" style={{ background: "var(--twilio-red, #e22)", color: "#fff", border: "none" }}>Add</button>
-                    <button onClick={() => setNewResourceGoal(null)} className="text-[11px] px-2 py-1 border border-gray-300 rounded text-[var(--twilio-navy)] hover:bg-gray-50">✕</button>
-                  </div>
-                </div>
-              ) : (
-                <div className="flex items-center gap-3 mt-1">
-                  <button
-                    onClick={() => { setNewResourceGoal(goal.id); setResourceForm({ label: "", url: "" }); }}
-                    className="text-[10px] transition-colors hover:opacity-70"
-                    style={{ color: "var(--text-secondary, #888)" }}
-                  >
-                    + Add resource
-                  </button>
-                  <button
-                    onClick={() => setLinkingGoalId(linkingGoalId === goal.id ? null : goal.id)}
-                    className="text-[10px] transition-colors hover:opacity-70"
-                    style={{ color: "#6366f1" }}
-                  >
-                    + Link goal
-                  </button>
-                </div>
-              )}
-            </div>
-          </div>
-        ))}
-
-        {/* Add project column */}
-        {creatingProject ? (
-          <div
-            className="shrink-0 rounded-lg flex flex-col gap-2 p-3 self-start"
-            style={{ width: 200, border: "1px solid var(--twilio-red, #e22)", background: "var(--surface, #fff)" }}
-          >
-            <p className="text-[10px] font-semibold uppercase tracking-wide" style={{ color: "var(--twilio-gray-60)" }}>New Project</p>
-            <input
-              ref={newProjectInputRef}
-              autoFocus
-              value={newProjectName}
-              onChange={(e) => setNewProjectName(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") addGoal();
-                if (e.key === "Escape") { setCreatingProject(false); setNewProjectName(""); }
-              }}
-              placeholder="Project name…"
-              className="w-full text-xs rounded px-2 py-1 border focus:outline-none focus:ring-1 focus:ring-red-300"
-              style={{ border: "1px solid rgba(0,0,0,0.12)", color: "var(--text-primary, #111)" }}
-            />
-            <div className="flex gap-1.5">
-              <button
-                onClick={addGoal}
-                className="flex-1 text-xs font-semibold py-1 rounded-lg text-white transition-colors"
-                style={{ background: "var(--twilio-red, #e22)" }}
-              >
-                Create
-              </button>
-              <button
-                onClick={() => { setCreatingProject(false); setNewProjectName(""); }}
-                className="flex-1 text-xs font-semibold py-1 rounded-lg border transition-colors hover:bg-gray-50"
-                style={{ color: "var(--text-secondary, #888)", border: "1px solid rgba(0,0,0,0.1)" }}
-              >
-                Cancel
-              </button>
-            </div>
-          </div>
-        ) : (
-          <div className="shrink-0 flex flex-row gap-2 self-start">
-            <button
-              onClick={() => setCreatingProject(true)}
-              className="rounded-lg flex items-center gap-1.5 px-3 py-2 text-xs font-medium transition-colors hover:opacity-80"
-              style={{
-                color: "var(--twilio-red, #e22)",
-                border: "1px dashed var(--twilio-red, #e22)",
-                background: "rgba(226,34,34,0.03)",
-              }}
-            >
-              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" className="w-3 h-3">
-                <path d="M8 3v10M3 8h10"/>
-              </svg>
-              New Project
-            </button>
-            <button
-              onClick={() => {
-                const newGoal = { id: uid(), name: "New Goal", url: "", actionIds: [], meetingIds: [], goalIds: [], resources: [] };
-                onChange([...goals, newGoal]);
-                setEditingId(newGoal.id);
-              }}
-              className="rounded-lg flex items-center gap-1.5 px-3 py-2 text-xs font-medium transition-colors hover:opacity-80"
-              style={{
-                color: "var(--twilio-gray-60)",
-                border: "1px dashed rgba(0,0,0,0.15)",
-                background: "var(--bg, #f5f5f5)",
-              }}
-            >
-              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" className="w-3 h-3">
-                <path d="M8 3v10M3 8h10"/>
-              </svg>
-              New Goal
-            </button>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
 
 // ── Quick Links Panel ─────────────────────────────────────────────────────────
 
@@ -5278,6 +4829,7 @@ export default function AccountDetailPage() {
   const [panel, setPanel] = useState<PanelItem | null>(null);
   const [goals, setGoals] = useState<GoalSection[]>([]);
   const [goalsLoaded, setGoalsLoaded] = useState(false);
+  const [projectMembers, setProjectMembers] = useState<ProjectMember[]>([]);
   const prevGoalsRef = useRef<GoalSection[]>([]);
   const pendingGoalSaves = useRef(new Set<string>());
   const [reportState, setReportState] = useState<
@@ -5322,19 +4874,26 @@ export default function AccountDetailPage() {
       if (acctRes.data.company_name.toLowerCase() !== "admin") {
         accountsApi.listProjectsByAccount(acctRes.data.company_name)
           .then(({ data }) => {
-            const loaded = data.results.map((p) => ({
+            const loaded = data.results.map((p): GoalSection => ({
               id: String(p.id),
               name: p.name,
               description: p.description ?? "",
-              url: "",
-              actionIds: [],
-              meetingIds: [],
-              goalIds: [],
-              resources: [],
+              url: p.url ?? "",
+              actionIds: p.action_ids ?? [],
+              meetingIds: p.meeting_ids ?? [],
+              goalIds: p.goal_ids ?? [],
+              resources: p.resources ?? [],
+              sfData: p.sf_data ?? {},
+              sfProjectId: p.sf_project_id ?? "",
+              kind: p.kind ?? "project",
             }));
             setGoals(loaded);
             prevGoalsRef.current = loaded;
             setGoalsLoaded(true);
+            const projectIds = loaded.filter((g) => g.kind === "project").map((g) => Number(g.id));
+            accountsApi.listProjectMembers(projectIds)
+              .then(({ data: pmData }) => setProjectMembers(pmData.results))
+              .catch(() => {});
           })
           .catch(() => setGoalsLoaded(true));
       }
@@ -5538,6 +5097,23 @@ export default function AccountDetailPage() {
     ));
   }
 
+  // Every AccountProject field the shared ProjectGoals component can edit — used for
+  // both create and update so a project's url/resources/sfData survive a page reload.
+  function goalFieldPayload(g: GoalSection) {
+    return {
+      name: g.name,
+      description: g.description ?? "",
+      url: g.url ?? "",
+      action_ids: g.actionIds,
+      meeting_ids: g.meetingIds,
+      goal_ids: g.goalIds ?? [],
+      resources: g.resources,
+      sf_data: g.sfData ?? {},
+      sf_project_id: g.sfProjectId ?? "",
+      kind: g.kind ?? "project",
+    };
+  }
+
   function handleGoalsChange(newGoals: GoalSection[]) {
     setGoals(newGoals);
     if (!account || account.company_name.toLowerCase() === "admin") {
@@ -5560,7 +5136,7 @@ export default function AccountDetailPage() {
     for (const g of newGoals) {
       if (!prev.find((p) => p.id === g.id) && !pendingGoalSaves.current.has(g.id)) {
         pendingGoalSaves.current.add(g.id);
-        accountsApi.createProject({ account: account.id, name: g.name, description: g.description ?? "" })
+        accountsApi.createProject({ account: account.id, ...goalFieldPayload(g) })
           .then(({ data: saved }) => {
             pendingGoalSaves.current.delete(g.id);
             const newId = String(saved.id);
@@ -5570,13 +5146,25 @@ export default function AccountDetailPage() {
           .catch(() => { pendingGoalSaves.current.delete(g.id); });
       }
     }
-    // Renamed goals (only for goals with a persisted backend ID)
+    // Changed goals (only for goals with a persisted backend ID)
     for (const g of newGoals) {
       const old = prev.find((p) => p.id === g.id);
-      if (old && (old.name !== g.name || old.description !== g.description) && /^\d+$/.test(g.id)) {
-        accountsApi.updateProject(Number(g.id), { name: g.name, description: g.description ?? "" }).catch(() => {});
+      if (old && /^\d+$/.test(g.id) && JSON.stringify(goalFieldPayload(old)) !== JSON.stringify(goalFieldPayload(g))) {
+        accountsApi.updateProject(Number(g.id), goalFieldPayload(g)).catch(() => {});
       }
     }
+  }
+
+  function handleAddProjectMember(projectId: number, teamMemberId: number) {
+    accountsApi.addProjectMember(projectId, teamMemberId)
+      .then(({ data }) => setProjectMembers((prev) => [...prev, data]))
+      .catch(() => {});
+  }
+
+  function handleRemoveProjectMember(projectMemberId: number) {
+    accountsApi.removeProjectMember(projectMemberId)
+      .then(() => setProjectMembers((prev) => prev.filter((m) => m.id !== projectMemberId)))
+      .catch(() => {});
   }
 
   async function handleNoteDropOnReminders(e: React.DragEvent) {
@@ -6349,6 +5937,10 @@ export default function AccountDetailPage() {
             onChange={handleGoalsChange}
             onSelectAction={(i) => setPanel({ kind: "action", item: i })}
             onNoteDropped={handleNoteDropOnGoal}
+            accountTeamMembers={account?.team_members ?? []}
+            projectMembers={projectMembers}
+            onAddProjectMember={handleAddProjectMember}
+            onRemoveProjectMember={handleRemoveProjectMember}
           />
         </div>
 
