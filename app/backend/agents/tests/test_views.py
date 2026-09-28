@@ -14,11 +14,12 @@ from asgiref.sync import async_to_sync
 from botocore import exceptions as botocore_exceptions
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ImproperlyConfigured
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, override_settings
 from rest_framework.test import APITestCase
 
 from agents.models import AgentMessage, AgentSession
 from agents.views import classify_agent_error
+from core.llm import GatewayCredentialError
 
 User = get_user_model()
 
@@ -235,6 +236,7 @@ class AgentSendStreamTest(APITestCase):
                 body = _consume(resp).decode()
         return body, logs.output
 
+    @override_settings(AGENT_BACKEND="bedrock")
     def test_partial_output_is_kept_when_the_stream_fails(self):
         body, _ = self._send_failing(
             botocore_exceptions.NoCredentialsError(), items=["partial answer"]
@@ -248,6 +250,7 @@ class AgentSendStreamTest(APITestCase):
             "partial answer",
         )
 
+    @override_settings(AGENT_BACKEND="bedrock")
     def test_expired_credentials_produce_an_actionable_message(self):
         body, _ = self._send_failing(
             botocore_exceptions.TokenRetrievalError(provider="sso", error_msg="expired")
@@ -255,6 +258,18 @@ class AgentSendStreamTest(APITestCase):
         self.assertIn("aws sso login", body)
         # The old blanket message told the user nothing.
         self.assertNotIn("[Agent error - check server logs]", body)
+
+    @override_settings(AGENT_BACKEND="gateway",
+                       AGENT_GATEWAY_TOKEN_COMMAND="/usr/local/bin/token-helper")
+    def test_a_gateway_credential_failure_tells_the_user_to_re_authenticate(self):
+        """
+        The reported bug: on the gateway, a credential failure told the user to run
+        `aws sso login`, which has nothing to do with the configured backend.
+        """
+        body, _ = self._send_failing(GatewayCredentialError("helper timed out"))
+        self.assertIn("Re-authenticate", body)
+        self.assertIn("/usr/local/bin/token-helper", body)
+        self.assertNotIn("aws sso login", body)
 
     def test_failure_is_logged_with_the_ref_shown_to_the_user(self):
         body, logs = self._send_failing(RuntimeError("kaboom"))
@@ -289,6 +304,7 @@ class ClassifyAgentErrorTest(SimpleTestCase):
             body=None,
         )
 
+    @override_settings(AGENT_BACKEND="bedrock")
     def test_bedrock_credential_errors_point_at_sso_login(self):
         for exc in (
             botocore_exceptions.TokenRetrievalError(provider="sso", error_msg="x"),
@@ -299,6 +315,27 @@ class ClassifyAgentErrorTest(SimpleTestCase):
         ):
             with self.subTest(exc=type(exc).__name__):
                 self.assertIn("aws sso login", classify_agent_error(exc, "ref1"))
+
+    @override_settings(AGENT_BACKEND="gateway")
+    def test_botocore_credential_errors_do_not_advise_aws_on_the_gateway(self):
+        """Advice must match the configured backend, not whatever raised."""
+        message = classify_agent_error(botocore_exceptions.NoCredentialsError(), "ref1")
+        self.assertNotIn("aws sso login", message)
+        self.assertIn("gateway token", message)
+
+    @override_settings(AGENT_BACKEND="gateway",
+                       AGENT_GATEWAY_TOKEN_COMMAND="/bin/token-helper")
+    def test_gateway_credential_error_is_classified_before_generic_misconfiguration(self):
+        """It subclasses ImproperlyConfigured, so branch order is load-bearing."""
+        message = classify_agent_error(GatewayCredentialError("no token"), "ref2")
+        self.assertIn("Re-authenticate", message)
+        self.assertNotIn("misconfigured", message)
+
+    @override_settings(AGENT_BACKEND="gateway")
+    def test_a_plain_misconfiguration_still_reads_as_misconfigured(self):
+        message = classify_agent_error(ImproperlyConfigured("no tier"), "ref3")
+        self.assertIn("misconfigured", message)
+        self.assertNotIn("Re-authenticate", message)
 
     def test_auth_errors_mention_key_or_role(self):
         for cls, code in (

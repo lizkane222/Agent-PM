@@ -63,6 +63,19 @@ class CalendarEvent(models.Model):
     attended = models.BooleanField(null=True, blank=True, default=None)
     # For events pushed from AgentPM (action items), stores the originating Airtable record ID
     agentpm_airtable_id = models.CharField(max_length=255, blank=True, default="")
+    # The Reminder this event is a scheduled occurrence of, when the user dropped a reminder
+    # onto the calendar grid. Scheduled reminders used to exist only as a `scheduledReminders`
+    # localStorage entry rendered as a synthetic `scheduled-reminder-*` overlay, so they were
+    # browser-local, invisible to the rest of the app, and lost on any storage clear.
+    # SET_NULL rather than CASCADE: deleting the reminder should not silently erase the block
+    # of time the user had already set aside for it.
+    reminder = models.ForeignKey(
+        "scheduler.Reminder",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="calendar_events",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     # Rich references: list of {resource_type, resource_id, label, url} objects added via @# trigger
@@ -70,6 +83,10 @@ class CalendarEvent(models.Model):
         default=list,
         help_text="Records referenced via @# picker: [{resource_type, resource_id, label, url}]",
     )
+    # AccountArtifact ids linked to this event. Only meaningful when the event has a
+    # linked account (the artifacts belong to that account); Google Calendar has no
+    # concept of this, so it's excluded from the Google-owned field snapshot.
+    artifact_ids = models.JSONField(default=list, blank=True)
 
     class Meta:
         ordering = ["start_datetime"]

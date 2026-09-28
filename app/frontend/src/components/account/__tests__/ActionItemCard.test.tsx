@@ -26,9 +26,25 @@ vi.mock("../ActionItemCardOccurrences", () => ({
 }));
 
 vi.mock("../ActionItemModal", () => ({
-  ActionItemModal: ({ onClose }: { onClose: () => void }) => (
+  ActionItemModal: ({
+    item,
+    onClose,
+    onUpdated,
+    onAutosaved,
+  }: {
+    item: AirtableActionItem;
+    onClose: () => void;
+    onUpdated?: (updated: AirtableActionItem) => void;
+    onAutosaved?: (updated: AirtableActionItem) => void;
+  }) => (
     <div data-testid="action-item-modal">
       <button onClick={onClose}>Close</button>
+      <button onClick={() => onUpdated?.({ ...item, task: "Saved via Save button" })}>
+        Simulate Save
+      </button>
+      <button onClick={() => onAutosaved?.({ ...item, slack_thread_url: "https://acme.slack.com/x" })}>
+        Simulate pasted Slack link
+      </button>
     </div>
   ),
 }));
@@ -105,6 +121,31 @@ describe("ActionItemCard", () => {
     render(<ActionItemCard item={mockItem} />);
     fireEvent.click(screen.getByText("Fix billing issue"));
     await waitFor(() => expect(screen.getByTestId("action-item-modal")).toBeInTheDocument());
+  });
+
+  // Regression: pasting a Slack link autosaves via `onAutosaved`, which used to be wired to
+  // the same handler as the Save button — so the modal closed itself the instant the link
+  // landed, before the user could do anything else.
+  it("does not close the modal when a Slack link autosaves", async () => {
+    const onUpdated = vi.fn();
+    render(<ActionItemCard item={mockItem} onUpdated={onUpdated} />);
+    fireEvent.click(screen.getByText("Fix billing issue"));
+    await waitFor(() => expect(screen.getByTestId("action-item-modal")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByText("Simulate pasted Slack link"));
+
+    expect(onUpdated).toHaveBeenCalledWith(expect.objectContaining({ slack_thread_url: "https://acme.slack.com/x" }));
+    expect(screen.getByTestId("action-item-modal")).toBeInTheDocument();
+  });
+
+  it("closes the modal once the Save button reports an update", async () => {
+    render(<ActionItemCard item={mockItem} />);
+    fireEvent.click(screen.getByText("Fix billing issue"));
+    await waitFor(() => expect(screen.getByTestId("action-item-modal")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByText("Simulate Save"));
+
+    await waitFor(() => expect(screen.queryByTestId("action-item-modal")).not.toBeInTheDocument());
   });
 
   it("right-clicking shows the context menu", () => {

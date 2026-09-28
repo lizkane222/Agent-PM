@@ -24,7 +24,7 @@ import CommentCountBadge from "../components/comments/CommentCountBadge";
 import CommentIcon from "../components/CommentIcon";
 import { useAppError } from "../context/AppErrorContext";
 import { ContextMenu, FocusPinBadge, focusPinMenuItem } from "../components/action-items/ContextMenu";
-import StepsPanel from "../components/action-items/StepsPanel";
+import { ActionItemModal } from "../components/account/ActionItemModal";
 import { useFocusPins } from "../hooks/useFocusPins";
 import { useActionItemZoneSets } from "../hooks/useActionItemZoneSets";
 import { groupActionItems, DONE_WINDOW_DAYS, isRecentlyDone, type SidebarGroupKey } from "../lib/actionItemSidebarOrder";
@@ -51,7 +51,26 @@ import {
   type ColorableEventType,
 } from "../lib/eventColors";
 import { sanitizeHtml, plainToHtml, htmlToPreviewText } from "../lib/noteHelpers";
+import UnloggedItemsWarningModal from "../components/calendar/UnloggedItemsWarningModal";
+import { computeDailyTotals } from "../lib/calendarDailyTotals";
+import {
+  buildLogDescription,
+  isSalesforceId,
+  roundUpToQuarterHour,
+  type LogWeekEntryInput,
+  type WeekPlanReport,
+} from "../lib/logWeek";
+import {
+  REMINDERS_CALENDAR_ID,
+  hasActionItemAt,
+  hasReminderAt,
+  migrateLegacyScheduledItems,
+  scheduleActionItem,
+  scheduleReminder,
+} from "../lib/calendarScheduling";
 import type { AirtableActionItem, AirtableAccount, CalendarEvent, LogTimeDayAssignment, Reminder, SalesforceProject } from "../types";
+import type { AccountArtifact } from "../types/accounts";
+import type { TeamMember } from "../types/team";
 import type { ContentView, EventCategory, NewEventDraft } from "../types/calendar";
 import { getRsvp, dateToLocalISO, toLocalISO, addMsToLocalISO } from "twilio-agent-pm-shared";
 import type { RsvpStatus } from "twilio-agent-pm-shared";
@@ -100,11 +119,34 @@ function statusColor(status: CalendarEvent["status"]): string {
  *  0.9 keeps the wash faint enough that body text stays readable on any palette. */
 const SURFACE_TINT = 0.9;
 
-/** True for the synthetic 15-minute markers a scheduled reminder puts on the grid.
- *  They carry `calendar_id: "work_tracking"`, so this test must be applied *before*
- *  the work-tracking one or every reminder would read as an action item. */
+/** True for a scheduled reminder occurrence on the grid.
+ *
+ *  Two shapes, because DB-backed rows replaced the localStorage-only ones:
+ *   - `calendar_id: "reminders"` — a real `CalendarEvent` linked to its Reminder.
+ *   - `google_event_id` starting `scheduled-reminder-` — the legacy synthetic marker, which
+ *     carried `calendar_id: "work_tracking"`. Kept so a tab holding un-migrated storage still
+ *     renders correctly; this test must run *before* the work-tracking one or those legacy
+ *     markers would every one read as an action item.
+ */
 function isScheduledReminderEvent(e: CalendarEvent): boolean {
-  return !!e.google_event_id?.startsWith("scheduled-reminder-");
+  return e.calendar_id === REMINDERS_CALENDAR_ID
+    || !!e.google_event_id?.startsWith("scheduled-reminder-");
+}
+
+/**
+ * True when this grid event is a scheduled action item backed by a real database row.
+ *
+ * Deliberately does **not** require `is_synced`. A row created the moment the user drops an
+ * item is real and editable immediately; `is_synced` only becomes true once the sync has
+ * mirrored it to Google, which may be minutes later or never (Google may be unreachable, or
+ * not connected at all). Gating the drag / resize / edit paths on `is_synced` — as they all
+ * did — left a freshly-scheduled block un-draggable and un-editable for no reason.
+ *
+ * A positive `id` is the real test: synthetic overlays (active timers, legacy `scheduled-*`
+ * items, synthesised account meetings) all carry a negative or absent id.
+ */
+function isDbBackedActionItemEvent(e: CalendarEvent): boolean {
+  return e.calendar_id === "work_tracking" && !!e.agentpm_airtable_id && (e.id ?? 0) > 0;
 }
 
 /**
@@ -172,7 +214,7 @@ function toFullCalendarEvent(e: CalendarEvent, colors: ColorResolver): EventInpu
   const isWorkSession = e.calendar_id === "work_tracking";
   const isScheduled = e.google_event_id?.startsWith("scheduled-");
   const isScheduledReminder = isScheduledReminderEvent(e);
-  const isDbWorkTracking = isWorkSession && !!e.agentpm_airtable_id && e.is_synced;
+  const isDbWorkTracking = isDbBackedActionItemEvent(e);
   // Work sessions and reminders resolve through eventBaseColor too (as the
   // "action_item" / "reminder" types), so an important override applies to them.
   const resolved = eventBaseColor(e, colors);
@@ -211,7 +253,7 @@ function toFullCalendarEvent(e: CalendarEvent, colors: ColorResolver): EventInpu
 function isCommentableEvent(e: CalendarEvent): boolean {
   const uid = e.google_event_id || String(e.id);
   if (uid.startsWith("active-timer-") || uid.startsWith("scheduled-")) return false;
-  if (e.calendar_id === "work_tracking" && e.is_synced && !!e.agentpm_airtable_id) return false;
+  if (isDbBackedActionItemEvent(e)) return false;
   return true;
 }
 
@@ -228,6 +270,8 @@ interface EventDetailPanelProps {
   actionItem?: AirtableActionItem | null;
   onUpdateActionItem?: (patch: Partial<AirtableActionItem>) => void;
   onUpdateScheduleTime?: (newStart: string, newEnd: string) => void;
+  /** Opens the shared ActionItemModal for field editing instead of inline editors. */
+  onOpenActionItemModal?: (item: AirtableActionItem) => void;
   /** Save edits to an ordinary calendar event. Absent ⇒ the event is not editable. */
   onUpdateEvent?: (patch: EventDetailsPatch) => Promise<void>;
   /** Bumped by the context menu's Edit entry to open straight into the edit form. */
@@ -238,26 +282,33 @@ interface EventDetailPanelProps {
 
 /** The fields `PATCH /events/<pk>/details/` accepts from this panel. */
 type EventDetailsPatch = Partial<Pick<CalendarEvent,
-  "title" | "description" | "location" | "start_datetime" | "end_datetime" | "event_category">>;
+  "title" | "description" | "location" | "start_datetime" | "end_datetime" | "event_category" | "artifact_ids">>;
 
-function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAccount, onUnlink, onRemove, onDelete, onUpdateReminder, actionItem, onUpdateActionItem, onUpdateScheduleTime, onUpdateEvent, editRequestId, colors }: EventDetailPanelProps) {
-  const { status: statusOptions } = useActionItemFieldOptions();
+function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAccount, onUnlink, onRemove, onDelete, onUpdateReminder, actionItem, onUpdateActionItem, onUpdateScheduleTime, onOpenActionItemModal, onUpdateEvent, editRequestId, colors }: EventDetailPanelProps) {
   const [dropOver, setDropOver] = useState(false);
   const isWorkSession = event.calendar_id === "work_tracking";
-  const isScheduledReminder = !!event.google_event_id?.startsWith("scheduled-reminder-");
-  // Local synthetic: google_event_id starts with "scheduled-"
-  // DB-backed (synced back from Google): calendar_id is "work_tracking" + has agentpm_airtable_id
+  const isScheduledReminder = isScheduledReminderEvent(event);
+  // Two shapes: a real row (the normal case now), or the legacy `scheduled-*` synthetic still
+  // held by a tab whose localStorage has not been migrated yet.
   const isScheduledActionItem = !isScheduledReminder && (
     !!event.google_event_id?.startsWith("scheduled-") ||
-    (isWorkSession && !!event.agentpm_airtable_id && event.is_synced)
+    isDbBackedActionItemEvent(event)
   );
 
-  // Reminder edit state
-  const reminderIdFromUid = isScheduledReminder ? (() => {
-    const body = event.google_event_id!.slice("scheduled-reminder-".length);
-    const sep = body.lastIndexOf("__");
-    return parseInt(sep === -1 ? body : body.slice(0, sep), 10);
-  })() : null;
+  // Reminder edit state. A DB-backed row carries the Reminder FK directly; only the legacy
+  // synthetic has to be recovered by parsing its `scheduled-reminder-<id>__<startMin>` uid
+  // (where `google_event_id` on a real row is blank until the sync mirrors it, so parsing it
+  // would yield NaN and the edit form would silently PATCH nothing).
+  const reminderIdFromUid = !isScheduledReminder
+    ? null
+    : event.reminder ?? (() => {
+        const uid = event.google_event_id ?? "";
+        if (!uid.startsWith("scheduled-reminder-")) return null;
+        const body = uid.slice("scheduled-reminder-".length);
+        const sep = body.lastIndexOf("__");
+        const parsed = parseInt(sep === -1 ? body : body.slice(0, sep), 10);
+        return Number.isNaN(parsed) ? null : parsed;
+      })();
   const [editTitle, setEditTitle] = useState(event.title.replace(/^🔔\s*/, ""));
   const [editBody, setEditBody] = useState("");
   const [editDueAt, setEditDueAt] = useState(event.start_datetime.slice(0, 16));
@@ -371,9 +422,49 @@ function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAcc
     }
   }
 
-  // Action item inline edit state
+  // Artifacts linked to this event — only meaningful when an account is linked.
+  const [availableArtifacts, setAvailableArtifacts] = useState<AccountArtifact[]>([]);
+  const [showNewArtifactForm, setShowNewArtifactForm] = useState(false);
+  const [newArtifactName, setNewArtifactName] = useState("");
+  const [newArtifactUrl, setNewArtifactUrl] = useState("");
+  const [savingArtifact, setSavingArtifact] = useState(false);
+
+  useEffect(() => {
+    setAvailableArtifacts([]);
+    if (!linkedAccount) return;
+    accountsApi.listArtifacts(linkedAccount.accountId)
+      .then((res) => setAvailableArtifacts(Array.isArray(res.data) ? res.data : []))
+      .catch(() => {});
+  }, [linkedAccount]);
+
+  const toggleEventArtifact = async (id: number) => {
+    if (!onUpdateEvent) return;
+    const current = event.artifact_ids ?? [];
+    const next = current.includes(id) ? current.filter((x) => x !== id) : [...current, id];
+    await onUpdateEvent({ artifact_ids: next }).catch(() => {});
+  };
+
+  const handleCreateEventArtifact = async () => {
+    if (!linkedAccount || !onUpdateEvent || !newArtifactName.trim() || !newArtifactUrl.trim()) return;
+    setSavingArtifact(true);
+    try {
+      const res = await accountsApi.addArtifactLink(linkedAccount.accountId, newArtifactName.trim(), newArtifactUrl.trim());
+      const created = res.data;
+      setAvailableArtifacts((prev) => [...prev, created]);
+      await onUpdateEvent({ artifact_ids: [...(event.artifact_ids ?? []), created.id] }).catch(() => {});
+      setNewArtifactName("");
+      setNewArtifactUrl("");
+      setShowNewArtifactForm(false);
+    } catch {
+      // best-effort; the artifact simply won't appear
+    } finally {
+      setSavingArtifact(false);
+    }
+  };
+
+  // Scheduled-occurrence time edit state. Field editing has moved to ActionItemModal;
+  // this now only ever means "editing when this item sits on the calendar."
   const [aiEditing, setAiEditing] = useState(false);
-  const [aiForm, setAiForm] = useState<CalCreateForm | null>(null);
   const [aiSaving, setAiSaving] = useState(false);
   // Store as local "HH:MM" for the time inputs — derive from the Date so the
   // browser's timezone is applied rather than reading the raw UTC string.
@@ -386,22 +477,9 @@ function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAcc
     return `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;
   });
 
-  // Reset action item form when the selected item changes
+  // Reset the time fields when the selected item changes
   useEffect(() => {
     if (actionItem) {
-      setAiForm({
-        task: actionItem.task,
-        task_details: actionItem.task_details,
-        priority: actionItem.priority,
-        status: actionItem.status,
-        due_date: actionItem.due_date ?? "",
-        account_name: actionItem.account_name ?? "",
-        estimated_time: actionItem.estimated_time,
-        time_spent: actionItem.time_spent,
-        prep_time: actionItem.prep_time,
-        slack_thread_url: actionItem.slack_thread_url,
-        assignee_name: actionItem.assignee_name,
-      });
       const ds = new Date(event.start_datetime);
       const de = new Date(event.end_datetime);
       setAiStart(`${String(ds.getHours()).padStart(2,"0")}:${String(ds.getMinutes()).padStart(2,"0")}`);
@@ -411,23 +489,9 @@ function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAcc
   }, [actionItem?.airtable_id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function commitAiEdit() {
-    if (!aiForm || !actionItem || !onUpdateActionItem) return;
+    if (!actionItem) return;
     setAiSaving(true);
-    const patch: Partial<AirtableActionItem> = {};
-    if (aiForm.task !== actionItem.task) patch.task = aiForm.task;
-    if (aiForm.task_details !== actionItem.task_details) patch.task_details = aiForm.task_details;
-    if (aiForm.priority !== actionItem.priority) patch.priority = aiForm.priority;
-    if (aiForm.status !== actionItem.status) patch.status = aiForm.status;
-    if ((aiForm.due_date || null) !== actionItem.due_date) patch.due_date = aiForm.due_date || null;
-    if ((aiForm.account_name || null) !== actionItem.account_name) patch.account_name = aiForm.account_name || null;
-    if (aiForm.estimated_time !== actionItem.estimated_time) patch.estimated_time = aiForm.estimated_time;
-    if (aiForm.time_spent !== actionItem.time_spent) patch.time_spent = aiForm.time_spent;
-    if (aiForm.prep_time !== actionItem.prep_time) patch.prep_time = aiForm.prep_time;
-    if (aiForm.slack_thread_url !== actionItem.slack_thread_url) patch.slack_thread_url = aiForm.slack_thread_url;
-    if (aiForm.assignee_name !== actionItem.assignee_name) patch.assignee_name = aiForm.assignee_name;
-    if (Object.keys(patch).length > 0) onUpdateActionItem(patch);
 
-    // If the scheduled time changed, notify the parent to update localStorage + calendar state
     // Rebuild full local datetime strings using the event's local date + edited HH:MM
     const eventDate = new Date(event.start_datetime);
     const localDate = `${eventDate.getFullYear()}-${String(eventDate.getMonth()+1).padStart(2,"0")}-${String(eventDate.getDate()).padStart(2,"0")}`;
@@ -555,8 +619,8 @@ function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAcc
             />
           </div>
         </div>
-      ) : isScheduledActionItem && actionItem && aiForm ? (
-        /* ── Inline action item view / edit ── */
+      ) : isScheduledActionItem && actionItem ? (
+        /* ── Scheduled action item: read-only summary + time-only edit ── */
         <div className="flex-1 overflow-y-auto px-4 py-4 flex flex-col gap-3 text-sm">
           {/* Scheduled time — same single-line style in both read and edit mode */}
           <div className="flex items-center gap-1 text-[11px] text-[var(--twilio-gray-60)] uppercase tracking-wide flex-wrap" onDoubleClick={() => { if (!aiEditing) setAiEditing(true); }}>
@@ -603,82 +667,46 @@ function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAcc
             )}
           </div>
 
-          {aiEditing ? (
-            /* Edit mode */
-            <>
-              <input
-                autoFocus
-                value={aiForm.task}
-                onChange={(e) => setAiForm((f) => f && ({ ...f, task: e.target.value }))}
-                onKeyDown={(e) => { if (e.key === "Enter") void commitAiEdit(); if (e.key === "Escape") setAiEditing(false); }}
-                placeholder="Task name"
-                className="w-full text-sm font-medium text-[var(--twilio-navy)] rounded-md border border-indigo-300 bg-indigo-50 px-3 py-1.5 focus:outline-none focus:border-indigo-500 focus:bg-white transition-colors"
+          {/* Double-click anywhere below opens the shared Action Item modal for field editing */}
+          <div className="flex flex-col gap-3 cursor-default select-none" onDoubleClick={() => onOpenActionItemModal?.(actionItem)}>
+            <p className="text-[var(--twilio-navy)] font-medium leading-snug">{actionItem.task}</p>
+            {actionItem.task_details && (
+              <div
+                className="text-[var(--twilio-gray-80)] text-[13px] leading-relaxed prose prose-sm max-w-none"
+                dangerouslySetInnerHTML={{ __html: sanitizeHtml(plainToHtml(actionItem.task_details)) }}
               />
-              <RichTextMentionEditor
-                value={aiForm.task_details}
-                onChange={(html) => setAiForm((f) => f && ({ ...f, task_details: html }))}
-                placeholder="Details…"
-                minHeightClassName="min-h-[60px]"
-              />
-              <div className="flex flex-wrap gap-1.5">
-                <CalPillSelect value={aiForm.status} options={statusOptions as AirtableActionItem["status"][]} colorMap={STATUS_COLORS_CAL} placeholder="Status" onChange={(v) => setAiForm((f) => f && ({ ...f, status: v }))} />
-                <CalPillSelect value={aiForm.priority} options={["Critical","High","Medium","Low"] as const} colorMap={PRIORITY_COLORS_CAL} placeholder="Priority" onChange={(v) => setAiForm((f) => f && ({ ...f, priority: v }))} />
-                <CalPillDate value={aiForm.due_date} onChange={(v) => setAiForm((f) => f && ({ ...f, due_date: v }))} />
-              </div>
-              <div className="flex flex-wrap gap-1.5">
-                <CalPillNumber value={aiForm.estimated_time} label="Est." onChange={(v) => setAiForm((f) => f && ({ ...f, estimated_time: v }))} />
-                <CalPillNumber value={aiForm.time_spent} label="Spent" onChange={(v) => setAiForm((f) => f && ({ ...f, time_spent: v }))} />
-                <CalPillNumber value={aiForm.prep_time} label="Prep" onChange={(v) => setAiForm((f) => f && ({ ...f, prep_time: v }))} />
-              </div>
-              <input
-                value={aiForm.account_name ?? ""}
-                onChange={(e) => setAiForm((f) => f && ({ ...f, account_name: e.target.value }))}
-                placeholder="Account name…"
-                className="w-full text-xs rounded-md border border-gray-200 px-3 py-1.5 focus:outline-none focus:border-indigo-300 placeholder:text-gray-400"
-              />
-            </>
-          ) : (
-            /* Read mode — double-click anywhere to start editing */
-            <div className="flex flex-col gap-3 cursor-default select-none" onDoubleClick={() => setAiEditing(true)}>
-              <p className="text-[var(--twilio-navy)] font-medium leading-snug">{actionItem.task}</p>
-              {actionItem.task_details && (
-                <div
-                  className="text-[var(--twilio-gray-80)] text-[13px] leading-relaxed prose prose-sm max-w-none"
-                  dangerouslySetInnerHTML={{ __html: sanitizeHtml(plainToHtml(actionItem.task_details)) }}
-                />
+            )}
+            <div className="flex flex-wrap gap-1.5">
+              <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full ${STATUS_COLORS_CAL[actionItem.status] ?? "bg-gray-100 text-gray-700"}`}>{actionItem.status}</span>
+              <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full ${PRIORITY_COLORS_CAL[actionItem.priority] ?? "bg-gray-100 text-gray-600"}`}>{actionItem.priority}</span>
+              {actionItem.due_date && (
+                <span className="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-amber-50 text-amber-700">
+                  Due {new Date(actionItem.due_date).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
+                </span>
               )}
-              <div className="flex flex-wrap gap-1.5">
-                <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full ${STATUS_COLORS_CAL[actionItem.status] ?? "bg-gray-100 text-gray-700"}`}>{actionItem.status}</span>
-                <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full ${PRIORITY_COLORS_CAL[actionItem.priority] ?? "bg-gray-100 text-gray-600"}`}>{actionItem.priority}</span>
-                {actionItem.due_date && (
-                  <span className="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-amber-50 text-amber-700">
-                    Due {new Date(actionItem.due_date).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
-                  </span>
-                )}
-              </div>
-              <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-[var(--twilio-gray-60)]">
-                {actionItem.assignee_name && <span>→ {actionItem.assignee_name}</span>}
-                {actionItem.estimated_time > 0 && <span>{Math.round(actionItem.estimated_time / 60)}m est.</span>}
-                {actionItem.time_spent > 0 && <span>{Math.round(actionItem.time_spent / 60)}m spent</span>}
-              </div>
-              {/* Linked account — drag to link or shows current */}
-              <div className={["rounded-lg px-3 py-2 border-2 border-dashed transition-colors text-sm", dropOver ? "border-indigo-400 bg-indigo-50" : "border-gray-200"].join(" ")}>
-                {linkedAccount ? (
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="flex items-center gap-2 min-w-0">
-                      <CorporateIcon className="w-4 h-4 shrink-0 text-indigo-500" />
-                      <span className="font-medium text-[var(--twilio-navy)] truncate">{linkedAccount.accountName}</span>
-                    </div>
-                    {onUnlink && <button onClick={onUnlink} className="text-[var(--twilio-gray-60)] hover:text-red-500 text-xs shrink-0 transition-colors">✕</button>}
-                  </div>
-                ) : actionItem.account_name ? (
-                  <span className="text-[var(--twilio-navy)] text-[13px]">{actionItem.account_name}</span>
-                ) : (
-                  <p className="text-[var(--twilio-gray-60)] text-center text-xs">Drop an account here to link</p>
-                )}
-              </div>
             </div>
-          )}
+            <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-[var(--twilio-gray-60)]">
+              {actionItem.assignee_name && <span>→ {actionItem.assignee_name}</span>}
+              {actionItem.estimated_time > 0 && <span>{Math.round(actionItem.estimated_time / 60)}m est.</span>}
+              {actionItem.time_spent > 0 && <span>{Math.round(actionItem.time_spent / 60)}m spent</span>}
+            </div>
+            {/* Linked account — drag to link or shows current */}
+            <div className={["rounded-lg px-3 py-2 border-2 border-dashed transition-colors text-sm", dropOver ? "border-indigo-400 bg-indigo-50" : "border-gray-200"].join(" ")}>
+              {linkedAccount ? (
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <CorporateIcon className="w-4 h-4 shrink-0 text-indigo-500" />
+                    <span className="font-medium text-[var(--twilio-navy)] truncate">{linkedAccount.accountName}</span>
+                  </div>
+                  {onUnlink && <button onClick={onUnlink} className="text-[var(--twilio-gray-60)] hover:text-red-500 text-xs shrink-0 transition-colors">✕</button>}
+                </div>
+              ) : actionItem.account_name ? (
+                <span className="text-[var(--twilio-navy)] text-[13px]">{actionItem.account_name}</span>
+              ) : (
+                <p className="text-[var(--twilio-gray-60)] text-center text-xs">Drop an account here to link</p>
+              )}
+            </div>
+          </div>
         </div>
       ) : evEditing ? (
         <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3 text-sm" data-testid="event-edit-form">
@@ -839,6 +867,77 @@ function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAcc
               <p className="text-[var(--twilio-gray-60)] text-center">Drop an account here to link</p>
             )}
           </div>
+
+          {/* Artifacts — only when an account is linked to this event */}
+          {canEditEvent && linkedAccount && (
+            <div>
+              <p className="text-sm text-[var(--twilio-gray-60)] uppercase tracking-wide mb-1">Artifacts</p>
+              {availableArtifacts.length > 0 && (
+                <ul className="space-y-1 mb-2">
+                  {availableArtifacts.map((art) => (
+                    <li key={art.id}>
+                      <label className="flex items-center gap-2 px-2 py-1 rounded hover:bg-gray-50 cursor-pointer text-sm">
+                        <input
+                          type="checkbox"
+                          checked={(event.artifact_ids ?? []).includes(art.id)}
+                          onChange={() => void toggleEventArtifact(art.id)}
+                          className="rounded border-gray-300 text-indigo-500"
+                        />
+                        <span className="text-[var(--twilio-gray-80)] truncate flex-1">{art.name}</span>
+                      </label>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {!showNewArtifactForm ? (
+                <button
+                  type="button"
+                  onClick={() => setShowNewArtifactForm(true)}
+                  className="text-xs text-indigo-600 hover:text-indigo-800 font-medium"
+                >
+                  + New artifact
+                </button>
+              ) : (
+                <div className="border border-gray-100 rounded-lg p-2 space-y-1.5">
+                  <input
+                    type="text"
+                    placeholder="Artifact name"
+                    value={newArtifactName}
+                    onChange={(e) => setNewArtifactName(e.target.value)}
+                    className="w-full text-xs border border-gray-200 rounded px-2 py-1"
+                  />
+                  <input
+                    type="text"
+                    placeholder="https://…"
+                    value={newArtifactUrl}
+                    onChange={(e) => setNewArtifactUrl(e.target.value)}
+                    className="w-full text-xs border border-gray-200 rounded px-2 py-1"
+                  />
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      disabled={savingArtifact || !newArtifactName.trim() || !newArtifactUrl.trim()}
+                      onClick={() => void handleCreateEventArtifact()}
+                      className="text-xs px-2 py-1 rounded bg-indigo-600 text-white disabled:opacity-50"
+                    >
+                      {savingArtifact ? "Adding…" : "Add"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowNewArtifactForm(false);
+                        setNewArtifactName("");
+                        setNewArtifactUrl("");
+                      }}
+                      className="text-xs px-2 py-1 rounded text-gray-500 hover:text-gray-700"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -872,9 +971,9 @@ function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAcc
             </div>
           ) : (
             <button
-              onClick={() => setAiEditing(true)}
+              onClick={() => onOpenActionItemModal?.(actionItem)}
               className="w-full text-[12px] font-semibold py-2 rounded-lg border border-indigo-200 text-indigo-600 hover:bg-indigo-50 transition-colors"
-            >Edit action item</button>
+            >Open action item</button>
           )
         )}
         {canEditEvent && (
@@ -957,11 +1056,57 @@ const LOGGED_DATES_EVENT = "loggedDatesUpdated";
 
 // ── Event cache (sessionStorage) ──────────────────────────────────────────────
 // Avoids redundant API calls when navigating away and back, or paging through
-// weeks that were already fetched this session. TTL = 5 minutes.
+// weeks that were already fetched this session.
+//
+// Two TTLs, because the two kinds of week age differently. The current and future
+// weeks are still being edited — by this user, by Google, by a colleague — so they
+// go stale in 5 minutes. A week that has already ended does not change unless the
+// user explicitly syncs, and any sync clears the whole cache anyway (see
+// `bustEventCache`), so a finished week is cached for the rest of the session.
+//
+// This is what makes paging back through the last six weeks instant and stable
+// instead of re-requesting each week every five minutes.
 const EVENT_CACHE_TTL_MS = 5 * 60 * 1000;
+/** How far back the calendar keeps history warm. */
+export const HISTORY_WEEKS = 6;
+
+/**
+ * The local calendar day a range boundary falls on.
+ *
+ * `slice(0, 10)` alone is not safe here. FullCalendar hands over a local ISO string with
+ * an offset (`2026-09-20T00:00:00-07:00`), while the prewarm below builds its ranges with
+ * `toISOString()` (`2026-09-20T07:00:00Z`) — the same instant, and west of UTC the same
+ * leading 10 characters, but east of UTC the naive slice lands on different days and the
+ * prewarmed entry would never be read. Going through `Date` makes both spellings of one
+ * instant produce one key in every timezone.
+ */
+function localDayKey(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso.slice(0, 10);
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${d.getFullYear()}-${mm}-${dd}`;
+}
 
 function eventCacheKey(start: string, end: string): string {
-  return `calEvents::${start.slice(0, 10)}::${end.slice(0, 10)}`;
+  return `calEvents::${localDayKey(start)}::${localDayKey(end)}`;
+}
+
+/** Local midnight on the Sunday that starts the week containing `d`. */
+function startOfWeek(d: Date): Date {
+  const out = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  out.setDate(out.getDate() - out.getDay());
+  return out;
+}
+
+/**
+ * A range lies wholly in the past — it ends at or before the start of the current
+ * week — so nothing in it can still be changing on its own.
+ */
+function isHistoricalRange(end: string, now: Date = new Date()): boolean {
+  const endDate = new Date(end);
+  if (Number.isNaN(endDate.getTime())) return false;
+  return endDate.getTime() <= startOfWeek(now).getTime();
 }
 
 function readEventCache(start: string, end: string): CalendarEvent[] | null {
@@ -969,7 +1114,7 @@ function readEventCache(start: string, end: string): CalendarEvent[] | null {
     const raw = sessionStorage.getItem(eventCacheKey(start, end));
     if (!raw) return null;
     const { ts, data } = JSON.parse(raw) as { ts: number; data: CalendarEvent[] };
-    if (Date.now() - ts > EVENT_CACHE_TTL_MS) return null;
+    if (!isHistoricalRange(end) && Date.now() - ts > EVENT_CACHE_TTL_MS) return null;
     return data;
   } catch { return null; }
 }
@@ -1029,45 +1174,16 @@ function readScheduledItems(): ScheduledItem[] {
   } catch { return []; }
 }
 
-/** Returns false if a duplicate (same airtableId, overlapping time slot) already exists. */
-function saveScheduledItem(item: ScheduledItem): ScheduledItem | null {
-  try {
-    const existing = readScheduledItems();
-    // Block duplicate: same item already scheduled at the same start minute
-    const startMin = item.start.slice(0, 16); // "YYYY-MM-DDTHH:MM"
-    const duplicate = existing.find(
-      (i) => i.airtableId === item.airtableId && i.start.slice(0, 16) === startMin
-    );
-    if (duplicate) return null;
-    // Assign a stable uid so the FC event id doesn't change when start is updated
-    const uid = item.uid ?? `sched-${item.airtableId}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-    const saved = { ...item, uid };
-    // Allow same item on different times — just append (don't filter out prior entries)
-    existing.push(saved);
-    localStorage.setItem(SCHEDULED_ITEMS_KEY, JSON.stringify(existing));
-    window.dispatchEvent(new StorageEvent("storage", { key: SCHEDULED_ITEMS_KEY, newValue: JSON.stringify(existing) }));
-    return saved;
-  } catch {
-    return null;
-  }
-}
+// `saveScheduledItem` / `saveScheduledReminder` are gone. They wrote a scheduling to
+// localStorage and nowhere else, which is what let the Google sync destroy it — see
+// `lib/calendarScheduling.ts` for the replacement, which creates a real CalendarEvent row.
+// The readers below survive: they feed the one-time migration of any storage still holding
+// the old shape, and keep a not-yet-migrated tab rendering.
 
 interface ScheduledReminder { reminderId: number; title: string; start: string; end: string }
 
 function readScheduledReminders(): ScheduledReminder[] {
   try { return JSON.parse(localStorage.getItem(SCHEDULED_REMINDERS_KEY) ?? "[]"); } catch { return []; }
-}
-
-function saveScheduledReminder(item: ScheduledReminder): boolean {
-  try {
-    const existing = readScheduledReminders();
-    const startMin = item.start.slice(0, 16);
-    if (existing.find((i) => i.reminderId === item.reminderId && i.start.slice(0, 16) === startMin)) return false;
-    existing.push(item);
-    localStorage.setItem(SCHEDULED_REMINDERS_KEY, JSON.stringify(existing));
-    window.dispatchEvent(new StorageEvent("storage", { key: SCHEDULED_REMINDERS_KEY, newValue: JSON.stringify(existing) }));
-    return true;
-  } catch { return false; }
 }
 
 type CalCreateForm = {
@@ -1188,21 +1304,16 @@ function OccurrencesList({ airtableId }: { airtableId: string }) {
   );
 }
 
-function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onUpdate, onAccountDrop, accounts, teamMembers, forceExpand, accent }: {
+function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onOpenModal, onAccountDrop, accent }: {
   item: AirtableActionItem;
   onDragStart: (e: React.DragEvent) => void;
   onDelete: () => void;
   onReminderToggle: () => void;
-  onUpdate: (patch: Partial<AirtableActionItem>) => void;
+  onOpenModal: (item: AirtableActionItem) => void;
   onAccountDrop: (accountId: number, accountName: string) => void;
-  accounts: AirtableAccount[];
-  teamMembers: { id: number; full_name: string }[];
-  forceExpand?: boolean;
   /** The user's action-item color — the same one the grid paints scheduled items with. */
   accent: string;
 }) {
-  const { status: statusOptions } = useActionItemFieldOptions();
-  const [expanded, setExpanded] = useState(forceExpand ?? false);
   const [ctxPos, setCtxPos] = useState<{ x: number; y: number } | null>(null);
   const { isPinned, toggle: toggleFocusPin } = useFocusPins();
 
@@ -1210,211 +1321,16 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
   const canPin = !item.airtable_id.startsWith("local-");
   const isPinnedToFocus = canPin && isPinned(item.airtable_id);
 
-  useEffect(() => {
-    if (forceExpand) setExpanded(true);
-  }, [forceExpand]);
-  const [editForm, setEditForm] = useState<CalCreateForm>({
-    task: item.task,
-    task_details: item.task_details,
-    priority: item.priority,
-    status: item.status,
-    due_date: item.due_date ?? "",
-    account_name: item.account_name ?? "",
-    estimated_time: item.estimated_time,
-    time_spent: item.time_spent,
-    prep_time: item.prep_time,
-    slack_thread_url: item.slack_thread_url,
-    assignee_name: item.assignee_name,
-  });
-  const cardRef = useRef<HTMLDivElement>(null);
   const hasReminder = !!item.reminder_due_at;
   const [isAccountDropTarget, setIsAccountDropTarget] = useState(false);
 
-  // Sync editForm when item prop changes (e.g. after save)
-  useEffect(() => {
-    if (!expanded) {
-      setEditForm({
-        task: item.task,
-        task_details: item.task_details,
-        priority: item.priority,
-        status: item.status,
-        due_date: item.due_date ?? "",
-        account_name: item.account_name ?? "",
-        estimated_time: item.estimated_time,
-        time_spent: item.time_spent,
-        prep_time: item.prep_time,
-        slack_thread_url: item.slack_thread_url,
-        assignee_name: item.assignee_name,
-      });
-    }
-  }, [item, expanded]);
-
-  function commitEdit() {
-    if (!expanded) return;
-    setExpanded(false);
-    // Build patch of only changed fields
-    const patch: Partial<AirtableActionItem> = {};
-    if (editForm.task !== item.task) patch.task = editForm.task;
-    if (editForm.task_details !== item.task_details) patch.task_details = editForm.task_details;
-    if (editForm.priority !== item.priority) patch.priority = editForm.priority;
-    if (editForm.status !== item.status) patch.status = editForm.status;
-    if ((editForm.due_date || null) !== item.due_date) patch.due_date = editForm.due_date || null;
-    if ((editForm.account_name || null) !== item.account_name) patch.account_name = editForm.account_name || null;
-    if (editForm.estimated_time !== item.estimated_time) patch.estimated_time = editForm.estimated_time;
-    if (editForm.time_spent !== item.time_spent) patch.time_spent = editForm.time_spent;
-    if (editForm.prep_time !== item.prep_time) patch.prep_time = editForm.prep_time;
-    if (editForm.slack_thread_url !== item.slack_thread_url) patch.slack_thread_url = editForm.slack_thread_url;
-    if (editForm.assignee_name !== item.assignee_name) patch.assignee_name = editForm.assignee_name;
-    if (Object.keys(patch).length > 0) onUpdate(patch);
-  }
-
-  // Click-outside → commit
-  useEffect(() => {
-    if (!expanded) return;
-    function onPointerDown(e: PointerEvent) {
-      if (cardRef.current && !cardRef.current.contains(e.target as Node)) {
-        commitEdit();
-      }
-    }
-    document.addEventListener("pointerdown", onPointerDown);
-    return () => document.removeEventListener("pointerdown", onPointerDown);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [expanded, editForm]);
-
-  if (expanded) {
-    return (
-      <div
-        ref={cardRef}
-        className="rounded-lg select-none"
-        data-accent={accent}
-        style={{
-          background: tint(accent, SURFACE_TINT),
-          borderLeft: `3px solid ${accent}`,
-          padding: "8px 10px",
-          display: "flex",
-          flexDirection: "column",
-          gap: 6,
-          boxShadow: "0 2px 8px rgba(0,0,0,0.12)",
-        }}
-      >
-        {/* Task title */}
-        <input
-          autoFocus
-          value={editForm.task}
-          onChange={(e) => setEditForm((f) => ({ ...f, task: e.target.value }))}
-          onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); commitEdit(); } if (e.key === "Escape") { setExpanded(false); } }}
-          placeholder="Task name"
-          className="w-full text-[13px] font-medium text-[var(--twilio-navy)] bg-white rounded px-2 py-1 border border-indigo-300 focus:outline-none focus:border-indigo-500"
-        />
-
-        {/* Task details */}
-        <RichTextMentionEditor
-          value={editForm.task_details}
-          onChange={(html) => setEditForm((f) => ({ ...f, task_details: html }))}
-          placeholder="Details…"
-          minHeightClassName="min-h-[40px]"
-        />
-
-        {/* Status + Priority */}
-        <div className="flex flex-wrap gap-1.5">
-          <CalPillSelect
-            value={editForm.status}
-            options={statusOptions as AirtableActionItem["status"][]}
-            colorMap={STATUS_COLORS_CAL}
-            placeholder="Status"
-            onChange={(v) => setEditForm((f) => ({ ...f, status: v }))}
-          />
-          <CalPillSelect
-            value={editForm.priority}
-            options={["Critical", "High", "Medium", "Low"] as const}
-            colorMap={PRIORITY_COLORS_CAL}
-            placeholder="Priority"
-            onChange={(v) => setEditForm((f) => ({ ...f, priority: v }))}
-          />
-          <CalPillDate value={editForm.due_date} onChange={(v) => setEditForm((f) => ({ ...f, due_date: v }))} />
-        </div>
-
-        {/* Time fields + Slack */}
-        <div className="flex flex-wrap gap-1.5">
-          <CalPillNumber value={editForm.estimated_time} label="Est." onChange={(v) => setEditForm((f) => ({ ...f, estimated_time: v }))} />
-          <CalPillNumber value={editForm.time_spent} label="Spent" onChange={(v) => setEditForm((f) => ({ ...f, time_spent: v }))} />
-          <CalPillNumber value={editForm.prep_time} label="Prep" onChange={(v) => setEditForm((f) => ({ ...f, prep_time: v }))} />
-          <CalPillUrl value={editForm.slack_thread_url} onChange={(v) => setEditForm((f) => ({ ...f, slack_thread_url: v }))} />
-        </div>
-
-        {/* Account + Assignee */}
-        <div className="flex flex-wrap gap-1.5">
-          <CalPillSelect
-            value={(editForm.account_name || "No account") as string}
-            options={["No account", ...accounts.map((a) => a.name)] as string[]}
-            colorMap={{}}
-            placeholder="Account"
-            onChange={(v) => setEditForm((f) => ({ ...f, account_name: v === "No account" ? "" : v }))}
-          />
-          {teamMembers.length > 0 && (
-            <CalPillSelect
-              value={(editForm.assignee_name || "Unassigned") as string}
-              options={["Unassigned", ...teamMembers.map((m) => m.full_name)] as string[]}
-              colorMap={{}}
-              placeholder="Assignee"
-              onChange={(v) => setEditForm((f) => ({ ...f, assignee_name: v === "Unassigned" ? "" : v }))}
-            />
-          )}
-        </div>
-
-        {/* Footer: reminder + delete + done */}
-        <div className="flex items-center justify-between pt-0.5">
-          <div className="flex items-center gap-1.5">
-            <button
-              onClick={(e) => { e.stopPropagation(); onReminderToggle(); }}
-              title={hasReminder ? `Reminder: ${new Date(item.reminder_due_at!).toLocaleString()}` : "Set reminder"}
-              className="rounded p-0.5 hover:bg-gray-200 transition-colors"
-              style={{ color: hasReminder ? "#f59e0b" : "#9ca3af" }}
-            >
-              <svg viewBox="0 0 16 16" width="12" height="12" fill={hasReminder ? "currentColor" : "none"} stroke="currentColor" strokeWidth="1.5">
-                <path strokeLinecap="round" d="M8 1a5 5 0 00-5 5v2.5L1.5 10h13L13 8.5V6a5 5 0 00-5-5z"/>
-                <path strokeLinecap="round" d="M6.5 13a1.5 1.5 0 003 0"/>
-              </svg>
-            </button>
-            <button
-              onClick={(e) => { e.stopPropagation(); onDelete(); }}
-              title="Delete"
-              className="rounded p-0.5 hover:bg-red-100 transition-colors text-gray-400 hover:text-red-500"
-            >
-              <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
-                <path d="M3 3l10 10M13 3L3 13"/>
-              </svg>
-            </button>
-          </div>
-          <button
-            onClick={(e) => { e.stopPropagation(); commitEdit(); }}
-            className="text-[11px] font-semibold px-2.5 py-1 rounded-md bg-indigo-600 text-white hover:bg-indigo-700 transition-colors"
-          >
-            Done
-          </button>
-        </div>
-
-
-        {/* Checklist — the same component the modals use, so an action item reads the same
-            wherever it is opened. Real Airtable items only: steps key off the numeric PK. */}
-        {!item.airtable_id.startsWith("local-") && (
-          <div className="pt-2 mt-1 border-t border-violet-100">
-            <StepsPanel actionItemId={item.id} />
-          </div>
-        )}
-        <OccurrencesList airtableId={item.airtable_id} />
-      </div>
-    );
-  }
-
-  // ── Collapsed view ────────────────────────────────────────────────────────────
+  // ── Collapsed view — the only view. Editing fields opens the shared ActionItemModal. ──
   return (
     <>
     <div
-      ref={cardRef}
       draggable
       onDragStart={onDragStart}
-      onClick={() => setExpanded(true)}
+      onClick={() => onOpenModal(item)}
       onContextMenu={(e) => {
         if (!canPin) return;
         e.preventDefault();
@@ -1456,11 +1372,11 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
       {isPinnedToFocus && <FocusPinBadge />}
       {/* Row 1: badges + actions */}
       <div className="flex items-center gap-1.5 flex-wrap">
-        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded whitespace-nowrap ${PRIORITY_COLORS_CAL[editForm.priority] ?? "bg-gray-100 text-gray-600"}`}>{editForm.priority}</span>
-        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded whitespace-nowrap ${STATUS_COLORS_CAL[editForm.status] ?? "bg-gray-100 text-gray-700"}`}>{editForm.status}</span>
-        {editForm.due_date && (
+        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded whitespace-nowrap ${PRIORITY_COLORS_CAL[item.priority] ?? "bg-gray-100 text-gray-600"}`}>{item.priority}</span>
+        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded whitespace-nowrap ${STATUS_COLORS_CAL[item.status] ?? "bg-gray-100 text-gray-700"}`}>{item.status}</span>
+        {item.due_date && (
           <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded whitespace-nowrap bg-amber-50 text-amber-700">
-            {new Date(editForm.due_date).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
+            {new Date(item.due_date).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
           </span>
         )}
         <div className="ml-auto flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
@@ -1489,21 +1405,21 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
 
       {/* Row 2: task title */}
       <p className="text-[13px] font-medium text-[var(--twilio-navy)] leading-snug" style={{ overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" as const }}>
-        {editForm.task || <span className="italic opacity-40">Untitled</span>}
+        {item.task || <span className="italic opacity-40">Untitled</span>}
       </p>
 
       {/* Row 3: details + meta */}
-      {(editForm.task_details || editForm.assignee_name || editForm.account_name || editForm.estimated_time) ? (
+      {(item.task_details || item.assignee_name || item.account_name || item.estimated_time) ? (
         <div className="flex flex-col gap-0.5">
-          {editForm.task_details && (
+          {item.task_details && (
             <p className="text-[11px] text-[var(--twilio-navy)] opacity-60 leading-snug" style={{ overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" as const }}>
-              {htmlToPreviewText(editForm.task_details)}
+              {htmlToPreviewText(item.task_details)}
             </p>
           )}
           <div className="flex gap-2 flex-wrap">
-            {editForm.account_name && <span className="text-[10px] text-[var(--twilio-gray-60)]">{editForm.account_name}</span>}
-            {editForm.assignee_name && <span className="text-[10px] text-[var(--twilio-gray-60)]">{editForm.assignee_name}</span>}
-            {editForm.estimated_time ? <span className="text-[10px] text-[var(--twilio-gray-60)]">{editForm.estimated_time}m est.</span> : null}
+            {item.account_name && <span className="text-[10px] text-[var(--twilio-gray-60)]">{item.account_name}</span>}
+            {item.assignee_name && <span className="text-[10px] text-[var(--twilio-gray-60)]">{item.assignee_name}</span>}
+            {item.estimated_time ? <span className="text-[10px] text-[var(--twilio-gray-60)]">{item.estimated_time}m est.</span> : null}
           </div>
         </div>
       ) : null}
@@ -1531,12 +1447,14 @@ function ActionItemsSidebar({ expandItemId, colors }: { onDropToast?: (msg: stri
   const { status: statusOptions } = useActionItemFieldOptions();
   const [items, setItems] = useState<AirtableActionItem[]>([]);
   const [loading, setLoading] = useState(true);
-  const [forcedExpandId, setForcedExpandId] = useState<string | null>(expandItemId ?? null);
+  const [modalItem, setModalItem] = useState<AirtableActionItem | null>(null);
 
-  // When a new expandItemId is pushed in, adopt it
+  // A pushed-in expandItemId opens the shared modal for that item, once it has loaded.
   useEffect(() => {
-    if (expandItemId) setForcedExpandId(expandItemId);
-  }, [expandItemId]);
+    if (!expandItemId) return;
+    const match = items.find((i) => i.airtable_id === expandItemId);
+    if (match) setModalItem(match);
+  }, [expandItemId, items]);
   // Where each card sits — the first three sections are positional state, not status.
   const { trackingIds, stagedIds } = useActionItemZoneSets();
   const { pinnedIds } = useFocusPins();
@@ -1555,7 +1473,7 @@ function ActionItemsSidebar({ expandItemId, colors }: { onDropToast?: (msg: stri
 
   // Airtable accounts and team members for the create form
   const [accounts, setAccounts] = useState<AirtableAccount[]>([]);
-  const [teamMembers, setTeamMembers] = useState<{ id: number; full_name: string }[]>([]);
+  const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
 
   const fetchItems = () =>
     airtableApi
@@ -1581,22 +1499,21 @@ function ActionItemsSidebar({ expandItemId, colors }: { onDropToast?: (msg: stri
             window.dispatchEvent(new StorageEvent("storage", { key: "activeTimers", newValue: JSON.stringify(pruned) }));
           }
         } catch { /* best effort */ }
-        // Prune scheduledActionItems — remove any entry whose backing record no longer exists
-        try {
-          const scheduled = readScheduledItems();
-          const pruned = scheduled.filter((s) => liveIds.has(s.airtableId));
-          if (pruned.length !== scheduled.length) {
-            localStorage.setItem(SCHEDULED_ITEMS_KEY, JSON.stringify(pruned));
-            window.dispatchEvent(new StorageEvent("storage", { key: SCHEDULED_ITEMS_KEY, newValue: JSON.stringify(pruned) }));
-          }
-        } catch { /* best effort */ }
+        // Deliberately NOT pruning `scheduledActionItems` here — this was a second copy of the
+        // page-level prune removed above, and it caused the same loss. `liveIds` comes from a
+        // status-filtered fetch, so an action item the user marked Done fell out of it and every
+        // calendar block for that item was deleted. It also ran *before* the legacy migration,
+        // wiping the entries the migration exists to rescue.
+        //
+        // Schedulings are database rows now; deleting a genuinely-removed action item still
+        // cleans up its blocks through `handleDelete` below.
       })
       .catch(() => {})
       .finally(() => setLoading(false));
 
   useEffect(() => {
     void fetchItems();
-    airtableApi.listAccounts().then(({ data }) => setAccounts(data.results)).catch(() => {});
+    airtableApi.listAccounts({ page_size: "500" }).then(({ data }) => setAccounts(data.results)).catch(() => {});
     teamApi.listMembers().then(({ data }) => setTeamMembers(data.results)).catch(() => {});
   }, []);
 
@@ -1631,13 +1548,29 @@ function ActionItemsSidebar({ expandItemId, colors }: { onDropToast?: (msg: stri
 
   async function handleDelete(item: AirtableActionItem) {
     setItems((prev) => prev.filter((i) => i.airtable_id !== item.airtable_id));
-    // Remove all calendar occurrences for this item from localStorage
+    // Remove any legacy localStorage occurrences for this item.
     const pruned = readScheduledItems().filter((s) => s.airtableId !== item.airtable_id);
     localStorage.setItem(SCHEDULED_ITEMS_KEY, JSON.stringify(pruned));
     window.dispatchEvent(new StorageEvent("storage", { key: SCHEDULED_ITEMS_KEY, newValue: JSON.stringify(pruned) }));
     try {
       await airtableApi.deleteActionItem(item.id);
+      // Also delete the calendar rows for it. `agentpm_airtable_id` is a CharField, not a
+      // foreign key, so nothing cascades server-side — without this, deleting an action item
+      // leaves its scheduled blocks on the calendar pointing at a record that is gone.
+      //
+      // Deliberately only on an explicit delete: a *status* change (including Done) must never
+      // remove the record of when the work was scheduled. Conflating the two is what erased
+      // blocks before.
+      try {
+        const { data: rows } = await schedulerApi.listEvents({ agentpm_airtable_id: item.airtable_id });
+        await Promise.all(
+          rows
+            .filter((e) => e.calendar_id === "work_tracking")
+            .map((e) => schedulerApi.deleteEvent(e.id).catch(() => {})),
+        );
+      } catch { /* best effort — the action item is already gone */ }
       window.dispatchEvent(new StorageEvent("storage", { key: "actionItemsUpdated", newValue: "1" }));
+      window.dispatchEvent(new StorageEvent("storage", { key: "calendarUpdated", newValue: "1" }));
     } catch {
       setItems((prev) => [...prev, item]);
     }
@@ -1676,19 +1609,6 @@ function ActionItemsSidebar({ expandItemId, colors }: { onDropToast?: (msg: stri
       });
     } catch { /* best effort */ }
     setReminderItemId(null);
-  }
-
-  async function handleUpdate(item: AirtableActionItem, patch: Partial<AirtableActionItem>) {
-    // Optimistic update
-    setItems((prev) => prev.map((i) => i.airtable_id === item.airtable_id ? { ...i, ...patch } : i));
-    try {
-      await airtableApi.updateActionItemFields(item.airtable_id, patch);
-      logActionItemUpdate(item, patch);
-      window.dispatchEvent(new StorageEvent("storage", { key: "actionItemsUpdated", newValue: "1" }));
-    } catch {
-      // Revert on failure
-      setItems((prev) => prev.map((i) => i.airtable_id === item.airtable_id ? item : i));
-    }
   }
 
   async function handleCreate() {
@@ -1810,10 +1730,9 @@ function ActionItemsSidebar({ expandItemId, colors }: { onDropToast?: (msg: stri
                 <ActionItemCard_Cal
                   item={item}
                   accent={accent}
-                  forceExpand={forcedExpandId === item.airtable_id}
                   onDragStart={(e) => handleDragStart(e, item)}
                   onDelete={() => handleDelete(item)}
-                  onUpdate={(patch) => void handleUpdate(item, patch)}
+                  onOpenModal={(item) => setModalItem(item)}
                   onAccountDrop={(accountId, accountName) => {
                     setItems((prev) => prev.map((i) => i.airtable_id === item.airtable_id ? { ...i, account: accountId, account_name: accountName } : i));
                     airtableApi.updateActionItemFields(item.airtable_id, { account: accountId, account_name: accountName }).catch(() => {
@@ -1821,8 +1740,6 @@ function ActionItemsSidebar({ expandItemId, colors }: { onDropToast?: (msg: stri
                     });
                     window.dispatchEvent(new StorageEvent("storage", { key: "actionItemsUpdated", newValue: "1" }));
                   }}
-                  accounts={accounts}
-                  teamMembers={teamMembers}
                   onReminderToggle={() => {
                     if (reminderItemId === item.airtable_id) {
                       setReminderItemId(null);
@@ -1995,6 +1912,33 @@ function ActionItemsSidebar({ expandItemId, colors }: { onDropToast?: (msg: stri
             style={{ background: accent, color: readableTextColor(accent) }}
           >+ New Action Item</button>
         </div>
+      )}
+
+      {modalItem && (
+        <ActionItemModal
+          item={modalItem}
+          accountId={accounts.find((a) => a.name === modalItem.account_name)?.id}
+          teamMembers={teamMembers}
+          onClose={() => setModalItem(null)}
+          onUpdated={(updated: AirtableActionItem) => {
+            setItems((prev) => prev.map((i) => i.airtable_id === updated.airtable_id ? updated : i));
+            window.dispatchEvent(new StorageEvent("storage", { key: "actionItemsUpdated", newValue: "1" }));
+            setModalItem(null);
+          }}
+          onAutosaved={(updated: AirtableActionItem) => {
+            setItems((prev) => prev.map((i) => i.airtable_id === updated.airtable_id ? updated : i));
+          }}
+          onConverted={() => {
+            setItems((prev) => prev.map((i) => i.airtable_id === modalItem.airtable_id ? { ...i, status: "Done" } as AirtableActionItem : i));
+            window.dispatchEvent(new StorageEvent("storage", { key: "actionItemsUpdated", newValue: "1" }));
+            setModalItem(null);
+          }}
+          onDeleted={(id: number) => {
+            setItems((prev) => prev.filter((i) => i.id !== id));
+            window.dispatchEvent(new StorageEvent("storage", { key: "actionItemsUpdated", newValue: "1" }));
+            setModalItem(null);
+          }}
+        />
       )}
     </div>
   );
@@ -2375,9 +2319,8 @@ function fmtDecimalHours(secs: number): string {
 }
 
 /** Round minutes up to the nearest 15-minute increment. */
-function roundUpToQuarterHour(mins: number): number {
-  return Math.ceil(mins / 15) * 15;
-}
+// `roundUpToQuarterHour` now comes from lib/logWeek so the hours this panel displays
+// are computed by the same function the server writes with.
 
 interface LogTimeDayColumnProps {
   date: string;
@@ -2849,6 +2792,7 @@ function LogTimePanel({
   scheduledItems,
   weekStart,
   onExit,
+  onWeekLogged,
 }: {
   accountName: string;
   visibleDays: string[];
@@ -2857,6 +2801,8 @@ function LogTimePanel({
   scheduledItems: ScheduledItem[];
   weekStart: string;
   onExit: () => void;
+  /** Hands the week's report up so the page can show the unlogged-items warning. */
+  onWeekLogged: (report: WeekPlanReport) => void;
 }) {
   const lsKey = (suffix: string) => `logtime::${accountName}::${suffix}`;
   function lsGet<T>(suffix: string, fallback: T): T {
@@ -3153,37 +3099,81 @@ function LogTimePanel({
     setLoggedDays((prev) => { const next = new Set([...prev, `${date}::${projectSfId}`]); lsSet("loggedDays", [...next]); return next; });
   }
 
+  /**
+   * Collect what this panel would log, honouring the client-only state the server
+   * cannot see: per-event hour overrides, removed rows, and which project each item
+   * was dragged onto on a multi-project day.
+   *
+   * Pseudo-projects (`local-*` / `admin-pseudo-*`) are dropped — they have no Cloud
+   * Coach record to write to, and the per-day Log button already treats them as
+   * mark-only.
+   */
+  function collectWeekEntries(): LogWeekEntryInput[] {
+    const out: LogWeekEntryInput[] = [];
+    for (const date of days) {
+      const dayAssignments = assignmentsForDay(date);
+      const multi = dayAssignments.length > 1;
+      for (const a of dayAssignments) {
+        if (!isSalesforceId(a.project_sf_id)) continue;
+        if (loggedDays.has(`${date}::${a.project_sf_id}`)) continue;
+        const projSecs = secsForProject(date, a.id);
+        const minutes = roundUpToQuarterHour(Math.round(projSecs / 60));
+        if (minutes <= 0) continue;
+        const projEvents = multi
+          ? dayCalEvents(date).filter((e) => itemAssignments[`${date}::e::${e.id}`] === a.id)
+          : dayCalEvents(date);
+        const projItems = multi
+          ? dayActionItems(date).filter((i) => itemAssignments[`${date}::i::${i.airtable_id}`] === a.id)
+          : dayActionItems(date);
+        const titles = [...projEvents.map((e) => e.title), ...projItems.map((i) => i.task)];
+        out.push({
+          date,
+          project_sf_id: a.project_sf_id,
+          project_name: a.project_name,
+          minutes,
+          titles,
+          description: buildLogDescription(titles, minutes),
+        });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Log the week in a single request.
+   *
+   * This used to fire one POST per (day, project) — N parallel writes with no
+   * all-or-nothing guarantee and no report of what could not be logged. The server now
+   * resolves anything the panel could not (event → account → Cloud Coach project),
+   * writes the lot through Salesforce's Composite API, and returns the skip report the
+   * warning modal renders.
+   */
   async function handleLogWeek() {
     setWeekLogState("logging");
     try {
-      const promises: Promise<void>[] = [];
-      for (const date of days) {
-        const dayAssignments = assignmentsForDay(date);
-        const multi = dayAssignments.length > 1;
-        for (const a of dayAssignments) {
-          const key = `${date}::${a.project_sf_id}`;
-          if (loggedDays.has(key)) continue;
-          const projSecs = secsForProject(date, a.id);
-          const totalMins = roundUpToQuarterHour(Math.round(projSecs / 60));
-          if (totalMins <= 0) continue;
-          const projEvents = multi
-            ? dayCalEvents(date).filter((e) => itemAssignments[`${date}::e::${e.id}`] === a.id)
-            : dayCalEvents(date);
-          const projItems = multi
-            ? dayActionItems(date).filter((i) => itemAssignments[`${date}::i::${i.airtable_id}`] === a.id)
-            : dayActionItems(date);
-          const lines: string[] = [
-            ...projEvents.map((e) => e.title),
-            ...projItems.map((i) => i.task),
-            `Total: ${fmtDecimalHours(projSecs)} hrs`,
-          ];
-          promises.push(handleLogDay(date, a.project_sf_id, totalMins, lines.join("\n")));
+      const entries = collectWeekEntries();
+      const { data } = await salesforceApi.logWeek({
+        week_start: weekStart,
+        account_name: accountName,
+        // Only send entries when there are some. An empty array would read as "log
+        // nothing"; omitting it asks the server to resolve the week itself, which is
+        // what makes Log Week work before any project has been dragged onto a day.
+        ...(entries.length ? { entries } : {}),
+      });
+      onWeekLogged(data);
+      setLoggedDays((prev) => {
+        const next = new Set(prev);
+        for (const entry of data.written ?? data.entries) {
+          next.add(`${entry.date}::${entry.project_sf_id}`);
         }
-      }
-      await Promise.all(promises);
+        lsSet("loggedDays", [...next]);
+        return next;
+      });
       setWeekLogState("done");
       setTimeout(() => setWeekLogState("idle"), 3000);
     } catch {
+      // Leave the button usable — a failed week must be retryable, and the error
+      // banner is the app's existing channel for the reason.
       setWeekLogState("idle");
     }
   }
@@ -3322,7 +3312,11 @@ function LogTimePanel({
         </div>
         <button
           onClick={() => void handleLogWeek()}
-          disabled={weekLogState === "logging" || Object.keys(projectTotals).length === 0}
+          // No longer gated on having dragged a project onto a day: the server resolves
+          // event → account → Cloud Coach project on its own, and a week where nothing
+          // can be resolved answers with the warning modal explaining why, which is more
+          // use than a permanently disabled button.
+          disabled={weekLogState === "logging"}
           className={[
             "shrink-0 rounded-xl px-5 py-2 text-sm font-semibold transition-colors",
             weekLogState === "done"
@@ -3345,6 +3339,11 @@ export default function CalendarPage() {
   const [eventEditRequestId, setEventEditRequestId] = useState(0);
   const [meetingPanelCollapsed, setMeetingPanelCollapsed] = useState(false);
   const [, setIsLoading] = useState(true);
+  // Distinct from the (write-only) loading flag: this flips once the first events fetch has
+  // actually RESOLVED. `visibleRange` cannot serve here — `handleDatesSet` sets it
+  // synchronously while `fetchEvents` is still in flight, so gating the legacy migration on
+  // it ran the migration against an empty `eventsRef` and duplicated every row.
+  const [firstFetchDone, setFirstFetchDone] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
   const [showWeekends, setShowWeekends] = useState(false);
   const [userEmail, setUserEmail] = useState<string | null>(null);
@@ -3354,6 +3353,13 @@ export default function CalendarPage() {
 
   const [expandActionItemId, setExpandActionItemId] = useState<string | null>(null);
   const [selectedActionItem, setSelectedActionItem] = useState<AirtableActionItem | null>(null);
+  // The shared Action Item modal, opened from the event-detail panel's grid view instead of
+  // editing fields inline. Distinct from `selectedActionItem` (the panel's read-only summary).
+  const [gridModalItem, setGridModalItem] = useState<AirtableActionItem | null>(null);
+  const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
+  useEffect(() => {
+    teamApi.listMembers().then(({ data }) => setTeamMembers(data.results)).catch(() => {});
+  }, []);
 
   function openItemsPanel(tab: "action-items" | "reminders", expandId?: string) {
     setItemsTab(tab);
@@ -3399,6 +3405,14 @@ export default function CalendarPage() {
   const allAccountsRef = useRef<{ id: number; name: string }[]>([]);
   const [selectedAccountName, setSelectedAccountName] = useState<string | null>(null);
   const [logTimeModeAccount, setLogTimeModeAccount] = useState<string | null>(null);
+  // Log Time mode force-switches the main grid to the "accounts" content view, scoped to
+  // whichever account is being logged. Without restoring the prior view on close, the grid
+  // stays silently filtered to that one account's events after the panel is dismissed — it
+  // looks exactly like "the calendar items disappeared," with no request or error involved.
+  const preLogTimeViewRef = useRef<{ contentView: ContentView; selectedAccountName: string | null } | null>(null);
+  // The last Log Week report, held here rather than in the panel so the warning modal
+  // survives the panel being closed straight after logging.
+  const [weekLogReport, setWeekLogReport] = useState<WeekPlanReport | null>(null);
   // Attendance is NOT local state — it lives on CalendarEvent.attended so it
   // survives navigation and refresh. See didNotAttend() below.
   // Visible date range (ISO strings) tracked for daily totals footer
@@ -3454,7 +3468,9 @@ export default function CalendarPage() {
   // Eagerly load all accounts on mount so auto-linking works on the first drop
   useEffect(() => {
     if (allAccountsRef.current.length > 0) return;
-    Promise.all([airtableApi.listAccounts(), accountsApi.listAccounts()])
+    // Unpaginated (page_size 500): the default DRF page size (50) was silently
+    // truncating this list, which fed the Create Event modal's account picker.
+    Promise.all([airtableApi.listAccounts({ page_size: "500" }), accountsApi.listAccounts({ page_size: "500" })])
       .then(([atRes, appRes]) => {
         const atAccounts = (atRes.data.results as AirtableAccount[]).map((a) => ({ id: a.id, name: a.name }));
         const atNames = new Set(atAccounts.map((a) => a.name?.toLowerCase()));
@@ -3480,31 +3496,21 @@ export default function CalendarPage() {
           window.dispatchEvent(new StorageEvent("storage", { key: "activeTimers", newValue: JSON.stringify(pruned) }));
         }
       } catch { /* best effort */ }
-      // Prune scheduledActionItems — remove entries whose airtableId no longer exists
-      try {
-        const scheduled = readScheduledItems();
-        const pruned = scheduled.filter((s) => liveIds.has(s.airtableId));
-        if (pruned.length !== scheduled.length) {
-          localStorage.setItem(SCHEDULED_ITEMS_KEY, JSON.stringify(pruned));
-          setScheduledItems(pruned);
-          window.dispatchEvent(new StorageEvent("storage", { key: SCHEDULED_ITEMS_KEY, newValue: JSON.stringify(pruned) }));
-        }
-      } catch { /* best effort */ }
-    }).catch(() => {});
-    // Prune scheduledReminders against live reminder IDs from the API
-    schedulerApi.listReminders({ page_size: "500" }).then(({ data }) => {
-      const liveIds = new Set((data.results ?? []).map((r) => r.id));
-      try {
-        const scheduled = readScheduledReminders();
-        const pruned = scheduled.filter((s) => liveIds.has(s.reminderId));
-        if (pruned.length !== scheduled.length) {
-          localStorage.setItem(SCHEDULED_REMINDERS_KEY, JSON.stringify(pruned));
-          setScheduledReminders(pruned);
-          window.dispatchEvent(new StorageEvent("storage", { key: SCHEDULED_REMINDERS_KEY, newValue: JSON.stringify(pruned) }));
-        }
-      } catch { /* best effort */ }
+      // Deliberately NOT pruning scheduled action items / reminders here any more.
+      //
+      // This block used to drop every `scheduledActionItems` entry whose id was absent from
+      // the query above — and that query asks for "Open,In Progress,Blocked,Backlogged,
+      // Complete", which **omits Done**. So marking an action item Done silently erased every
+      // calendar block for it on the next page mount. (Observed in the activity log:
+      // reciLjmvsfVJX1k7V was marked Done at 18:33:03 and scheduled at 18:33:25, 22 seconds
+      // later; the scheduling was gone by the next visit.)
+      //
+      // Schedulings are database rows now, so there is no client-side list to prune: a row
+      // whose action item is genuinely deleted is cleaned up server-side, and "Done" is a
+      // status, not a reason to destroy the record of when the work was scheduled.
     }).catch(() => {});
   }, []);
+
 
   const [loggedDates, setLoggedDates] = useState<Set<string>>(() => readLoggedDates());
 
@@ -3626,10 +3632,144 @@ export default function CalendarPage() {
         // Silently degrade — calendar shows empty.
       } finally {
         setIsLoading(false);
+        setFirstFetchDone(true);
       }
     },
     []
   );
+
+  /** Re-read the visible range from the DB, busting the session cache first. */
+  const refetchVisibleRange = useCallback(async () => {
+    bustEventCache();
+    const api = calendarRef.current?.getApi();
+    if (!api) return;
+    const { activeStart, activeEnd } = api.view;
+    await fetchEvents(activeStart.toISOString(), activeEnd.toISOString(), { bustCache: true });
+  }, [fetchEvents]);
+
+  /**
+   * Persist a dropped action item as a real `CalendarEvent`, then refresh the grid.
+   *
+   * The single write path for all three drop surfaces (FullCalendar's own `drop`, the
+   * hand-rolled timegrid drop listener, and "create an action item from the + modal"), so the
+   * duplicate rule, the toast wording, the activity-log line and the account link cannot
+   * diverge between them.
+   *
+   * Replaces `saveScheduledItem`, which wrote to `localStorage` only. A scheduling that lived
+   * nowhere but the browser is what the Google sync then deleted; see `lib/calendarScheduling.ts`.
+   *
+   * A failure is surfaced, never swallowed: the user has to know the block was not saved,
+   * because silence is exactly how the original bug presented.
+   */
+  const persistScheduledActionItem = useCallback(async (input: {
+    airtableId: string;
+    task: string;
+    accountName?: string | null;
+    start: string;
+    end: string;
+  }): Promise<CalendarEvent | null> => {
+    const { airtableId, task, accountName, start, end } = input;
+    const label = new Date(start).toLocaleString(undefined, {
+      weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
+    });
+
+    if (hasActionItemAt(eventsRef.current, airtableId, start)) {
+      setDropToast({ msg: "Already scheduled at that time", type: "warn" });
+      setTimeout(() => setDropToast(null), 3000);
+      return null;
+    }
+
+    let created: CalendarEvent;
+    try {
+      created = await scheduleActionItem({ airtableId, task, start, end, accountName });
+    } catch {
+      setDropToast({ msg: "Could not add to the calendar — nothing was saved", type: "warn" });
+      setTimeout(() => setDropToast(null), 4000);
+      return null;
+    }
+
+    setDropToast({ msg: `Scheduled for ${label}`, type: "success" });
+    setTimeout(() => setDropToast(null), 3000);
+    addLog({
+      category: "calendar",
+      message: `"${task}" added to calendar for ${label}${accountName ? ` (${accountName})` : ""}`,
+      links: [{ label: "View calendar", path: "/calendar" }],
+      resource: { type: "action_item", id: airtableId },
+    });
+
+    // `perform_create` auto-links the account server-side from the action item, but the grid's
+    // faded backgrounds read `eventAccountLinks`, so mirror it under the row's own uid — which
+    // is now the numeric id, not the old synthetic `scheduled-*` string.
+    if (accountName) {
+      const match = allAccountsRef.current.find(
+        (a) => a.name.toLowerCase() === accountName.toLowerCase()
+      );
+      if (match) linkEventToAccountRef.current(match.id, match.name, String(created.id));
+    }
+
+    await refetchVisibleRange();
+    window.dispatchEvent(new StorageEvent("storage", { key: "calendarUpdated", newValue: "1" }));
+    return created;
+  }, [refetchVisibleRange]);
+
+  /** Persist a dropped reminder occurrence. Same contract as the action-item helper. */
+  const persistScheduledReminder = useCallback(async (input: {
+    reminderId: number;
+    title: string;
+    start: string;
+    end?: string;
+  }): Promise<CalendarEvent | null> => {
+    if (hasReminderAt(eventsRef.current, input.reminderId, input.start)) {
+      setDropToast({ msg: "Already scheduled at that time", type: "warn" });
+      setTimeout(() => setDropToast(null), 3000);
+      return null;
+    }
+    let created: CalendarEvent;
+    try {
+      created = await scheduleReminder(input);
+    } catch {
+      setDropToast({ msg: "Could not add the reminder — nothing was saved", type: "warn" });
+      setTimeout(() => setDropToast(null), 4000);
+      return null;
+    }
+    const label = new Date(input.start).toLocaleString(undefined, {
+      weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
+    });
+    setDropToast({ msg: `Reminder scheduled for ${label}`, type: "success" });
+    setTimeout(() => setDropToast(null), 3000);
+    await refetchVisibleRange();
+    window.dispatchEvent(new StorageEvent("storage", { key: "calendarUpdated", newValue: "1" }));
+    return created;
+  }, [refetchVisibleRange]);
+
+  // On mount: move any surviving localStorage-only schedulings into the database.
+  //
+  // A one-time migration for tabs still holding the old representation. Gated on
+  // `firstFetchDone` so `eventsRef.current` is populated and duplicate detection is
+  // meaningful — see that flag's declaration for why `visibleRange` cannot be used.
+  //
+  // The storage key is cleared only when every entry is accounted for; see
+  // `migrateLegacyScheduledItems`. Clearing on partial success is the bug being undone.
+  const legacyMigrationRunRef = useRef(false);
+  useEffect(() => {
+    if (legacyMigrationRunRef.current || !firstFetchDone) return;
+    legacyMigrationRunRef.current = true;
+    void migrateLegacyScheduledItems(eventsRef.current).then((result) => {
+      if (result.created > 0) {
+        setScheduledItems(readScheduledItems());
+        setScheduledReminders(readScheduledReminders());
+        void refetchVisibleRange();
+      }
+    });
+  }, [firstFetchDone, refetchVisibleRange]);
+
+  // The drop handlers below are `useCallback(..., [])` (they are attached to native listeners
+  // that must not be re-bound on every render), so they reach these through refs rather than
+  // taking them as dependencies — the same pattern `linkEventToAccountRef` already uses.
+  const persistScheduledActionItemRef = useRef(persistScheduledActionItem);
+  persistScheduledActionItemRef.current = persistScheduledActionItem;
+  const persistScheduledReminderRef = useRef(persistScheduledReminder);
+  persistScheduledReminderRef.current = persistScheduledReminder;
 
   const [currentView, setCurrentView] = useState<string>("timeGridWeek");
 
@@ -3651,6 +3791,47 @@ export default function CalendarPage() {
     }
   }, [events, visibleRange]);
 
+  // Warm the last HISTORY_WEEKS weeks into the session cache once, after the first
+  // fetch has landed.
+  //
+  // Paging back used to mean a request per week, each of which the 5-minute TTL would
+  // then throw away — so a user scrolling back through six weeks paid for them again on
+  // the way forward. These are finished weeks and cannot change without a sync, so one
+  // request each buys the whole session.
+  //
+  // Deliberately sequential, not Promise.all: this is speculative background work and
+  // has no business competing with the visible week for the concurrency budget (six
+  // parallel requests is exactly the fan-out shape that produced this repo's 429s).
+  // Any week already cached is skipped, so this is a no-op on a warm session.
+  const historyPrewarmedRef = useRef(false);
+  useEffect(() => {
+    if (historyPrewarmedRef.current || !firstFetchDone) return;
+    historyPrewarmedRef.current = true;
+
+    let cancelled = false;
+    void (async () => {
+      const thisWeek = startOfWeek(new Date());
+      for (let i = 1; i <= HISTORY_WEEKS; i++) {
+        if (cancelled) return;
+        const start = new Date(thisWeek);
+        start.setDate(start.getDate() - 7 * i);
+        const end = new Date(start);
+        end.setDate(end.getDate() + 7);
+        const startIso = start.toISOString();
+        const endIso = end.toISOString();
+        if (readEventCache(startIso, endIso)) continue;
+        try {
+          const { data } = await schedulerApi.listEvents({ start: startIso, end: endIso });
+          if (cancelled) return;
+          writeEventCache(startIso, endIso, data);
+        } catch {
+          // Best effort: a failed prewarm just means that week fetches on demand.
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [firstFetchDone]);
+
   const handleEventClick = useCallback(
     (info: EventClickArg) => {
       // Resolve to the DB row up front: extendedProps has no `id`, so a panel opened
@@ -3667,7 +3848,7 @@ export default function CalendarPage() {
 
       // Scheduled action item — fetch the backing Airtable record for inline edit
       const isLocalScheduledAI = uid.startsWith("scheduled-") && !uid.startsWith("scheduled-reminder-");
-      const isDbBackedWorkAI = extProps.calendar_id === "work_tracking" && !!extProps.agentpm_airtable_id && extProps.is_synced;
+      const isDbBackedWorkAI = isDbBackedActionItemEvent(extProps);
       const isScheduledAI = isLocalScheduledAI || isDbBackedWorkAI;
       if (isScheduledAI) {
         let airtableId: string;
@@ -3788,7 +3969,7 @@ export default function CalendarPage() {
   const saveEventDetails = useCallback(async (
     ev: CalendarEvent,
     patch: Partial<Pick<CalendarEvent,
-      "title" | "description" | "location" | "start_datetime" | "end_datetime" | "event_category">>,
+      "title" | "description" | "location" | "start_datetime" | "end_datetime" | "event_category" | "artifact_ids">>,
   ) => {
     const row = resolveEventRow(ev);
     const pk = row.id;
@@ -3817,6 +3998,13 @@ export default function CalendarPage() {
       setSelectedEvent((prev) => (prev && matches(prev) ? { ...prev, ...previous } : prev));
       reportError("Could not save the event. Please try again.");
       throw err;
+    } finally {
+      // Releasing the latch is not optional. It gates `fetchEvents` from writing ANY
+      // result into state, so leaving it set makes every later week-navigation resolve
+      // its request and then discard the response — the calendar silently renders the
+      // week it was on when the edit happened, for the rest of the session. `finally`,
+      // not a tail assignment, because this function re-throws on failure.
+      localMutationRef.current = false;
     }
   }, [resolveEventRow, reportError]);
 
@@ -3894,6 +4082,9 @@ export default function CalendarPage() {
       setEvents((prev) => prev.map((e) => (matches(e) ? { ...e, attended: reverted } : e)));
       setSelectedEvent((prev) => (prev && matches(prev) ? { ...prev, attended: reverted } : prev));
       reportError("Could not save attendance. Please try again.");
+    } finally {
+      // See saveEventDetails: an unreleased latch blanks every subsequent week.
+      localMutationRef.current = false;
     }
   }, [reportError]);
 
@@ -3914,7 +4105,7 @@ export default function CalendarPage() {
     setNewEventDraft(blankNewEventDraft({ start: toLocalISO(start), end: toLocalISO(end) }));
     // Eagerly load accounts the first time the modal opens
     if (allAccountsRef.current.length === 0) {
-      Promise.all([airtableApi.listAccounts(), accountsApi.listAccounts()])
+      Promise.all([airtableApi.listAccounts({ page_size: "500" }), accountsApi.listAccounts({ page_size: "500" })])
         .then(([atRes, appRes]) => {
           const atAccounts = (atRes.data.results as AirtableAccount[]).map((a) => ({ id: a.id, name: a.name }));
           const atNames = new Set(atAccounts.map((a) => a.name?.toLowerCase()));
@@ -3972,14 +4163,19 @@ export default function CalendarPage() {
           account_name: draft.selectedAccount?.name ?? null,
           estimated_time: Math.round((new Date(draft.end).getTime() - new Date(draft.start).getTime()) / 60000),
         });
-        saveScheduledItem({ airtableId: newItem.airtable_id, task: newItem.task, accountName: newItem.account_name, start: draft.start, end: draft.end });
-        setScheduledItems(readScheduledItems());
-        // Add account link so the tile shows the account name immediately
-        if (draft.selectedAccount) {
-          const scheduledUid = `scheduled-${newItem.airtable_id}__${draft.start.slice(0, 16)}`;
+        const scheduled = await persistScheduledActionItem({
+          airtableId: newItem.airtable_id,
+          task: newItem.task,
+          accountName: newItem.account_name,
+          start: draft.start,
+          end: draft.end,
+        });
+        // Add account link so the tile shows the account name immediately. Keyed by the row's
+        // numeric id now that the row is real, not the old synthetic `scheduled-*` uid.
+        if (draft.selectedAccount && scheduled) {
           setEventAccountLinks((prev) => {
             const next = new Map(prev);
-            next.set(scheduledUid, { accountId: draft.selectedAccount!.id, accountName: draft.selectedAccount!.name });
+            next.set(String(scheduled.id), { accountId: draft.selectedAccount!.id, accountName: draft.selectedAccount!.name });
             return next;
           });
         }
@@ -4000,6 +4196,7 @@ export default function CalendarPage() {
             attendees,
             meet_link: meetLink,
             event_category: draft.category,
+            artifact_ids: draft.linkedArtifactIds,
           });
           setEvents((prev) => [...prev, created.data]);
           if (draft.selectedAccount) {
@@ -4072,31 +4269,8 @@ export default function CalendarPage() {
     const localStr = info.dateStr.includes("T") ? info.dateStr.slice(0, 19) : `${info.dateStr}T09:00:00`;
     const start = toLocalISO(localStr);
     const end = addMsToLocalISO(localStr, 15 * 60 * 1000);
-    const saved = saveScheduledItem({ airtableId, task, accountName, start, end });
-
-    if (saved) {
-      const label = new Date(start).toLocaleString(undefined, { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
-      setDropToast({ msg: `Scheduled for ${label}`, type: "success" });
-      addLog({
-        category: "calendar",
-        message: `"${task}" added to calendar for ${label}${accountName ? ` (${accountName})` : ""}`,
-        links: [{ label: "View calendar", path: "/calendar" }],
-        resource: { type: "action_item", id: airtableId },
-      });
-      // Auto-link the account so SF projects appear without a manual drag
-      if (accountName && saved.uid) {
-        const eventUid = `scheduled-${airtableId}__${start.slice(0, 16)}`;
-        const match = allAccountsRef.current.find(
-          (a) => a.name.toLowerCase() === accountName.toLowerCase()
-        );
-        if (match) {
-          linkEventToAccountRef.current(match.id, match.name, eventUid);
-        }
-      }
-    } else {
-      setDropToast({ msg: "Already scheduled at that time", type: "warn" });
-    }
-    setTimeout(() => setDropToast(null), 3000);
+    // Writes a real CalendarEvent row (and owns the toast, log line and account link).
+    void persistScheduledActionItemRef.current({ airtableId, task, accountName, start, end });
   }, []);
 
   // Parse "scheduled-{airtableId}__{startMin}" → { airtableId, startMin }
@@ -4166,7 +4340,7 @@ export default function CalendarPage() {
       return;
     }
     // DB-backed synced action item — persist updated times to the DB + Airtable due_date
-    if (ev.calendar_id === "work_tracking" && ev.agentpm_airtable_id && ev.is_synced) {
+    if (isDbBackedActionItemEvent(ev)) {
       localMutationRef.current = true;
       setEvents((prev) => prev.map((e) => e.google_event_id === uid ? { ...e, start_datetime: newStart, end_datetime: newEnd } : e));
       setSelectedEvent((prev) => prev?.google_event_id === uid ? { ...prev, start_datetime: newStart, end_datetime: newEnd } : prev);
@@ -4225,7 +4399,7 @@ export default function CalendarPage() {
       return;
     }
     // DB-backed synced action item — persist updated times to the DB + Airtable due_date
-    if (ev.calendar_id === "work_tracking" && ev.agentpm_airtable_id && ev.is_synced) {
+    if (isDbBackedActionItemEvent(ev)) {
       localMutationRef.current = true;
       setEvents((prev) => prev.map((e) => e.google_event_id === uid ? { ...e, start_datetime: newStart, end_datetime: newEnd } : e));
       setSelectedEvent((prev) => prev?.google_event_id === uid ? { ...prev, start_datetime: newStart, end_datetime: newEnd } : prev);
@@ -4357,13 +4531,20 @@ export default function CalendarPage() {
         }
       } catch { /* best effort */ }
     } else {
-      // DB-backed work-tracking event (real Google event ID) — delete from DB
-      const ev = eventsRef.current.find((e) => e.google_event_id === uid);
+      // DB-backed work-tracking event or scheduled reminder — delete the row.
+      //
+      // Matched by numeric id as well as `google_event_id`: a row created by dropping an item
+      // has a BLANK google_event_id until the sync mirrors it, and `eventUid()` falls back to
+      // `String(e.id)` for exactly that case. Looking up by google_event_id alone meant
+      // "Remove from calendar" silently did nothing on a freshly-scheduled block.
+      const ev = eventsRef.current.find(
+        (e) => (e.google_event_id && e.google_event_id === uid) || String(e.id) === uid
+      );
       if (ev) {
         const durationSecs = ev.agentpm_airtable_id
           ? Math.round((new Date(ev.end_datetime).getTime() - new Date(ev.start_datetime).getTime()) / 1000)
           : 0;
-        setEvents((prev) => prev.filter((e) => e.google_event_id !== uid));
+        setEvents((prev) => prev.filter((e) => e.id !== ev.id));
         schedulerApi.deleteEvent(ev.id).catch(() => {});
         // Tell ActionItemsPage to subtract this session's duration from the timer display
         if (ev.agentpm_airtable_id && durationSecs > 0) {
@@ -4630,14 +4811,7 @@ export default function CalendarPage() {
         }
 
         const start = `${dropDate}T${String(dropHour).padStart(2, "0")}:${String(dropMinute).padStart(2, "0")}:00`;
-        const saved = saveScheduledReminder({ reminderId, title, start, end: start });
-        if (saved) {
-          const label = new Date(start).toLocaleString(undefined, { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
-          setDropToast({ msg: `Reminder scheduled for ${label}`, type: "success" });
-        } else {
-          setDropToast({ msg: "Already scheduled at that time", type: "warn" });
-        }
-        setTimeout(() => setDropToast(null), 3000);
+        void persistScheduledReminderRef.current({ reminderId, title, start });
         return;
       }
 
@@ -4693,30 +4867,7 @@ export default function CalendarPage() {
       const start = toLocalISO(localStr);
       const end = addMsToLocalISO(localStr, durationMs);
 
-      const saved = saveScheduledItem({ airtableId, task, accountName, start, end });
-      if (saved) {
-        const label = new Date(start).toLocaleString(undefined, { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
-        setDropToast({ msg: `Scheduled for ${label}`, type: "success" });
-        addLog({
-          category: "calendar",
-          message: `"${task}" added to calendar for ${label}${accountName ? ` (${accountName})` : ""}`,
-          links: [{ label: "View calendar", path: "/calendar" }],
-          resource: { type: "action_item", id: airtableId },
-        });
-        // Auto-link the account so SF projects appear without a manual drag
-        if (accountName && saved.uid) {
-          const eventUid = `scheduled-${airtableId}__${start.slice(0, 16)}`;
-          const match = allAccountsRef.current.find(
-            (a) => a.name.toLowerCase() === accountName.toLowerCase()
-          );
-          if (match) {
-            linkEventToAccountRef.current(match.id, match.name, eventUid);
-          }
-        }
-      } else {
-        setDropToast({ msg: "Already scheduled at that time", type: "warn" });
-      }
-      setTimeout(() => setDropToast(null), 3000);
+      void persistScheduledActionItemRef.current({ airtableId, task, accountName, start, end });
     }
 
     // Attach to the timegrid body so drops anywhere on the grid are captured
@@ -4752,107 +4903,24 @@ export default function CalendarPage() {
       setTimeout(() => setDropToast(null), 4000);
     };
     try {
-      // ── Step 1: Push scheduled action items to Google FIRST so that the
-      // pull in step 2 can bring them back as proper DB records in this same
-      // sync cycle (avoids duplicates on subsequent syncs).
+      // Sync, then re-read the range. That is the whole operation now.
       //
-      // Skip items that are already represented as synced DB records in the
-      // current eventsRef — they don't need to be pushed again.
-      const alreadySyncedAirtableIds = new Set(
-        eventsRef.current
-          .filter((e) => e.is_synced && e.agentpm_airtable_id)
-          .map((e) => e.agentpm_airtable_id)
-      );
-      const currentItems = readScheduledItems().filter(
-        // Skip if already pushed to Google (has a googleEventId) OR already
-        // visible as a synced DB record in the current view range. This prevents
-        // double-pushing when the original push happened outside the visible week.
-        (s) => !s.googleEventId && !alreadySyncedAirtableIds.has(s.airtableId)
-      );
-
-      if (currentItems.length > 0) {
-        let pushData: { results: Array<{ airtableId: string; start: string; googleEventId: string }> } | null = null;
-        try {
-          const resp = await integrationsApi.pushActionItemsToGoogle(
-            currentItems.map((s) => ({
-              airtableId: s.airtableId,
-              start: s.start,
-              end: s.end,
-              task: s.task,
-              accountName: s.accountName ?? undefined,
-              googleEventId: s.googleEventId,
-            }))
-          );
-          pushData = resp.data;
-        } catch (pushErr) {
-          console.error("[Sync] Push API call failed:", pushErr);
-          showToast("Push to Google Calendar failed — check console", "warn");
-        }
-
-        if (pushData?.results?.length) {
-          const newlySynced = pushData.results.filter((r) => r.googleEventId);
-          const failed = pushData.results.filter((r) => !r.googleEventId).length;
-          if (failed > 0) console.warn("[Sync] Push failed for", failed, "item(s)");
-          if (newlySynced.length > 0) showToast(`Synced ${newlySynced.length} action item${newlySynced.length > 1 ? "s" : ""} to Google Calendar`, "success");
-          if (failed > 0 && newlySynced.length === 0) showToast(`Failed to push ${failed} action item${failed > 1 ? "s" : ""} to Google Calendar`, "warn");
-
-          // Persist returned Google event IDs, then immediately prune items that
-          // now have a googleEventId (they're synced regardless of visible range).
-          const idMap = new Map(pushData.results.map((r) => [`${r.airtableId}__${r.start.slice(0, 16)}`, r.googleEventId]));
-          const syncedGoogleIds = new Set(newlySynced.map((r) => r.googleEventId));
-          const afterPush = readScheduledItems()
-            .map((s) => {
-              const key = `${s.airtableId}__${s.start.slice(0, 16)}`;
-              const gid = idMap.get(key);
-              if (gid === undefined) return s;
-              if (gid === "") return { ...s, googleEventId: undefined };
-              return { ...s, googleEventId: gid };
-            })
-            // Remove items whose google event was just confirmed — they'll come
-            // back as proper DB records after the pull in Step 2.
-            .filter((s) => !s.googleEventId || !syncedGoogleIds.has(s.googleEventId));
-          localStorage.setItem(SCHEDULED_ITEMS_KEY, JSON.stringify(afterPush));
-          setScheduledItems(afterPush);
-          window.dispatchEvent(new StorageEvent("storage", { key: SCHEDULED_ITEMS_KEY, newValue: JSON.stringify(afterPush) }));
-        }
-      }
-
-      // ── Step 2: Pull Google Calendar → Django DB. Because we pushed first,
-      // action items we just created in Google are now included in this pull
-      // and will land as is_synced=true DB records.
+      // This used to be a four-step push-then-prune dance, and it was the bug behind
+      // "Sync Google Calendar removed the action items I had added":
+      //
+      //   Step 1 pushed `scheduledActionItems` (a localStorage-only representation) to
+      //   Google and then DELETED those entries, on the assumption that Step 2's pull would
+      //   bring each one back as a database row. Step 4 pruned anything left over by
+      //   `airtableId`. When the round trip did not complete — and it could not for a second
+      //   occurrence of an action item, because the push view deduped on `airtableId` alone
+      //   and answered with the FIRST occurrence's Google id — the scheduling was deleted
+      //   from the only place it had ever existed.
+      //
+      // Scheduling now writes a real `CalendarEvent` up front (lib/calendarScheduling.ts) and
+      // the server mirrors it to Google in the sync's own PHASE 1b, so there is nothing here
+      // for the client to push and, crucially, nothing for it to delete.
       await integrationsApi.syncGoogleCalendar();
-
-      // ── Step 3: Bust cache and refetch the visible range from the DB so that
-      // freshly-synced Google events are shown immediately.
-      bustEventCache();
-      const api = calendarRef.current?.getApi();
-      if (api) {
-        const { activeStart, activeEnd } = api.view;
-        await fetchEvents(activeStart.toISOString(), activeEnd.toISOString(), { bustCache: true });
-      }
-
-      // ── Step 4: Prune any remaining localStorage entries that are now
-      // represented as proper DB records (is_synced=true + matching airtable id).
-      const dbSyncedAirtableIds = new Set(
-        eventsRef.current
-          .filter((e) => e.is_synced && e.agentpm_airtable_id)
-          .map((e) => e.agentpm_airtable_id)
-      );
-      const dbSyncedGoogleIds = new Set(
-        eventsRef.current
-          .filter((e) => e.is_synced && e.google_event_id)
-          .map((e) => e.google_event_id)
-      );
-      const afterPrune = readScheduledItems().filter(
-        (s) => !dbSyncedAirtableIds.has(s.airtableId) &&
-               (!s.googleEventId || !dbSyncedGoogleIds.has(s.googleEventId))
-      );
-      const currentStored = readScheduledItems();
-      if (afterPrune.length < currentStored.length) {
-        localStorage.setItem(SCHEDULED_ITEMS_KEY, JSON.stringify(afterPrune));
-        setScheduledItems(afterPrune);
-        window.dispatchEvent(new StorageEvent("storage", { key: SCHEDULED_ITEMS_KEY, newValue: JSON.stringify(afterPrune) }));
-      }
+      await refetchVisibleRange();
       window.dispatchEvent(new StorageEvent("storage", { key: "calendarUpdated", newValue: "1" }));
     } catch (err) {
       console.error("[Sync] Sync failed:", err);
@@ -4861,7 +4929,7 @@ export default function CalendarPage() {
     } finally {
       setIsSyncing(false);
     }
-  }, [fetchEvents]);
+  }, [refetchVisibleRange]);
 
   // When accounts view is active, fetch Airtable meetings for all linked accounts.
   // Derive a stable string key from the actual account IDs so the effect only
@@ -5054,18 +5122,11 @@ export default function CalendarPage() {
     });
   })();
 
-  const dailyTotals: Record<string, number> = {};
-  for (const day of visibleDays) {
-    let secs = 0;
-    for (const e of filteredEvents) {
-      if (didNotAttend(e)) continue;
-      const eDay = e.start_datetime.slice(0, 10);
-      if (eDay !== day) continue;
-      const dur = (new Date(e.end_datetime).getTime() - new Date(e.start_datetime).getTime()) / 1000;
-      if (dur > 0) secs += dur;
-    }
-    dailyTotals[day] = secs;
-  }
+  // Clips each event to its actual overlap with each local calendar day rather than
+  // crediting a whole event's duration to whichever day its start falls on — see
+  // lib/calendarDailyTotals.ts for why (a forgotten running timer's synthetic event can
+  // span many days).
+  const dailyTotals: Record<string, number> = computeDailyTotals(filteredEvents, visibleDays);
   const weekTotal = Object.values(dailyTotals).reduce((a, b) => a + b, 0);
 
   // Right panels: always-visible action items sidebar + conditional meeting detail
@@ -5092,7 +5153,24 @@ export default function CalendarPage() {
           if (logTimeModeAccount && name && name !== logTimeModeAccount) setLogTimeModeAccount(name);
         }}
         logTimeModeAccount={logTimeModeAccount}
-        onLogTimeMode={(name) => { setLogTimeModeAccount(name ?? null); if (name) { setSelectedAccountName(name); setContentView("accounts"); } }}
+        onLogTimeMode={(name) => {
+          if (name) {
+            if (!logTimeModeAccount) {
+              preLogTimeViewRef.current = { contentView, selectedAccountName };
+            }
+            setLogTimeModeAccount(name);
+            setSelectedAccountName(name);
+            setContentView("accounts");
+          } else {
+            setLogTimeModeAccount(null);
+            const prev = preLogTimeViewRef.current;
+            if (prev) {
+              setContentView(prev.contentView);
+              setSelectedAccountName(prev.selectedAccountName);
+              preLogTimeViewRef.current = null;
+            }
+          }
+        }}
         overLeftNav={!!logTimeModeAccount}
         isUnlinkedView={contentView === "unlinked"}
         onShowUnlinkedView={() => {
@@ -5251,6 +5329,7 @@ export default function CalendarPage() {
                 setSelectedEvent((prev) => prev ? { ...prev, title: `🔔 ${patch.title ?? prev.title.replace(/^🔔\s*/, "")}`, start_datetime: newStart, end_datetime: newEnd } : prev);
               }
             }}
+            onOpenActionItemModal={(item) => setGridModalItem(item)}
             onUpdateScheduleTime={(newStart, newEnd) => {
               if (!selectedEvent) return;
               const uid = selectedEvent.google_event_id ?? "";
@@ -5274,6 +5353,33 @@ export default function CalendarPage() {
               setEvents((prev) => prev.map((e) =>
                 e.google_event_id === uid ? { ...e, start_datetime: newStart, end_datetime: newEnd } : e
               ));
+            }}
+          />
+        )}
+        {gridModalItem && (
+          <ActionItemModal
+            item={gridModalItem}
+            accountId={allAccountsRef.current.find((a) => a.name === gridModalItem.account_name)?.id}
+            teamMembers={teamMembers}
+            onClose={() => setGridModalItem(null)}
+            onUpdated={(updated: AirtableActionItem) => {
+              setSelectedActionItem((prev) => prev && prev.airtable_id === updated.airtable_id ? updated : prev);
+              setEvents((prev) => prev.map((e) =>
+                e.google_event_id === selectedEvent?.google_event_id ? { ...e, title: updated.task } : e
+              ));
+              window.dispatchEvent(new StorageEvent("storage", { key: "actionItemsUpdated", newValue: "1" }));
+              setGridModalItem(null);
+            }}
+            onConverted={() => {
+              setSelectedActionItem((prev) => prev && prev.airtable_id === gridModalItem.airtable_id ? { ...prev, status: "Done" } as AirtableActionItem : prev);
+              window.dispatchEvent(new StorageEvent("storage", { key: "actionItemsUpdated", newValue: "1" }));
+              setGridModalItem(null);
+            }}
+            onDeleted={() => {
+              setSelectedActionItem((prev) => prev && prev.airtable_id === gridModalItem.airtable_id ? null : prev);
+              setSelectedEvent(null);
+              window.dispatchEvent(new StorageEvent("storage", { key: "actionItemsUpdated", newValue: "1" }));
+              setGridModalItem(null);
             }}
           />
         )}
@@ -5538,11 +5644,12 @@ export default function CalendarPage() {
                   resource_id: ev.id > 0 ? ev.id : null,
                   resource_label: ev.title,
                   notify_in_app: true,
-                }).then(({ data: r }) => {
+                }).then(async ({ data: r }) => {
                   const startLocal = toLocalISO(due.toISOString().slice(0, 19));
                   const endLocal = addMsToLocalISO(due.toISOString().slice(0, 19), 15 * 60 * 1000);
-                  saveScheduledReminder({ reminderId: r.id, title: r.title, start: startLocal, end: endLocal });
-                  setScheduledReminders(readScheduledReminders());
+                  await persistScheduledReminder({
+                    reminderId: r.id, title: r.title, start: startLocal, end: endLocal,
+                  });
                   window.dispatchEvent(new StorageEvent("storage", { key: "remindersUpdated", newValue: "1" }));
                 }).catch(() => {});
               })}
@@ -5923,7 +6030,7 @@ export default function CalendarPage() {
                 } else if (uid.startsWith("scheduled-")) {
                   type = "scheduled";
                   uidBody = uid.slice("scheduled-".length);
-                } else if (extProps.calendar_id === "work_tracking" && extProps.is_synced && !!extProps.agentpm_airtable_id) {
+                } else if (isDbBackedActionItemEvent(extProps)) {
                   type = "db-work";
                   uidBody = uid;
                 } else {
@@ -6061,8 +6168,16 @@ export default function CalendarPage() {
             scheduledItems={scheduledItems}
             weekStart={visibleDays[0] ?? ""}
             onExit={() => setLogTimeModeAccount(null)}
+            onWeekLogged={setWeekLogReport}
           />
         )}
+
+        {/* Warns about calendar items that could not reach Cloud Coach. Renders
+            nothing when the week logged cleanly. */}
+        <UnloggedItemsWarningModal
+          report={weekLogReport}
+          onClose={() => setWeekLogReport(null)}
+        />
 
         {/* Account context — full width below the calendar */}
         {selectedEvent && (

@@ -255,6 +255,37 @@ describe("MeetingDetail — meeting summary provider toggle", () => {
     await waitFor(() => expect(hits).toEqual(["- Pasted a Zoom recap"]));
   });
 
+  it("re-seeds the panel when the selected meeting changes", async () => {
+    // Event 1 has Gong notes, event 2 has Zoom notes: the panel must follow the switch.
+    server.use(
+      http.post("/api/v1/airtable/match/", async ({ request }) => {
+        const { event_uid } = await request.json() as { event_uid: string };
+        return HttpResponse.json({
+          matched: true,
+          account: { id: 1, name: "Acme Corp" },
+          this_meeting: {
+            id: event_uid === "1" ? 7 : 8, airtable_id: `recMTG00${event_uid}`,
+            name: "Meeting", date: null, duration: 0, expected_topics: "",
+            gong_notes: event_uid === "1" ? GONG_NOTES : "", gong_url: "",
+            zoom_notes: event_uid === "1" ? "" : ZOOM_NOTES, zoom_url: "",
+            customer_slack: "", account_team_slack: "", last_synced: "",
+            account: 1, account_name: "Acme Corp",
+          },
+        });
+      })
+    );
+
+    const { rerender } = render(
+      <MemoryRouter><MeetingDetail event={mockCalendarEvents[0]} /></MemoryRouter>
+    );
+    await screen.findByText("Gong said pricing");
+
+    rerender(<MemoryRouter><MeetingDetail event={mockCalendarEvents[1]} /></MemoryRouter>);
+
+    expect(await screen.findByText("Zoom said rollout")).toBeInTheDocument();
+    expect(screen.queryByText("Gong said pricing")).not.toBeInTheDocument();
+  });
+
   it("Clear only clears the active provider", async () => {
     const cleared: string[] = [];
     serveMatch({ gong_notes: GONG_NOTES, zoom_notes: ZOOM_NOTES });
@@ -276,5 +307,162 @@ describe("MeetingDetail — meeting summary provider toggle", () => {
     fireEvent.click(screen.getByRole("button", { name: "Clear" }));
 
     await waitFor(() => expect(cleared).toEqual(["zoom:"]));
+  });
+});
+
+// ── Switching meetings must not leave the previous one's summary behind ────────
+
+/**
+ * The reported bug: paste a summary onto one meeting, click another, and the bottom
+ * section still showed the first meeting's notes. Both meetings here are *unlinked* —
+ * no AirtableMeeting row, which the 2026-08-18 "GET Meeting Notes" session measured as
+ * the common case — so `existingNotes`/`existingZoomNotes` are undefined for both and a
+ * notes-text-only re-seed guard never fires. The second test is the sharper half: the
+ * panel cached the first meeting's PK, so the next save went to the wrong Airtable row.
+ */
+describe("MeetingDetail — the summary follows the selected meeting", () => {
+  const PASTE_PATH = "/api/v1/airtable/meetings/by-event/:eventId/gong-notes/";
+
+  beforeEach(() => {
+    localStorage.clear();
+    vi.stubGlobal("WebSocket", FakeSocket);
+    registerHandlers();
+    // No `this_meeting`: neither event has a meeting row until a paste creates one.
+    server.use(
+      http.post("/api/v1/airtable/match/", () =>
+        HttpResponse.json({ matched: true, account: { id: 1, name: "Acme Corp" } })
+      )
+    );
+  });
+
+  function renderEvent(index: number) {
+    return render(
+      <MemoryRouter><MeetingDetail event={mockCalendarEvents[index]} /></MemoryRouter>
+    );
+  }
+
+  async function pasteSummary(text: string) {
+    const box = await screen.findByPlaceholderText(/Gong AI summary/i);
+    fireEvent.change(box, { target: { value: text } });
+    fireEvent.click(screen.getByRole("button", { name: /Parse & Save/i }));
+  }
+
+  it("drops the pasted summary when another meeting is selected", async () => {
+    const saved: string[] = [];
+    server.use(
+      http.patch(PASTE_PATH, async ({ request }) => {
+        const body = await request.json() as { gong_notes: string };
+        saved.push(body.gong_notes);
+        return HttpResponse.json({ id: 7, gong_notes: body.gong_notes });
+      })
+    );
+
+    const { rerender } = renderEvent(0);
+    await pasteSummary("- Pricing agreed");
+    await waitFor(() => expect(saved).toEqual(["- Pricing agreed"]));
+    expect(await screen.findByText("Pricing agreed")).toBeInTheDocument();
+
+    rerender(<MemoryRouter><MeetingDetail event={mockCalendarEvents[1]} /></MemoryRouter>);
+
+    await waitFor(() =>
+      expect(screen.queryByText("Pricing agreed")).not.toBeInTheDocument()
+    );
+    // Back to an empty paste box, not the previous meeting's bullets.
+    expect(await screen.findByPlaceholderText(/Gong AI summary/i)).toHaveValue("");
+  });
+
+  it("saves a paste against the newly selected meeting, not the previous one", async () => {
+    const urls: string[] = [];
+    server.use(
+      http.patch(PASTE_PATH, async ({ request }) => {
+        urls.push(new URL(request.url).pathname);
+        return HttpResponse.json({ id: 7, gong_notes: "" });
+      }),
+      // The by-PK route is what a stale cached meeting id would reach for.
+      http.patch("/api/v1/airtable/meetings/:id/gong-notes/", ({ params }) => {
+        urls.push(`STALE-PK-${params.id}`);
+        return HttpResponse.json({ id: Number(params.id), gong_notes: "" });
+      })
+    );
+
+    const { rerender } = renderEvent(0);
+    await pasteSummary("- First meeting recap");
+    await waitFor(() =>
+      expect(urls).toEqual(["/api/v1/airtable/meetings/by-event/1/gong-notes/"])
+    );
+
+    rerender(<MemoryRouter><MeetingDetail event={mockCalendarEvents[1]} /></MemoryRouter>);
+    await pasteSummary("- Second meeting recap");
+
+    await waitFor(() => expect(urls).toHaveLength(2));
+    expect(urls[1]).toBe("/api/v1/airtable/meetings/by-event/2/gong-notes/");
+  });
+
+  it("clears an unsent note draft so it cannot post to the next meeting", async () => {
+    let posted = 0;
+    server.use(http.post(NOTES_PATH, () => { posted += 1; return HttpResponse.json(noteResponse); }));
+
+    const { rerender } = renderEvent(0);
+    const composer = await screen.findByPlaceholderText(/Add a note/i);
+    fireEvent.change(composer, { target: { value: "Typed against the first meeting" } });
+
+    rerender(<MemoryRouter><MeetingDetail event={mockCalendarEvents[1]} /></MemoryRouter>);
+
+    const next = await screen.findByPlaceholderText(/Add a note/i);
+    await waitFor(() => expect(next).toHaveValue(""));
+    fireEvent.keyDown(next, { key: "Enter" });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(posted).toBe(0);
+  });
+});
+
+describe("MeetingDetail — no WebSocket for synthetic overlay events", () => {
+  // Airtable meetings / scheduled action items / reminders rendered as calendar
+  // overlays (CalendarPage.tsx's synthesis effects) get a non-positive `id` — there is
+  // no backing CalendarEvent row, and the backend's ws route only matches a positive
+  // integer, so attempting the connection just fails loudly in the console.
+  let sockets: string[] = [];
+
+  class TrackingSocket {
+    static CONNECTING = 0;
+    readyState = 1;
+    onopen: (() => void) | null = null;
+    onmessage: ((e: MessageEvent) => void) | null = null;
+    onerror: (() => void) | null = null;
+    onclose: (() => void) | null = null;
+    constructor(url: string) {
+      sockets.push(url);
+    }
+    send() {}
+    close() {}
+  }
+
+  beforeEach(() => {
+    localStorage.clear();
+    sockets = [];
+    vi.stubGlobal("WebSocket", TrackingSocket);
+    registerHandlers();
+  });
+
+  it("opens the notes-collaboration socket for a real, positive-id event", async () => {
+    render(
+      <MemoryRouter>
+        <MeetingDetail event={mockCalendarEvents[0]} />
+      </MemoryRouter>
+    );
+    await screen.findByPlaceholderText(/Add a note/i);
+    expect(sockets).toHaveLength(1);
+    expect(sockets[0]).toContain("/ws/meeting-notes/1/");
+  });
+
+  it("skips the socket entirely for a synthetic overlay event with a negative id", async () => {
+    const syntheticEvent = { ...mockCalendarEvents[0], id: -3298 };
+    render(
+      <MemoryRouter>
+        <MeetingDetail event={syntheticEvent} />
+      </MemoryRouter>
+    );
+    await screen.findByPlaceholderText(/Add a note/i);
+    expect(sockets).toHaveLength(0);
   });
 });

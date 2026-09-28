@@ -3,8 +3,9 @@ import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { http, HttpResponse } from "msw";
 import { server } from "../../../test/msw-server";
 import { mockArtifact } from "../../../test/handlers/accounts";
+import { MemoryRouter } from "react-router-dom";
 import { ArtifactsPanel } from "../ArtifactsPanel";
-import type { GoalSection } from "../../../types";
+import type { CommentReference, GoalSection } from "../../../types";
 
 // Silence console.error from act() warnings in tests
 beforeEach(() => {
@@ -13,7 +14,11 @@ beforeEach(() => {
 });
 
 function renderPanel(props: Partial<Parameters<typeof ArtifactsPanel>[0]> = {}) {
-  return render(<ArtifactsPanel accountId={1} {...props} />);
+  return render(
+    <MemoryRouter>
+      <ArtifactsPanel accountId={1} {...props} />
+    </MemoryRouter>,
+  );
 }
 
 describe("ArtifactsPanel", () => {
@@ -257,6 +262,90 @@ describe("ArtifactsPanel", () => {
     await waitFor(() => screen.getByText("Product Spec"));
     const card = screen.getByText("Product Spec").closest("[draggable]")!;
     expect(card.getAttribute("draggable")).toBe("true");
+  });
+
+  // ── Description / creator / linked records ─────────────────────────────────
+
+  it("edit modal offers a rich-text description field", async () => {
+    renderPanel();
+    await waitFor(() => screen.getByText("Product Spec"));
+    fireEvent.contextMenu(screen.getByText("Product Spec").closest("[draggable]")!);
+    fireEvent.click(screen.getByText("Edit artifact"));
+    expect(screen.getByText(/Description/)).toBeInTheDocument();
+  });
+
+  it("saving the edit modal PATCHes description and references", async () => {
+    const seen: Record<string, unknown>[] = [];
+    server.use(
+      http.patch("/api/v1/accounts/artifacts/:id/", async ({ request }) => {
+        const body = await request.json() as Record<string, unknown>;
+        seen.push(body);
+        return HttpResponse.json({ ...mockArtifact, ...body });
+      }),
+      http.get("/api/v1/accounts/accounts/:id/artifacts/", () =>
+        HttpResponse.json([{ ...mockArtifact, description: "<p>The source of truth</p>" }])
+      ),
+    );
+    renderPanel();
+    await waitFor(() => screen.getByText("Product Spec"));
+    fireEvent.contextMenu(screen.getByText("Product Spec").closest("[draggable]")!);
+    fireEvent.click(screen.getByText("Edit artifact"));
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(seen).toHaveLength(1));
+    expect(seen[0].description).toBe("<p>The source of truth</p>");
+    expect(seen[0].references).toEqual([]);
+  });
+
+  it("shows who added the artifact on the card", async () => {
+    renderPanel();
+    // mockCodeArtifact was uploaded by alice; mockArtifact has no uploader.
+    await waitFor(() => expect(screen.getByText("alice")).toBeInTheDocument());
+  });
+
+  it("shows a used-in count when the artifact is referenced elsewhere", async () => {
+    const usedIn: CommentReference[] = [
+      { resource_type: "calendar_event", resource_id: 7, label: "Kickoff call", url: "/calendar" },
+      { resource_type: "action_item", resource_id: 9, label: "Send SOW", url: "/action-items" },
+    ];
+    server.use(
+      http.get("/api/v1/accounts/accounts/:id/artifacts/", () =>
+        HttpResponse.json([{ ...mockArtifact, used_in: usedIn }])
+      ),
+    );
+    renderPanel();
+    await waitFor(() => expect(screen.getByText("used in 2")).toBeInTheDocument());
+  });
+
+  it("the viewer lists the description, the creator and both link directions", async () => {
+    server.use(
+      http.get("/api/v1/accounts/accounts/:id/artifacts/", () =>
+        HttpResponse.json([{
+          ...mockArtifact,
+          description: "<p>Signed contract</p>",
+          uploaded_by_username: "bob",
+          references: [{ resource_type: "meeting", resource_id: 2, label: "Weekly sync", url: "/calendar" }],
+          used_in: [{ resource_type: "project", resource_id: 3, label: "Segment rollout", url: "/accounts/1" }],
+        }])
+      ),
+    );
+    renderPanel();
+    await waitFor(() => screen.getByText("Product Spec"));
+    fireEvent.click(screen.getByText("Product Spec"));
+    const panel = await screen.findByTestId("artifact-details");
+    expect(panel).toHaveTextContent("Signed contract");
+    expect(panel).toHaveTextContent("bob");
+    expect(panel).toHaveTextContent("Mentions in description");
+    expect(panel).toHaveTextContent("Weekly sync");
+    expect(panel).toHaveTextContent("Used in");
+    expect(panel).toHaveTextContent("Segment rollout");
+  });
+
+  it("the viewer omits the details panel when there is nothing to show", async () => {
+    renderPanel();
+    await waitFor(() => screen.getByText("Product Spec"));
+    fireEvent.click(screen.getByText("Product Spec"));
+    await waitFor(() => expect(screen.getByText("Open in new tab ↗")).toBeInTheDocument());
+    expect(screen.queryByTestId("artifact-details")).not.toBeInTheDocument();
   });
 
   it("dragstart sets artifactDrop data with artifact id and name", async () => {

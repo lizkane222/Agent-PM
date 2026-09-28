@@ -13,35 +13,24 @@ import logging
 from celery import shared_task
 from django.conf import settings
 
+from core.llm import complete
+
 logger = logging.getLogger(__name__)
 
 HIGH_CONFIDENCE = 0.90
 LOW_CONFIDENCE = 0.50
 
 
-def _bedrock_client():
-    import boto3
-    profile = settings.AWS_PROFILE or None
-    region = settings.AWS_REGION or "us-west-2"
-    session = boto3.Session(profile_name=profile)
-    return session.client("bedrock-runtime", region_name=region)
-
-
 def _call_claude(prompt: str) -> str:
-    client = _bedrock_client()
-    body = json.dumps({
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 1024,
-        "messages": [{"role": "user", "content": prompt}],
-    })
-    response = client.invoke_model(
-        modelId="anthropic.claude-sonnet-4-5",
-        contentType="application/json",
-        accept="application/json",
-        body=body,
-    )
-    result = json.loads(response["body"].read())
-    return result["content"][0]["text"]
+    """
+    Single-turn triage call through core.llm.
+
+    Was a raw boto3 invoke_model speaking the Bedrock wire protocol
+    ({"anthropic_version": "bedrock-2023-05-31", ...}), which could not reach the
+    LiteLLM gateway at all. core.llm.complete resolves both client and model from
+    AGENT_BACKEND / AGENT_MODEL_TIERS.
+    """
+    return complete(prompt, max_tokens=1024)
 
 
 def _build_review_prompt(item, accounts) -> str:

@@ -22,6 +22,16 @@ vi.mock("../../../hooks/useExportTray", () => ({
   }),
 }));
 
+// ActionItemCard opens this modal internally on click; the real one renders
+// SVG-icon imports that jsdom can't handle. Same stub ActionItemCard.test.tsx uses.
+vi.mock("../ActionItemModal", () => ({
+  ActionItemModal: ({ onClose }: { onClose: () => void }) => (
+    <div data-testid="action-item-modal">
+      <button onClick={onClose}>Close</button>
+    </div>
+  ),
+}));
+
 function makeDataTransfer(data: Record<string, string>) {
   return { getData: (key: string) => data[key] ?? "", types: Object.keys(data) };
 }
@@ -72,10 +82,12 @@ function renderBoard(props: Partial<React.ComponentProps<typeof ProjectGoals>> =
       actionItems={props.actionItems ?? []}
       meetings={props.meetings ?? []}
       onChange={onChange}
+      onSelectAction={props.onSelectAction}
       accountTeamMembers={props.accountTeamMembers}
       projectMembers={props.projectMembers}
       onAddProjectMember={props.onAddProjectMember}
       onRemoveProjectMember={props.onRemoveProjectMember}
+      onCloudCoachSyncResult={props.onCloudCoachSyncResult}
     />
   );
   return { onChange };
@@ -153,6 +165,139 @@ describe("ProjectGoals — single-owner move (project vs. nested goal)", () => {
     fireEvent.click(within(screen.getByTestId("goal-row-10")).getAllByRole("button")[0]);
 
     expect(screen.getAllByText("Ship it")).toHaveLength(1);
+  });
+});
+
+describe("ProjectGoals — resource drag reassignment", () => {
+  it("moving a resource from a goal onto its parent project removes it from the goal", () => {
+    const project = baseGoal({ id: "1", kind: "project", goalIds: ["10"] });
+    const goal = baseGoal({
+      id: "10", kind: "goal", name: "Milestone 1",
+      resources: [{ id: "res-1", label: "Spec Doc", url: "https://docs.example.com" }],
+    });
+    const { onChange } = renderBoard({ goals: [project, goal] });
+
+    fireEvent.drop(screen.getByTestId("project-row-1"), {
+      dataTransfer: makeDataTransfer({ goalResourceId: "res-1" }),
+    });
+
+    expect(onChange).toHaveBeenCalled();
+    const updated = onChange.mock.calls[0][0] as GoalSection[];
+    expect(updated.find((g) => g.id === "10")!.resources).toEqual([]);
+    expect(updated.find((g) => g.id === "1")!.resources).toEqual([
+      { id: "res-1", label: "Spec Doc", url: "https://docs.example.com" },
+    ]);
+  });
+
+  it("moving a resource between goals under two different projects reassigns it", () => {
+    const projectA = baseGoal({ id: "1", kind: "project", goalIds: ["10"] });
+    const goalA = baseGoal({
+      id: "10", kind: "goal", name: "Milestone 1",
+      resources: [{ id: "res-1", label: "Spec Doc", url: "https://docs.example.com" }],
+    });
+    const projectB = baseGoal({ id: "2", kind: "project", name: "Other Project", goalIds: ["20"] });
+    const goalB = baseGoal({ id: "20", kind: "goal", name: "Milestone 2" });
+    const { onChange } = renderBoard({ goals: [projectA, goalA, projectB, goalB] });
+
+    fireEvent.drop(screen.getByTestId("goal-row-20"), {
+      dataTransfer: makeDataTransfer({ goalResourceId: "res-1" }),
+    });
+
+    expect(onChange).toHaveBeenCalled();
+    const updated = onChange.mock.calls[0][0] as GoalSection[];
+    expect(updated.find((g) => g.id === "10")!.resources).toEqual([]);
+    expect(updated.find((g) => g.id === "20")!.resources.map((r) => r.id)).toEqual(["res-1"]);
+  });
+
+  it("keeps a resource row draggable with the goalResourceId dataTransfer key the drop handler expects", () => {
+    const project = baseGoal({
+      id: "1", kind: "project",
+      resources: [{ id: "res-1", label: "Spec Doc", url: "https://docs.example.com" }],
+    });
+    renderBoard({ goals: [project] });
+
+    const row = screen.getByText("Spec Doc").closest("[draggable]");
+    expect(row).not.toBeNull();
+    const setData = vi.fn();
+    fireEvent.dragStart(row!, { dataTransfer: { setData } });
+    expect(setData).toHaveBeenCalledWith("goalResourceId", "res-1");
+  });
+});
+
+describe("ProjectGoals — collapsed action items", () => {
+  function setUpGoalWithItem(overrides: Partial<AirtableActionItem> = {}) {
+    const project = baseGoal({ id: "1", kind: "project", goalIds: ["10"] });
+    const goal = baseGoal({ id: "10", kind: "goal", name: "Milestone 1", actionIds: ["a1"] });
+    const item = makeActionItem({ task_details: "Some details about the task", priority: "Critical", ...overrides });
+    return { project, goal, item };
+  }
+
+  it("renders an action item inside a goal collapsed by default", () => {
+    const { project, goal, item } = setUpGoalWithItem();
+    renderBoard({ goals: [project, goal], actionItems: [item] });
+
+    // Expand the goal row so the collapsed action-item row is visible.
+    fireEvent.click(within(screen.getByTestId("goal-row-10")).getAllByRole("button")[0]);
+
+    expect(screen.getByText("Ship it")).toBeInTheDocument();
+    // Full-card-only content must not be present while collapsed.
+    expect(screen.queryByText("Some details about the task")).not.toBeInTheDocument();
+    expect(screen.queryByText("Critical")).not.toBeInTheDocument();
+  });
+
+  it("expands a collapsed action item on click without opening the modal", () => {
+    const { project, goal, item } = setUpGoalWithItem();
+    const onSelectAction = vi.fn();
+    renderBoard({ goals: [project, goal], actionItems: [item], onSelectAction });
+
+    fireEvent.click(within(screen.getByTestId("goal-row-10")).getAllByRole("button")[0]);
+    fireEvent.click(screen.getByText("Ship it"));
+
+    expect(screen.getByText("Some details about the task")).toBeInTheDocument();
+    expect(onSelectAction).not.toHaveBeenCalled();
+  });
+
+  it("opens the action item modal only when the already-expanded card is clicked", () => {
+    const { project, goal, item } = setUpGoalWithItem();
+    const onSelectAction = vi.fn();
+    renderBoard({ goals: [project, goal], actionItems: [item], onSelectAction });
+
+    fireEvent.click(within(screen.getByTestId("goal-row-10")).getAllByRole("button")[0]);
+    // First click expands.
+    fireEvent.click(screen.getByText("Ship it"));
+    expect(onSelectAction).not.toHaveBeenCalled();
+
+    // Second click, now on the expanded full card, opens the modal.
+    fireEvent.click(screen.getByText("Ship it"));
+    expect(onSelectAction).toHaveBeenCalledWith(item);
+  });
+
+  it("keeps a collapsed row draggable with the same dataTransfer keys the drop handler expects", () => {
+    const { project, goal, item } = setUpGoalWithItem();
+    renderBoard({ goals: [project, goal], actionItems: [item] });
+
+    fireEvent.click(within(screen.getByTestId("goal-row-10")).getAllByRole("button")[0]);
+
+    const row = screen.getByText("Ship it").closest("[draggable]");
+    expect(row).not.toBeNull();
+    const setData = vi.fn();
+    fireEvent.dragStart(row!, { dataTransfer: { setData } });
+    expect(setData).toHaveBeenCalledWith("goalActionId", "a1");
+    expect(setData).toHaveBeenCalledWith("timelineActionId", "a1");
+  });
+
+  it("folds an expanded action item back down via its Collapse control", () => {
+    const { project, goal, item } = setUpGoalWithItem();
+    renderBoard({ goals: [project, goal], actionItems: [item] });
+
+    fireEvent.click(within(screen.getByTestId("goal-row-10")).getAllByRole("button")[0]);
+    fireEvent.click(screen.getByText("Ship it"));
+    expect(screen.getByText("Some details about the task")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("Collapse"));
+
+    expect(screen.queryByText("Some details about the task")).not.toBeInTheDocument();
+    expect(screen.getByText("Ship it")).toBeInTheDocument();
   });
 });
 
@@ -355,5 +500,165 @@ describe("ProjectGoals — ProjectDetailsModal", () => {
     const saved = onChange.mock.calls[0][0][0];
     expect(saved.sfProjectId).toBe("a0B999");
     expect(saved.name).toBe("New Initiative");
+  });
+});
+
+// ── Cloud Coach member backfill ────────────────────────────────────────────────
+//
+// Two-step by design: the first click previews (dry_run) so the plan can be read before
+// anything is written to a shared Salesforce org. Request bodies are asserted at the MSW
+// layer rather than by mocking lib/api, because "the first call must be a dry run" is the
+// whole safety property.
+
+describe("ProjectGoals — sync members to Cloud Coach", () => {
+  const SAVED_PROJECT: GoalSection = {
+    id: "7",
+    name: "Acme Rollout",
+    description: "",
+    url: "",
+    kind: "project",
+    sfProjectId: "a0B000000000001",
+    actionIds: [],
+    meetingIds: [],
+    goalIds: [],
+    resources: [],
+    sfData: {},
+  };
+
+  const MEMBER: ProjectMember = {
+    id: 11,
+    project: 7,
+    team_member: 5,
+    team_member_name: "Ashley Shadday",
+    team_member_email: "ashley@example.com",
+    team_member_avatar_url: "",
+    role: "",
+    added_by: null,
+    created_at: "2026-08-31T00:00:00Z",
+  };
+
+  async function openMembers(overrides: Partial<React.ComponentProps<typeof ProjectGoals>> = {}) {
+    const user = userEvent.setup();
+    const props = {
+      goals: [SAVED_PROJECT],
+      projectMembers: [MEMBER],
+      accountTeamMembers: [teamMember],
+      ...overrides,
+    };
+    render(
+      <ProjectGoals
+        goals={props.goals}
+        actionItems={[]}
+        meetings={[]}
+        onChange={vi.fn()}
+        projectMembers={props.projectMembers}
+        accountTeamMembers={props.accountTeamMembers}
+        onCloudCoachSyncResult={props.onCloudCoachSyncResult}
+      />
+    );
+    await user.click(screen.getByRole("button", { name: /Acme Rollout/i }));
+    await user.click(screen.getByText(/Team Members/i));
+    return { user };
+  }
+
+  it("previews first, then pushes on a second click", async () => {
+    const bodies: Array<{ dry_run?: boolean }> = [];
+    server.use(
+      http.post("/api/v1/accounts/projects/:id/sync-members-to-salesforce/", async ({ request }) => {
+        const body = (await request.json()) as { dry_run?: boolean };
+        bodies.push(body);
+        return HttpResponse.json({
+          status: "ok",
+          dry_run: !!body.dry_run,
+          counts: { pushed: 1 },
+          results: [{ status: "pushed", member_name: "Ashley Shadday", project_name: "Acme Rollout" }],
+        });
+      }),
+    );
+
+    const { user } = await openMembers();
+    const button = screen.getByTestId("sync-members-to-cloud-coach");
+
+    await user.click(button);
+    expect(bodies).toEqual([{ dry_run: true }]);
+    expect(await screen.findByTestId("sync-members-message")).toHaveTextContent("Would sync: 1 added");
+    // The label changes so the second click is unambiguously a confirmation.
+    expect(screen.getByTestId("sync-members-to-cloud-coach")).toHaveTextContent(/Confirm/);
+
+    await user.click(screen.getByTestId("sync-members-to-cloud-coach"));
+    expect(bodies).toEqual([{ dry_run: true }, { dry_run: false }]);
+    expect(screen.getByTestId("sync-members-message")).toHaveTextContent("Synced: 1 added");
+  });
+
+  it("hands the real push results up for the toast, but not the dry run", async () => {
+    const onCloudCoachSyncResult = vi.fn();
+    server.use(
+      http.post("/api/v1/accounts/projects/:id/sync-members-to-salesforce/", async ({ request }) => {
+        const body = (await request.json()) as { dry_run?: boolean };
+        return HttpResponse.json({
+          status: "ok",
+          dry_run: !!body.dry_run,
+          counts: { pushed: 1 },
+          results: [{ status: "pushed", member_name: "Ashley Shadday" }],
+        });
+      }),
+    );
+
+    const { user } = await openMembers({ onCloudCoachSyncResult });
+
+    await user.click(screen.getByTestId("sync-members-to-cloud-coach"));
+    expect(onCloudCoachSyncResult).not.toHaveBeenCalled();
+
+    await user.click(screen.getByTestId("sync-members-to-cloud-coach"));
+    expect(onCloudCoachSyncResult).toHaveBeenCalledWith([
+      { status: "pushed", member_name: "Ashley Shadday" },
+    ]);
+  });
+
+  it("needs no confirmation when the dry run would change nothing", async () => {
+    // Everyone is already on the project, so there is nothing to confirm.
+    const bodies: Array<{ dry_run?: boolean }> = [];
+    server.use(
+      http.post("/api/v1/accounts/projects/:id/sync-members-to-salesforce/", async ({ request }) => {
+        bodies.push((await request.json()) as { dry_run?: boolean });
+        return HttpResponse.json({
+          status: "ok", dry_run: true, counts: { already_member: 1 },
+          results: [{ status: "already_member", member_name: "Ashley Shadday" }],
+        });
+      }),
+    );
+
+    const { user } = await openMembers();
+    await user.click(screen.getByTestId("sync-members-to-cloud-coach"));
+
+    expect(await screen.findByTestId("sync-members-message")).toHaveTextContent("1 already on it");
+    expect(screen.getByTestId("sync-members-to-cloud-coach")).not.toHaveTextContent(/Confirm/);
+    expect(bodies).toHaveLength(1);
+  });
+
+  it("reports a failure and resets to a preview", async () => {
+    server.use(
+      http.post("/api/v1/accounts/projects/:id/sync-members-to-salesforce/", () =>
+        HttpResponse.json({ detail: "Could not reach Salesforce." }, { status: 502 })
+      ),
+    );
+
+    const { user } = await openMembers();
+    await user.click(screen.getByTestId("sync-members-to-cloud-coach"));
+
+    expect(await screen.findByTestId("sync-members-message")).toHaveTextContent("Could not reach Salesforce.");
+    expect(screen.getByTestId("sync-members-to-cloud-coach")).not.toHaveTextContent(/Confirm/);
+  });
+
+  it("is not offered on a project with no Salesforce id", async () => {
+    await openMembers({ goals: [{ ...SAVED_PROJECT, sfProjectId: "" }] });
+
+    expect(screen.queryByTestId("sync-members-to-cloud-coach")).not.toBeInTheDocument();
+  });
+
+  it("is not offered when the project has no members", async () => {
+    await openMembers({ projectMembers: [] });
+
+    expect(screen.queryByTestId("sync-members-to-cloud-coach")).not.toBeInTheDocument();
   });
 });

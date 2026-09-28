@@ -12,6 +12,8 @@ import logging
 from celery import shared_task
 from django.conf import settings
 
+from core.llm import complete
+
 logger = logging.getLogger(__name__)
 
 AIRTABLE_META_BASE = "https://api.airtable.com/v0/meta/bases"
@@ -46,10 +48,13 @@ def _create_field_in_airtable(field_name: str, field_type: str, table_id: str) -
 
 
 def _bedrock_determine_type(field_name: str, field_value: str) -> str:
-    """Ask Claude on Bedrock to pick the best Airtable field type for a custom field."""
-    import boto3
-    session = boto3.Session(profile_name=getattr(settings, "AWS_PROFILE", None))
-    client = session.client("bedrock-runtime", region_name=getattr(settings, "AWS_REGION", "us-west-2"))
+    """
+    Ask Claude to pick the best Airtable field type for a custom field.
+
+    Name kept for its call sites; it no longer speaks to Bedrock directly. Was a raw
+    boto3 invoke_model using the Bedrock wire protocol, which could not reach the
+    LiteLLM gateway — now routed through core.llm.complete.
+    """
     prompt = f"""You are an Airtable schema designer. Given the field name and sample value below,
 pick the most appropriate Airtable field type from this list:
 singleLineText, multilineText, url, number, checkbox, date, singleSelect, multipleSelects, multipleAttachments
@@ -58,19 +63,7 @@ Field name: {field_name}
 Sample value: {field_value or "(none provided)"}
 
 Respond with ONLY the field type name, nothing else."""
-    body = json.dumps({
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 32,
-        "messages": [{"role": "user", "content": prompt}],
-    })
-    response = client.invoke_model(
-        modelId="anthropic.claude-sonnet-4-5",
-        contentType="application/json",
-        accept="application/json",
-        body=body,
-    )
-    result = json.loads(response["body"].read())
-    return result["content"][0]["text"].strip()
+    return complete(prompt, max_tokens=32)
 
 
 @shared_task(name="account_feed.tasks.create_airtable_field")

@@ -167,6 +167,12 @@ class ActionItemAttachment(models.Model):
     file = models.FileField(upload_to="action_item_attachments/%Y/%m/", null=True, blank=True)
     mime_type = models.CharField(max_length=100, blank=True)
     file_size = models.PositiveIntegerField(null=True, blank=True)
+    # The AccountArtifact this attachment was picked from, when created via ArtifactPicker.
+    # Only populated going forward — historical attachments predate this link.
+    source_artifact = models.ForeignKey(
+        "accounts.AccountArtifact", on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="action_item_attachments"
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

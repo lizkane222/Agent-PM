@@ -30,14 +30,11 @@ import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
-import anthropic
-import truststore
 from django.conf import settings
-from django.core.exceptions import ImproperlyConfigured
 
-from .mcp_server import mcp_server
+from core import llm as core_llm
 
-truststore.inject_into_ssl()
+from .mcp_server import GROUP_LABELS, mcp_server
 
 logger = logging.getLogger(__name__)
 
@@ -50,29 +47,15 @@ def _publish(user, event_type: str, title: str, detail: str = "") -> None:
     except Exception as exc:
         logger.debug("Sync publish skipped: %s", exc)
 
-TIER_DEFAULT = "default"
-TIER_STRONG = "strong"
+# Tier names and model/client resolution live in core.llm, which is shared with the
+# five non-agent LLM call sites (skills review, sync-review triage, account-feed field
+# typing, and the two Gong/Zoom summarisers). Re-exported here because these names are
+# part of this module's public surface.
+TIER_DEFAULT = core_llm.TIER_DEFAULT
+TIER_STRONG = core_llm.TIER_STRONG
+TIER_VOICE = core_llm.TIER_VOICE
 
-
-def model_for_tier(tier: str) -> str:
-    """Resolve a tier name to a concrete model id for the configured backend."""
-    if settings.AGENT_MODEL_OVERRIDE:
-        return settings.AGENT_MODEL_OVERRIDE
-    backend = settings.AGENT_BACKEND
-    try:
-        tiers = settings.AGENT_MODEL_TIERS[backend]
-    except KeyError:
-        raise ImproperlyConfigured(
-            f"AGENT_BACKEND={backend!r} is not one of "
-            f"{sorted(settings.AGENT_MODEL_TIERS)}."
-        ) from None
-    model = tiers.get(tier) or ""
-    if not model:
-        raise ImproperlyConfigured(
-            f"No model configured for backend {backend!r} tier {tier!r}. "
-            f"Set AGENT_MODEL_{backend.upper()}_{tier.upper()}."
-        )
-    return model
+model_for_tier = core_llm.model_for_tier
 
 
 def max_tokens_for_tier(tier: str, *, streaming: bool) -> int:
@@ -97,31 +80,8 @@ def max_tokens_for_tier(tier: str, *, streaming: bool) -> int:
 
 
 def build_client() -> Any:
-    """
-    Construct the Anthropic async client for the configured backend.
-
-    `base_url` is always passed explicitly: Claude Code's managed settings export
-    ANTHROPIC_BASE_URL, and a bare client would otherwise inherit it from whichever
-    shell launched Django.
-    """
-    backend = settings.AGENT_BACKEND
-    if backend == "gateway":
-        if not settings.ANTHROPIC_API_KEY:
-            raise ImproperlyConfigured(
-                "AGENT_BACKEND=gateway requires ANTHROPIC_API_KEY (the LiteLLM virtual key)."
-            )
-        # The gateway authenticates with a bearer token, not an x-api-key header.
-        return anthropic.AsyncAnthropic(
-            base_url=settings.AGENT_GATEWAY_BASE_URL,
-            auth_token=settings.ANTHROPIC_API_KEY,
-        )
-    if backend == "bedrock":
-        # Credentials resolve from AWS_PROFILE / AWS_REGION via botocore.
-        return anthropic.AsyncAnthropicBedrock()
-    raise ImproperlyConfigured(
-        f"AGENT_BACKEND={backend!r} is not one of "
-        f"{sorted(settings.AGENT_MODEL_TIERS)}."
-    )
+    """Construct the Anthropic async client for the configured backend."""
+    return core_llm.build_async_client()
 
 
 ESCALATE_TOOL_NAME = "escalate_to_stronger_model"
@@ -152,43 +112,14 @@ ESCALATE_TOOL = {
     },
 }
 
-SYSTEM_PROMPT = """You are Agent PM, an AI assistant embedded in a team productivity platform.
+_PROMPT_PREAMBLE = """You are Agent PM, an AI assistant embedded in a team productivity platform.
 
 You are a capable general-purpose assistant — you can answer questions, explain concepts, write content, help with analysis, and hold natural conversation on any topic.
 
 IMPORTANT — you have FULL tool access right now. Ignore anything said in earlier turns about lacking capabilities.
+"""
 
-== YOUR TOOLS ==
-
-READ / SEARCH
-- search_records: fuzzy keyword search across action_items, meetings, accounts, or calendar_events
-- get_calendar_events: search calendar events by date range
-- get_airtable_records: read full lists of action items, accounts, or meetings
-- get_emails: search Gmail
-- get_slack_messages: read Slack channels
-- get_token_usage: check how many tokens have been used (today / this_week / this_month / all_time)
-
-CREATE
-- create_action_item: create a new action item and sync to Airtable
-- create_calendar_event: create a new calendar event
-- add_account_note: add a timestamped note to an account
-
-UPDATE
-- update_action_item: update status, priority, due date, notes, or assignee of an action item
-- update_calendar_event: update title, time, location, or status of a calendar event
-- update_meeting: update name, date, topics, or notes of a meeting; push to Airtable
-- update_account: update account details (name, status, ARR, industry)
-
-DELETE (not available for accounts or users)
-- delete_action_item: permanently remove an action item
-- delete_calendar_event: permanently remove a calendar event
-- delete_meeting: permanently remove a meeting record
-
-COMMUNICATE
-- send_sms: send an SMS via Twilio
-- make_phone_call: make a phone call via Twilio
-
-== GUIDELINES ==
+_PROMPT_GUIDELINES = """== GUIDELINES ==
 
 VAGUE REFERENCES — when the user says "that meeting where we discussed pricing" or "the action item about onboarding":
 1. Call search_records with the best keyword(s) from the user's description.
@@ -220,6 +151,35 @@ ERRORS — if a tool returns an error, report it clearly and suggest a next step
 
 TONE — concise and natural. Match length to the user's message. Voice-friendly: short responses work better when the user is on a voice session.
 """
+
+
+def _render_tool_section() -> str:
+    """
+    Build the "== YOUR TOOLS ==" block from the MCP registry.
+
+    Descriptions are the tool docstrings' first lines — the same source
+    mcp_server.tool_schemas() sends to Claude — so the prompt can never disagree
+    with the schemas the model actually receives. The hand-written block this
+    replaces had already drifted: get_meeting_notes_from_email was missing from it.
+    """
+    lines = ["== YOUR TOOLS =="]
+    for group, entries in mcp_server.grouped_catalog().items():
+        lines.append("")
+        lines.append(GROUP_LABELS[group])
+        lines.extend(f"- {name}: {description}" for name, description in entries)
+    return "\n".join(lines)
+
+
+def build_system_prompt() -> str:
+    """Assemble the chat system prompt: preamble, generated tool section, guidelines."""
+    return f"{_PROMPT_PREAMBLE}\n{_render_tool_section()}\n\n{_PROMPT_GUIDELINES}"
+
+
+# Evaluated at import time, which is safe: this module imports mcp_server above, and
+# every @mcp_server.tool() decorator in agents/mcp_server.py is module-level, so the
+# registry is complete before execution reaches here. The name is preserved because
+# tests and the voice layer import it.
+SYSTEM_PROMPT = build_system_prompt()
 
 
 class AgentOrchestrator:

@@ -6,6 +6,7 @@
 import type { AirtableActionItem, AirtableMeeting } from "./airtable";
 import type { TeamMember } from "./team";
 import type { CalendarEvent, Reminder } from "./scheduler";
+import type { CommentReference } from "./comments";
 
 export interface CustomerContactNote {
   id: number;
@@ -93,6 +94,9 @@ export interface AccountArtifact {
   file_url: string | null;
   mime_type: string;
   file_size: number | null;
+  description: string;
+  references: CommentReference[];
+  used_in: CommentReference[];
   uploaded_by: number | null;
   uploaded_by_username: string | null;
   created_at: string;

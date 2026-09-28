@@ -59,6 +59,7 @@ import type {
   SalesforceAccount,
   Task,
   TeamMember,
+  TeamMemberDocument,
   UserProfile,
   VoiceSession,
   WorkingSession,
@@ -82,6 +83,8 @@ import {
 } from "./rateLimit";
 import { clearGetCache, createCachingAdapter } from "./requestCache";
 import { isActionItemMutationUrl, notifyActionItemsChanged } from "./actionItemEvents";
+import type { WeekPlanReport } from "./logWeek";
+import type { CloudCoachSyncReport, CloudCoachPushResult } from "./cloudCoachPush";
 
 const BASE_URL = import.meta.env["VITE_API_BASE_URL"] ?? "/api/v1";
 
@@ -521,6 +524,14 @@ export const teamApi = {
   updateMember: (id: number, data: Partial<TeamMember>) =>
     apiClient.patch<TeamMember>(`/team/members/${id}/`, data),
   deleteMember: (id: number) => apiClient.delete(`/team/members/${id}/`),
+  listMemberDocuments: (memberId: number) =>
+    apiClient.get<TeamMemberDocument[]>(`/team/members/${memberId}/documents/`),
+  addMemberDocument: (memberId: number, data: Partial<TeamMemberDocument>) =>
+    apiClient.post<TeamMemberDocument>(`/team/members/${memberId}/documents/`, data),
+  updateMemberDocument: (docId: number, data: Partial<TeamMemberDocument>) =>
+    apiClient.patch<TeamMemberDocument>(`/team/member-documents/${docId}/`, data),
+  deleteMemberDocument: (docId: number) =>
+    apiClient.delete(`/team/member-documents/${docId}/`),
 };
 
 export const discoverApi = {
@@ -580,8 +591,24 @@ export const accountsApi = {
       params: { ids: accountIds.join(",") },
     });
   },
-  addArtifactLink: (accountId: number, name: string, url: string, iconKey?: string, secondaryUrl?: string) =>
-    apiClient.post<AccountArtifact>(`/accounts/accounts/${accountId}/artifacts/`, { artifact_type: "link", name, url, icon_key: iconKey ?? "", secondary_url: secondaryUrl ?? "" }),
+  addArtifactLink: (
+    accountId: number,
+    name: string,
+    url: string,
+    iconKey?: string,
+    secondaryUrl?: string,
+    description?: string,
+    references?: CommentReference[]
+  ) =>
+    apiClient.post<AccountArtifact>(`/accounts/accounts/${accountId}/artifacts/`, {
+      artifact_type: "link",
+      name,
+      url,
+      icon_key: iconKey ?? "",
+      secondary_url: secondaryUrl ?? "",
+      description: description ?? "",
+      references: references ?? [],
+    }),
   uploadArtifactFile: (accountId: number, file: File) => {
     const fd = new FormData();
     fd.append("artifact_type", "file");
@@ -593,9 +620,10 @@ export const accountsApi = {
   },
   deleteArtifact: (artifactId: number) =>
     apiClient.delete(`/accounts/artifacts/${artifactId}/`),
-  createUserArtifact: (data: { name: string; url: string; icon_key?: string; secondary_url?: string; account?: number | null }) =>
+  createUserArtifact: (data: { name: string; url: string; icon_key?: string; secondary_url?: string; account?: number | null; description?: string; references?: CommentReference[] }) =>
     apiClient.post<AccountArtifact>("/accounts/artifacts/", { artifact_type: "link", ...data }),
-  updateArtifact: (artifactId: number, data: { name?: string; url?: string; icon_key?: string; secondary_url?: string; account?: number | null }) =>
+  // `url` accepts null: the edit modal clears a link by sending null explicitly.
+  updateArtifact: (artifactId: number, data: { name?: string; url?: string | null; icon_key?: string; secondary_url?: string; account?: number | null; description?: string; references?: CommentReference[] }) =>
     apiClient.patch<AccountArtifact>(`/accounts/artifacts/${artifactId}/`, data),
   listQuickLinks: (accountId: number) =>
     apiClient.get<AccountQuickLink[]>(`/accounts/accounts/${accountId}/quick-links/`),
@@ -647,12 +675,21 @@ export const accountsApi = {
       params: { project__in: projectIds.join(",") },
     });
   },
+  // The create response carries an extra `cloud_coach` key when the membership was pushed
+  // to Cloud Coach (see accounts.views.ProjectMemberViewSet.create) — present only when a
+  // push was attempted, so the base row shape is unchanged for every other consumer.
   addProjectMember: (projectId: number, teamMemberId: number, role?: string) =>
-    apiClient.post<ProjectMember>("/accounts/project-members/", {
+    apiClient.post<ProjectMember & { cloud_coach?: CloudCoachPushResult }>("/accounts/project-members/", {
       project: projectId, team_member: teamMemberId, role: role ?? "",
     }),
   removeProjectMember: (id: number) =>
     apiClient.delete(`/accounts/project-members/${id}/`),
+  /** Backfill a project's members into Cloud Coach. `dryRun` previews without writing. */
+  syncProjectMembersToSalesforce: (projectId: number, dryRun = false) =>
+    apiClient.post<CloudCoachSyncReport>(
+      `/accounts/projects/${projectId}/sync-members-to-salesforce/`,
+      { dry_run: dryRun },
+    ),
 };
 
 export const accountFeedApi = {
@@ -686,6 +723,12 @@ export const salesforceApi = {
     duration_minutes: number;
     description?: string;
   }) => apiClient.post<SalesforceTimeEntry>("/salesforce/log-time/", data),
+  /** Log a whole week to Cloud Coach in one request. */
+  logWeek: (data: Record<string, unknown>) =>
+    apiClient.post<WeekPlanReport>("/salesforce/log-week/", data),
+  /** Same endpoint, read-only: returns the plan without writing anything. */
+  previewWeek: (data: Record<string, unknown>) =>
+    apiClient.post<WeekPlanReport>("/salesforce/log-week/", { ...data, dry_run: true }),
   postChatter: (record_id: string, body: string) =>
     apiClient.post("/salesforce/chatter/", { record_id, body }),
   triggerSync: () =>
@@ -758,8 +801,15 @@ export const airtableApi = {
   triggerSync: () => apiClient.post<{ accounts: number; meetings: number; action_items: number; artifacts: number; action_item_attachments: number }>("/airtable/sync/"),
   listAttachments: (actionItemId: number) =>
     apiClient.get<ActionItemAttachment[]>(`/airtable/action-items/${actionItemId}/attachments/`),
-  addAttachmentLink: (actionItemId: number, name: string, url: string) =>
-    apiClient.post<ActionItemAttachment>(`/airtable/action-items/${actionItemId}/attachments/`, { artifact_type: "link", name, url }),
+  addAttachmentLink: (actionItemId: number, name: string, url: string, sourceArtifactId?: number) =>
+    apiClient.post<ActionItemAttachment>(`/airtable/action-items/${actionItemId}/attachments/`, {
+      artifact_type: "link",
+      name,
+      url,
+      // Links the attachment back to the artifact it was picked from, so the artifact can
+      // report where it is used. Omitted entirely when absent — the field is nullable.
+      ...(sourceArtifactId ? { source_artifact: sourceArtifactId } : {}),
+    }),
   uploadAttachmentFile: (actionItemId: number, file: File) => {
     const fd = new FormData();
     fd.append("artifact_type", "file");

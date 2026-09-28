@@ -105,6 +105,38 @@ def push_account_delete(airtable_id: str) -> bool:
         return False
 
 
+def push_account_segment_workspaces(airtable_account) -> bool:
+    """
+    Push an AirtableAccount's segment_workspaces to the Airtable "Segment
+    Workspaces" column. Operates on the AirtableAccount mirror (not the
+    Django Account) since that's where the field lives.
+    """
+    if not airtable_account.airtable_id:
+        logger.warning(
+            "push_account_segment_workspaces called with no airtable_id on account %s",
+            airtable_account.pk,
+        )
+        return False
+    try:
+        table = get_table(TABLE_ACCOUNTS)
+        _airtable_call(
+            table.update,
+            airtable_account.airtable_id,
+            {"Segment Workspaces": airtable_account.segment_workspaces},
+        )
+        logger.info(
+            "Updated Airtable account segment_workspaces for record %s",
+            airtable_account.airtable_id,
+        )
+        return True
+    except Exception:
+        logger.exception(
+            "Failed to push Airtable account %s segment_workspaces",
+            airtable_account.airtable_id,
+        )
+        return False
+
+
 # ── Action Items ──────────────────────────────────────────────────────────────
 
 # Map our internal values → Airtable select option names

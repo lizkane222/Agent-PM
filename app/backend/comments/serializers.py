@@ -8,15 +8,20 @@ from .models import Comment
 User = get_user_model()
 
 
-def _author_display(obj) -> str:
-    """Human-facing name for a comment's author, falling back to the username."""
-    if not obj.author:
+def _user_display_name(user) -> str:
+    """Human-facing name for a user: profile display name, then full name, then username."""
+    if not user:
         return "Unknown"
-    profile = getattr(obj.author, "profile", None)
+    profile = getattr(user, "profile", None)
     if profile and getattr(profile, "display_name", None):
         return profile.display_name
-    full = obj.author.get_full_name()
-    return full if full else obj.author.username
+    full = user.get_full_name()
+    return full if full else user.username
+
+
+def _author_display(obj) -> str:
+    """Human-facing name for a comment's author, falling back to the username."""
+    return _user_display_name(obj.author)
 
 
 class CommentPreviewSerializer(serializers.ModelSerializer):

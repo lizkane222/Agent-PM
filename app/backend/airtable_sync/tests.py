@@ -341,6 +341,145 @@ class GongNotesByEventAPITests(TestCase):
         self.assertEqual(resp.status_code, 404)
 
 
+# ── Stub meeting account resolution ───────────────────────────────────────────
+
+class MeetingStubAccountResolutionTests(TestCase):
+    """A stub meeting must pick up the account CalendarEventAccountLink already resolved
+    for the event — the same account the calendar page's own meeting panel shows —
+    not the never-populated CalendarEvent.account Django FK."""
+
+    def setUp(self):
+        self.user = make_user("acctresuser")
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+        self.account = make_airtable_account(airtable_id="recACCTLINK")
+
+    @patch("airtable_sync.write_back.get_table")
+    def test_new_stub_picks_up_the_matched_account(self, mock_get_table):
+        mock_table = MagicMock()
+        mock_table.create.return_value = {"id": "recNEWLINKED"}
+        mock_get_table.return_value = mock_table
+
+        event = make_calendar_event(self.user, title="Acme Sync", agentpm_airtable_id="")
+        CalendarEventAccountLink.objects.create(
+            calendar_event_uid=str(event.pk),
+            account=self.account,
+            match_method="manual",
+        )
+
+        resp = self.client.patch(
+            f"/api/v1/airtable/meetings/by-event/{event.pk}/gong-notes/",
+            {"gong_notes": "Notes"},
+            format="json",
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        meeting = AirtableMeeting.objects.get(name="Acme Sync")
+        self.assertEqual(meeting.account_id, self.account.pk)
+
+    @patch("airtable_sync.write_back.get_table")
+    def test_existing_accountless_stub_is_backfilled_on_next_save(self, mock_get_table):
+        """A stub created before a link existed (or before it resolved) must not stay
+        accountless forever — the next touch should backfill it."""
+        mock_get_table.return_value = MagicMock()
+
+        event = make_calendar_event(self.user, agentpm_airtable_id="recEXISTINGSTUB")
+        make_meeting(airtable_id="recEXISTINGSTUB", account=None, gong_notes="")
+        CalendarEventAccountLink.objects.create(
+            calendar_event_uid=str(event.pk),
+            account=self.account,
+            match_method="domain",
+        )
+
+        resp = self.client.patch(
+            f"/api/v1/airtable/meetings/by-event/{event.pk}/gong-notes/",
+            {"gong_notes": "Backfilled"},
+            format="json",
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        meeting = AirtableMeeting.objects.get(airtable_id="recEXISTINGSTUB")
+        self.assertEqual(meeting.account_id, self.account.pk)
+        self.assertEqual(meeting.gong_notes, "Backfilled")
+
+    @patch("airtable_sync.write_back.get_table")
+    def test_prefers_the_account_link_over_the_django_fk(self, mock_get_table):
+        """CalendarEventAccountLink — what the UI actually shows — must win over
+        CalendarEvent.account even when the latter happens to be set."""
+        from accounts.models import Account as DjangoAccount
+
+        mock_table = MagicMock()
+        mock_table.create.return_value = {"id": "recPRIORITY"}
+        mock_get_table.return_value = mock_table
+
+        other_at_account = make_airtable_account(airtable_id="recOTHERACCT")
+        django_acct = DjangoAccount.objects.create(
+            company_name="Other Co", airtable_id="recOTHERACCT"
+        )
+        event = make_calendar_event(self.user, agentpm_airtable_id="")
+        event.account = django_acct
+        event.save(update_fields=["account"])
+        CalendarEventAccountLink.objects.create(
+            calendar_event_uid=str(event.pk),
+            account=self.account,
+            match_method="title",
+        )
+
+        self.client.patch(
+            f"/api/v1/airtable/meetings/by-event/{event.pk}/gong-notes/",
+            {"gong_notes": "Notes"},
+            format="json",
+        )
+
+        meeting = AirtableMeeting.objects.get(airtable_id="recPRIORITY")
+        self.assertEqual(meeting.account_id, self.account.pk)
+        self.assertNotEqual(meeting.account_id, other_at_account.pk)
+
+    @patch("airtable_sync.write_back.get_table")
+    def test_falls_back_to_the_django_fk_when_no_link_exists(self, mock_get_table):
+        """No CalendarEventAccountLink row: falls back to CalendarEvent.account when a
+        caller does set it (e.g. some future direct assignment), still resolved to the
+        matching AirtableAccount by airtable_id."""
+        from accounts.models import Account as DjangoAccount
+
+        mock_table = MagicMock()
+        mock_table.create.return_value = {"id": "recFALLBACK"}
+        mock_get_table.return_value = mock_table
+
+        django_acct = DjangoAccount.objects.create(
+            company_name="Fallback Co", airtable_id="recACCTLINK"
+        )
+        event = make_calendar_event(self.user, agentpm_airtable_id="")
+        event.account = django_acct
+        event.save(update_fields=["account"])
+
+        self.client.patch(
+            f"/api/v1/airtable/meetings/by-event/{event.pk}/gong-notes/",
+            {"gong_notes": "Notes"},
+            format="json",
+        )
+
+        meeting = AirtableMeeting.objects.get(airtable_id="recFALLBACK")
+        self.assertEqual(meeting.account_id, self.account.pk)
+
+    @patch("airtable_sync.write_back.get_table")
+    def test_no_link_and_no_django_account_leaves_meeting_accountless(self, mock_get_table):
+        mock_table = MagicMock()
+        mock_table.create.return_value = {"id": "recNOACCT"}
+        mock_get_table.return_value = mock_table
+
+        event = make_calendar_event(self.user, agentpm_airtable_id="")
+
+        self.client.patch(
+            f"/api/v1/airtable/meetings/by-event/{event.pk}/gong-notes/",
+            {"gong_notes": "Notes"},
+            format="json",
+        )
+
+        meeting = AirtableMeeting.objects.get(airtable_id="recNOACCT")
+        self.assertIsNone(meeting.account_id)
+
+
 # ── Response shape tests ──────────────────────────────────────────────────────
 
 class GongNotesResponseShapeTests(TestCase):
@@ -889,6 +1028,27 @@ class ActionItemWriteEndpointPermissionParityTests(APITestCase):
         self.assertEqual(resp.status_code, 200)
         item.refresh_from_db()
         self.assertEqual(item.task, "Renamed")
+
+    @patch("airtable_sync.views.get_table")
+    def test_pasting_a_slack_link_saves_locally_and_pushes_to_airtable(self, mock_get_table):
+        """Regression: slack_thread_url was absent from FIELD_MAP, so /fields/ silently
+        dropped it — a 200 response carrying the item's unchanged (old) value, which read
+        as the pasted link "not saving"."""
+        mock_table = MagicMock()
+        mock_get_table.return_value = mock_table
+        item = self._item("usrMINE", "recSlack")
+        resp = self.client.patch(
+            f"/api/v1/airtable/action-items/{item.airtable_id}/fields/",
+            {"slack_thread_url": "https://acme.slack.com/archives/C1/p123"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.data)
+        item.refresh_from_db()
+        self.assertEqual(item.slack_thread_url, "https://acme.slack.com/archives/C1/p123")
+        self.assertEqual(resp.data["slack_thread_url"], "https://acme.slack.com/archives/C1/p123")
+        mock_table.update.assert_called_once_with(
+            "recSlack", {"Slack Thread URL": "https://acme.slack.com/archives/C1/p123"},
+        )
 
     def test_editing_another_users_item_fields_is_denied(self):
         """Unchanged boundary — an assigned item still belongs to its assignee."""
@@ -1565,6 +1725,178 @@ class SyncMeetingsZoomFieldTests(TestCase):
         self.assertEqual(meeting.gong_notes, "Locally imported Gong recap")
         self.assertEqual(meeting.zoom_notes, "Locally imported Zoom recap")
         self.assertEqual(meeting.zoom_url, "")
+
+
+class PushAccountSegmentWorkspacesUnitTests(TestCase):
+    """write_back.push_account_segment_workspaces — no HTTP, pure function."""
+
+    @patch("airtable_sync.write_back.get_table")
+    def test_pushes_value_to_airtable(self, mock_get_table):
+        mock_table = MagicMock()
+        mock_get_table.return_value = mock_table
+
+        account = make_airtable_account(airtable_id="recACCT001")
+        account.segment_workspaces = "<https://app.segment.com/acme|Acme Workspace>"
+        account.save()
+
+        from .write_back import push_account_segment_workspaces
+        self.assertTrue(push_account_segment_workspaces(account))
+
+        mock_table.update.assert_called_once_with(
+            "recACCT001",
+            {"Segment Workspaces": "<https://app.segment.com/acme|Acme Workspace>"},
+        )
+
+    def test_no_airtable_id_returns_false_without_calling_airtable(self):
+        account = AirtableAccount(name="No Record Yet", segment_workspaces="x")
+        from .write_back import push_account_segment_workspaces
+        self.assertFalse(push_account_segment_workspaces(account))
+
+    @patch("airtable_sync.write_back.get_table")
+    def test_airtable_failure_returns_false_without_raising(self, mock_get_table):
+        mock_table = MagicMock()
+        mock_table.update.side_effect = Exception("boom")
+        mock_get_table.return_value = mock_table
+
+        account = make_airtable_account(airtable_id="recACCT002")
+        account.segment_workspaces = "x"
+        account.save()
+
+        from .write_back import push_account_segment_workspaces
+        self.assertFalse(push_account_segment_workspaces(account))
+
+
+class AirtableAccountSegmentWorkspacesAPITests(APITestCase):
+    """PATCH /airtable/accounts/<id>/ must write-through segment_workspaces."""
+
+    def setUp(self):
+        # Staff bypasses the team-membership scoping in get_queryset — sufficient here
+        # since this suite is about the write-through push, not visibility.
+        self.user = User.objects.create_user(
+            username="segworkspaceuser", password="{PASSWORD}", is_staff=True
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+        self.account = make_airtable_account(airtable_id="recACCT001")
+
+    @patch("airtable_sync.write_back.get_table")
+    def test_patch_saves_locally_and_pushes_to_airtable(self, mock_get_table):
+        mock_table = MagicMock()
+        mock_get_table.return_value = mock_table
+
+        resp = self.client.patch(
+            f"/api/v1/airtable/accounts/{self.account.pk}/",
+            {"segment_workspaces": "<https://app.segment.com/acme|Acme>"},
+            format="json",
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.segment_workspaces, "<https://app.segment.com/acme|Acme>")
+        mock_table.update.assert_called_once_with(
+            "recACCT001",
+            {"Segment Workspaces": "<https://app.segment.com/acme|Acme>"},
+        )
+
+    @patch("airtable_sync.write_back.get_table")
+    def test_airtable_failure_does_not_block_local_save(self, mock_get_table):
+        mock_table = MagicMock()
+        mock_table.update.side_effect = Exception("boom")
+        mock_get_table.return_value = mock_table
+
+        resp = self.client.patch(
+            f"/api/v1/airtable/accounts/{self.account.pk}/",
+            {"segment_workspaces": "saved locally"},
+            format="json",
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.segment_workspaces, "saved locally")
+
+    def test_patch_with_no_editable_fields_does_not_touch_airtable(self):
+        """A PATCH carrying no whitelisted field must not call the Airtable client at all."""
+        with patch("airtable_sync.write_back.get_table") as mock_get_table:
+            resp = self.client.patch(
+                f"/api/v1/airtable/accounts/{self.account.pk}/",
+                {"name": "Should be ignored"},
+                format="json",
+            )
+            self.assertEqual(resp.status_code, 200)
+            mock_get_table.assert_not_called()
+
+    def test_401_unauthenticated(self):
+        self.client.force_authenticate(user=None)
+        resp = self.client.patch(
+            f"/api/v1/airtable/accounts/{self.account.pk}/",
+            {"segment_workspaces": "x"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 401)
+
+
+class SyncAccountsSegmentWorkspacesFieldTests(TestCase):
+    """sync_accounts must not blank a locally-saved segment_workspaces when Airtable is silent.
+
+    Same guard, and the same reason, as SyncMeetingsZoomFieldTests above: this field is
+    edited only through the app UI (Airtable has no flow that populates it), so an
+    unguarded 30-minute pull was blanking whatever the user had just saved back to "".
+    """
+
+    @patch("airtable_sync.sync.get_table")
+    def test_blank_airtable_value_preserves_local_value(self, mock_get_table):
+        account = make_airtable_account(airtable_id="recACCT001")
+        account.segment_workspaces = "Locally saved workspace link"
+        account.save()
+
+        mock_table = MagicMock()
+        mock_table.all.return_value = [{
+            "id": "recACCT001",
+            "fields": {"Account Name": "Acme Corp"},
+        }]
+        mock_get_table.return_value = mock_table
+
+        from .sync import sync_accounts
+        sync_accounts()
+
+        account.refresh_from_db()
+        self.assertEqual(account.segment_workspaces, "Locally saved workspace link")
+
+    @patch("airtable_sync.sync.get_table")
+    def test_non_blank_airtable_value_is_pulled_in(self, mock_get_table):
+        account = make_airtable_account(airtable_id="recACCT001")
+
+        mock_table = MagicMock()
+        mock_table.all.return_value = [{
+            "id": "recACCT001",
+            "fields": {"Account Name": "Acme Corp", "Segment Workspaces": "From Airtable"},
+        }]
+        mock_get_table.return_value = mock_table
+
+        from .sync import sync_accounts
+        sync_accounts()
+
+        account.refresh_from_db()
+        self.assertEqual(account.segment_workspaces, "From Airtable")
+
+    @patch("airtable_sync.sync.get_table")
+    def test_whitespace_only_airtable_value_does_not_overwrite_local_value(self, mock_get_table):
+        account = make_airtable_account(airtable_id="recACCT001")
+        account.segment_workspaces = "Locally saved workspace link"
+        account.save()
+
+        mock_table = MagicMock()
+        mock_table.all.return_value = [{
+            "id": "recACCT001",
+            "fields": {"Account Name": "Acme Corp", "Segment Workspaces": "\n"},
+        }]
+        mock_get_table.return_value = mock_table
+
+        from .sync import sync_accounts
+        sync_accounts()
+
+        account.refresh_from_db()
+        self.assertEqual(account.segment_workspaces, "Locally saved workspace link")
 
 
 class CalendarEventAccountLinkAdminDisplayNameTests(APITestCase):

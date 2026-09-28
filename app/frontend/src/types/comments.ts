@@ -10,7 +10,9 @@ export type CommentResourceType =
   | "account_note"
   | "artifact"
   | "meeting_note"
-  | "claude_skill";
+  | "claude_skill"
+  | "goal"
+  | "project";
 
 export interface CommentReference {
   resource_type: CommentResourceType;

@@ -184,3 +184,31 @@ class TeamMember(models.Model):
 
     def __str__(self) -> str:
         return f"{self.full_name} <{self.email}>"
+
+
+class TeamMemberDocument(models.Model):
+    """
+    A link to a document (e.g. an out-of-office coverage doc) shared on a team
+    member's profile so anyone can look it up later. Visible to any authenticated
+    user; only the member themselves or staff may add/edit/remove one.
+    """
+
+    team_member = models.ForeignKey(TeamMember, on_delete=models.CASCADE, related_name="documents")
+    added_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="added_team_member_documents",
+    )
+    name = models.CharField(max_length=300)
+    url = models.TextField()
+    position = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["position", "created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.name} — {self.team_member.full_name}"

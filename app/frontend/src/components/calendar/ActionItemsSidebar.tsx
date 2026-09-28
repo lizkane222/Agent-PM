@@ -6,8 +6,9 @@ import { airtableApi, teamApi } from "../../lib/api";
 import { addLog } from "../../lib/appLog";
 import { logActionItemUpdate } from "../../lib/actionItemLog";
 import type { AirtableActionItem, AirtableAccount } from "../../types";
+import type { TeamMember } from "../../types/team";
 import { ContextMenu, FocusPinBadge, focusPinMenuItem, type ContextMenuItem } from "../action-items/ContextMenu";
-import StepsPanel from "../action-items/StepsPanel";
+import { ActionItemModal } from "../account/ActionItemModal";
 import { useFocusPins } from "../../hooks/useFocusPins";
 import { useActionItemZoneSets } from "../../hooks/useActionItemZoneSets";
 import { groupActionItems, DONE_WINDOW_DAYS, isRecentlyDone, type SidebarGroupKey } from "../../lib/actionItemSidebarOrder";
@@ -22,7 +23,6 @@ import {
   WORK_TRACKING_COLOR,
   PRIORITY_COLORS_CAL,
   STATUS_COLORS_CAL,
-  CalCreateForm,
   BLANK_FORM,
   readScheduledItems,
   CalPillSelect,
@@ -48,19 +48,26 @@ function OccurrencesList({ airtableId }: { airtableId: string }) {
   );
 }
 
-function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onUpdate, onAccountDrop, accounts, teamMembers, forceExpand }: {
+/**
+ * A card in the calendar's action-items sidebar.
+ *
+ * **Collapsed is the only view.** Editing any field opens the shared `ActionItemModal`, so the
+ * sidebar and the modal cannot disagree about what a field means or how it is saved. The card
+ * used to carry its own inline expanded editor with a click-outside commit — a second,
+ * diverging copy of the modal's form.
+ *
+ * `onUpdate` survives for the one-click "Mark as Done" / "Reopen" context-menu entry, which is a
+ * single known field rather than field editing.
+ */
+function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onUpdate, onOpenModal, onAccountDrop }: {
   item: AirtableActionItem;
   onDragStart: (e: React.DragEvent) => void;
   onDelete: () => void;
   onReminderToggle: () => void;
   onUpdate: (patch: Partial<AirtableActionItem>) => void;
+  onOpenModal: (item: AirtableActionItem) => void;
   onAccountDrop: (accountId: number, accountName: string) => void;
-  accounts: AirtableAccount[];
-  teamMembers: { id: number; full_name: string }[];
-  forceExpand?: boolean;
 }) {
-  const { status: statusOptions } = useActionItemFieldOptions();
-  const [expanded, setExpanded] = useState(forceExpand ?? false);
   const [ctxPos, setCtxPos] = useState<{ x: number; y: number } | null>(null);
   const { addToTray } = useExportTray();
   const { isPinned, toggle: toggleFocusPin } = useFocusPins();
@@ -70,202 +77,9 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
   const isPinnedToFocus = canPin && isPinned(item.airtable_id);
   const commentMenuEntry = useCommentMenuItem("action_item", canPin ? item.id : null, item.task || "", ctxPos);
 
-  useEffect(() => {
-    if (forceExpand) setExpanded(true);
-  }, [forceExpand]);
-  const [editForm, setEditForm] = useState<CalCreateForm>({
-    task: item.task,
-    task_details: item.task_details,
-    priority: item.priority,
-    status: item.status,
-    due_date: item.due_date ?? "",
-    account_name: item.account_name ?? "",
-    estimated_time: item.estimated_time,
-    time_spent: item.time_spent,
-    prep_time: item.prep_time,
-    slack_thread_url: item.slack_thread_url,
-    assignee_name: item.assignee_name,
-  });
   const cardRef = useRef<HTMLDivElement>(null);
   const hasReminder = !!item.reminder_due_at;
   const [isAccountDropTarget, setIsAccountDropTarget] = useState(false);
-
-  // Sync editForm when item prop changes (e.g. after save)
-  useEffect(() => {
-    if (!expanded) {
-      setEditForm({
-        task: item.task,
-        task_details: item.task_details,
-        priority: item.priority,
-        status: item.status,
-        due_date: item.due_date ?? "",
-        account_name: item.account_name ?? "",
-        estimated_time: item.estimated_time,
-        time_spent: item.time_spent,
-        prep_time: item.prep_time,
-        slack_thread_url: item.slack_thread_url,
-        assignee_name: item.assignee_name,
-      });
-    }
-  }, [item, expanded]);
-
-  function commitEdit() {
-    if (!expanded) return;
-    setExpanded(false);
-    // Build patch of only changed fields
-    const patch: Partial<AirtableActionItem> = {};
-    if (editForm.task !== item.task) patch.task = editForm.task;
-    if (editForm.task_details !== item.task_details) patch.task_details = editForm.task_details;
-    if (editForm.priority !== item.priority) patch.priority = editForm.priority;
-    if (editForm.status !== item.status) patch.status = editForm.status;
-    if ((editForm.due_date || null) !== item.due_date) patch.due_date = editForm.due_date || null;
-    if ((editForm.account_name || null) !== item.account_name) patch.account_name = editForm.account_name || null;
-    if (editForm.estimated_time !== item.estimated_time) patch.estimated_time = editForm.estimated_time;
-    if (editForm.time_spent !== item.time_spent) patch.time_spent = editForm.time_spent;
-    if (editForm.prep_time !== item.prep_time) patch.prep_time = editForm.prep_time;
-    if (editForm.slack_thread_url !== item.slack_thread_url) patch.slack_thread_url = editForm.slack_thread_url;
-    if (editForm.assignee_name !== item.assignee_name) patch.assignee_name = editForm.assignee_name;
-    if (Object.keys(patch).length > 0) onUpdate(patch);
-  }
-
-  // Click-outside → commit
-  useEffect(() => {
-    if (!expanded) return;
-    function onPointerDown(e: PointerEvent) {
-      if (cardRef.current && !cardRef.current.contains(e.target as Node)) {
-        commitEdit();
-      }
-    }
-    document.addEventListener("pointerdown", onPointerDown);
-    return () => document.removeEventListener("pointerdown", onPointerDown);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [expanded, editForm]);
-
-  if (expanded) {
-    return (
-      <div
-        ref={cardRef}
-        className="rounded-lg select-none"
-        style={{
-          background: "#F5F3FF",
-          borderLeft: "3px solid #a78bfa",
-          padding: "8px 10px",
-          display: "flex",
-          flexDirection: "column",
-          gap: 6,
-          boxShadow: "0 2px 8px rgba(0,0,0,0.12)",
-        }}
-      >
-        {/* Task title */}
-        <input
-          autoFocus
-          value={editForm.task}
-          onChange={(e) => setEditForm((f) => ({ ...f, task: e.target.value }))}
-          onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); commitEdit(); } if (e.key === "Escape") { setExpanded(false); } }}
-          placeholder="Task name"
-          className="w-full text-[13px] font-medium text-[var(--twilio-navy)] bg-white rounded px-2 py-1 border border-indigo-300 focus:outline-none focus:border-indigo-500"
-        />
-
-        {/* Task details */}
-        <textarea
-          value={editForm.task_details}
-          onChange={(e) => setEditForm((f) => ({ ...f, task_details: e.target.value }))}
-          rows={2}
-          placeholder="Details…"
-          className="w-full text-[11px] text-[var(--twilio-navy)] bg-white rounded px-2 py-1 border border-gray-200 focus:outline-none focus:border-indigo-300 resize-none leading-relaxed placeholder:text-gray-400"
-        />
-
-        {/* Status + Priority */}
-        <div className="flex flex-wrap gap-1.5">
-          <CalPillSelect
-            value={editForm.status}
-            options={statusOptions as AirtableActionItem["status"][]}
-            colorMap={STATUS_COLORS_CAL}
-            placeholder="Status"
-            onChange={(v) => setEditForm((f) => ({ ...f, status: v }))}
-          />
-          <CalPillSelect
-            value={editForm.priority}
-            options={["Critical", "High", "Medium", "Low"] as const}
-            colorMap={PRIORITY_COLORS_CAL}
-            placeholder="Priority"
-            onChange={(v) => setEditForm((f) => ({ ...f, priority: v }))}
-          />
-          <CalPillDate value={editForm.due_date} onChange={(v) => setEditForm((f) => ({ ...f, due_date: v }))} />
-        </div>
-
-        {/* Time fields + Slack */}
-        <div className="flex flex-wrap gap-1.5">
-          <CalPillNumber value={editForm.estimated_time} label="Est." onChange={(v) => setEditForm((f) => ({ ...f, estimated_time: v }))} />
-          <CalPillNumber value={editForm.time_spent} label="Spent" onChange={(v) => setEditForm((f) => ({ ...f, time_spent: v }))} />
-          <CalPillNumber value={editForm.prep_time} label="Prep" onChange={(v) => setEditForm((f) => ({ ...f, prep_time: v }))} />
-          <CalPillUrl value={editForm.slack_thread_url} onChange={(v) => setEditForm((f) => ({ ...f, slack_thread_url: v }))} />
-        </div>
-
-        {/* Account + Assignee */}
-        <div className="flex flex-wrap gap-1.5">
-          <CalPillSelect
-            value={(editForm.account_name || "No account") as string}
-            options={["No account", ...accounts.map((a) => a.name)] as string[]}
-            colorMap={{}}
-            placeholder="Account"
-            onChange={(v) => setEditForm((f) => ({ ...f, account_name: v === "No account" ? "" : v }))}
-          />
-          {teamMembers.length > 0 && (
-            <CalPillSelect
-              value={(editForm.assignee_name || "Unassigned") as string}
-              options={["Unassigned", ...teamMembers.map((m) => m.full_name)] as string[]}
-              colorMap={{}}
-              placeholder="Assignee"
-              onChange={(v) => setEditForm((f) => ({ ...f, assignee_name: v === "Unassigned" ? "" : v }))}
-            />
-          )}
-        </div>
-
-        {/* Footer: reminder + delete + done */}
-        <div className="flex items-center justify-between pt-0.5">
-          <div className="flex items-center gap-1.5">
-            <button
-              onClick={(e) => { e.stopPropagation(); onReminderToggle(); }}
-              title={hasReminder ? `Reminder: ${new Date(item.reminder_due_at!).toLocaleString()}` : "Set reminder"}
-              className="rounded p-0.5 hover:bg-gray-200 transition-colors"
-              style={{ color: hasReminder ? "#f59e0b" : "#9ca3af" }}
-            >
-              <svg viewBox="0 0 16 16" width="12" height="12" fill={hasReminder ? "currentColor" : "none"} stroke="currentColor" strokeWidth="1.5">
-                <path strokeLinecap="round" d="M8 1a5 5 0 00-5 5v2.5L1.5 10h13L13 8.5V6a5 5 0 00-5-5z"/>
-                <path strokeLinecap="round" d="M6.5 13a1.5 1.5 0 003 0"/>
-              </svg>
-            </button>
-            <button
-              onClick={(e) => { e.stopPropagation(); onDelete(); }}
-              title="Delete"
-              className="rounded p-0.5 hover:bg-red-100 transition-colors text-gray-400 hover:text-red-500"
-            >
-              <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
-                <path d="M3 3l10 10M13 3L3 13"/>
-              </svg>
-            </button>
-          </div>
-          <button
-            onClick={(e) => { e.stopPropagation(); commitEdit(); }}
-            className="text-[11px] font-semibold px-2.5 py-1 rounded-md bg-indigo-600 text-white hover:bg-indigo-700 transition-colors"
-          >
-            Done
-          </button>
-        </div>
-
-
-        {/* Checklist — the same component the modals use, so an action item reads the same
-            wherever it is opened. Real Airtable items only: steps key off the numeric PK. */}
-        {!item.airtable_id.startsWith("local-") && (
-          <div className="pt-2 mt-1 border-t border-violet-100">
-            <StepsPanel actionItemId={item.id} />
-          </div>
-        )}
-        <OccurrencesList airtableId={item.airtable_id} />
-      </div>
-    );
-  }
 
   const ctxItems: ContextMenuItem[] = [
     ...(canPin ? [
@@ -273,16 +87,16 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
       { separator: true, label: "", onClick: () => {} } as ContextMenuItem,
     ] : []),
     {
-      label: "Expand",
+      label: "Edit details",
       icon: <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5"><path d="M9 2H12v3"/><path d="M7 7l5-5"/><path d="M12 9v3H2V2h4"/></svg>,
-      onClick: () => setExpanded(true),
+      onClick: () => onOpenModal(item),
     },
     {
-      label: editForm.status === "Done" ? "Reopen" : "Mark as Done",
-      icon: editForm.status === "Done"
+      label: item.status === "Done" ? "Reopen" : "Mark as Done",
+      icon: item.status === "Done"
         ? <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5"><circle cx="7" cy="7" r="6"/><path d="M4.5 7.5 6 9l3.5-4"/></svg>
         : <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5"><path d="M2 7l3.5 3.5L12 3.5"/></svg>,
-      onClick: () => onUpdate({ status: editForm.status === "Done" ? "Open" : "Done" }),
+      onClick: () => onUpdate({ status: item.status === "Done" ? "Open" : "Done" }),
     },
     {
       label: "Copy task name",
@@ -307,7 +121,7 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
       ref={cardRef}
       draggable
       onDragStart={onDragStart}
-      onClick={() => setExpanded(true)}
+      onClick={() => onOpenModal(item)}
       onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setCtxPos({ x: e.clientX, y: e.clientY }); }}
       onDragOver={(e) => {
         const w = window as unknown as Record<string, string>;
@@ -342,11 +156,11 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
     >
       {/* Row 1: badges + actions */}
       <div className="flex items-center gap-1.5 flex-wrap">
-        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded whitespace-nowrap ${PRIORITY_COLORS_CAL[editForm.priority] ?? "bg-gray-100 text-gray-600"}`}>{editForm.priority}</span>
-        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded whitespace-nowrap ${STATUS_COLORS_CAL[editForm.status] ?? "bg-gray-100 text-gray-700"}`}>{editForm.status}</span>
-        {editForm.due_date && (
+        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded whitespace-nowrap ${PRIORITY_COLORS_CAL[item.priority] ?? "bg-gray-100 text-gray-600"}`}>{item.priority}</span>
+        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded whitespace-nowrap ${STATUS_COLORS_CAL[item.status] ?? "bg-gray-100 text-gray-700"}`}>{item.status}</span>
+        {item.due_date && (
           <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded whitespace-nowrap bg-amber-50 text-amber-700">
-            {new Date(editForm.due_date).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
+            {new Date(item.due_date).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
           </span>
         )}
         <div className="ml-auto flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
@@ -375,21 +189,21 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
 
       {/* Row 2: task title */}
       <p className="text-[13px] font-medium text-[var(--twilio-navy)] leading-snug" style={{ overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" as const }}>
-        {editForm.task || <span className="italic opacity-40">Untitled</span>}
+        {item.task || <span className="italic opacity-40">Untitled</span>}
       </p>
 
       {/* Row 3: details + meta */}
-      {(editForm.task_details || editForm.assignee_name || editForm.account_name || editForm.estimated_time) ? (
+      {(item.task_details || item.assignee_name || item.account_name || item.estimated_time) ? (
         <div className="flex flex-col gap-0.5">
-          {editForm.task_details && (
+          {item.task_details && (
             <p className="text-[11px] text-[var(--twilio-navy)] opacity-60 leading-snug" style={{ overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" as const }}>
-              {editForm.task_details}
+              {item.task_details}
             </p>
           )}
           <div className="flex gap-2 flex-wrap">
-            {editForm.account_name && <span className="text-[10px] text-[var(--twilio-gray-60)]">{editForm.account_name}</span>}
-            {editForm.assignee_name && <span className="text-[10px] text-[var(--twilio-gray-60)]">{editForm.assignee_name}</span>}
-            {editForm.estimated_time ? <span className="text-[10px] text-[var(--twilio-gray-60)]">{editForm.estimated_time}m est.</span> : null}
+            {item.account_name && <span className="text-[10px] text-[var(--twilio-gray-60)]">{item.account_name}</span>}
+            {item.assignee_name && <span className="text-[10px] text-[var(--twilio-gray-60)]">{item.assignee_name}</span>}
+            {item.estimated_time ? <span className="text-[10px] text-[var(--twilio-gray-60)]">{item.estimated_time}m est.</span> : null}
           </div>
         </div>
       ) : null}
@@ -419,12 +233,16 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
   const { status: statusOptions } = useActionItemFieldOptions();
   const [items, setItems] = useState<AirtableActionItem[]>([]);
   const [loading, setLoading] = useState(true);
-  const [forcedExpandId, setForcedExpandId] = useState<string | null>(expandItemId ?? null);
+  // `expandItemId` used to force a card into its inline expanded editor. Editing now happens
+  // only in the shared ActionItemModal, so the same request opens that instead.
+  const [modalItem, setModalItem] = useState<AirtableActionItem | null>(null);
 
   // When a new expandItemId is pushed in, adopt it
   useEffect(() => {
-    if (expandItemId) setForcedExpandId(expandItemId);
-  }, [expandItemId]);
+    if (!expandItemId) return;
+    const match = items.find((i) => i.airtable_id === expandItemId);
+    if (match) setModalItem(match);
+  }, [expandItemId, items]);
   // Where each card sits — the first three sections are positional state, not status.
   const { trackingIds, stagedIds } = useActionItemZoneSets();
   const { pinnedIds } = useFocusPins();
@@ -442,7 +260,7 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
 
   // Airtable accounts and team members for the create form
   const [accounts, setAccounts] = useState<AirtableAccount[]>([]);
-  const [teamMembers, setTeamMembers] = useState<{ id: number; full_name: string }[]>([]);
+  const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
 
   const fetchItems = () =>
     airtableApi
@@ -704,10 +522,10 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
                 )}
                 <ActionItemCard_Cal
                   item={item}
-                  forceExpand={forcedExpandId === item.airtable_id}
                   onDragStart={(e) => handleDragStart(e, item)}
                   onDelete={() => handleDelete(item)}
                   onUpdate={(patch) => void handleUpdate(item, patch)}
+                  onOpenModal={(it) => setModalItem(it)}
                   onAccountDrop={(accountId, accountName) => {
                     setItems((prev) => prev.map((i) => i.airtable_id === item.airtable_id ? { ...i, account: accountId, account_name: accountName } : i));
                     airtableApi.updateActionItemFields(item.airtable_id, { account: accountId, account_name: accountName }).catch(() => {
@@ -715,8 +533,6 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
                     });
                     window.dispatchEvent(new StorageEvent("storage", { key: "actionItemsUpdated", newValue: "1" }));
                   }}
-                  accounts={accounts}
-                  teamMembers={teamMembers}
                   onReminderToggle={() => {
                     if (reminderItemId === item.airtable_id) {
                       setReminderItemId(null);
@@ -885,6 +701,34 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
             style={{ background: "#a78bfa" }}
           >+ New Action Item</button>
         </div>
+      )}
+
+      {/* The one place an action item's fields are edited. */}
+      {modalItem && (
+        <ActionItemModal
+          item={modalItem}
+          accountId={accounts.find((a) => a.name === modalItem.account_name)?.id}
+          teamMembers={teamMembers}
+          onClose={() => setModalItem(null)}
+          onUpdated={(updated: AirtableActionItem) => {
+            setItems((prev) => prev.map((i) => i.airtable_id === updated.airtable_id ? updated : i));
+            window.dispatchEvent(new StorageEvent("storage", { key: "actionItemsUpdated", newValue: "1" }));
+            setModalItem(null);
+          }}
+          onAutosaved={(updated: AirtableActionItem) => {
+            setItems((prev) => prev.map((i) => i.airtable_id === updated.airtable_id ? updated : i));
+          }}
+          onConverted={() => {
+            setItems((prev) => prev.map((i) => i.airtable_id === modalItem.airtable_id ? { ...i, status: "Done" } as AirtableActionItem : i));
+            window.dispatchEvent(new StorageEvent("storage", { key: "actionItemsUpdated", newValue: "1" }));
+            setModalItem(null);
+          }}
+          onDeleted={(id: number) => {
+            setItems((prev) => prev.filter((i) => i.id !== id));
+            window.dispatchEvent(new StorageEvent("storage", { key: "actionItemsUpdated", newValue: "1" }));
+            setModalItem(null);
+          }}
+        />
       )}
     </div>
   );

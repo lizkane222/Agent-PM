@@ -145,19 +145,27 @@ def sync_accounts() -> int:
     upserted = 0
     for record in table.all():
         f = record["fields"]
+        at_segment_workspaces = _str(f.get("Segment Workspaces", ""))
+        defaults = {
+            "name": _str(f.get("Account Name", "")),
+            "email_domain": _str(f.get("Email Domain", "")),
+            "health_score": _str(f.get("Health Score", "")),
+            "next_meeting": _parse_dt(f.get("Next Meeting")),
+            "open_ticket_count": int(f.get("Open Ticket Count") or 0),
+            "time_budget": int(f.get("Time Budget") or 0),
+            "total_meeting_duration": int(f.get("Total Meeting Duration") or 0),
+            "salesforce_account_id": _str(f.get("Salesforce Account ID", "")),
+        }
+        # Only overwrite segment_workspaces from Airtable when Airtable actually has
+        # content — same guard as Gong/Zoom meeting notes (see sync_meetings below).
+        # Without it, this field is edited only through the app (there is no Airtable
+        # UI flow that populates it), so every 30-minute pull was blanking whatever the
+        # user had just saved back to "".
+        if at_segment_workspaces.strip():
+            defaults["segment_workspaces"] = at_segment_workspaces
         AirtableAccount.objects.update_or_create(
             airtable_id=record["id"],
-            defaults={
-                "name": _str(f.get("Account Name", "")),
-                "email_domain": _str(f.get("Email Domain", "")),
-                "health_score": _str(f.get("Health Score", "")),
-                "next_meeting": _parse_dt(f.get("Next Meeting")),
-                "open_ticket_count": int(f.get("Open Ticket Count") or 0),
-                "time_budget": int(f.get("Time Budget") or 0),
-                "total_meeting_duration": int(f.get("Total Meeting Duration") or 0),
-                "salesforce_account_id": _str(f.get("Salesforce Account ID", "")),
-                "segment_workspaces": _str(f.get("Segment Workspaces", "")),
-            },
+            defaults=defaults,
         )
         seen_ids.add(record["id"])
         upserted += 1

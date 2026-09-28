@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import { accountsApi, airtableApi, searchApi } from "../../lib/api";
 import type { SearchResult } from "../../lib/api";
-import type { AccountArtifact, ActionItemAttachment, GoalSection } from "../../types";
+import type { AccountArtifact, ActionItemAttachment, CommentReference, GoalSection } from "../../types";
 import { resolveEmojiShortcodes } from "../../lib/emojiShortcodes";
 import { ArtifactIcon, ArtifactIconImg, type ArtifactIconEntry, ARTIFACT_ICON_CATALOG, getAutoIconKey } from "./ArtifactIcon";
 import { ArtifactViewer } from "./ArtifactViewer";
+import RichTextMentionEditor from "../shared/RichTextMentionEditor";
 
 function _stripMentions(text: string) {
   return text.replace(/@\S+/g, "").replace(/\s{2,}/g, " ").trim();
@@ -262,6 +263,8 @@ function EditArtifactModal({
   const [url, setUrl] = useState(artifact.url ?? "");
   const [secondaryUrl, setSecondaryUrl] = useState(artifact.secondary_url ?? "");
   const [iconKey, setIconKey] = useState(artifact.icon_key ?? "link");
+  const [description, setDescription] = useState(artifact.description ?? "");
+  const [references, setReferences] = useState<CommentReference[]>(artifact.references ?? []);
   const [category, setCategory] = useState(currentCategory);
   const [showCatDropdown, setShowCatDropdown] = useState(false);
   const [pendingFile, setPendingFile] = useState<File | null>(null);
@@ -312,13 +315,17 @@ function EditArtifactModal({
         const { data: patched } = await accountsApi.updateArtifact(uploaded.id, {
           name: name.trim() || pendingFile.name,
           icon_key: iconKey,
+          description,
+          references,
         });
         await accountsApi.deleteArtifact(artifact.id);
         onSaved(patched, category.trim(), artifact.id);
       } else {
-        const patch: Record<string, string | null | undefined> = {
+        const patch: Parameters<typeof accountsApi.updateArtifact>[1] = {
           name: name.trim() || artifact.name,
           icon_key: iconKey,
+          description,
+          references,
         };
         if (!isFile) {
           patch.url = url.trim() || null;
@@ -441,6 +448,22 @@ function EditArtifactModal({
                 </div>
               );
             })()}
+          </div>
+
+          {/* Description */}
+          <div>
+            <label style={labelStyle}>Description <span style={{ fontWeight: 400 }}>(optional — @# to link a record)</span></label>
+            <RichTextMentionEditor
+              value={description}
+              onChange={setDescription}
+              placeholder="What is this, and when should someone reach for it?"
+              minHeightClassName="min-h-[70px]"
+              onReferenceInsert={(ref) => setReferences((prev) =>
+                prev.some((r) => r.resource_type === ref.resource_type && r.resource_id === ref.resource_id)
+                  ? prev
+                  : [...prev, ref],
+              )}
+            />
           </div>
         </div>
 
@@ -843,6 +866,31 @@ export function ArtifactsPanel({
               )}
             </div>
           )}
+          {(a.uploaded_by_username || a.used_in?.length) && (
+            <div style={{ display: "flex", alignItems: "center", gap: "5px", marginTop: "3px" }}>
+              {a.uploaded_by_username && (
+                <>
+                  <span
+                    className="w-4 h-4 rounded-full bg-indigo-600 text-white text-[8px] font-bold flex items-center justify-center shrink-0"
+                    title={`Added by ${a.uploaded_by_username}`}
+                  >
+                    {a.uploaded_by_username[0].toUpperCase()}
+                  </span>
+                  <span style={{ fontSize: "0.625rem", color: "var(--text-secondary, #aaa)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {a.uploaded_by_username}
+                  </span>
+                </>
+              )}
+              {!!a.used_in?.length && (
+                <span
+                  style={{ fontSize: "0.5625rem", fontWeight: 600, color: "#6366f1", background: "rgba(99,102,241,0.08)", borderRadius: "4px", padding: "1px 5px", flexShrink: 0 }}
+                  title={a.used_in.map((r) => r.label).join(", ")}
+                >
+                  used in {a.used_in.length}
+                </span>
+              )}
+            </div>
+          )}
         </div>
       </div>
     );
@@ -1002,7 +1050,11 @@ export function ArtifactsPanel({
         ref={fileInputRef}
         type="file"
         multiple
-        accept=".js,.ts,.tsx,.jsx,.mjs,.css,.scss,.html,.py,.rb,.go,.java,.c,.cpp,.cs,.php,.rs,.json,.yaml,.yml,.sh,.sql,.md,image/*,application/pdf,.doc,.docx,.xls,.xlsx,.csv,.zip"
+        // Must not advertise anything the server's _BLOCKED_EXTENSIONS rejects
+        // (accounts/views.py). It previously offered .js/.ts/.tsx/.jsx/.py/.rb/.sh/.php,
+        // all of which 400, so the picker invited uploads that could never succeed.
+        // .html IS accepted — it is sanitized on upload and served sandboxed.
+        accept=".html,.htm,.css,.scss,.go,.java,.c,.cpp,.cs,.rs,.json,.yaml,.yml,.sql,.md,.txt,image/*,application/pdf,.doc,.docx,.xls,.xlsx,.csv,.zip"
         style={{ display: "none" }}
         onChange={(e) => { if (e.target.files) void handleFiles(e.target.files); e.target.value = ""; }}
       />
@@ -1136,6 +1188,8 @@ function AddArtifactModal({
   const [url, setUrl] = useState("");
   const [secondaryUrl, setSecondaryUrl] = useState("");
   const [iconKey, setIconKey] = useState("link");
+  const [description, setDescription] = useState("");
+  const [references, setReferences] = useState<CommentReference[]>([]);
   const [category, setCategory] = useState("");
   const [showCatDropdown, setShowCatDropdown] = useState(false);
   const catInputRef = useRef<HTMLInputElement>(null);
@@ -1196,7 +1250,7 @@ function AddArtifactModal({
     setError(null);
     try {
       const displayName = name.trim() || url.trim();
-      const { data } = await accountsApi.addArtifactLink(accountId, displayName, url.trim(), iconKey, secondaryUrl.trim() || undefined);
+      const { data } = await accountsApi.addArtifactLink(accountId, displayName, url.trim(), iconKey, secondaryUrl.trim() || undefined, description, references);
       onAdded(data, category.trim());
     } catch {
       setError("Failed to add link — please try again.");
@@ -1344,6 +1398,24 @@ function AddArtifactModal({
                 </div>
               );
             })()}
+          </div>
+
+          {/* Description */}
+          <div>
+            <label style={{ display: "block", fontSize: "0.6875rem", fontWeight: 600, color: "var(--text-secondary, #888)", marginBottom: "4px" }}>
+              Description <span style={{ fontWeight: 400 }}>(optional — @# to link a record)</span>
+            </label>
+            <RichTextMentionEditor
+              value={description}
+              onChange={setDescription}
+              placeholder="What is this, and when should someone reach for it?"
+              minHeightClassName="min-h-[70px]"
+              onReferenceInsert={(ref) => setReferences((prev) =>
+                prev.some((r) => r.resource_type === ref.resource_type && r.resource_id === ref.resource_id)
+                  ? prev
+                  : [...prev, ref],
+              )}
+            />
           </div>
         </div>
 

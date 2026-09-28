@@ -25,6 +25,19 @@ export interface TeamMember {
   updated_at: string;
 }
 
+/** A link to a document shared on a team member's profile (e.g. an OOO coverage doc). */
+export interface TeamMemberDocument {
+  id: number;
+  team_member: number;
+  name: string;
+  url: string;
+  position: number;
+  added_by: number | null;
+  added_by_name: string;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface UserProfile {
   id: number;
   username: string;

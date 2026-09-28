@@ -200,6 +200,9 @@ class AccountArtifact(models.Model):
     file = models.FileField(upload_to="account_artifacts/%Y/%m/", null=True, blank=True)
     mime_type = models.CharField(max_length=100, blank=True)
     file_size = models.PositiveIntegerField(null=True, blank=True)  # bytes
+    description = models.TextField(blank=True, default="")  # rich text (HTML)
+    # Records referenced via @# picker inside the description: [{resource_type, resource_id, label, url}]
+    references = models.JSONField(default=list, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -219,7 +222,11 @@ class AccountProject(models.Model):
     ]
 
     account = models.ForeignKey(Account, on_delete=models.CASCADE, related_name="projects")
-    name = models.CharField(max_length=512)
+    # blank=True is load-bearing, not cosmetic: "+ Add Goal" creates the row first and
+    # lets the user type the name into the card afterwards. While this was required,
+    # DRF rejected every one of those POSTs with 400 "This field may not be blank",
+    # the frontend discarded the error, and no goal ever persisted.
+    name = models.CharField(max_length=512, blank=True, default="")
     description = models.TextField(blank=True, default="")
     position = models.PositiveSmallIntegerField(default=0)
     url = models.CharField(max_length=2048, blank=True, default="")

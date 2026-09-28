@@ -63,22 +63,62 @@ def _allowed_airtable_ids_for(user: Any) -> set[str]:
     )
 
 
+# Ordering and headings for the generated "== YOUR TOOLS ==" prompt section. A flat
+# alphabetical list of 21 tools reads materially worse to the model than grouped
+# headings, so the curated grouping is kept — but it now lives on the tool itself
+# (see MCPServer.tool's `group=`) instead of in a hand-maintained list that drifts.
+GROUP_ORDER = ("read", "create", "update", "delete", "communicate", "skills", "other")
+
+GROUP_LABELS = {
+    "read": "READ / SEARCH",
+    "create": "CREATE",
+    "update": "UPDATE",
+    "delete": "DELETE (not available for accounts or users)",
+    "communicate": "COMMUNICATE",
+    "skills": "SAVED WORKFLOWS",
+    "other": "OTHER",
+}
+
+
 class MCPServer:
     """Registry and dispatcher for async MCP tools."""
 
     def __init__(self) -> None:
         self._registry: dict[str, Callable[..., Coroutine[Any, Any, Any]]] = {}
         self._schemas: dict[str, dict] = {}
+        self._meta: dict[str, dict] = {}
 
-    def tool(self, name: str | None = None, schema: dict | None = None):
-        """Decorator that registers an async function as an MCP tool."""
+    def tool(
+        self,
+        name: str | None = None,
+        schema: dict | None = None,
+        *,
+        group: str = "other",
+        skill_safe: bool = False,
+    ):
+        """
+        Decorator that registers an async function as an MCP tool.
+
+        `group` and `skill_safe` are declared here, at the single point of
+        registration, so the two downstream consumers — the agent system prompt's
+        tool section and the skills app's allowed-tools catalog — are *derived*
+        rather than hand-maintained. A new tool cannot silently go missing from one
+        of them, which is exactly how get_meeting_notes_from_email came to be
+        absent from the prompt while present in the schemas Claude received.
+        """
 
         def decorator(fn: Callable):
             tool_name = name or fn.__name__
             if tool_name in self._registry:
                 raise ValueError(f"Tool '{tool_name}' is already registered.")
+            if group not in GROUP_ORDER:
+                raise ValueError(
+                    f"Tool '{tool_name}' declares unknown group {group!r}; "
+                    f"expected one of {GROUP_ORDER}."
+                )
             self._registry[tool_name] = fn
             self._schemas[tool_name] = schema or {}
+            self._meta[tool_name] = {"group": group, "skill_safe": skill_safe}
             logger.debug("Registered MCP tool: %s", tool_name)
             return fn
 
@@ -86,6 +126,36 @@ class MCPServer:
 
     def list_tools(self) -> list[str]:
         return list(self._registry.keys())
+
+    def _description(self, name: str) -> str:
+        """First docstring line — the same source tool_schemas() sends to Claude."""
+        fn = self._registry[name]
+        return (fn.__doc__ or "").strip().split("\n")[0]
+
+    def grouped_catalog(self) -> dict[str, list[tuple[str, str]]]:
+        """
+        {group: [(tool_name, description), ...]} ordered by GROUP_ORDER.
+
+        Covers every registered tool exactly once. Empty groups are omitted.
+        """
+        catalog: dict[str, list[tuple[str, str]]] = {}
+        for group in GROUP_ORDER:
+            entries = [
+                (name, self._description(name))
+                for name in self._registry
+                if self._meta.get(name, {}).get("group", "other") == group
+            ]
+            if entries:
+                catalog[group] = entries
+        return catalog
+
+    def skill_safe_tools(self) -> list[str]:
+        """Tool names a skill author may reference in `allowed_tools`."""
+        return [
+            name
+            for name in self._registry
+            if self._meta.get(name, {}).get("skill_safe", False)
+        ]
 
     async def dispatch(self, tool_name: str, arguments: dict[str, Any], user: Any = None) -> Any:
         if tool_name not in self._registry:
@@ -100,11 +170,11 @@ class MCPServer:
 
     def tool_schemas(self) -> list[dict]:
         schemas = []
-        for name, fn in self._registry.items():
+        for name in self._registry:
             custom = self._schemas.get(name, {})
             schemas.append({
                 "name": name,
-                "description": (fn.__doc__ or "").strip().split("\n")[0],
+                "description": self._description(name),
                 "input_schema": custom.get("input_schema", {
                     "type": "object",
                     "properties": {},
@@ -119,7 +189,7 @@ mcp_server = MCPServer()
 
 # ── Google Calendar ───────────────────────────────────────────────────────────
 
-@mcp_server.tool(schema={"input_schema": {
+@mcp_server.tool(group="read", skill_safe=False, schema={"input_schema": {
     "type": "object",
     "properties": {
         "calendar_id": {"type": "string", "default": "primary"},
@@ -174,7 +244,7 @@ async def get_calendar_events(
     return await loop.run_in_executor(None, _query)
 
 
-@mcp_server.tool(schema={"input_schema": {
+@mcp_server.tool(group="create", skill_safe=True, schema={"input_schema": {
     "type": "object",
     "properties": {
         "title": {"type": "string", "description": "Event title"},
@@ -243,7 +313,7 @@ async def create_calendar_event(
 
 # ── Gmail ─────────────────────────────────────────────────────────────────────
 
-@mcp_server.tool(schema={"input_schema": {
+@mcp_server.tool(group="read", skill_safe=False, schema={"input_schema": {
     "type": "object",
     "properties": {
         "query": {"type": "string"},
@@ -268,7 +338,7 @@ async def get_emails(
 
 # ── Airtable ──────────────────────────────────────────────────────────────────
 
-@mcp_server.tool(schema={"input_schema": {
+@mcp_server.tool(group="read", skill_safe=True, schema={"input_schema": {
     "type": "object",
     "properties": {
         "table_name": {"type": "string", "description": "One of: action_items, accounts, meetings"},
@@ -357,7 +427,7 @@ async def get_airtable_records(
     return await loop.run_in_executor(None, _query)
 
 
-@mcp_server.tool(schema={"input_schema": {
+@mcp_server.tool(group="create", skill_safe=True, schema={"input_schema": {
     "type": "object",
     "properties": {
         "task": {"type": "string", "description": "Action item title / description"},
@@ -465,7 +535,7 @@ async def create_action_item(
 
 # ── Record search (fuzzy lookup across all types) ────────────────────────────
 
-@mcp_server.tool(schema={"input_schema": {
+@mcp_server.tool(group="read", skill_safe=True, schema={"input_schema": {
     "type": "object",
     "properties": {
         "record_type": {
@@ -584,7 +654,7 @@ async def search_records(
 
 # ── Update action item ────────────────────────────────────────────────────────
 
-@mcp_server.tool(schema={"input_schema": {
+@mcp_server.tool(group="update", skill_safe=True, schema={"input_schema": {
     "type": "object",
     "properties": {
         "airtable_id": {"type": "string", "description": "The airtable_id of the action item to update"},
@@ -675,7 +745,7 @@ async def update_action_item(
 
 # ── Delete action item ────────────────────────────────────────────────────────
 
-@mcp_server.tool(schema={"input_schema": {
+@mcp_server.tool(group="delete", skill_safe=True, schema={"input_schema": {
     "type": "object",
     "properties": {
         "airtable_id": {"type": "string", "description": "The airtable_id of the action item to delete"},
@@ -722,7 +792,7 @@ async def delete_action_item(airtable_id: str) -> dict:
 
 # ── Update calendar event ─────────────────────────────────────────────────────
 
-@mcp_server.tool(schema={"input_schema": {
+@mcp_server.tool(group="update", skill_safe=True, schema={"input_schema": {
     "type": "object",
     "properties": {
         "event_id": {"type": "integer", "description": "The id of the calendar event to update"},
@@ -797,7 +867,7 @@ async def update_calendar_event(
 
 # ── Delete calendar event ─────────────────────────────────────────────────────
 
-@mcp_server.tool(schema={"input_schema": {
+@mcp_server.tool(group="delete", skill_safe=True, schema={"input_schema": {
     "type": "object",
     "properties": {
         "event_id": {"type": "integer", "description": "The id of the calendar event to delete"},
@@ -830,7 +900,7 @@ async def delete_calendar_event(event_id: int) -> dict:
 
 # ── Update meeting (Airtable) ─────────────────────────────────────────────────
 
-@mcp_server.tool(schema={"input_schema": {
+@mcp_server.tool(group="update", skill_safe=True, schema={"input_schema": {
     "type": "object",
     "properties": {
         "airtable_id": {"type": "string", "description": "The airtable_id of the meeting to update"},
@@ -909,7 +979,7 @@ async def update_meeting(
 
 # ── Delete meeting ────────────────────────────────────────────────────────────
 
-@mcp_server.tool(schema={"input_schema": {
+@mcp_server.tool(group="delete", skill_safe=True, schema={"input_schema": {
     "type": "object",
     "properties": {
         "airtable_id": {"type": "string", "description": "The airtable_id of the meeting to delete"},
@@ -947,7 +1017,7 @@ async def delete_meeting(airtable_id: str) -> dict:
 
 # ── Update account ────────────────────────────────────────────────────────────
 
-@mcp_server.tool(schema={"input_schema": {
+@mcp_server.tool(group="update", skill_safe=True, schema={"input_schema": {
     "type": "object",
     "properties": {
         "account_name": {"type": "string", "description": "Current name of the account to update"},
@@ -1018,7 +1088,7 @@ async def update_account(
 
 # ── Add account note ──────────────────────────────────────────────────────────
 
-@mcp_server.tool(schema={"input_schema": {
+@mcp_server.tool(group="create", skill_safe=True, schema={"input_schema": {
     "type": "object",
     "properties": {
         "account_name": {"type": "string", "description": "Name of the account to add the note to"},
@@ -1063,7 +1133,7 @@ async def add_account_note(account_name: str, content: str) -> dict:
 
 # ── Meeting notes from email ──────────────────────────────────────────────────
 
-@mcp_server.tool(schema={"input_schema": {
+@mcp_server.tool(group="read", skill_safe=True, schema={"input_schema": {
     "type": "object",
     "properties": {
         "days": {
@@ -1124,7 +1194,7 @@ async def get_meeting_notes_from_email(days: int = 30, account_name: str = "") -
 
 # ── Slack ─────────────────────────────────────────────────────────────────────
 
-@mcp_server.tool(schema={"input_schema": {
+@mcp_server.tool(group="read", skill_safe=False, schema={"input_schema": {
     "type": "object",
     "properties": {
         "channel": {"type": "string"},
@@ -1152,7 +1222,7 @@ async def get_slack_messages(
 
 # ── Twilio SMS ────────────────────────────────────────────────────────────────
 
-@mcp_server.tool(schema={"input_schema": {
+@mcp_server.tool(group="communicate", skill_safe=False, schema={"input_schema": {
     "type": "object",
     "properties": {
         "to": {"type": "string", "description": "Recipient phone number in E.164 format, e.g. +15005550006"},
@@ -1193,7 +1263,7 @@ async def send_sms(to: str, body: str) -> dict:
 
 # ── Token usage ──────────────────────────────────────────────────────────────
 
-@mcp_server.tool(schema={"input_schema": {
+@mcp_server.tool(group="read", skill_safe=False, schema={"input_schema": {
     "type": "object",
     "properties": {
         "period": {
@@ -1287,7 +1357,7 @@ async def get_token_usage(period: str = "all_time") -> dict:
 
 # ── Twilio Voice (initiate outbound call) ─────────────────────────────────────
 
-@mcp_server.tool(schema={"input_schema": {
+@mcp_server.tool(group="communicate", skill_safe=False, schema={"input_schema": {
     "type": "object",
     "properties": {
         "to": {"type": "string", "description": "Phone number to call in E.164 format"},
@@ -1328,3 +1398,100 @@ async def make_phone_call(to: str, message: str = "Hello from Agent PM.") -> dic
     except Exception as exc:
         logger.exception("Twilio call initiation failed: %s", exc)
         return {"status": "error", "error": str(exc)}
+
+
+# ── Saved workflows (AgentSkill) ──────────────────────────────────────────────
+#
+# These two make saved workflows reachable from the agent — most importantly from
+# voice, where the user can only *say* a skill's name. `AgentSkill` is imported
+# inside the function bodies (the style used throughout this module) so there is no
+# agents ↔ skills import cycle.
+#
+# Both use sync_to_async(thread_sensitive=True) rather than the
+# loop.run_in_executor(None, ...) the other 17 tools use. Two reasons: a bare
+# executor thread never runs Django's close_old_connections, so it can leak a DB
+# connection per call (pre-existing, but voice multiplies tool calls per session);
+# and executor threads cannot see APITestCase transaction data, so run_in_executor
+# tools are untestable from inside a TestCase.
+
+
+def _skill_scope(user: Any):
+    """
+    Approved skills this user may run.
+
+    Mirrors AgentSkillViewSet.get_queryset intersected with status="approved":
+    staff sees all approved, everyone else sees their own approved skills (private
+    ones they authored included) plus public+approved. Drafts are excluded for
+    everyone — they have not passed security review, matching the guard on
+    AgentSkillViewSet.run. Anonymous callers see nothing, as with every other tool.
+    """
+    from django.db.models import Q
+    from skills.models import AgentSkill
+
+    if not user:
+        return AgentSkill.objects.none()
+    qs = AgentSkill.objects.filter(status="approved")
+    if not _is_staff(user):
+        qs = qs.filter(Q(created_by=user) | Q(visibility="public")).distinct()
+    return qs
+
+
+def _list_skills_sync(user: Any, query: str) -> list[dict]:
+    from django.db.models import Q
+
+    qs = _skill_scope(user)
+    if query:
+        qs = qs.filter(Q(name__icontains=query) | Q(description__icontains=query))
+    return [
+        {"name": s.name, "description": s.description, "allowed_tools": s.allowed_tools or []}
+        for s in qs.order_by("name")
+    ]
+
+
+def _load_skill_sync(user: Any, name: str) -> dict:
+    skill = _skill_scope(user).filter(name=name).first()
+    if skill is None:
+        # One message for every miss — unknown name, unapproved draft and someone
+        # else's private skill are deliberately indistinguishable, so this cannot be
+        # used to probe which skills exist.
+        return {
+            "error": f"No approved workflow named '{name}' is available to you.",
+            "available": [s["name"] for s in _list_skills_sync(user, "")],
+        }
+    return {
+        "name": skill.name,
+        "description": skill.description,
+        "instructions": skill.instructions,
+        "allowed_tools": skill.allowed_tools or [],
+    }
+
+
+@mcp_server.tool(group="skills", skill_safe=False, schema={"input_schema": {
+    "type": "object",
+    "properties": {
+        "query": {"type": "string", "description": "Optional keyword filter on name or description."},
+    },
+}})
+async def list_skills(query: str = "") -> list[dict]:
+    """List the saved workflows (skills) available to this user. Call this when the user names a workflow you don't recognize, or asks what you can do."""
+    from asgiref.sync import sync_to_async
+
+    user = _current_user.get()
+    logger.info("list_skills: query=%r user=%s", query, user)
+    return await sync_to_async(_list_skills_sync, thread_sensitive=True)(user, query)
+
+
+@mcp_server.tool(group="skills", skill_safe=False, schema={"input_schema": {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string", "description": "Exact skill name, kebab-case."},
+    },
+    "required": ["name"],
+}})
+async def load_skill(name: str) -> dict:
+    """Load a saved workflow's step-by-step instructions before doing the work. Call this FIRST, before any other tool, when the request matches a workflow's description — the instructions tell you which tools to call and in what order."""
+    from asgiref.sync import sync_to_async
+
+    user = _current_user.get()
+    logger.info("load_skill: name=%r user=%s", name, user)
+    return await sync_to_async(_load_skill_sync, thread_sensitive=True)(user, name)

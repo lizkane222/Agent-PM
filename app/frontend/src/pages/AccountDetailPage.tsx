@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useParams, useNavigate } from "react-router-dom";
 import CorporateIcon from "../assets/icons/Corporate.svg?react";
@@ -10,7 +10,7 @@ import { accountsApi, airtableApi, teamApi, skillsApi, schedulerApi, integration
 import type { GmailThread, MeetingNotesSource, SearchResult } from "../lib/api";
 import { MeetingSummarySourceToggle, preferredMeetingSource } from "../components/account/MeetingSummarySourceToggle";
 import { GetMeetingNotesButton } from "../components/shared/GetMeetingNotesButton";
-import type { Account, AccountArtifact, AccountNote, AccountQuickLink, ActionItemAttachment, AirtableAccount, AirtableActionItem, AirtableMeeting, Attendee, CalendarEvent, CustomerContact, CustomerContactNote, GoalSection, MeetingNote, ProjectMember, Reminder, TeamMember } from "../types";
+import type { Account, AccountArtifact, AccountNote, AccountQuickLink, AccountTeamMember, ActionItemAttachment, AirtableAccount, AirtableActionItem, AirtableMeeting, Attendee, CalendarEvent, CommentReference, CustomerContact, CustomerContactNote, GoalSection, MeetingNote, ProjectMember, Reminder, TeamMember } from "../types";
 import { ProjectGoals } from "../components/account/ProjectGoals";
 import { ROLE_META, getTitleRole } from "../lib/titleRoles";
 import { useLogGlow } from "../hooks/useLogGlow";
@@ -31,12 +31,16 @@ import ArtifactPicker from "../components/action-items/ArtifactPicker";
 import { useFocusPins } from "../hooks/useFocusPins";
 import { useStatusArrivalOrder } from "../hooks/useStatusArrivalOrder";
 import UrlPillInput from "../components/shared/UrlPillInput";
+import LinkedRecordsList from "../components/shared/LinkedRecordsList";
 import { useSlackLinkAutosave } from "../hooks/useSlackLinkAutosave";
 import InlineCommentThread from "../components/comments/InlineCommentThread";
 import ActivityLogSection from "../components/ActivityLogSection";
 import { convertActionItemToEvent, restoreConversion } from "../hooks/useConvert";
 import RichTextMentionEditor, { type RichTextMentionEditorHandle } from "../components/shared/RichTextMentionEditor";
 import { htmlToPreviewText, sanitizeHtml, plainToHtml } from "../lib/noteHelpers";
+import { useAppError } from "../context/AppErrorContext";
+import CloudCoachPushToast from "../components/shared/CloudCoachPushToast";
+import { isPushOk, summarizePush, type CloudCoachPushResult } from "../lib/cloudCoachPush";
 
 // ── Edit Modal ────────────────────────────────────────────────────────────────
 
@@ -488,6 +492,7 @@ function ActionItemModal({
   meetings = [],
   onClose,
   onUpdated,
+  onAutosaved,
   onConverted,
   onDeleted,
 }: {
@@ -496,6 +501,10 @@ function ActionItemModal({
   meetings?: AirtableMeeting[];
   onClose: () => void;
   onUpdated?: (updated: AirtableActionItem) => void;
+  /** Fires for a pasted Slack link, which saves itself without waiting for Save — see
+   *  hooks/useSlackLinkAutosave.ts. Distinct from `onUpdated`: the caller closes the modal in
+   *  response to `onUpdated` (the explicit Save button), and a paste must not trigger that. */
+  onAutosaved?: (updated: AirtableActionItem) => void;
   onConverted?: () => void;
   onDeleted?: (id: number) => void;
 }) {
@@ -510,6 +519,13 @@ function ActionItemModal({
   const [attachError, setAttachError] = useState<string | null>(null);
   const attachFileRef = useRef<HTMLInputElement>(null);
   const memberNames = ["Unassigned", ...teamMembers.map((m) => m.full_name)] as string[];
+
+  // Dragging OS files anywhere onto the modal attaches them, same as the + File button.
+  // A local-* draft has no PK for an attachment to hang off, same guard the Attachments
+  // section itself uses.
+  const [fileDragOver, setFileDragOver] = useState(false);
+  const fileDragCounterRef = useRef(0);
+  const canAttachFiles = !item.airtable_id.startsWith("local-");
 
   useEffect(() => {
     if (item.airtable_id.startsWith("local-")) return;
@@ -595,10 +611,46 @@ function ActionItemModal({
       onClick={onClose}
     >
       <div
-        className="rounded-2xl shadow-2xl flex flex-col overflow-hidden"
+        data-testid="action-item-modal-panel"
+        className="relative rounded-2xl shadow-2xl flex flex-col overflow-hidden"
         style={{ background: "#fff", width: "480px", maxWidth: "calc(100vw - 32px)", maxHeight: "calc(100vh - 48px)", borderLeft: `4px solid ${accent}` }}
         onClick={(e) => e.stopPropagation()}
+        // The modal isn't a portal, so a drag/drop over it would otherwise bubble to the
+        // kanban board's own drop zones underneath (handleKanbanDrop, handleNoteDropOnActions
+        // etc.), which assume a real DataTransfer carrying their own custom keys.
+        onDragEnter={(e) => {
+          e.stopPropagation();
+          if (!canAttachFiles || !e.dataTransfer.types.includes("Files")) return;
+          e.preventDefault();
+          fileDragCounterRef.current += 1;
+          if (fileDragCounterRef.current === 1) setFileDragOver(true);
+        }}
+        onDragOver={(e) => {
+          e.stopPropagation();
+          if (!canAttachFiles || !e.dataTransfer.types.includes("Files")) return;
+          e.preventDefault();
+        }}
+        onDragLeave={(e) => {
+          e.stopPropagation();
+          if (fileDragCounterRef.current === 0) return;
+          fileDragCounterRef.current -= 1;
+          if (fileDragCounterRef.current <= 0) { fileDragCounterRef.current = 0; setFileDragOver(false); }
+        }}
+        onDrop={(e) => {
+          e.stopPropagation();
+          if (!canAttachFiles) return;
+          e.preventDefault();
+          fileDragCounterRef.current = 0;
+          setFileDragOver(false);
+          if (e.dataTransfer.files.length) void handleAttachFiles(e.dataTransfer.files);
+        }}
       >
+        {fileDragOver && (
+          <div className="absolute inset-0 z-20 flex items-center justify-center rounded-2xl border-2 border-dashed border-indigo-400 bg-indigo-50/70 pointer-events-none">
+            <p className="text-sm font-bold text-indigo-600">Drop files to attach</p>
+          </div>
+        )}
+
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-4" style={{ borderBottom: "1px solid rgba(0,0,0,0.07)" }}>
           <textarea
@@ -680,7 +732,7 @@ function ActionItemModal({
             <AccPillNumber value={form.prep_time} label="Prep" onChange={(v) => set({ prep_time: v ?? 0 })} />
             <AccPillUrl
               value={form.slack_thread_url}
-              onChange={(v) => { set({ slack_thread_url: v }); autosaveSlackLink(item, v, onUpdated); }}
+              onChange={(v) => { set({ slack_thread_url: v }); autosaveSlackLink(item, v, onAutosaved); }}
             />
           </div>
 
@@ -742,6 +794,7 @@ function ActionItemModal({
                   {uploadingAttachment && <span className="text-[11px] text-gray-400 animate-pulse">Uploading…</span>}
                   <button
                     onClick={() => attachFileRef.current?.click()}
+                    title="Click to pick a file, or drag a file from your computer anywhere onto this window"
                     className="text-[11px] px-2 py-0.5 rounded border border-gray-200 text-[var(--twilio-navy)] hover:bg-gray-50 transition-colors"
                   >+ File</button>
                   <ArtifactPicker
@@ -960,6 +1013,7 @@ function ActionItemCard({
           meetings={meetings}
           onClose={() => setModalOpen(false)}
           onUpdated={(updated) => { onUpdated?.(updated); setModalOpen(false); }}
+          onAutosaved={(updated) => onUpdated?.(updated)}
           onConverted={() => { onUpdated?.({ ...item, status: "Done" } as AirtableActionItem); setModalOpen(false); }}
           onDeleted={(id) => { onDeleted?.(id); setModalOpen(false); }}
         />
@@ -1425,20 +1479,30 @@ function NoteActionTooltip({ kind, noteText, eventId, accountName, airtableAccou
 
 // Detect team members mentioned by name in a Gong bullet.
 // Returns the members found and a new display string with @FirstLast substitutions.
-function detectMentions(text: string, teamMembers: TeamMember[]): { members: TeamMember[]; display: string } {
+// `accountTeamMembers` scopes matching to people known to be on this account's team —
+// mirroring MeetingDetail.tsx's detectMentionsInSummary — so a name that merely appears
+// somewhere in the org roster, but isn't clearly someone tied to this account, is left
+// alone rather than guessed at.
+function detectMentions(text: string, teamMembers: TeamMember[], accountTeamMembers: { full_name: string }[] = []): { members: TeamMember[]; display: string } {
+  const accountNames = new Set(accountTeamMembers.map((m) => m.full_name.trim().toLowerCase()));
   const found: TeamMember[] = [];
   let display = text;
   for (const m of teamMembers) {
-    const first = m.full_name.split(" ")[0];
+    const full = m.full_name.trim();
+    // A blank name degenerates the regex below to a zero-width match at every word
+    // boundary, prepending "@" to the whole text — skip rather than let that happen.
+    if (!full) continue;
+    if (!accountNames.has(full.toLowerCase())) continue;
+    const first = full.split(" ")[0];
     // Match full name or first name (word boundary, case-insensitive), not already @-prefixed
     const patterns = [
-      new RegExp(`(?<!@)\\b${m.full_name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "gi"),
+      new RegExp(`(?<!@)\\b${full.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "gi"),
       new RegExp(`(?<!@)\\b${first.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "gi"),
     ];
     for (const pat of patterns) {
       if (pat.test(display)) {
         if (!found.find((f) => f.id === m.id)) found.push(m);
-        display = display.replace(pat, `@${m.full_name}`);
+        display = display.replace(pat, `@${full}`);
         break;
       }
     }
@@ -1464,7 +1528,7 @@ function parseBullets(text: string): GongItem[] {
 
 type NotesBySource = Record<MeetingNotesSource, string>;
 
-function GongSummaryPanel({ eventId, meetingId: meetingIdProp, existingNotes, existingZoomNotes, accountName, airtableAccountId, onCreatedActionItem, onSaved, teamMembers = [] }: { eventId: number; meetingId?: number; existingNotes?: string; existingZoomNotes?: string; accountName?: string | null; airtableAccountId?: number | null; onCreatedActionItem?: (item: AirtableActionItem) => void; onSaved?: (updated: AirtableMeeting) => void; teamMembers?: TeamMember[] }) {
+function GongSummaryPanel({ eventId, meetingId: meetingIdProp, existingNotes, existingZoomNotes, accountName, airtableAccountId, onCreatedActionItem, onSaved, teamMembers = [], accountTeamMembers = [] }: { eventId: number; meetingId?: number; existingNotes?: string; existingZoomNotes?: string; accountName?: string | null; airtableAccountId?: number | null; onCreatedActionItem?: (item: AirtableActionItem) => void; onSaved?: (updated: AirtableMeeting) => void; teamMembers?: TeamMember[]; accountTeamMembers?: AccountTeamMember[] }) {
   // Both providers' summaries are held at once so switching the toggle doesn't need a
   // round-trip; `raw` / `items` / `showPaste` are the view of whichever is active.
   const [notesBySource, setNotesBySource] = useState<NotesBySource>(() => ({
@@ -1550,7 +1614,7 @@ function GongSummaryPanel({ eventId, meetingId: meetingIdProp, existingNotes, ex
     const notified = new Set<number>();
     const enriched = parsed.map((item) => {
       if (item.kind !== "bullet") return item;
-      const { members, display } = detectMentions(item.text, teamMembers);
+      const { members, display } = detectMentions(item.text, teamMembers, accountTeamMembers);
       return { ...item, text: display, mentionedMembers: members };
     });
     setItems(enriched);
@@ -2760,7 +2824,7 @@ function SidePanel({ panel, onClose, onCreatedActionItem, onMeetingUpdated, onUp
             )}
             {panel.item.gong_url && <a href={panel.item.gong_url} target="_blank" rel="noreferrer" className="underline text-xs" style={{ color: "var(--twilio-red, #e22)" }}>Gong recording ↗</a>}
             {panel.item.customer_slack && <a href={panel.item.customer_slack} target="_blank" rel="noreferrer" className="block underline text-xs" style={{ color: "var(--twilio-red, #e22)" }}>Customer Slack ↗</a>}
-            <GongSummaryPanel eventId={0} meetingId={panel.item.id} existingNotes={panel.item.gong_notes} existingZoomNotes={panel.item.zoom_notes} accountName={panel.item.account_name} airtableAccountId={airtableAccountId} onCreatedActionItem={onCreatedActionItem} onSaved={onMeetingUpdated} teamMembers={teamMembers} />
+            <GongSummaryPanel eventId={0} meetingId={panel.item.id} existingNotes={panel.item.gong_notes} existingZoomNotes={panel.item.zoom_notes} accountName={panel.item.account_name} airtableAccountId={airtableAccountId} onCreatedActionItem={onCreatedActionItem} onSaved={onMeetingUpdated} teamMembers={teamMembers} accountTeamMembers={account?.team_members ?? []} />
           </>
         )}
         {panel.kind === "member" && (
@@ -2882,7 +2946,7 @@ function SidePanel({ panel, onClose, onCreatedActionItem, onMeetingUpdated, onUp
               {/* Meeting notes — synced with Calendar page */}
               <div style={{ borderTop: "1px solid rgba(0,0,0,0.06)", paddingTop: "10px", marginTop: "4px" }}>
                 <MeetingNotesPanel eventId={ev.id} accountName={ev.account_name} airtableAccountId={airtableAccountId} onCreatedActionItem={onCreatedActionItem} />
-                <GongSummaryPanel eventId={ev.id} meetingId={panel.kind === "calendar" ? panel.linkedMeeting?.id : undefined} existingNotes={panel.kind === "calendar" ? panel.linkedMeeting?.gong_notes : undefined} existingZoomNotes={panel.kind === "calendar" ? panel.linkedMeeting?.zoom_notes : undefined} accountName={ev.account_name} airtableAccountId={airtableAccountId} onCreatedActionItem={onCreatedActionItem} onSaved={onMeetingUpdated} teamMembers={teamMembers} />
+                <GongSummaryPanel eventId={ev.id} meetingId={panel.kind === "calendar" ? panel.linkedMeeting?.id : undefined} existingNotes={panel.kind === "calendar" ? panel.linkedMeeting?.gong_notes : undefined} existingZoomNotes={panel.kind === "calendar" ? panel.linkedMeeting?.zoom_notes : undefined} accountName={ev.account_name} airtableAccountId={airtableAccountId} onCreatedActionItem={onCreatedActionItem} onSaved={onMeetingUpdated} teamMembers={teamMembers} accountTeamMembers={account?.team_members ?? []} />
               </div>
             </>
           );
@@ -3605,6 +3669,7 @@ function ArtifactsPanel({ accountId, airtableAccountId }: { accountId: number; a
   const [viewer, setViewer] = useState<AccountArtifact | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragCounterRef = useRef(0);
+  const { reportError } = useAppError();
 
   const load = useCallback(() => {
     accountsApi.listArtifacts(accountId)
@@ -3637,14 +3702,24 @@ function ArtifactsPanel({ accountId, airtableAccountId }: { accountId: number; a
     const arr = Array.from(files);
     if (!arr.length) return;
     setUploading(true);
+    const failures: string[] = [];
     try {
       for (const f of arr) {
-        await accountsApi.uploadArtifactFile(accountId, f);
+        try {
+          await accountsApi.uploadArtifactFile(accountId, f);
+        } catch (e: unknown) {
+          // The server rejects blocked file types with {"error": "..."} and a 400. With no
+          // catch here that surfaced as an unhandled AxiosError in the console and the file
+          // just silently never appeared. Per-file so one rejection doesn't abandon the rest.
+          const detail = (e as { response?: { data?: { error?: string } } })?.response?.data?.error;
+          failures.push(detail ? `${f.name}: ${detail}` : `${f.name}: upload failed.`);
+        }
       }
       load();
     } finally {
       setUploading(false);
     }
+    if (failures.length) reportError(failures.join(" "), "AccountDetailPage");
   }
 
   async function handleDelete(id: number) {
@@ -3761,6 +3836,31 @@ function ArtifactsPanel({ accountId, airtableAccountId }: { accountId: number; a
                     )}
                   </div>
                 )}
+                {(a.uploaded_by_username || a.used_in?.length) && (
+                  <div style={{ display: "flex", alignItems: "center", gap: "5px", marginTop: "3px" }}>
+                    {a.uploaded_by_username && (
+                      <>
+                        <span
+                          className="w-4 h-4 rounded-full bg-indigo-600 text-white text-[8px] font-bold flex items-center justify-center shrink-0"
+                          title={`Added by ${a.uploaded_by_username}`}
+                        >
+                          {a.uploaded_by_username[0].toUpperCase()}
+                        </span>
+                        <span style={{ fontSize: "0.625rem", color: "var(--text-secondary, #aaa)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {a.uploaded_by_username}
+                        </span>
+                      </>
+                    )}
+                    {!!a.used_in?.length && (
+                      <span
+                        style={{ fontSize: "0.5625rem", fontWeight: 600, color: "#6366f1", background: "rgba(99,102,241,0.08)", borderRadius: "4px", padding: "1px 5px", flexShrink: 0 }}
+                        title={a.used_in.map((r) => r.label).join(", ")}
+                      >
+                        used in {a.used_in.length}
+                      </span>
+                    )}
+                  </div>
+                )}
               </div>
               <button
                 className="card-btn"
@@ -3851,6 +3951,8 @@ function AddArtifactModal({
   const [url, setUrl] = useState("");
   const [secondaryUrl, setSecondaryUrl] = useState("");
   const [iconKey, setIconKey] = useState("link");
+  const [description, setDescription] = useState("");
+  const [references, setReferences] = useState<CommentReference[]>([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -3896,7 +3998,7 @@ function AddArtifactModal({
     setError(null);
     try {
       const displayName = name.trim() || url.trim();
-      const { data } = await accountsApi.addArtifactLink(accountId, displayName, url.trim(), iconKey, secondaryUrl.trim() || undefined);
+      const { data } = await accountsApi.addArtifactLink(accountId, displayName, url.trim(), iconKey, secondaryUrl.trim() || undefined, description, references);
       onAdded(data);
     } catch {
       setError("Failed to add link — please try again.");
@@ -4002,6 +4104,24 @@ function AddArtifactModal({
             onChange={(e) => setName(resolveEmojiShortcodes(e.target.value))}
             style={{ width: "100%", padding: "9px 12px", borderRadius: "8px", border: "1px solid var(--border, rgba(0,0,0,0.12))", fontSize: "0.8125rem", outline: "none", background: "var(--surface, #fff)", color: "var(--text-primary, #111)", boxSizing: "border-box" }}
           />
+
+          {/* Description */}
+          <div>
+            <label style={{ display: "block", fontSize: "0.6875rem", fontWeight: 600, color: "var(--text-secondary, #888)", marginBottom: "4px" }}>
+              Description <span style={{ fontWeight: 400 }}>(optional — @# to link a record)</span>
+            </label>
+            <RichTextMentionEditor
+              value={description}
+              onChange={setDescription}
+              placeholder="What is this, and when should someone reach for it?"
+              minHeightClassName="min-h-[70px]"
+              onReferenceInsert={(ref) => setReferences((prev) =>
+                prev.some((r) => r.resource_type === ref.resource_type && r.resource_id === ref.resource_id)
+                  ? prev
+                  : [...prev, ref],
+              )}
+            />
+          </div>
         </div>
 
         {/* Icon picker */}
@@ -4065,6 +4185,9 @@ function ArtifactViewer({
   canPreview: boolean;
 }) {
   const href = artifact.file_url ?? artifact.url ?? "";
+  const references = artifact.references ?? [];
+  const usedIn = artifact.used_in ?? [];
+  const hasDetails = Boolean(artifact.description?.trim()) || references.length > 0 || usedIn.length > 0 || Boolean(artifact.uploaded_by_username);
 
   return (
     <div className="fixed inset-0 z-50 flex flex-col bg-black/70 backdrop-blur-sm" onClick={onClose}>
@@ -4100,7 +4223,8 @@ function ArtifactViewer({
         </div>
       </div>
 
-      <div style={{ flex: 1, overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center" }} onClick={(e) => e.stopPropagation()}>
+      <div style={{ flex: 1, overflow: "hidden", display: "flex", minHeight: 0 }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ flex: 1, overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center" }}>
         {canPreview && artifact.mime_type.startsWith("image/") ? (
           <img src={href} alt={artifact.name} style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }} />
         ) : canPreview ? (
@@ -4116,6 +4240,36 @@ function ArtifactViewer({
               Open file ↗
             </a>
           </div>
+        )}
+        </div>
+
+        {hasDetails && (
+          <aside
+            data-testid="artifact-details"
+            style={{ width: "300px", flexShrink: 0, background: "#fff", overflowY: "auto", padding: "16px", borderLeft: "1px solid rgba(0,0,0,0.08)" }}
+          >
+            {artifact.uploaded_by_username && (
+              <div className="flex items-center gap-2 mb-3">
+                <span className="w-6 h-6 rounded-full bg-indigo-600 text-white text-[10px] font-bold flex items-center justify-center shrink-0">
+                  {artifact.uploaded_by_username[0].toUpperCase()}
+                </span>
+                <span className="text-xs text-gray-600">
+                  Added by <span className="font-semibold text-gray-800">{artifact.uploaded_by_username}</span>
+                </span>
+              </div>
+            )}
+            {artifact.description?.trim() && (
+              <div className="mb-3">
+                <p className="text-[9px] font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide">Description</p>
+                <div
+                  className="mt-1 text-xs text-[var(--twilio-navy)]"
+                  dangerouslySetInnerHTML={{ __html: sanitizeHtml(plainToHtml(artifact.description)) }}
+                />
+              </div>
+            )}
+            <LinkedRecordsList title="Mentions in description" references={references} className="mb-3" />
+            <LinkedRecordsList title="Used in" references={usedIn} />
+          </aside>
         )}
       </div>
     </div>
@@ -4829,9 +4983,27 @@ export default function AccountDetailPage() {
   const [panel, setPanel] = useState<PanelItem | null>(null);
   const [goals, setGoals] = useState<GoalSection[]>([]);
   const [goalsLoaded, setGoalsLoaded] = useState(false);
+  // Action items already attached to a project/goal are single-owner — they stop showing
+  // in the drag-source strip above Project Goals once claimed.
+  const claimedActionItemIds = useMemo(
+    () => new Set(goals.flatMap((g) => g.actionIds)),
+    [goals],
+  );
+  const unclaimedStripActionItems = useMemo(
+    () => actionItems.filter((item) => !claimedActionItemIds.has(item.airtable_id)),
+    [actionItems, claimedActionItemIds],
+  );
   const [projectMembers, setProjectMembers] = useState<ProjectMember[]>([]);
+  // Outcome of the Cloud Coach membership push that assigning a member can trigger.
+  const [cloudCoachPushes, setCloudCoachPushes] = useState<CloudCoachPushResult[] | null>(null);
+  const { reportError } = useAppError();
   const prevGoalsRef = useRef<GoalSection[]>([]);
   const pendingGoalSaves = useRef(new Set<string>());
+  // Ids whose create POST failed. Without this a failed goal is unrecoverable: it is in
+  // prevGoalsRef by then, so the "added goals" pass skips it forever, and the "changed
+  // goals" pass is gated on a numeric id which a client uid never is — so typing the name
+  // afterwards sends nothing. Re-attempting on the next change is the only way back.
+  const failedGoalSaves = useRef(new Set<string>());
   const [reportState, setReportState] = useState<
     | { stage: "idle" }
     | { stage: "loading"; message: string }
@@ -4858,6 +5030,7 @@ export default function AccountDetailPage() {
     setGoalsLoaded(false);
     prevGoalsRef.current = [];
     pendingGoalSaves.current.clear();
+    failedGoalSaves.current.clear();
     Promise.all([
       accountsApi.getAccount(numId),
       accountsApi.listNotes(numId),
@@ -5134,31 +5307,90 @@ export default function AccountDetailPage() {
     }
     // Added goals
     for (const g of newGoals) {
-      if (!prev.find((p) => p.id === g.id) && !pendingGoalSaves.current.has(g.id)) {
+      const neverSaved = !prev.find((p) => p.id === g.id) || failedGoalSaves.current.has(g.id);
+      if (neverSaved && !pendingGoalSaves.current.has(g.id)) {
         pendingGoalSaves.current.add(g.id);
+        failedGoalSaves.current.delete(g.id);
         accountsApi.createProject({ account: account.id, ...goalFieldPayload(g) })
           .then(({ data: saved }) => {
             pendingGoalSaves.current.delete(g.id);
             const newId = String(saved.id);
-            prevGoalsRef.current = prevGoalsRef.current.map((x) => x.id === g.id ? { ...x, id: newId } : x);
-            setGoals((curr) => curr.map((x) => x.id === g.id ? { ...x, id: newId } : x));
+            // Rewrite the row's own id AND every goalIds array that referenced it by its
+            // client-side uid. Remapping only `x.id` (as this did) leaves the parent project
+            // pointing at a uid that matches no row, so a goal that saved correctly still
+            // renders as a standalone card and its nesting is lost on the next load.
+            const remapRow = (x: GoalSection): GoalSection => {
+              const row = x.id === g.id ? { ...x, id: newId } : x;
+              const ids = row.goalIds ?? [];
+              return ids.includes(g.id)
+                ? { ...row, goalIds: ids.map((id) => (id === g.id ? newId : id)) }
+                : row;
+            };
+            // Captured before the rewrite: after it, prev and next both hold newId, so the
+            // "changed goals" pass below sees no diff and would never persist the link.
+            const parentIdsToFlush = prevGoalsRef.current
+              .filter((x) => x.id !== g.id && /^\d+$/.test(x.id) && (x.goalIds ?? []).includes(g.id))
+              .map((x) => x.id);
+            prevGoalsRef.current = prevGoalsRef.current.map(remapRow);
+            for (const pid of parentIdsToFlush) {
+              const parent = prevGoalsRef.current.find((x) => x.id === pid);
+              if (!parent) continue;
+              accountsApi.updateProject(Number(pid), goalFieldPayload(parent))
+                .catch(() => reportError("Saved the goal, but could not link it to its project.", "AccountDetailPage"));
+            }
+            setGoals((curr) => {
+              const remapped = curr.map(remapRow);
+              // Edits made while the create POST was in flight (e.g. an action item
+              // dragged onto this goal before it had a real id) landed in local state
+              // but were never sent — the "changed goals" pass below only fires for
+              // goals with a persisted id, which this one didn't have yet. Flush them
+              // now so they aren't silently dropped on the next refresh.
+              const current = remapped.find((x) => x.id === newId);
+              if (current && JSON.stringify(goalFieldPayload(current)) !== JSON.stringify(goalFieldPayload(g))) {
+                prevGoalsRef.current = prevGoalsRef.current.map((x) => x.id === newId ? current : x);
+                accountsApi.updateProject(saved.id, goalFieldPayload(current))
+                  .catch(() => reportError("Could not save the latest changes to that goal.", "AccountDetailPage"));
+              }
+              return remapped;
+            });
           })
-          .catch(() => { pendingGoalSaves.current.delete(g.id); });
+          .catch(() => {
+            pendingGoalSaves.current.delete(g.id);
+            failedGoalSaves.current.add(g.id);
+            // Reported, not swallowed. A silent catch here is what hid the blank-name 400
+            // that discarded every goal ever created on this page.
+            reportError(
+              `Could not save the ${g.kind === "goal" ? "goal" : "project"}. It has not been kept — please try again.`,
+              "AccountDetailPage",
+            );
+          });
       }
     }
     // Changed goals (only for goals with a persisted backend ID)
     for (const g of newGoals) {
       const old = prev.find((p) => p.id === g.id);
       if (old && /^\d+$/.test(g.id) && JSON.stringify(goalFieldPayload(old)) !== JSON.stringify(goalFieldPayload(g))) {
-        accountsApi.updateProject(Number(g.id), goalFieldPayload(g)).catch(() => {});
+        accountsApi.updateProject(Number(g.id), goalFieldPayload(g))
+          .catch(() => reportError("Could not save your change to that goal.", "AccountDetailPage"));
       }
     }
   }
 
   function handleAddProjectMember(projectId: number, teamMemberId: number) {
     accountsApi.addProjectMember(projectId, teamMemberId)
-      .then(({ data }) => setProjectMembers((prev) => [...prev, data]))
-      .catch(() => {});
+      .then(({ data }) => {
+        setProjectMembers((prev) => [...prev, data]);
+        // Present only when the project carries an sf_project_id. The push is best effort,
+        // so the local row above exists whether or not Salesforce accepted it — surfacing
+        // the outcome is the only way the user learns they still cannot log time to it.
+        if (data.cloud_coach) {
+          setCloudCoachPushes([data.cloud_coach]);
+          if (!isPushOk(data.cloud_coach)) {
+            reportError(summarizePush(data.cloud_coach), "AccountDetailPage");
+          }
+        }
+      })
+      .catch(() => reportError("Could not add that member to the project.", "AccountDetailPage"));
   }
 
   function handleRemoveProjectMember(projectMemberId: number) {
@@ -5893,7 +6125,7 @@ export default function AccountDetailPage() {
           </div>
 
           {/* Drag sources */}
-          {(actionItems.length > 0 || meetings.length > 0) && (
+          {(unclaimedStripActionItems.length > 0 || meetings.length > 0) && (
             <div className="mb-3 p-2 bg-gray-50 rounded-md border border-dashed border-gray-300">
               <p className="text-[10px] text-[var(--twilio-gray-60)] uppercase tracking-wide mb-1.5">Drag to a goal section below · drag to calendar to set due date</p>
               {meetings.length > 0 && (
@@ -5912,9 +6144,9 @@ export default function AccountDetailPage() {
                   ))}
                 </div>
               )}
-              {actionItems.length > 0 && (
+              {unclaimedStripActionItems.length > 0 && (
                 <div className="flex flex-wrap gap-2">
-                  {actionItems.map((item) => (
+                  {unclaimedStripActionItems.map((item) => (
                     <ActionItemCard
                       key={item.airtable_id}
                       item={item}
@@ -5941,6 +6173,12 @@ export default function AccountDetailPage() {
             projectMembers={projectMembers}
             onAddProjectMember={handleAddProjectMember}
             onRemoveProjectMember={handleRemoveProjectMember}
+            onCloudCoachSyncResult={(results) => setCloudCoachPushes(results)}
+          />
+          {/* Reports whether assigning a member also reached Cloud Coach. */}
+          <CloudCoachPushToast
+            results={cloudCoachPushes}
+            onClose={() => setCloudCoachPushes(null)}
           />
         </div>
 

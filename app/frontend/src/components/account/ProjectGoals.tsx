@@ -1,10 +1,21 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import type { AccountTeamMember, AirtableActionItem, AirtableMeeting, GoalResource, GoalSection, ProjectMember, SalesforceProjectData } from "../../types";
 import { accountsApi } from "../../lib/api";
+import { summarizeSyncReport, type CloudCoachPushResult, type CloudCoachSyncReport } from "../../lib/cloudCoachPush";
 import { ArtifactIconImg, CATALOG_BY_KEY, getAutoIconKey } from "./ArtifactIcon";
 import { ActionItemCard } from "./ActionItemCard";
 
 function uid() { return Math.random().toString(36).slice(2, 9); }
+
+// Mirrors ActionItemCard's own (non-exported) STATUS_PILLS so the collapsed row's pill
+// matches the color the full card would show once expanded.
+const ACTION_STATUS_PILLS: Record<string, string> = {
+  "Open": "bg-gray-100 text-gray-700",
+  "In Progress": "bg-indigo-50 text-indigo-700",
+  "Done": "bg-emerald-50 text-emerald-700",
+  "Blocked": "bg-red-50 text-red-700",
+  "Backlogged": "bg-slate-100 text-slate-600",
+};
 
 // ── SF section schema ─────────────────────────────────────────────────────────
 
@@ -270,6 +281,7 @@ function ProjectDetailsModal({
   onSave,
   onAddMember,
   onRemoveMember,
+  onSyncMembersToSalesforce,
 }: {
   goal: GoalSection;
   members: ProjectMember[];
@@ -278,6 +290,8 @@ function ProjectDetailsModal({
   onSave: (updated: Partial<GoalSection>) => void;
   onAddMember?: (teamMemberId: number) => void;
   onRemoveMember?: (projectMemberId: number) => void;
+  /** Reconcile this project's members with Cloud Coach. Omit to hide the control. */
+  onSyncMembersToSalesforce?: (dryRun: boolean) => Promise<CloudCoachSyncReport>;
 }) {
   const [name, setName] = useState(goal.name);
   const [url, setUrl] = useState(goal.url ?? "");
@@ -291,6 +305,29 @@ function ProjectDetailsModal({
   const highlightTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fieldRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const [addingMember, setAddingMember] = useState(false);
+  const [memberSyncState, setMemberSyncState] = useState<"idle" | "working">("idle");
+  // Non-null once a dry run has been read back. Its presence is what turns the button
+  // into "Confirm", so a push always requires a second, deliberate click.
+  const [memberSyncPreview, setMemberSyncPreview] = useState<CloudCoachSyncReport | null>(null);
+  const [memberSyncMessage, setMemberSyncMessage] = useState("");
+
+  async function handleSyncMembers() {
+    if (!onSyncMembersToSalesforce) return;
+    const confirming = memberSyncPreview !== null;
+    setMemberSyncState("working");
+    try {
+      const report = await onSyncMembersToSalesforce(!confirming);
+      setMemberSyncMessage(summarizeSyncReport(report));
+      // A dry run that would change nothing needs no confirmation step.
+      const worthPushing = (report.counts?.["pushed"] ?? 0) > 0;
+      setMemberSyncPreview(confirming || !worthPushing ? null : report);
+    } catch {
+      setMemberSyncMessage("Could not reach Salesforce.");
+      setMemberSyncPreview(null);
+    } finally {
+      setMemberSyncState("idle");
+    }
+  }
 
   // A brand-new project only exists as an in-memory draft (see `newGoalDraft` in
   // ProjectGoals) until Save is clicked — there's no id to attach members to yet.
@@ -644,6 +681,31 @@ function ProjectDetailsModal({
                       + Add team member
                     </button>
                   )}
+                  {/* Backfill for members linked before the auto-push existed. Two-step on
+                      purpose: the first click previews (dry_run) so the plan can be read
+                      before anything is written to a shared Salesforce org. Only offered
+                      when the project is actually Salesforce-linked. */}
+                  {sfProjectId && members.length > 0 && onSyncMembersToSalesforce && (
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginTop: 2 }}>
+                      <button
+                        data-testid="sync-members-to-cloud-coach"
+                        disabled={memberSyncState === "working"}
+                        onClick={() => void handleSyncMembers()}
+                        style={{ fontSize: "0.75rem", color: memberSyncPreview ? "#047857" : "#6366f1", background: "none", border: "none", cursor: memberSyncState === "working" ? "default" : "pointer", textAlign: "left", padding: 0, fontWeight: memberSyncPreview ? 600 : 400 }}
+                      >
+                        {memberSyncState === "working"
+                          ? "Checking…"
+                          : memberSyncPreview
+                            ? "Confirm — push to Cloud Coach"
+                            : "Sync members to Cloud Coach"}
+                      </button>
+                      {memberSyncMessage && (
+                        <span data-testid="sync-members-message" style={{ fontSize: "0.6875rem", color: "#6b7280" }}>
+                          {memberSyncMessage}
+                        </span>
+                      )}
+                    </div>
+                  )}
                 </>
               )}
             </div>
@@ -760,6 +822,7 @@ export function ProjectGoals({
   projectMembers = [],
   onAddProjectMember,
   onRemoveProjectMember,
+  onCloudCoachSyncResult,
 }: {
   goals: GoalSection[];
   actionItems: AirtableActionItem[];
@@ -773,12 +836,19 @@ export function ProjectGoals({
   projectMembers?: ProjectMember[];
   onAddProjectMember?: (projectId: number, teamMemberId: number) => void;
   onRemoveProjectMember?: (projectMemberId: number) => void;
+  /** Per-member outcomes of a real (non-dry-run) Cloud Coach member sync, for the toast. */
+  onCloudCoachSyncResult?: (results: CloudCoachPushResult[]) => void;
 }) {
   const [itemDropTarget, setItemDropTarget] = useState<string | null>(null);
   const [goalDropTarget, setGoalDropTarget] = useState<string | null>(null); // project accepting a dragged goal
   const [newGoalDraft, setNewGoalDraft] = useState<GoalSection | null>(null);
   const [modalGoalId, setModalGoalId] = useState<string | null>(null);
   const [expandedGoals, setExpandedGoals] = useState<Set<string>>(new Set());
+  // Action items inside a project/goal render collapsed by default; a click expands one in
+  // place. Session-only, not persisted — mirrors expandedGoals rather than the localStorage-
+  // backed useCardCollapse (that hook's default is "not collapsed", the opposite of what's
+  // wanted here).
+  const [expandedActionItemIds, setExpandedActionItemIds] = useState<Set<string>>(new Set());
   const [editingGoalId, setEditingGoalId] = useState<string | null>(null);
   const [newResourceTarget, setNewResourceTarget] = useState<string | null>(null);
   const [resourceForm, setResourceForm] = useState({ label: "", url: "" });
@@ -853,6 +923,7 @@ export function ProjectGoals({
     setItemDropTarget(null);
     const actionId = e.dataTransfer.getData("goalActionId");
     const meetingId = e.dataTransfer.getData("goalMeetingId");
+    const resourceId = e.dataTransfer.getData("goalResourceId");
     const noteText = e.dataTransfer.getData("noteText");
     const artifactRaw = e.dataTransfer.getData("artifactDrop");
     if (noteText && onNoteDropped) { onNoteDropped(noteText, targetId); return; }
@@ -873,16 +944,24 @@ export function ProjectGoals({
       } catch { /* ignore */ }
       return;
     }
+    // A resource carries its own label/url/iconKey (unlike actionIds/meetingIds, which are
+    // just ids looked up elsewhere), so the moved object has to be found before rebuilding
+    // the array — the target goal doesn't have a copy of it to reuse.
+    const movedResource = resourceId
+      ? goals.flatMap((g) => g.resources).find((r) => r.id === resourceId) ?? null
+      : null;
     onChange(goals.map((g) => {
       if (g.id === targetId) {
         let next = g;
         if (actionId && !next.actionIds.includes(actionId)) next = { ...next, actionIds: [...next.actionIds, actionId] };
         if (meetingId && !next.meetingIds.includes(meetingId)) next = { ...next, meetingIds: [...next.meetingIds, meetingId] };
+        if (movedResource && !next.resources.some((r) => r.id === resourceId)) next = { ...next, resources: [...next.resources, movedResource] };
         return next;
       }
       let next = g;
       if (actionId && next.actionIds.includes(actionId)) next = { ...next, actionIds: next.actionIds.filter((x) => x !== actionId) };
       if (meetingId && next.meetingIds.includes(meetingId)) next = { ...next, meetingIds: next.meetingIds.filter((x) => x !== meetingId) };
+      if (resourceId && next.resources.some((r) => r.id === resourceId)) next = { ...next, resources: next.resources.filter((r) => r.id !== resourceId) };
       return next;
     }));
   }
@@ -901,6 +980,57 @@ export function ProjectGoals({
     setModalGoalId(null);
   }, []);
 
+  // Action items inside a project/goal render collapsed by default — a compact single row —
+  // and expand into the full ActionItemCard only on click. Shared by the per-goal list
+  // (renderGoalItems) and the per-project aggregate cluster view (renderClusterEntry) so the
+  // two can't drift. showOwnerBadge is true only for the cluster view, where entries from
+  // several owners are mixed together and need the disambiguating chip.
+  function renderActionItemEntry(aid: string, item: AirtableActionItem, ownerId: string, ownerLabel: string, showOwnerBadge = false) {
+    const isExpanded = expandedActionItemIds.has(aid);
+    const onDragStart = (e: React.DragEvent) => {
+      e.dataTransfer.setData("goalActionId", aid);
+      e.dataTransfer.setData("timelineActionId", aid);
+    };
+    if (!isExpanded) {
+      return (
+        <div
+          key={aid}
+          draggable
+          onDragStart={onDragStart}
+          onClick={() => setExpandedActionItemIds((prev) => new Set(prev).add(aid))}
+          className="group flex items-center gap-1.5 bg-white rounded px-2 py-1 border border-gray-200 text-[11px] cursor-pointer hover:bg-gray-50 transition-colors"
+        >
+          <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" className="w-2.5 h-2.5 shrink-0 text-gray-400"><path d="M4 2l4 4-4 4"/></svg>
+          <span className="flex-1 truncate text-[var(--twilio-navy)]">{item.task || <span className="italic opacity-50">Untitled</span>}</span>
+          <span className={`shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded-full ${ACTION_STATUS_PILLS[item.status] ?? "bg-gray-100 text-gray-700"}`}>{item.status}</span>
+          {showOwnerBadge && ownerLabel && (
+            <span className="shrink-0 text-[9px] px-1.5 py-0.5 rounded-full bg-indigo-50 text-indigo-500 truncate max-w-[80px]">{ownerLabel}</span>
+          )}
+          <button onClick={(e) => { e.stopPropagation(); removeAction(ownerId, aid); }} className="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-red-400 transition-all shrink-0">✕</button>
+        </div>
+      );
+    }
+    return (
+      <div key={aid} className="group relative">
+        <button
+          onClick={(e) => { e.stopPropagation(); setExpandedActionItemIds((prev) => { const n = new Set(prev); n.delete(aid); return n; }); }}
+          className="absolute -top-1 left-1 z-10 flex items-center gap-0.5 text-[9px] text-gray-400 hover:text-gray-600 transition-colors"
+          style={{ background: "rgba(255,255,255,0.9)", borderRadius: 3, padding: "1px 3px" }}
+        >
+          <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" className="w-2.5 h-2.5" style={{ transform: "rotate(90deg)" }}><path d="M4 2l4 4-4 4"/></svg>
+          Collapse
+        </button>
+        <div className="cursor-pointer" onClick={() => onSelectAction?.(item)}>
+          <ActionItemCard item={item} projectName={ownerLabel} onDragStart={onDragStart} />
+        </div>
+        {showOwnerBadge && (
+          <span className="absolute top-1 right-6 text-[9px] px-1.5 py-0.5 rounded-full bg-indigo-50 text-indigo-500" style={{ background: "rgba(255,255,255,0.9)" }}>{ownerLabel}</span>
+        )}
+        <button onClick={() => removeAction(ownerId, aid)} className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 transition-opacity text-gray-300 hover:text-red-400 text-xs leading-none" style={{ background: "rgba(255,255,255,0.9)", borderRadius: 3, padding: "1px 3px" }}>✕</button>
+      </div>
+    );
+  }
+
   // ── Shared goal body renderer (items inside a goal) ────────────────────────
 
   function renderGoalItems(goal: GoalSection) {
@@ -912,7 +1042,12 @@ export function ProjectGoals({
           <div className="flex flex-col gap-1">
             <p className="text-[9px] font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide">Resources</p>
             {goal.resources.map((r) => (
-              <div key={r.id} className="group flex items-center gap-1.5 bg-white rounded px-2 py-1 border border-gray-200 text-[11px]">
+              <div
+                key={r.id}
+                draggable
+                onDragStart={(e) => e.dataTransfer.setData("goalResourceId", r.id)}
+                className="group flex items-center gap-1.5 bg-white rounded px-2 py-1 border border-gray-200 text-[11px] cursor-grab"
+              >
                 {r.iconKey ? <ArtifactIconImg entry={CATALOG_BY_KEY[r.iconKey] ?? CATALOG_BY_KEY["link"]} size={10} /> : (
                   <svg viewBox="0 0 16 16" fill="currentColor" className="w-2.5 h-2.5 text-blue-400 shrink-0"><path d="M7.293 1.293a1 1 0 011.414 0l6 6a1 1 0 010 1.414l-6 6a1 1 0 01-1.414-1.414L11.586 9H2a1 1 0 110-2h9.586L7.293 2.707a1 1 0 010-1.414z"/></svg>
                 )}
@@ -946,14 +1081,7 @@ export function ProjectGoals({
             {goal.actionIds.map((aid) => {
               const item = actionMap[aid];
               if (!item) return null;
-              return (
-                <div key={aid} className="group relative">
-                  <div className="cursor-pointer" onClick={() => onSelectAction?.(item)}>
-                    <ActionItemCard item={item} projectName={goal.name} onDragStart={(e) => { e.dataTransfer.setData("goalActionId", aid); e.dataTransfer.setData("timelineActionId", aid); }} />
-                  </div>
-                  <button onClick={() => removeAction(goal.id, aid)} className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 transition-opacity text-gray-300 hover:text-red-400 text-xs leading-none" style={{ background: "rgba(255,255,255,0.9)", borderRadius: 3, padding: "1px 3px" }}>✕</button>
-                </div>
-              );
+              return renderActionItemEntry(aid, item, goal.id, goal.name);
             })}
           </div>
         )}
@@ -1079,7 +1207,12 @@ export function ProjectGoals({
     if (entry.kind === "resource") {
       const r = entry.resource;
       return (
-        <div key={`r-${r.id}`} className="group flex items-center gap-1.5 bg-white rounded px-2 py-1 border border-gray-200 text-[11px]">
+        <div
+          key={`r-${r.id}`}
+          draggable
+          onDragStart={(e) => e.dataTransfer.setData("goalResourceId", r.id)}
+          className="group flex items-center gap-1.5 bg-white rounded px-2 py-1 border border-gray-200 text-[11px] cursor-grab"
+        >
           {r.iconKey ? <ArtifactIconImg entry={CATALOG_BY_KEY[r.iconKey] ?? CATALOG_BY_KEY["link"]} size={10} /> : (
             <svg viewBox="0 0 16 16" fill="currentColor" className="w-2.5 h-2.5 text-blue-400 shrink-0"><path d="M7.293 1.293a1 1 0 011.414 0l6 6a1 1 0 010 1.414l-6 6a1 1 0 01-1.414-1.414L11.586 9H2a1 1 0 110-2h9.586L7.293 2.707a1 1 0 010-1.414z"/></svg>
           )}
@@ -1091,15 +1224,7 @@ export function ProjectGoals({
       );
     }
     const { item } = entry;
-    return (
-      <div key={`a-${item.airtable_id}`} className="group relative">
-        <div className="cursor-pointer" onClick={() => onSelectAction?.(item)}>
-          <ActionItemCard item={item} projectName={entry.ownerName} onDragStart={(e) => { e.dataTransfer.setData("goalActionId", item.airtable_id); e.dataTransfer.setData("timelineActionId", item.airtable_id); }} />
-        </div>
-        <span className="absolute top-1 right-6 text-[9px] px-1.5 py-0.5 rounded-full bg-indigo-50 text-indigo-500" style={{ background: "rgba(255,255,255,0.9)" }}>{entry.ownerName}</span>
-        <button onClick={() => removeAction(entry.ownerId, item.airtable_id)} className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 transition-opacity text-gray-300 hover:text-red-400 text-xs leading-none" style={{ background: "rgba(255,255,255,0.9)", borderRadius: 3, padding: "1px 3px" }}>✕</button>
-      </div>
-    );
+    return renderActionItemEntry(item.airtable_id, item, entry.ownerId, entry.ownerName, true);
   }
 
   function renderClusterView(project: GoalSection, nestedGoals: GoalSection[], view: ClusterView, search: string) {
@@ -1455,6 +1580,18 @@ export function ProjectGoals({
           onSave={handleModalSave}
           onAddMember={onAddProjectMember ? (teamMemberId) => onAddProjectMember(Number(modalGoal.id), teamMemberId) : undefined}
           onRemoveMember={onRemoveProjectMember}
+          onSyncMembersToSalesforce={
+            Number.isNaN(Number(modalGoal.id))
+              ? undefined
+              : async (dryRun: boolean) => {
+                  const { data } = await accountsApi.syncProjectMembersToSalesforce(
+                    Number(modalGoal.id), dryRun,
+                  );
+                  // Only a real push is worth a toast; a dry run is reported inline.
+                  if (!dryRun && data.results?.length) onCloudCoachSyncResult?.(data.results);
+                  return data;
+                }
+          }
         />
       )}
     </div>

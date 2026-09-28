@@ -15,6 +15,7 @@ import { accountFeedHandlers } from "./handlers/account_feed";
 import { searchHandlers } from "./handlers/search";
 import { layoutsHandlers } from "./handlers/layouts";
 import { skillsHandlers } from "./handlers/skills";
+import { salesforceHandlers } from "./handlers/salesforce";
 
 export const server = setupServer(
   ...schedulerHandlers,
@@ -33,4 +34,5 @@ export const server = setupServer(
   ...searchHandlers,
   ...layoutsHandlers,
   ...skillsHandlers,
+  ...salesforceHandlers,
 );

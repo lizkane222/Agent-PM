@@ -74,3 +74,37 @@ describe("action items sidebar ordering parity", () => {
     expect(source).not.toContain('v === "today"');
   });
 });
+
+describe("action items are edited only in the shared modal", () => {
+  // Requested behaviour: clicking a sidebar action item opens ActionItemModal, and the card
+  // itself never becomes an editor. Both copies had their own inline expanded form — a second,
+  // diverging implementation of the modal's field set and save rules.
+  //
+  // Structural guards because the live copy cannot be rendered (see the header comment);
+  // `ActionItemsSidebarModalOnly.test.tsx` asserts the behaviour against the module copy.
+
+  it.each(SIDEBAR_COPIES)("%s opens ActionItemModal from its card", (file) => {
+    const source = read(file);
+    expect(source).toContain("ActionItemModal");
+    expect(source).toContain("setModalItem(");
+  });
+
+  it.each(SIDEBAR_COPIES)("%s has no inline expand-to-edit state on the card", (file) => {
+    const source = read(file);
+    // The inline editor's three tells. `commitEdit` was its click-outside save, `forceExpand`
+    // the prop that opened it, and `setExpanded` the toggle.
+    expect(source).not.toContain("forceExpand");
+    expect(source).not.toMatch(/function ActionItemCard_Cal[\s\S]{0,4000}?setExpanded\(/);
+    expect(source).not.toMatch(/function ActionItemCard_Cal[\s\S]{0,4000}?function commitEdit\(/);
+  });
+
+  it.each(SIDEBAR_COPIES)("%s card renders the item prop, not a local form copy", (file) => {
+    const source = read(file);
+    // A collapsed-only card has no `editForm`; reading one back meant the card could display
+    // values that had never been saved.
+    const cardStart = source.indexOf("function ActionItemCard_Cal");
+    expect(cardStart).toBeGreaterThan(-1);
+    const card = source.slice(cardStart, cardStart + 6000);
+    expect(card).not.toContain("editForm");
+  });
+});

@@ -1,7 +1,8 @@
 """API views for the team app."""
 
 from django.db import models
-from rest_framework import filters, viewsets
+from django.shortcuts import get_object_or_404
+from rest_framework import filters, mixins, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import IsAuthenticated, SAFE_METHODS
@@ -10,9 +11,10 @@ from rest_framework.response import Response
 
 from core.mixins import _staff_sees_all
 from core.pagination import ClientPageSizePagination
-from .models import Tag, Team, TeamMember, TeamMembership, UserProfile
+from .models import Tag, Team, TeamMember, TeamMemberDocument, TeamMembership, UserProfile
 from .serializers import (
     TagSerializer,
+    TeamMemberDocumentSerializer,
     TeamMemberSerializer,
     TeamMembershipSerializer,
     TeamSerializer,
@@ -239,6 +241,10 @@ class TeamMemberViewSet(viewsets.ModelViewSet):
         super().initial(request, *args, **kwargs)
         # TeamMember records represent shared org data (department, manager,
         # linked Django user). Only staff may create/update/delete them.
+        # The `documents` action is exempt — it enforces its own self-or-staff
+        # check, since a member may add docs to their own profile.
+        if getattr(self, "action", None) == "documents":
+            return
         if request.method not in SAFE_METHODS and not request.user.is_staff:
             raise PermissionDenied("Only staff users may modify team members.")
 
@@ -267,3 +273,36 @@ class TeamMemberViewSet(viewsets.ModelViewSet):
         if tag:
             qs = qs.filter(tags__name__icontains=tag)
         return qs
+
+    @action(detail=True, methods=["get", "post"], url_path="documents")
+    def documents(self, request, pk=None):
+        """
+        Linked docs on a member's profile (e.g. an out-of-office coverage doc).
+
+        Visible to any authenticated user regardless of the normal TeamMember
+        visibility scoping — the point is that anyone can look it up later — so
+        this looks the member up unscoped rather than via get_object().
+        """
+        member = get_object_or_404(TeamMember, pk=pk)
+        if request.method == "POST":
+            if not (request.user.is_staff or member.user_id == request.user.id):
+                raise PermissionDenied("You can only add documents to your own profile.")
+            serializer = TeamMemberDocumentSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            serializer.save(team_member=member, added_by=request.user)
+            return Response(serializer.data, status=201)
+        docs = member.documents.select_related("added_by__profile").all()
+        return Response(TeamMemberDocumentSerializer(docs, many=True).data)
+
+
+class TeamMemberDocumentViewSet(mixins.UpdateModelMixin, mixins.DestroyModelMixin, viewsets.GenericViewSet):
+    """Edit/remove a linked doc — only the owning member or staff may reach one."""
+
+    serializer_class = TeamMemberDocumentSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        qs = TeamMemberDocument.objects.select_related("team_member", "added_by__profile")
+        if _staff_sees_all(self.request.user):
+            return qs
+        return qs.filter(team_member__user=self.request.user)

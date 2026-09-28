@@ -7,6 +7,11 @@ celery>=5.4,<6.0
 redis>=5.0,<6.0
 psycopg2-binary>=2.9,<3.0
 python-dotenv>=1.0,<2.0
+# Imported directly by app code (airtable_sync/team_sync.py, integrations, management
+# commands). It was previously satisfied only as a transitive dep of twilio / google-api /
+# simple-salesforce — so a fresh install would have broken the moment any of those moved
+# to httpx. Declared explicitly because we import it ourselves.
+requests>=2.31,<3.0
 anthropic>=0.28,<1.0
 boto3>=1.34,<2.0
 twilio>=9.0,<10.0
@@ -22,7 +27,11 @@ djangorestframework-simplejwt>=5.3,<6.0
 mozilla-django-oidc>=4.0,<5.0
 # Field-level encryption for OAuth tokens
 django-encrypted-model-fields>=0.6,<1.0
-cryptography>=42.0,<45.0
+# Floor is 49, not 42: the installed pyOpenSSL requires cryptography<50,>=49.0.0 and
+# service-identity requires >=47 (both pulled in by Twisted/daphne). The previous
+# ">=42.0,<45.0" was unsatisfiable alongside them, so a fresh `pip install -r
+# requirements.txt` could not resolve — while the working venv had 49.0.0 all along.
+cryptography>=49.0,<50.0
 drf-spectacular>=0.27,<1.0
 django-csp>=3.8,<4.0
 daphne>=4.0,<5.0

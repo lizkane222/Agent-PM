@@ -9,6 +9,9 @@ import { addLog } from "../lib/appLog";
 import { useExport } from "../context/ExportContext";
 import { useRightClickComment } from "../components/comments/CommentContext";
 import CommentPreviewList from "../components/comments/CommentPreviewList";
+import { useAppError } from "../context/AppErrorContext";
+import CloudCoachPushToast from "../components/shared/CloudCoachPushToast";
+import { isPushOk, summarizePush, type CloudCoachPushResult } from "../lib/cloudCoachPush";
 
 type ViewMode = "cards" | "list" | "table";
 
@@ -560,6 +563,9 @@ export default function AccountsPage() {
   const [modal, setModal] = useState<Partial<Account> | null | "new">(null);
   const [memberPanelOpen, setMemberPanelOpen] = useState(false);
   const [dropTargetId, setDropTargetId] = useState<number | null>(null);
+  // Outcome of the Cloud Coach membership push a member drop can trigger.
+  const [cloudCoachPushes, setCloudCoachPushes] = useState<CloudCoachPushResult[] | null>(null);
+  const { reportError } = useAppError();
   const [dropTargetSidebarMemberId, setDropTargetSidebarMemberId] = useState<number | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("cards");
 
@@ -654,10 +660,27 @@ export default function AccountsPage() {
     if (!memberId) return;
     const existing = (account.team_members ?? []).map((m) => m.id);
     if (existing.includes(memberId)) return;
-    const { data } = await accountsApi.updateAccount(account.id, {
-      team_member_ids: [...existing, memberId],
-    } as Partial<Account>);
-    setAccounts((prev) => prev.map((a) => (a.id === data.id ? data : a)));
+    try {
+      const { data } = await accountsApi.updateAccount(account.id, {
+        team_member_ids: [...existing, memberId],
+      } as Partial<Account>);
+      setAccounts((prev) => prev.map((a) => (a.id === data.id ? data : a)));
+      // Present only when the account has exactly one Salesforce-linked project, in which
+      // case the server also added the person to it in Cloud Coach so they can log time.
+      const pushes = (data as Account & { cloud_coach_pushes?: CloudCoachPushResult[] })
+        .cloud_coach_pushes;
+      if (pushes?.length) {
+        setCloudCoachPushes(pushes);
+        for (const push of pushes.filter((p) => !isPushOk(p))) {
+          reportError(summarizePush(push), "AccountsPage");
+        }
+      }
+    } catch {
+      // Previously unguarded, so a rejected drop (e.g. the team-member allowlist in
+      // AccountViewSet._validate_account_write_fks) failed silently and the card simply
+      // never updated.
+      reportError("Could not add that team member to the account.", "AccountsPage");
+    }
   }
 
   return (
@@ -905,6 +928,13 @@ export default function AccountsPage() {
 
       </div> {/* end max-w-7xl */}
       </div> {/* end main content */}
+
+      {/* Reports whether a dragged-in member also reached Cloud Coach. Renders nothing
+          unless the account had exactly one Salesforce-linked project. */}
+      <CloudCoachPushToast
+        results={cloudCoachPushes}
+        onClose={() => setCloudCoachPushes(null)}
+      />
     </div>
   );
 }

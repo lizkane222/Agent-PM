@@ -161,7 +161,9 @@ describe("ArtifactPicker", () => {
     fireEvent.click(screen.getByText("Architecture diagram"));
 
     await waitFor(() => expect(calls.attached).toEqual([
-      { artifact_type: "link", name: "Architecture diagram", url: "https://example.com/diagram" },
+      // source_artifact is what lets the artifact show where it is used — without it
+      // the attachment is an untraceable copy of the link.
+      { artifact_type: "link", name: "Architecture diagram", url: "https://example.com/diagram", source_artifact: 1 },
     ]));
     expect(onAttached).toHaveBeenCalledWith(expect.objectContaining({ id: 99 }));
   });
@@ -176,7 +178,7 @@ describe("ArtifactPicker", () => {
     fireEvent.click(screen.getByText("Signed SOW"));
 
     await waitFor(() => expect(calls.attached).toEqual([
-      { artifact_type: "link", name: "Signed SOW", url: "https://files/sow.pdf" },
+      { artifact_type: "link", name: "Signed SOW", url: "https://files/sow.pdf", source_artifact: 5 },
     ]));
   });
 

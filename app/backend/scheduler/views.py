@@ -9,7 +9,7 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from core.mixins import RequireAccountMembershipMixin, RequireCalendarEventOwnershipMixin
+from core.mixins import RequireAccountMembershipMixin, RequireCalendarEventOwnershipMixin, _staff_sees_all
 from core.pagination import ClientPageSizePagination
 from core.query_params import csv_int_params
 from realtime.sync import publish_activity_event
@@ -33,6 +33,7 @@ DETAILS_EDITABLE_FIELDS = frozenset({
     "all_day",
     "event_category",
     "agentpm_airtable_id",
+    "artifact_ids",
 })
 
 # The fields Google owns — i.e. the ones `_sync_google_calendar` puts in its
@@ -121,12 +122,14 @@ class CalendarEventViewSet(RequireAccountMembershipMixin, viewsets.ModelViewSet)
         return Response(CalendarEventSerializer(event, context={"request": request}).data)
 
     def perform_create(self, serializer):
+        self._autolink_account_from_action_item(serializer)
         # RequireAccountMembershipMixin.perform_create would run this too, but this
         # viewset overrides perform_create to inject owner=user and Google sync, so
         # the subclass wins the MRO. Call the mixin's helper explicitly so account
         # re-parenting is still gated on team membership.
         self._check_account_membership(self._resolve_target_account(serializer))
         event = serializer.save(owner=self.request.user)
+        self._store_source_links(event)
 
         # Push primary-calendar events straight to Google Calendar
         if event.calendar_id == "primary":
@@ -140,6 +143,84 @@ class CalendarEventViewSet(RequireAccountMembershipMixin, viewsets.ModelViewSet)
             f"**Created** Calendar Event",
             detail=event.title,
         )
+
+    def _store_source_links(self, event):
+        """Persist `agentpm_airtable_id` / `reminder` from the raw request body onto a new row.
+
+        Both are `read_only` on the serializer (the Airtable and Google syncs own them on an
+        existing row), so they never reach `validated_data` and handing them to the serializer
+        would be silently dropped while still returning 201 — the same trap the `details`
+        action documents for `agentpm_airtable_id`. Assign them on the model instead.
+
+        This is what makes "drop an action item / reminder on the calendar" durable: the row
+        records what it is a scheduled occurrence *of*, so the calendar can render it, the
+        Google sync can recognise it as AgentPM-owned, and the rest of the app can find it.
+        """
+        update_fields = []
+
+        airtable_id = self.request.data.get("agentpm_airtable_id")
+        if isinstance(airtable_id, str) and airtable_id:
+            event.agentpm_airtable_id = airtable_id
+            update_fields.append("agentpm_airtable_id")
+
+        reminder_id = self.request.data.get("reminder")
+        if reminder_id not in (None, ""):
+            # Scoped to the caller's own reminders. A blind assignment would let anyone
+            # attach their calendar block to a stranger's reminder, and `Reminder` has no
+            # object-permission check of its own on this path.
+            reminder = Reminder.objects.filter(
+                pk=reminder_id, created_by=self.request.user
+            ).first()
+            if reminder is not None:
+                event.reminder = reminder
+                update_fields.append("reminder")
+            else:
+                logger.warning(
+                    "Ignoring reminder=%r on new calendar event for %s: not found or not theirs",
+                    reminder_id, self.request.user,
+                )
+
+        if update_fields:
+            event.save(update_fields=[*update_fields, "updated_at"])
+
+    def _autolink_account_from_action_item(self, serializer):
+        """Attach the source action item's own account when the caller omitted one.
+
+        Work-tracking events (starting a timer / dragging an item into "Currently
+        Tracking") are created with only `agentpm_airtable_id` — no `account` — so
+        `account_name` came back null and the calendar grid's work_tracking fallback
+        displayed the current user's own username instead of the account the action
+        item is actually linked to. This reuses the same AirtableAccount->Account
+        bridge `_resolve_scheduler_account` already uses for the Airtable sync path.
+        """
+        if serializer.validated_data.get("account") is not None:
+            return  # caller already set one explicitly — don't override
+        # `agentpm_airtable_id` is read_only on the serializer (see the comment on
+        # DETAILS_EDITABLE_FIELDS above), so it never survives into validated_data —
+        # it must be read off the raw request body instead.
+        airtable_id = self.request.data.get("agentpm_airtable_id")
+        if not airtable_id:
+            return
+
+        from airtable_sync.models import AirtableActionItem
+        from airtable_sync.sync import _resolve_scheduler_account
+
+        air_item = AirtableActionItem.objects.filter(airtable_id=airtable_id).select_related("account").first()
+        if air_item is None:
+            return
+        account = _resolve_scheduler_account(air_item)
+        if account is None:
+            return
+
+        # Best-effort: an auto-link must never turn "start a timer" into a 403.
+        # Only attach when the caller may actually attach records to this account —
+        # the same rule _check_account_membership enforces below.
+        user = self.request.user
+        if not _staff_sees_all(user) and not (
+            account.team_members.filter(user=user).exists() or account.admin_owner_id == user.id
+        ):
+            return
+        serializer.validated_data["account"] = account
 
     def _push_to_google(self, event):
         from django.conf import settings
@@ -299,6 +380,11 @@ class CalendarEventViewSet(RequireAccountMembershipMixin, viewsets.ModelViewSet)
             # isinstance, not truthiness — Python treats 1 == True, so a membership or
             # bool() test would silently accept integers. Same trap `attendance` hit.
             return Response({"all_day": "Must be true or false."}, status=400)
+
+        if "artifact_ids" in patch:
+            ids = patch["artifact_ids"]
+            if not isinstance(ids, list) or not all(isinstance(i, int) and not isinstance(i, bool) for i in ids):
+                return Response({"artifact_ids": "Must be a list of integers."}, status=400)
 
         # `agentpm_airtable_id` is read_only on the serializer (it is normally owned by the
         # Airtable/Google sync), so handing it to the serializer would be silently dropped

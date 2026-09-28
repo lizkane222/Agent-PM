@@ -9,8 +9,13 @@ router.register("tasks", views.SalesforceTaskViewSet, basename="sf-tasks")
 router.register("time-entries", views.SalesforceTimeEntryViewSet, basename="sf-time-entries")
 
 urlpatterns = [
+    # MUST precede the router: DRF's default detail lookup regex is `[^/.]+`, so
+    # `projects/lookup/` would otherwise resolve as the projects detail route with
+    # pk="lookup". Same trap the MSW handler ordering notes in CLAUDE.md describe.
+    path("projects/lookup/", views.lookup_project, name="sf-project-lookup"),
     path("", include(router.urls)),
     path("log-time/", views.log_time, name="sf-log-time"),
+    path("log-week/", views.log_week, name="sf-log-week"),
     path("log-time-assignments/", views.log_time_day_assignments, name="sf-log-time-assignments"),
     path("chatter/", views.post_chatter, name="sf-chatter"),
     path("sync/", views.trigger_sync, name="sf-sync"),

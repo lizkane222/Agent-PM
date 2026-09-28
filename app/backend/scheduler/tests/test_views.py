@@ -1,5 +1,7 @@
 """Tests for scheduler.ReminderViewSet — permission scoping and CRUD."""
 
+from unittest import mock
+
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from django.urls import reverse
@@ -596,6 +598,49 @@ class CalendarEventDetailsUpdateTest(APITestCase):
         self.event.refresh_from_db()
         self.assertEqual(self.event.agentpm_airtable_id, "recABC123")
 
+    def test_edits_artifact_ids(self):
+        resp = self.client.patch(
+            details_url(self.event.pk), {"artifact_ids": [1, 2, 3]}, format="json"
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["artifact_ids"], [1, 2, 3])
+        self.event.refresh_from_db()
+        self.assertEqual(self.event.artifact_ids, [1, 2, 3])
+
+    def test_clears_artifact_ids(self):
+        self.event.artifact_ids = [1, 2]
+        self.event.save(update_fields=["artifact_ids"])
+        resp = self.client.patch(
+            details_url(self.event.pk), {"artifact_ids": []}, format="json"
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.event.refresh_from_db()
+        self.assertEqual(self.event.artifact_ids, [])
+
+    def test_rejects_a_malformed_artifact_ids(self):
+        for bad in ["not-a-list", {"a": 1}, [1, "two"], [1, True], 5]:
+            with self.subTest(value=bad):
+                resp = self.client.patch(
+                    details_url(self.event.pk), {"artifact_ids": bad}, format="json"
+                )
+                self.assertEqual(resp.status_code, 400)
+        self.event.refresh_from_db()
+        self.assertEqual(self.event.artifact_ids, [])
+
+    def test_artifact_ids_does_not_trigger_a_google_push(self):
+        """Google has no concept of linked artifacts; excluded from the owned snapshot."""
+        self.event.is_synced = True
+        self.event.google_event_id = "gcal-abc"
+        self.event.save(update_fields=["is_synced", "google_event_id"])
+        with mock.patch(
+            "scheduler.views.CalendarEventViewSet._update_in_google"
+        ) as mocked_push:
+            resp = self.client.patch(
+                details_url(self.event.pk), {"artifact_ids": [1]}, format="json"
+            )
+        self.assertEqual(resp.status_code, 200)
+        mocked_push.assert_not_called()
+
 
 class CalendarEventGooglePushTest(APITestCase):
     """When a local edit is pushed back to Google.
@@ -800,3 +845,261 @@ class CalendarEventGoogleBodyFormatTest(APITestCase):
         self.assertEqual(captured["body"]["start"]["dateTime"], "2026-08-20T16:00:00+00:00")
         self.assertEqual(captured["body"]["end"]["dateTime"], "2026-08-20T17:00:00+00:00")
         self.assertNotIn(" ", captured["body"]["start"]["dateTime"])
+
+
+# ── Auto-link the action item's own account onto a work-tracking event ─────────
+
+EVENTS_LIST_URL = "/api/v1/scheduler/events/"
+
+
+class CalendarEventAccountAutolinkTest(APITestCase):
+    """Dragging an action item into "Currently Tracking" (or Track/Auto-Track) creates
+    a `work_tracking` CalendarEvent carrying only `agentpm_airtable_id` — no `account`.
+    `account_name` then came back null, and the calendar grid's work_tracking fallback
+    displayed the current user's own username instead of the account the action item
+    is actually linked to. `_autolink_account_from_action_item` resolves and attaches
+    the action item's own account via the same bridge `_resolve_scheduler_account`
+    already uses for the Airtable sync path.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.user = _make_user("autolink_user")
+        self.client.force_authenticate(user=self.user)
+
+    def _create_event(self, **overrides):
+        payload = {
+            "title": "Work session",
+            "description": "Work session — Acme Corp",
+            "start_datetime": "2026-08-20T10:00:00Z",
+            "end_datetime": "2026-08-20T11:00:00Z",
+            "all_day": False,
+            "status": "confirmed",
+            "calendar_id": "work_tracking",
+            "is_synced": False,
+        }
+        payload.update(overrides)
+        return self.client.post(EVENTS_LIST_URL, payload, format="json")
+
+    def test_autolinks_the_action_items_own_account_for_a_member(self):
+        from accounts.models import Account
+        from airtable_sync.models import AirtableAccount, AirtableActionItem
+        from team.models import TeamMember
+
+        member = TeamMember.objects.create(
+            full_name="Autolink User", email="autolink_user@example.com", user=self.user
+        )
+        account = Account.objects.create(company_name="Acme Corp", airtable_id="recACME1")
+        account.team_members.add(member)
+        air_account = AirtableAccount.objects.create(airtable_id="recACME1", name="Acme Corp")
+        air_item = AirtableActionItem.objects.create(
+            airtable_id="recITEM1", account=air_account, task="Follow up with Acme",
+        )
+
+        resp = self._create_event(agentpm_airtable_id=air_item.airtable_id)
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["account"], account.id)
+        self.assertEqual(resp.data["account_name"], "Acme Corp")
+
+    def test_does_not_link_when_user_is_not_a_member_of_the_resolved_account(self):
+        """Best-effort: an auto-link must never turn "start a timer" into a 403."""
+        from airtable_sync.models import AirtableAccount, AirtableActionItem
+
+        air_account = AirtableAccount.objects.create(airtable_id="recNOTMINE", name="Not Mine Corp")
+        air_item = AirtableActionItem.objects.create(
+            airtable_id="recITEM2", account=air_account, task="Someone else's item",
+        )
+        from accounts.models import Account
+        Account.objects.create(company_name="Not Mine Corp", airtable_id="recNOTMINE")
+
+        resp = self._create_event(agentpm_airtable_id=air_item.airtable_id)
+        self.assertEqual(resp.status_code, 201)
+        self.assertIsNone(resp.data["account"])
+
+    def test_an_explicit_account_is_never_overridden(self):
+        from accounts.models import Account
+        from airtable_sync.models import AirtableAccount, AirtableActionItem
+        from team.models import TeamMember
+
+        member = TeamMember.objects.create(
+            full_name="Autolink User", email="autolink_user@example.com", user=self.user
+        )
+        explicit_account = Account.objects.create(company_name="Explicit Corp")
+        explicit_account.team_members.add(member)
+
+        other_account = Account.objects.create(company_name="Resolved Corp", airtable_id="recOTHER")
+        other_account.team_members.add(member)
+        air_account = AirtableAccount.objects.create(airtable_id="recOTHER", name="Resolved Corp")
+        air_item = AirtableActionItem.objects.create(
+            airtable_id="recITEM3", account=air_account, task="Has an explicit account",
+        )
+
+        resp = self._create_event(account=explicit_account.id, agentpm_airtable_id=air_item.airtable_id)
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["account"], explicit_account.id)
+
+    def test_no_airtable_id_is_a_no_op(self):
+        resp = self._create_event()
+        self.assertEqual(resp.status_code, 201)
+        self.assertIsNone(resp.data["account"])
+
+    def test_unresolvable_airtable_id_is_a_no_op(self):
+        resp = self._create_event(agentpm_airtable_id="rec-does-not-exist")
+        self.assertEqual(resp.status_code, 201)
+        self.assertIsNone(resp.data["account"])
+
+    def test_admin_account_routes_to_the_assignees_personal_admin_account(self):
+        """The per-user "Admin" special case `_resolve_scheduler_account` already
+        handles for the Airtable sync path — an Admin-account action item must
+        resolve to *this* user's own personal Admin account, not a shared one."""
+        from accounts.models import ADMIN_ACCOUNT_NAME, Account
+        from airtable_sync.models import AirtableAccount, AirtableActionItem
+        from team.models import TeamMember
+
+        UserProfile.objects.create(user=self.user, airtable_collaborator_id="collabAutolink")
+        TeamMember.objects.create(
+            full_name="Autolink User", email="autolink_user@example.com", user=self.user
+        )
+        admin_air_account = AirtableAccount.objects.create(airtable_id="recADMIN", name=ADMIN_ACCOUNT_NAME)
+        air_item = AirtableActionItem.objects.create(
+            airtable_id="recITEM4",
+            account=admin_air_account,
+            task="Personal admin task",
+            assignee_airtable_id="collabAutolink",
+        )
+
+        resp = self._create_event(agentpm_airtable_id=air_item.airtable_id)
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["account_name"], ADMIN_ACCOUNT_NAME)
+
+        linked_account = Account.objects.get(pk=resp.data["account"])
+        self.assertEqual(linked_account.admin_owner_id, self.user.id)
+
+    def test_staff_gets_the_autolink_without_formal_membership(self):
+        from accounts.models import Account
+        from airtable_sync.models import AirtableAccount, AirtableActionItem
+
+        staff = _make_user("autolink_staff", is_staff=True)
+        self.client.force_authenticate(user=staff)
+
+        account = Account.objects.create(company_name="Staff Reach Corp", airtable_id="recSTAFF")
+        air_account = AirtableAccount.objects.create(airtable_id="recSTAFF", name="Staff Reach Corp")
+        air_item = AirtableActionItem.objects.create(
+            airtable_id="recITEM5", account=air_account, task="Staff can see everything",
+        )
+
+        resp = self._create_event(agentpm_airtable_id=air_item.airtable_id)
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["account"], account.id)
+
+
+# ── Scheduling onto the calendar creates a row that records what it links to ───
+
+class CalendarEventSourceLinkCreateTest(APITestCase):
+    """`perform_create` persists `agentpm_airtable_id` and `reminder`.
+
+    Both are `read_only` on the serializer, so handing them to `serializer.save()` was
+    silently dropped while still returning 201 — the worst kind of failure. Every
+    work-tracking row created by the timer path therefore had a blank link, and a scheduled
+    action item could not be told apart from an untitled block of time.
+
+    This is what makes "drop an action item on the calendar" durable rather than a
+    localStorage-only overlay that the Google sync deletes.
+    """
+
+    URL = "/api/v1/scheduler/events/"
+
+    def setUp(self):
+        cache.clear()
+        self.user = _make_user("sched_link_user")
+        self.other = _make_user("sched_link_other")
+        self.client.force_authenticate(self.user)
+
+    def tearDown(self):
+        cache.clear()
+
+    def _payload(self, **extra):
+        body = {
+            "title": "Provision SQL Traits",
+            "start_datetime": "2026-09-15T18:00:00Z",
+            "end_datetime": "2026-09-15T19:00:00Z",
+            "calendar_id": "work_tracking",
+        }
+        body.update(extra)
+        return body
+
+    def test_agentpm_airtable_id_is_stored(self):
+        resp = self.client.post(
+            self.URL, self._payload(agentpm_airtable_id="rec9AwGLeyC2jMn2I"), format="json"
+        )
+        self.assertEqual(resp.status_code, 201, resp.data)
+
+        event = CalendarEvent.objects.get(pk=resp.data["id"])
+        self.assertEqual(event.agentpm_airtable_id, "rec9AwGLeyC2jMn2I")
+
+    def test_the_stored_link_is_returned_in_the_response(self):
+        """The client relies on this to render the new row without a refetch."""
+        resp = self.client.post(
+            self.URL, self._payload(agentpm_airtable_id="recXYZ"), format="json"
+        )
+        self.assertEqual(resp.data["agentpm_airtable_id"], "recXYZ")
+
+    def test_a_reminder_the_caller_owns_is_stored(self):
+        reminder = Reminder.objects.create(
+            created_by=self.user, title="Call back", due_at="2026-09-15T18:00:00Z"
+        )
+        resp = self.client.post(
+            self.URL,
+            self._payload(calendar_id="reminders", reminder=reminder.pk),
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201, resp.data)
+
+        event = CalendarEvent.objects.get(pk=resp.data["id"])
+        self.assertEqual(event.reminder_id, reminder.pk)
+
+    def test_another_users_reminder_is_ignored_not_attached(self):
+        """`Reminder` has no object-permission check on this path, so scope it here."""
+        theirs = Reminder.objects.create(
+            created_by=self.other, title="Not yours", due_at="2026-09-15T18:00:00Z"
+        )
+        resp = self.client.post(
+            self.URL,
+            self._payload(calendar_id="reminders", reminder=theirs.pk),
+            format="json",
+        )
+        # Still created — the block of time is legitimate; only the bogus link is dropped.
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertIsNone(CalendarEvent.objects.get(pk=resp.data["id"]).reminder_id)
+
+    def test_a_nonexistent_reminder_is_ignored(self):
+        resp = self.client.post(
+            self.URL, self._payload(calendar_id="reminders", reminder=999999), format="json"
+        )
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertIsNone(CalendarEvent.objects.get(pk=resp.data["id"]).reminder_id)
+
+    def test_omitting_both_links_still_creates_a_plain_event(self):
+        resp = self.client.post(self.URL, self._payload(calendar_id="primary"), format="json")
+        self.assertEqual(resp.status_code, 201, resp.data)
+
+        event = CalendarEvent.objects.get(pk=resp.data["id"])
+        self.assertEqual(event.agentpm_airtable_id, "")
+        self.assertIsNone(event.reminder_id)
+
+    def test_a_scheduled_row_starts_unsynced_so_the_sync_will_push_it(self):
+        """PHASE 1b keys off `google_event_id=""`, so a fresh row must not claim to be synced."""
+        resp = self.client.post(
+            self.URL, self._payload(agentpm_airtable_id="recPUSHME"), format="json"
+        )
+        event = CalendarEvent.objects.get(pk=resp.data["id"])
+        self.assertEqual(event.google_event_id, "")
+        self.assertFalse(event.is_synced)
+
+    def test_a_work_tracking_create_is_not_pushed_to_google_at_create_time(self):
+        """The sync owns mirroring these; pushing here would double-create."""
+        with mock.patch.object(CalendarEventViewSet, "_push_to_google") as pushed:
+            self.client.post(
+                self.URL, self._payload(agentpm_airtable_id="recNOPUSH"), format="json"
+            )
+        pushed.assert_not_called()

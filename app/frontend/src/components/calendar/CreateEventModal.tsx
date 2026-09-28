@@ -112,6 +112,10 @@ export default function CreateEventModal({ draft, onChange, onSave, onCancel, sa
   const [availableArtifacts, setAvailableArtifacts] = useState<AccountArtifact[]>([]);
   const [showLinkItems, setShowLinkItems] = useState(false);
   const [showLinkArtifacts, setShowLinkArtifacts] = useState(false);
+  const [showNewArtifactForm, setShowNewArtifactForm] = useState(false);
+  const [newArtifactName, setNewArtifactName] = useState("");
+  const [newArtifactUrl, setNewArtifactUrl] = useState("");
+  const [savingArtifact, setSavingArtifact] = useState(false);
 
   // ── Invite prompt state ───────────────────────────────────────────────────
   const [showInvitePrompt, setShowInvitePrompt] = useState(false);
@@ -256,6 +260,26 @@ export default function CreateEventModal({ draft, onChange, onSave, onCancel, sa
         ? d.linkedArtifactIds.filter((x) => x !== id)
         : [...d.linkedArtifactIds, id],
     }));
+  };
+
+  const handleCreateArtifact = async () => {
+    const acct = draft.selectedAccount;
+    if (!acct || !newArtifactName.trim() || !newArtifactUrl.trim()) return;
+    setSavingArtifact(true);
+    try {
+      const res = await accountsApi.addArtifactLink(acct.id, newArtifactName.trim(), newArtifactUrl.trim());
+      const created = res.data;
+      setAvailableArtifacts((prev) => [...prev, created]);
+      onChange((d) => ({ ...d, linkedArtifactIds: [...d.linkedArtifactIds, created.id] }));
+      setNewArtifactName("");
+      setNewArtifactUrl("");
+      setShowNewArtifactForm(false);
+      setShowLinkArtifacts(true);
+    } catch {
+      // best-effort; the artifact simply won't appear
+    } finally {
+      setSavingArtifact(false);
+    }
   };
 
   const handleConfirmSave = async () => {
@@ -465,16 +489,16 @@ export default function CreateEventModal({ draft, onChange, onSave, onCancel, sa
                     onFocus={() => {
                       const q = draft.accountQuery.trim();
                       const results = q
-                        ? allAccountsRef.current.filter((a) => a.name.toLowerCase().includes(q.toLowerCase())).slice(0, 8)
-                        : allAccountsRef.current.slice(0, 8);
+                        ? allAccountsRef.current.filter((a) => a.name.toLowerCase().includes(q.toLowerCase()))
+                        : allAccountsRef.current;
                       onChange((d) => ({ ...d, accountResults: results }));
                     }}
                     onBlur={() => setTimeout(() => onChange((d) => ({ ...d, accountResults: [] })), 150)}
                     onChange={(e) => {
                       const q = e.target.value;
                       const results = q.trim()
-                        ? allAccountsRef.current.filter((a) => a.name.toLowerCase().includes(q.toLowerCase())).slice(0, 8)
-                        : allAccountsRef.current.slice(0, 8);
+                        ? allAccountsRef.current.filter((a) => a.name.toLowerCase().includes(q.toLowerCase()))
+                        : allAccountsRef.current;
                       onChange((d) => ({ ...d, accountQuery: q, accountResults: results }));
                     }}
                     className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400"
@@ -482,7 +506,7 @@ export default function CreateEventModal({ draft, onChange, onSave, onCancel, sa
                   {draft.accountResults.length > 0 && (
                     <ul className="absolute z-10 left-0 right-0 mt-1 bg-white border border-gray-200 rounded-xl shadow-lg overflow-y-auto max-h-40">
                       {draft.accountResults.map((a) => (
-                        <li key={a.name}>
+                        <li key={a.id}>
                           <button
                             type="button"
                             className="w-full text-left px-3 py-2 text-sm hover:bg-indigo-50 transition-colors truncate"
@@ -673,8 +697,8 @@ export default function CreateEventModal({ draft, onChange, onSave, onCancel, sa
               </div>
             )}
 
-            {/* Artifacts linker */}
-            {availableArtifacts.length > 0 && (
+            {/* Artifacts linker — only when an account is selected */}
+            {draft.selectedAccount && (
               <div className="mt-2">
                 <button
                   type="button"
@@ -688,21 +712,72 @@ export default function CreateEventModal({ draft, onChange, onSave, onCancel, sa
                   )}
                 </button>
                 {showLinkArtifacts && (
-                  <ul className="mt-1.5 max-h-32 overflow-y-auto border border-gray-100 rounded-lg divide-y divide-gray-50">
-                    {availableArtifacts.map((art) => (
-                      <li key={art.id}>
-                        <label className="flex items-center gap-2 px-3 py-1.5 hover:bg-gray-50 cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={draft.linkedArtifactIds.includes(art.id)}
-                            onChange={() => toggleArtifact(art.id)}
-                            className="rounded border-gray-300 text-indigo-500"
-                          />
-                          <span className="text-xs text-gray-700 truncate flex-1">{art.name}</span>
-                        </label>
-                      </li>
-                    ))}
-                  </ul>
+                  <>
+                    {availableArtifacts.length > 0 && (
+                      <ul className="mt-1.5 max-h-32 overflow-y-auto border border-gray-100 rounded-lg divide-y divide-gray-50">
+                        {availableArtifacts.map((art) => (
+                          <li key={art.id}>
+                            <label className="flex items-center gap-2 px-3 py-1.5 hover:bg-gray-50 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={draft.linkedArtifactIds.includes(art.id)}
+                                onChange={() => toggleArtifact(art.id)}
+                                className="rounded border-gray-300 text-indigo-500"
+                              />
+                              <span className="text-xs text-gray-700 truncate flex-1">{art.name}</span>
+                            </label>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                    {!showNewArtifactForm ? (
+                      <button
+                        type="button"
+                        onClick={() => setShowNewArtifactForm(true)}
+                        className="mt-1.5 text-xs text-indigo-600 hover:text-indigo-800 font-medium"
+                      >
+                        + New artifact
+                      </button>
+                    ) : (
+                      <div className="mt-1.5 border border-gray-100 rounded-lg p-2 space-y-1.5">
+                        <input
+                          type="text"
+                          placeholder="Artifact name"
+                          value={newArtifactName}
+                          onChange={(e) => setNewArtifactName(e.target.value)}
+                          className="w-full text-xs border border-gray-200 rounded px-2 py-1"
+                        />
+                        <input
+                          type="text"
+                          placeholder="https://…"
+                          value={newArtifactUrl}
+                          onChange={(e) => setNewArtifactUrl(e.target.value)}
+                          className="w-full text-xs border border-gray-200 rounded px-2 py-1"
+                        />
+                        <div className="flex gap-2">
+                          <button
+                            type="button"
+                            disabled={savingArtifact || !newArtifactName.trim() || !newArtifactUrl.trim()}
+                            onClick={handleCreateArtifact}
+                            className="text-xs px-2 py-1 rounded bg-indigo-600 text-white disabled:opacity-50"
+                          >
+                            {savingArtifact ? "Adding…" : "Add"}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setShowNewArtifactForm(false);
+                              setNewArtifactName("");
+                              setNewArtifactUrl("");
+                            }}
+                            className="text-xs px-2 py-1 rounded text-gray-500 hover:text-gray-700"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </>
                 )}
               </div>
             )}

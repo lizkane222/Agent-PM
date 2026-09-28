@@ -53,7 +53,7 @@ export interface Task {
 }
 
 // ── Team (moved to types/team.ts — re-exported here for backwards compat) ────
-export type { Tag, TeamMember, UserProfile } from "./team";
+export type { Tag, TeamMember, TeamMemberDocument, UserProfile } from "./team";
 
 // ── Realtime ──────────────────────────────────────────────────────────────────
 
@@ -245,6 +245,7 @@ export interface ActionItemAttachment {
   file_url: string | null;
   mime_type: string;
   file_size: number | null;
+  source_artifact: number | null;
   uploaded_by: number | null;
   uploaded_by_username: string | null;
   created_at: string;

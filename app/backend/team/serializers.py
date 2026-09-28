@@ -5,7 +5,7 @@ import re
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
-from .models import Tag, Team, TeamMember, TeamMembership, UserProfile
+from .models import Tag, Team, TeamMember, TeamMemberDocument, TeamMembership, UserProfile
 
 User = get_user_model()
 
@@ -206,6 +206,20 @@ class UserProfileSerializer(serializers.ModelSerializer):
                     raise serializers.ValidationError({key: "All items must be strings."})
 
         return value
+
+
+class TeamMemberDocumentSerializer(serializers.ModelSerializer):
+    added_by_name = serializers.CharField(
+        source="added_by.profile.display_name", read_only=True, default=""
+    )
+
+    class Meta:
+        model = TeamMemberDocument
+        fields = [
+            "id", "team_member", "name", "url", "position",
+            "added_by", "added_by_name", "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "team_member", "added_by", "created_at", "updated_at"]
 
 
 class TeamMemberSerializer(serializers.ModelSerializer):

@@ -1,5 +1,5 @@
 import { http, HttpResponse } from "msw";
-import type { TeamMember, UserProfile } from "../../types";
+import type { TeamMember, TeamMemberDocument, UserProfile } from "../../types";
 
 export const mockUserProfile: UserProfile = {
   id: 1,
@@ -61,6 +61,20 @@ export const mockTeamMembers: TeamMember[] = [
   },
 ];
 
+export const mockTeamMemberDocuments: TeamMemberDocument[] = [
+  {
+    id: 1,
+    team_member: 1,
+    name: "OOO coverage doc",
+    url: "https://docs.example.com/coverage",
+    position: 0,
+    added_by: 1,
+    added_by_name: "Alice Smith",
+    created_at: "2024-01-05T00:00:00Z",
+    updated_at: "2024-01-05T00:00:00Z",
+  },
+];
+
 export const teamHandlers = [
   http.get("/api/v1/team/profiles/me/", () =>
     HttpResponse.json(mockUserProfile)
@@ -88,6 +102,26 @@ export const teamHandlers = [
     return HttpResponse.json({ ...mockTeamMembers[0], ...body });
   }),
   http.delete("/api/v1/team/members/:id/", () =>
+    new HttpResponse(null, { status: 204 })
+  ),
+  // Default: no docs, so every existing TeamPage test's DOM stays unchanged.
+  // Tests that exercise the Linked Docs section override with server.use(...).
+  http.get("/api/v1/team/members/:id/documents/", () => HttpResponse.json([])),
+  http.post("/api/v1/team/members/:id/documents/", async ({ request }) => {
+    const body = (await request.json()) as Partial<TeamMemberDocument>;
+    const newDoc: TeamMemberDocument = {
+      ...mockTeamMemberDocuments[0],
+      id: 100,
+      name: body.name ?? "New doc",
+      url: body.url ?? "https://example.com",
+    };
+    return HttpResponse.json(newDoc, { status: 201 });
+  }),
+  http.patch("/api/v1/team/member-documents/:id/", async ({ request }) => {
+    const body = (await request.json()) as Partial<TeamMemberDocument>;
+    return HttpResponse.json({ ...mockTeamMemberDocuments[0], ...body });
+  }),
+  http.delete("/api/v1/team/member-documents/:id/", () =>
     new HttpResponse(null, { status: 204 })
   ),
 ];

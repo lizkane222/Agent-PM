@@ -1,5 +1,6 @@
 """API views for the integrations app."""
 
+import datetime as _datetime
 import logging
 import re
 
@@ -144,6 +145,86 @@ GOOGLE_EVENT_TYPE_TO_CATEGORY = {
     "workingLocation": "working_location",
 }
 
+#: `calendar_id` values for rows AgentPM creates itself — a scheduled action item
+#: ("work_tracking") or a scheduled reminder ("reminders"). Google is *not* authoritative for
+#: these: the user created them here, and the DB row is the original. They are mirrored to
+#: Google as a convenience, so the pull must never treat "Google didn't return it" as
+#: "the user deleted it". See `_reconcile_missing_google_events`.
+AGENTPM_OWNED_CALENDAR_IDS = ("work_tracking", "reminders")
+
+#: `agentpm_source` values written into Google's private extended properties so a pulled event
+#: can be classified back to the right `calendar_id` instead of reading as an ordinary meeting.
+AGENTPM_SOURCE_TO_CALENDAR_ID = {
+    "action_item": "work_tracking",
+    "reminder": "reminders",
+}
+
+
+def _parse_start_minute(value):
+    """An RFC3339 start string truncated to the minute as an aware datetime, or None.
+
+    Used to scope the action-item push dedup to a single time slot. Returns None on anything
+    unparseable so the caller falls through to creating the event: a failed parse must not be
+    read as "a duplicate already exists", which would silently drop the scheduling.
+    """
+    if not value:
+        return None
+    text = str(value).strip()
+    # fromisoformat() accepts "+00:00" but not the "Z" suffix before Python 3.11.
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = _datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_datetime.timezone.utc)
+    return parsed.replace(second=0, microsecond=0)
+
+
+def _agentpm_extended_properties(event):
+    """Google `extendedProperties.private` identifying an AgentPM-created event.
+
+    Mirrors what `GoogleActionItemsPushView` writes, so an event inserted by the sync and one
+    inserted by that view come back from the pull looking identical. Without these the pull
+    resolves `calendar_id` to "primary" and a scheduled action item silently becomes a meeting.
+    """
+    source = "reminder" if event.calendar_id == "reminders" else "action_item"
+    props = {"agentpm_source": source}
+    if event.agentpm_airtable_id:
+        props["agentpm_airtable_id"] = event.agentpm_airtable_id
+    if event.reminder_id:
+        props["agentpm_reminder_id"] = str(event.reminder_id)
+    return {"private": props}
+
+
+def _insert_agentpm_event_in_google(event, service):
+    """Create a Google event for an AgentPM-owned row that has never been pushed.
+
+    Returns the new Google event id, or "" on failure. Raises nothing: one unreachable insert
+    among a batch must not abort the whole sync, and the local row stays authoritative.
+    """
+    body = {
+        "summary": event.title,
+        "description": event.description or "",
+        "location": event.location or "",
+        "start": {"date": event.start_datetime.date().isoformat()} if event.all_day
+                 else {"dateTime": event.start_datetime.isoformat()},
+        "end": {"date": event.end_datetime.date().isoformat()} if event.all_day
+               else {"dateTime": event.end_datetime.isoformat()},
+        "extendedProperties": _agentpm_extended_properties(event),
+        "colorId": "3",  # grape/purple, matching GoogleActionItemsPushView
+    }
+    try:
+        created = service.events().insert(calendarId="primary", body=body).execute()
+        return created.get("id", "")
+    except Exception:
+        logger.exception(
+            "Failed to insert AgentPM event '%s' (pk=%s) into Google Calendar",
+            event.title, event.pk,
+        )
+        return ""
+
 
 def _push_event_to_google(event, creds):
     """Push a single CalendarEvent's editable fields to Google Calendar.
@@ -213,18 +294,127 @@ def _push_event_to_google(event, creds):
             else:
                 logger.exception("Failed to push event '%s' to Google Calendar", event.title)
                 return
+        except Exception:
+            # Any other failure — a network timeout, connection reset, or transport-level
+            # error from one of a batch of sequential pushes — must not escape either.
+            # One flaky call among hundreds would otherwise abort the whole sync and
+            # surface as a 500; the local row stays authoritative regardless.
+            logger.exception("Failed to push event '%s' to Google Calendar", event.title)
+            return
+
+
+def _reconcile_missing_google_events(user, seen_ids, window_start, window_end):
+    """Reconcile local rows Google did not return. Returns (deleted_count, unlinked_count).
+
+    Google's silence about an event only means "deleted in Google" under three conditions, and
+    the previous implementation checked none of them — it deleted every `is_synced=True` row in
+    `primary`/`work_tracking` missing from `seen_ids`, which destroyed user data:
+
+    1.  **The row must actually have a `google_event_id`.** Google cannot omit an event it was
+        never told about. A blank id meant "never pushed", yet `.exclude(google_event_id__in=...)`
+        matched it, so a locally-created row was deleted the first time any sync ran.
+
+    2.  **The row's start must fall inside the pull window.** The pull asks for now ±90 days, so
+        an event outside that range is *absent by construction*. Deleting on that basis threw
+        away every event the user scheduled further out than 90 days.
+
+    3.  **The row must not be AgentPM-owned.** For `work_tracking` / `reminders` rows the DB is
+        the original and Google is the copy, so a missing Google event means the mirror is
+        stale, not that the work is cancelled. These are **unlinked** (`google_event_id=""`,
+        `is_synced=False`) rather than deleted, which leaves them on the calendar and lets the
+        next sync re-push them. This is the bound that makes the reported failure mode
+        impossible: the worst case is a redundant re-push, never data loss.
+
+    Plain `primary` meetings keep the original delete semantics — Google really is authoritative
+    for those — now correctly scoped by (1) and (2).
+    """
+    from scheduler.models import CalendarEvent
+
+    # Rows that could legitimately have been removed in Google: pushed at some point, and
+    # inside the range the pull actually asked about.
+    candidates = (
+        CalendarEvent.objects.filter(
+            owner=user,
+            is_synced=True,
+            start_datetime__gte=window_start,
+            start_datetime__lte=window_end,
+        )
+        .exclude(google_event_id="")
+        .exclude(google_event_id__in=seen_ids)
+    )
+
+    unlinked_count = candidates.filter(
+        calendar_id__in=AGENTPM_OWNED_CALENDAR_IDS
+    ).update(google_event_id="", is_synced=False)
+    if unlinked_count:
+        logger.info(
+            "Google Calendar sync: unlinked %d AgentPM-owned events for %s "
+            "(kept locally, will be re-pushed)",
+            unlinked_count, user,
+        )
+
+    deleted_count, _ = candidates.exclude(
+        calendar_id__in=AGENTPM_OWNED_CALENDAR_IDS
+    ).filter(calendar_id="primary").delete()
+    if deleted_count:
+        logger.info("Google Calendar sync: removed %d stale events for %s", deleted_count, user)
+
+    return deleted_count, unlinked_count
+
+
+def _push_new_agentpm_events(user, service, window_start, window_end):
+    """Mirror AgentPM-owned rows that have never reached Google. Returns the count pushed.
+
+    Scheduled action items and reminders are created as real rows the moment the user drops
+    them on the grid, so the sync — not the client — owns getting them into Google. This is
+    what let the frontend stop its push-then-prune dance, which deleted the client's only copy
+    of a scheduling before confirming the round trip had replaced it.
+    """
+    from scheduler.models import CalendarEvent
+
+    pending = CalendarEvent.objects.filter(
+        owner=user,
+        google_event_id="",
+        calendar_id__in=AGENTPM_OWNED_CALENDAR_IDS,
+        start_datetime__gte=window_start,
+        start_datetime__lte=window_end,
+    )
+
+    pushed = 0
+    for event in pending:
+        google_event_id = _insert_agentpm_event_in_google(event, service)
+        if not google_event_id:
+            continue  # already logged; the local row stays and the next sync retries
+        # .update() rather than .save() so `updated_at` (auto_now) is not bumped — mirroring
+        # to Google is not a local edit, and a false "recently edited" flag makes the next
+        # sync's PHASE 1 re-push the row for no reason.
+        CalendarEvent.objects.filter(pk=event.pk).update(
+            google_event_id=google_event_id, is_synced=True
+        )
+        pushed += 1
+
+    if pushed:
+        logger.info("Google Calendar sync: pushed %d new AgentPM events for %s", pushed, user)
+    return pushed
 
 
 def _sync_google_calendar(user, creds):
     """Bi-directional sync: push recent edits to Google, then pull from Google.
 
-    PHASE 1: Push any synced events that were modified since the last sync.
-             This ensures local edits reach Google before the pull overwrites them.
+    PHASE 1:  Push any synced events that were modified since the last sync.
+              This ensures local edits reach Google before the pull overwrites them.
 
-    PHASE 2: Pull the upcoming 90 days of events from Google Calendar into CalendarEvent.
+    PHASE 1b: Insert AgentPM-owned rows (scheduled action items / reminders) that have never
+              been pushed, so PHASE 2 pulls them back as synced rows in this same cycle.
+
+    PHASE 2:  Pull the surrounding ±90 days of events from Google Calendar into CalendarEvent.
+
+    PHASE 3:  Reconcile local rows Google did not return — see
+              `_reconcile_missing_google_events` for why that is not simply a delete.
     """
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
+    from django.db import transaction
     from django.utils import timezone
     import datetime
     import time
@@ -255,12 +445,20 @@ def _sync_google_calendar(user, creds):
         if pushed_count > 0:
             logger.info("Google Calendar sync: pushed %d recently-edited events for %s", pushed_count, user)
 
-    # PHASE 2: Pull from Google Calendar
     service = build("calendar", "v3", credentials=creds, cache_discovery=False)
     now = timezone.now()
-    time_min = (now - datetime.timedelta(days=90)).isoformat()
-    time_max = (now + datetime.timedelta(days=90)).isoformat()
+    # Kept as real datetimes as well as ISO strings: PHASE 1b and PHASE 3 both need to compare
+    # them against `start_datetime` in the ORM, and the window bound is what makes PHASE 3 safe.
+    window_start = now - datetime.timedelta(days=90)
+    window_end = now + datetime.timedelta(days=90)
+    time_min = window_start.isoformat()
+    time_max = window_end.isoformat()
 
+    # PHASE 1b: Mirror AgentPM-owned rows that have never reached Google. Runs before the pull
+    # so anything inserted here comes straight back as a synced row in this same cycle.
+    _push_new_agentpm_events(user, service, window_start, window_end)
+
+    # PHASE 2: Pull from Google Calendar
     page_token = None
     created = updated = 0
     seen_ids = set()
@@ -328,10 +526,11 @@ def _sync_google_calendar(user, creds):
             private_props = item.get("extendedProperties", {}).get("private", {})
             agentpm_source = private_props.get("agentpm_source", "")
             agentpm_airtable_id = private_props.get("agentpm_airtable_id", "")
-            if agentpm_source == "action_item":
-                resolved_calendar_id = "work_tracking"
-            else:
-                resolved_calendar_id = "primary"
+            agentpm_reminder_id = private_props.get("agentpm_reminder_id", "")
+            # "action_item" -> work_tracking, "reminder" -> reminders, anything else -> primary.
+            # A scheduled reminder that resolved to "primary" would render as an ordinary
+            # meeting, lose its reminder colour, and drop out of the reminder edit path.
+            resolved_calendar_id = AGENTPM_SOURCE_TO_CALENDAR_ID.get(agentpm_source, "primary")
 
             defaults = {
                 "title": item.get("summary", "(No title)"),
@@ -359,11 +558,37 @@ def _sync_google_calendar(user, creds):
             if agentpm_airtable_id:
                 defaults["agentpm_airtable_id"] = agentpm_airtable_id
 
-            obj, was_created = CalendarEvent.objects.update_or_create(
-                owner=user,
-                google_event_id=item["id"],
-                defaults=defaults,
-            )
+            # Same rule for the reminder link: only overwrite when Google carries a value, and
+            # only when it still resolves to one of this user's own reminders — the id round
+            # trips through a Google field the user can edit, so it is not trustworthy input.
+            if agentpm_reminder_id:
+                from scheduler.models import Reminder
+                reminder_pk = Reminder.objects.filter(
+                    pk=agentpm_reminder_id, created_by=user
+                ).values_list("pk", flat=True).first() if agentpm_reminder_id.isdigit() else None
+                if reminder_pk is not None:
+                    defaults["reminder_id"] = reminder_pk
+
+            # Deliberately not update_or_create(): that calls instance.save() on an
+            # existing row, which bumps updated_at (auto_now=True) even though nothing
+            # here reflects a local edit. That falsely marks every pulled event as
+            # "recently edited", so the next sync's PHASE 1 re-pushes the entire
+            # calendar back to Google instead of just what the user actually changed.
+            # QuerySet.update() does not trigger auto_now, so it leaves updated_at
+            # as the true signal of a local edit.
+            with transaction.atomic():
+                existing = CalendarEvent.objects.filter(
+                    owner=user, google_event_id=item["id"]
+                ).first()
+                if existing is not None:
+                    CalendarEvent.objects.filter(pk=existing.pk).update(**defaults)
+                    obj = existing
+                    was_created = False
+                else:
+                    obj = CalendarEvent.objects.create(
+                        owner=user, google_event_id=item["id"], **defaults
+                    )
+                    was_created = True
             # If we just created this row and there's a matching stub keyed by our
             # internal PK, link it now so future syncs won't lose the connection.
             if was_created:
@@ -383,20 +608,14 @@ def _sync_google_calendar(user, creds):
         if not page_token:
             break
 
-    # Delete local events (primary AND work_tracking) that no longer exist in Google's
-    # response — moved outside the window, deleted, or cancelled.
-    # Guard: if Google returned nothing at all, skip deletion — likely a transient
-    # auth/quota failure that already saw all items skipped as "cancelled".
-    deleted_count = 0
+    # PHASE 3: Reconcile local rows Google did not return.
+    # Guard: if Google returned nothing at all, skip reconciliation entirely — likely a
+    # transient auth/quota failure, or a response whose every item was skipped as "cancelled".
+    deleted_count = unlinked_count = 0
     if seen_ids:
-        deleted_qs = CalendarEvent.objects.filter(
-            owner=user,
-            calendar_id__in=["primary", "work_tracking"],
-            is_synced=True,
-        ).exclude(google_event_id__in=seen_ids)
-        deleted_count, _ = deleted_qs.delete()
-        if deleted_count:
-            logger.info("Google Calendar sync: removed %d stale events for %s", deleted_count, user)
+        deleted_count, unlinked_count = _reconcile_missing_google_events(
+            user, seen_ids, window_start, window_end
+        )
 
     SyncState.objects.update_or_create(
         user=user,
@@ -404,7 +623,10 @@ def _sync_google_calendar(user, creds):
         resource="calendar",
         defaults={"last_synced_at": now},
     )
-    logger.info("Google Calendar sync complete for %s: %d created, %d updated, %d deleted", user, created, updated, deleted_count)
+    logger.info(
+        "Google Calendar sync complete for %s: %d created, %d updated, %d deleted, %d unlinked",
+        user, created, updated, deleted_count, unlinked_count,
+    )
 
 
 class GoogleOAuthInitView(APIView):
@@ -634,14 +856,25 @@ class GoogleActionItemsPushView(APIView):
             }
 
             try:
-                # Dedup guard: check if this airtable_id already has a synced CalendarEvent
-                # in our DB — if so, return its google_event_id without touching Google.
+                # Dedup guard: if this action item already has a synced CalendarEvent *at this
+                # same start minute*, return its google_event_id without touching Google.
+                #
+                # The start-minute match is load-bearing. Matching on `agentpm_airtable_id`
+                # alone treated a *second* occurrence of the same action item as a duplicate of
+                # the first, and answered with the first occurrence's google_event_id — which
+                # the caller then took as confirmation that the new occurrence had been created.
+                # Nothing was created, so the new scheduling existed nowhere.
                 from scheduler.models import CalendarEvent as CalEv
-                existing_db_event = CalEv.objects.filter(
-                    owner=request.user,
-                    agentpm_airtable_id=airtable_id,
-                    is_synced=True,
-                ).exclude(google_event_id="").first()
+                existing_db_event = None
+                start_minute = _parse_start_minute(start)
+                if start_minute is not None:
+                    existing_db_event = CalEv.objects.filter(
+                        owner=request.user,
+                        agentpm_airtable_id=airtable_id,
+                        is_synced=True,
+                        start_datetime__gte=start_minute,
+                        start_datetime__lt=start_minute + _datetime.timedelta(minutes=1),
+                    ).exclude(google_event_id="").first()
                 if existing_db_event:
                     results.append({
                         "airtableId": airtable_id,
@@ -1005,8 +1238,17 @@ class GmailThreadsView(APIView):
             return Response({"threads": []})
 
         # ── 5. Claude: summarise + status each thread ─────────────────────────
-        import anthropic
-        client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY) if hasattr(settings, "ANTHROPIC_API_KEY") and settings.ANTHROPIC_API_KEY else None
+        # Routed through core.llm so this follows AGENT_BACKEND like every other
+        # LLM call. Best-effort: threads are still returned unsummarised if the
+        # backend is unreachable.
+        try:
+            from core.llm import build_sync_client, model_for_tier
+            client = build_sync_client()
+            thread_summary_model = model_for_tier("voice")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("gmail threads: LLM unavailable, returning unsummarised: %s", exc)
+            client = None
+            thread_summary_model = ""
 
         if client:
             for t in threads_data:
@@ -1025,7 +1267,7 @@ class GmailThreadsView(APIView):
                 )
                 try:
                     msg = client.messages.create(
-                        model="claude-haiku-4-5-20251001",
+                        model=thread_summary_model,
                         max_tokens=300,
                         messages=[{"role": "user", "content": prompt}],
                     )
@@ -1323,6 +1565,26 @@ class AirtableConnectView(APIView):
         return Response({"detail": "Airtable connected successfully."})
 
 
+#: Salesforce User ids always carry the `005` key prefix and are 15 or 18 chars.
+#: Matching the prefix as well as the shape means a malformed identity URL is rejected
+#: rather than stored as a plausible-looking id that every later SOQL filter misses.
+_SF_USER_ID_RE = re.compile(r"^005[a-zA-Z0-9]{12}([a-zA-Z0-9]{3})?$")
+
+
+def extract_sf_user_id(identity_url: str | None) -> str:
+    """
+    The Salesforce User id out of a token response's `id` field, or `""`.
+
+    The identity URL is `https://<login host>/id/<org id>/<user id>`, so the user id is
+    simply its last path segment. Returns `""` on anything unexpected — the caller treats
+    a blank as "not discovered" and falls back to the identity API.
+    """
+    if not identity_url:
+        return ""
+    candidate = str(identity_url).rstrip("/").rsplit("/", 1)[-1]
+    return candidate if _SF_USER_ID_RE.match(candidate) else ""
+
+
 class SalesforceOAuthInitView(APIView):
     """Kick off the Salesforce OAuth2 Authorization Code flow."""
 
@@ -1344,7 +1606,10 @@ class SalesforceOAuthInitView(APIView):
             "scope": "api refresh_token full",
             "state": state,
         }
-        base = settings.SALESFORCE_INSTANCE_URL.rstrip("/")
+        # SALESFORCE_LOGIN_URL, not the instance URL: a sandbox may need the generic
+        # test.salesforce.com login host even though its API base is a My Domain URL.
+        # Defaults to SALESFORCE_INSTANCE_URL, so unset behaves exactly as before.
+        base = settings.SALESFORCE_LOGIN_URL.rstrip("/")
         auth_url = f"{base}/services/oauth2/authorize?" + urlencode(params)
         return Response({"authorization_url": auth_url})
 
@@ -1372,7 +1637,9 @@ class SalesforceOAuthCallbackView(APIView):
             logger.warning("Could not resolve user from SF OAuth state: %s", exc)
             return Response({"detail": "Invalid state."}, status=status.HTTP_400_BAD_REQUEST)
 
-        base = settings.SALESFORCE_INSTANCE_URL.rstrip("/")
+        # Same host that issued the authorization code — see SalesforceOAuthInitView.
+        # Exchanging a code against a different host returns invalid_grant.
+        base = settings.SALESFORCE_LOGIN_URL.rstrip("/")
         resp = requests.post(
             f"{base}/services/oauth2/token",
             data={
@@ -1406,6 +1673,35 @@ class SalesforceOAuthCallbackView(APIView):
                 "is_active": True,
             },
         )
+
+        # Persist the instance_url Salesforce just told us. It is authoritative — a real
+        # org's My Domain host differs from the login host, and a sandbox differs again —
+        # and it was previously dropped on the floor, so every REST call fell back to
+        # settings.SALESFORCE_INSTANCE_URL whether or not that was right.
+        #
+        # Same story for the identity URL: `data["id"]` is
+        # https://<login host>/id/<org 18-char id>/<user 18-char id>, so its last segment
+        # IS sf_user_id. Storing it here removes the app's only other source for that
+        # value — `sync._get_or_create_config`'s `chatter/users/me` call, which needs
+        # Chatter enabled in the org and silently leaves sf_user_id blank when it isn't.
+        # A blank sf_user_id disables the role-matched project fallback in
+        # `log_week._role_project_ids`, empties SalesforceProjectViewSet, and drops
+        # Resource__c off every time entry — i.e. time logs that belong to nobody.
+        #
+        # Must happen before sync_all(), which builds a client and reads this row.
+        sf_instance_url = (data.get("instance_url") or "").strip().rstrip("/")
+        sf_user_id = extract_sf_user_id(data.get("id"))
+        sf_defaults = {}
+        if sf_instance_url:
+            sf_defaults["instance_url"] = sf_instance_url
+        if sf_user_id:
+            sf_defaults["sf_user_id"] = sf_user_id
+        if sf_defaults:
+            try:
+                from salesforce_sync.models import SalesforceConfig
+                SalesforceConfig.objects.update_or_create(user=user, defaults=sf_defaults)
+            except Exception as exc:
+                logger.warning("Could not store SF connection details (non-fatal): %s", exc)
 
         # Kick off an immediate sync + namespace discovery
         try:

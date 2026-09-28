@@ -372,30 +372,66 @@ class ProviderUrlTests(TestCase):
 
 
 class SummarizeEmailTests(TestCase):
-    @override_settings(ANTHROPIC_API_KEY="")
-    def test_no_api_key_uses_the_vendor_text(self):
-        out = meeting_notes.summarize_email("Recap\n- Talked pricing", "Acme Sync", "gong")
-        self.assertIn("- Talked pricing", out)
+    """
+    Claude is a normaliser with a fallback here, not a hard dependency: an
+    unreachable backend must still store the vendor's own recap text, which is what
+    the user would otherwise have pasted by hand.
 
-    @override_settings(ANTHROPIC_API_KEY="")
-    def test_empty_body_returns_empty(self):
-        self.assertEqual(meeting_notes.summarize_email("   ", "Acme Sync", "gong"), "")
+    These used to gate on ANTHROPIC_API_KEY being empty. That stopped meaning
+    "no LLM available" when the app moved to the LiteLLM gateway, where an empty
+    ANTHROPIC_API_KEY is the *normal* configuration (the Okta token helper supplies
+    the credential) — so the unavailability case is now simulated by making the
+    client constructor fail, which is what actually happens in that situation.
+    """
 
-    @override_settings(ANTHROPIC_API_KEY="sk-test")
-    def test_claude_output_is_used_when_available(self):
+    def _fake_client(self, text):
         block = MagicMock()
         block.type = "text"
-        block.text = "Recap\n- Claude wrote this"
-        fake_client = MagicMock()
-        fake_client.messages.create.return_value = MagicMock(content=[block])
+        block.text = text
+        client = MagicMock()
+        client.messages.create.return_value = MagicMock(content=[block])
+        return client
 
-        with patch("anthropic.Anthropic", return_value=fake_client):
+    def test_an_unreachable_backend_falls_back_to_the_vendor_text(self):
+        with patch("core.llm.build_sync_client", side_effect=RuntimeError("no credential")):
+            out = meeting_notes.summarize_email("Recap\n- Talked pricing", "Acme Sync", "gong")
+        self.assertIn("- Talked pricing", out)
+
+    def test_a_failed_completion_falls_back_to_the_vendor_text(self):
+        client = MagicMock()
+        client.messages.create.side_effect = RuntimeError("upstream 500")
+        with patch("core.llm.build_sync_client", return_value=client):
+            out = meeting_notes.summarize_email("Recap\n- Talked pricing", "Acme Sync", "gong")
+        self.assertIn("- Talked pricing", out)
+
+    def test_empty_body_returns_empty_without_building_a_client(self):
+        with patch("core.llm.build_sync_client") as build:
+            self.assertEqual(meeting_notes.summarize_email("   ", "Acme Sync", "gong"), "")
+        build.assert_not_called()
+
+    def test_claude_output_is_used_when_available(self):
+        client = self._fake_client("Recap\n- Claude wrote this")
+        with patch("core.llm.build_sync_client", return_value=client):
             out = meeting_notes.summarize_email("raw email text", "Acme Sync", "gong")
-
         self.assertEqual(out, "Recap\n- Claude wrote this")
+
+    def test_the_model_is_resolved_from_the_configured_tier(self):
+        """SUMMARY_MODEL is now an override hook; blank means "use the default tier"."""
+        from core.llm import TIER_DEFAULT, model_for_tier
+        client = self._fake_client("Recap\n- x")
+        with patch("core.llm.build_sync_client", return_value=client):
+            meeting_notes.summarize_email("raw email text", "Acme Sync", "gong")
         self.assertEqual(
-            fake_client.messages.create.call_args.kwargs["model"],
-            meeting_notes.SUMMARY_MODEL,
+            client.messages.create.call_args.kwargs["model"], model_for_tier(TIER_DEFAULT)
+        )
+
+    def test_an_explicit_summary_model_overrides_the_tier(self):
+        client = self._fake_client("Recap\n- x")
+        with patch.object(meeting_notes, "SUMMARY_MODEL", "claude-pinned-summariser"), \
+             patch("core.llm.build_sync_client", return_value=client):
+            meeting_notes.summarize_email("raw email text", "Acme Sync", "gong")
+        self.assertEqual(
+            client.messages.create.call_args.kwargs["model"], "claude-pinned-summariser"
         )
 
     @override_settings(ANTHROPIC_API_KEY="sk-test")

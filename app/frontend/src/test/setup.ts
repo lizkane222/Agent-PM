@@ -6,6 +6,7 @@ import { resetRequestCache } from "../lib/requestCache";
 import { resetCommentSummaries } from "../lib/commentSummaryStore";
 import { reloadActionItemZones } from "../hooks/useActionItemZoneSets";
 import { reloadStatusArrivalOrder } from "../hooks/useStatusArrivalOrder";
+import { resetCreatedEventIds } from "./handlers/scheduler";
 import { accountHandlers } from "./handlers/accounts";
 import { actionItemHandlers } from "./handlers/action_items";
 import { commentsHandlers } from "./handlers/comments";
@@ -17,6 +18,7 @@ import { accountFeedHandlers } from "./handlers/account_feed";
 import { searchHandlers } from "./handlers/search";
 import { layoutsHandlers } from "./handlers/layouts";
 import { skillsHandlers } from "./handlers/skills";
+import { salesforceHandlers } from "./handlers/salesforce";
 
 // These handlers must always be registered. They're added here (not only in
 // msw-server.ts) so the test suite is resilient to editor buffer reverts.
@@ -32,6 +34,7 @@ const extraHandlers = [
   ...searchHandlers,
   ...layoutsHandlers,
   ...skillsHandlers,
+  ...salesforceHandlers,
 ];
 
 // TipTap's Placeholder extension calls document.elementFromPoint, which jsdom
@@ -66,5 +69,8 @@ afterEach(() => {
   // Same trap again for the kanban status arrival order (hooks/useStatusArrivalOrder.ts):
   // a status move recorded by one test would otherwise still order the next test's columns.
   reloadStatusArrivalOrder();
+  // The create-event MSW handler hands out ascending ids from a module-level counter, so
+  // without this an id assertion depends on how many events earlier tests created.
+  resetCreatedEventIds();
 });
 afterAll(() => server.close());

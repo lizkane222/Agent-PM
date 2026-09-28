@@ -48,6 +48,7 @@ export function ActionItemModal({
   meetings = [],
   onClose,
   onUpdated,
+  onAutosaved,
   onConverted,
   onDeleted,
 }: {
@@ -57,6 +58,10 @@ export function ActionItemModal({
   meetings?: AirtableMeeting[];
   onClose: () => void;
   onUpdated?: (updated: AirtableActionItem) => void;
+  /** Fires for a pasted Slack link, which saves itself without waiting for Save — see
+   *  hooks/useSlackLinkAutosave.ts. Distinct from `onUpdated`: callers close the modal in
+   *  response to `onUpdated` (the explicit Save button), and a paste must not trigger that. */
+  onAutosaved?: (updated: AirtableActionItem) => void;
   onConverted?: () => void;
   onDeleted?: (id: number) => void;
 }) {
@@ -73,6 +78,13 @@ export function ActionItemModal({
   const [attachError, setAttachError] = useState<string | null>(null);
   const attachFileRef = useRef<HTMLInputElement>(null);
   const memberNames = ["Unassigned", ...teamMembers.map((m) => m.full_name)] as string[];
+
+  // Dragging OS files anywhere onto the modal attaches them, same as the + File button.
+  // A local-* draft has no PK for an attachment to hang off, same guard the Attachments
+  // section itself uses.
+  const [fileDragOver, setFileDragOver] = useState(false);
+  const fileDragCounterRef = useRef(0);
+  const canAttachFiles = !item.airtable_id.startsWith("local-");
 
   // Link form
   const [linkFormOpen, setLinkFormOpen] = useState(false);
@@ -203,10 +215,46 @@ export function ActionItemModal({
       onClick={onClose}
     >
       <div
-        className="rounded-2xl shadow-2xl flex flex-col overflow-hidden"
+        data-testid="action-item-modal-panel"
+        className="relative rounded-2xl shadow-2xl flex flex-col overflow-hidden"
         style={{ background: "#fff", width: "480px", maxWidth: "calc(100vw - 32px)", maxHeight: "calc(100vh - 48px)", borderLeft: `4px solid ${accent}` }}
         onClick={(e) => e.stopPropagation()}
+        // The modal isn't a portal, so a drag/drop over it would otherwise bubble to the
+        // kanban board's own drop zones underneath (handleKanbanDrop, handleNoteDropOnActions
+        // etc.), which assume a real DataTransfer carrying their own custom keys.
+        onDragEnter={(e) => {
+          e.stopPropagation();
+          if (!canAttachFiles || !e.dataTransfer.types.includes("Files")) return;
+          e.preventDefault();
+          fileDragCounterRef.current += 1;
+          if (fileDragCounterRef.current === 1) setFileDragOver(true);
+        }}
+        onDragOver={(e) => {
+          e.stopPropagation();
+          if (!canAttachFiles || !e.dataTransfer.types.includes("Files")) return;
+          e.preventDefault();
+        }}
+        onDragLeave={(e) => {
+          e.stopPropagation();
+          if (fileDragCounterRef.current === 0) return;
+          fileDragCounterRef.current -= 1;
+          if (fileDragCounterRef.current <= 0) { fileDragCounterRef.current = 0; setFileDragOver(false); }
+        }}
+        onDrop={(e) => {
+          e.stopPropagation();
+          if (!canAttachFiles) return;
+          e.preventDefault();
+          fileDragCounterRef.current = 0;
+          setFileDragOver(false);
+          if (e.dataTransfer.files.length) void handleAttachFiles(e.dataTransfer.files);
+        }}
       >
+        {fileDragOver && (
+          <div className="absolute inset-0 z-20 flex items-center justify-center rounded-2xl border-2 border-dashed border-indigo-400 bg-indigo-50/70 pointer-events-none">
+            <p className="text-sm font-bold text-indigo-600">Drop files to attach</p>
+          </div>
+        )}
+
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-4" style={{ borderBottom: "1px solid rgba(0,0,0,0.07)" }}>
           <textarea
@@ -280,7 +328,7 @@ export function ActionItemModal({
             <AccPillNumber value={form.prep_time} label="Prep" onChange={(v) => set({ prep_time: v ?? 0 })} />
             <AccPillUrl
               value={form.slack_thread_url}
-              onChange={(v) => { set({ slack_thread_url: v }); autosaveSlackLink(item, v, onUpdated); }}
+              onChange={(v) => { set({ slack_thread_url: v }); autosaveSlackLink(item, v, onAutosaved); }}
             />
           </div>
 
@@ -342,6 +390,7 @@ export function ActionItemModal({
                   {uploadingAttachment && <span className="text-[11px] text-gray-400 animate-pulse">Uploading…</span>}
                   <button
                     onClick={() => attachFileRef.current?.click()}
+                    title="Click to pick a file, or drag a file from your computer anywhere onto this window"
                     className="text-[11px] px-2 py-0.5 rounded border border-gray-200 text-[var(--twilio-navy)] hover:bg-gray-50 transition-colors"
                   >+ File</button>
                   <button

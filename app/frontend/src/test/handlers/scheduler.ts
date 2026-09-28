@@ -1,6 +1,43 @@
 import { http, HttpResponse } from "msw";
 import type { Reminder, CalendarEvent } from "../../types";
 
+/** Ids for events created during a test. Starts high so it cannot collide with a fixture. */
+let createdEventId = 9000;
+export function nextCreatedEventId(): number {
+  return ++createdEventId;
+}
+/** Reset between tests so an id assertion is not order-dependent. */
+export function resetCreatedEventIds(): void {
+  createdEventId = 9000;
+}
+
+/** A `CalendarEvent` with every required field, for spreading a partial create body over. */
+export function blankCalendarEvent(id: number): CalendarEvent {
+  return {
+    id,
+    owner: 1,
+    owner_username: "alice",
+    account: null,
+    account_name: null,
+    google_event_id: "",
+    title: "",
+    description: "",
+    location: "",
+    start_datetime: "2026-07-30T09:00:00Z",
+    end_datetime: "2026-07-30T09:15:00Z",
+    all_day: false,
+    status: "confirmed",
+    attendees: [],
+    meet_link: "",
+    calendar_id: "primary",
+    is_synced: false,
+    agentpm_airtable_id: "",
+    reminder: null,
+    created_at: "2026-07-01T00:00:00Z",
+    updated_at: "2026-07-01T00:00:00Z",
+  };
+}
+
 export const mockReminders: Reminder[] = [
   {
     id: 1,
@@ -114,6 +151,21 @@ export const schedulerHandlers = [
   http.get("/api/v1/scheduler/events/", () =>
     HttpResponse.json(mockCalendarEvents)
   ),
+  // Creating a calendar event — how a dropped action item or reminder is persisted.
+  // Echoes the posted body over a blank row, and deliberately reproduces the two
+  // server-side properties the client depends on: a fresh row is NOT synced and has no
+  // `google_event_id` (which is what makes the sync's PHASE 1b pick it up), while
+  // `agentpm_airtable_id` / `reminder` ARE reflected back (`perform_create` assigns them on
+  // the model even though they are read-only on the serializer).
+  http.post("/api/v1/scheduler/events/", async ({ request }) => {
+    const body = await request.json() as Partial<CalendarEvent>;
+    return HttpResponse.json({
+      ...blankCalendarEvent(nextCreatedEventId()),
+      ...body,
+      google_event_id: "",
+      is_synced: false,
+    }, { status: 201 });
+  }),
   // The scheduler-side mirror of action items, read by RolePage and ProfilePage.
   // Distinct from /airtable/action-items/ in test/handlers/action_items.ts.
   http.get("/api/v1/scheduler/action-items/", () =>

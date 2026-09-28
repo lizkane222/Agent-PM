@@ -46,6 +46,7 @@ export interface ActionItemAttachment {
   file_url: string | null;
   mime_type: string;
   file_size: number | null;
+  source_artifact: number | null;
   uploaded_by: number | null;
   uploaded_by_username: string | null;
   created_at: string;

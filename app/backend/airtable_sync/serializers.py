@@ -25,10 +25,13 @@ class ActionItemAttachmentSerializer(serializers.ModelSerializer):
         fields = [
             "id", "action_item", "artifact_type", "name", "url",
             "file_url", "mime_type", "file_size",
-            "uploaded_by", "uploaded_by_username",
+            "uploaded_by", "uploaded_by_username", "source_artifact",
             "created_at", "updated_at",
         ]
-        read_only_fields = ["id", "action_item", "uploaded_by", "uploaded_by_username", "file_url", "created_at", "updated_at"]
+        read_only_fields = [
+            "id", "action_item", "uploaded_by", "uploaded_by_username", "file_url",
+            "source_artifact", "created_at", "updated_at",
+        ]
 
     def get_uploaded_by_username(self, obj):
         if obj.uploaded_by:

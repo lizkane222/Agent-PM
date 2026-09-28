@@ -98,7 +98,7 @@ export default function ArtifactPicker({
     const url = a.url ?? a.file_url ?? "";
     setAttachingId(a.id);
     try {
-      const { data } = await airtableApi.addAttachmentLink(actionItemId, a.name || url, url);
+      const { data } = await airtableApi.addAttachmentLink(actionItemId, a.name || url, url, a.id);
       onAttached(data);
       setOpen(false);
     } catch (err: unknown) {

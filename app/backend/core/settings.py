@@ -6,6 +6,7 @@ Copy .env.example to .env and fill in real values before running.
 """
 
 import os
+import sys
 from datetime import timedelta
 from pathlib import Path
 
@@ -71,6 +72,9 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
+    # Before CSPMiddleware on purpose: response phases run in reverse order, so this
+    # runs after it and its sandbox header wins for user-uploaded HTML under MEDIA_URL.
+    "core.middleware.MediaSecurityHeadersMiddleware",
     "csp.middleware.CSPMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
@@ -284,7 +288,44 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 # Which transport the agent uses to reach Claude.
 #   "bedrock" — AWS Bedrock via the twilio-devex-bedrock SSO profile (needs `aws sso login`)
 #   "gateway" — the corporate LiteLLM proxy, authenticated with ANTHROPIC_API_KEY as a bearer token
-AGENT_BACKEND = os.getenv("AGENT_BACKEND", "bedrock").strip().lower()
+AGENT_BACKEND = os.getenv("AGENT_BACKEND", "gateway").strip().lower()
+
+# The gateway is authenticated with a short-lived Okta token. Prefer a static
+# ANTHROPIC_API_KEY (a LiteLLM virtual key) where one exists — CI and prod should use
+# that; locally this helper mints and caches one, re-authenticating via the browser
+# when its own cache is stale. See core.llm.gateway_token.
+AGENT_GATEWAY_TOKEN_COMMAND = os.getenv(
+    "AGENT_GATEWAY_TOKEN_COMMAND", "/usr/local/bin/claude-litellm-token"
+)
+# Bounded so a web worker can never block on the helper's interactive browser flow.
+AGENT_GATEWAY_TOKEN_TIMEOUT = float(os.getenv("AGENT_GATEWAY_TOKEN_TIMEOUT", "20"))
+
+# Refuse to send this app's data to a non-Anthropic model. The gateway publishes
+# `et-router` and `claude-router`, which pool Anthropic's models with third-party ones
+# — measured 2026-08-31, both dispatched to moonshotai.kimi-k2.5. Enforced in
+# core.llm.model_for_tier, the one funnel every LLM call goes through.
+AGENT_REQUIRE_ANTHROPIC_MODEL = os.getenv("AGENT_REQUIRE_ANTHROPIC_MODEL", "1") not in ("0", "false", "False")
+
+# Never send a request to an Opus model, on cost grounds. Enforced in
+# core.llm.model_for_tier: an Opus id from any source — a tier, or an
+# AGENT_MODEL_OVERRIDE — is *substituted* with the best non-Opus model configured for
+# the active backend and logged, rather than raising. Degrading is the right failure
+# mode for a cost preference; taking the agent down over one is not.
+# The escalation path (agents.agent.ESCALATE_TOOL) therefore now runs
+# default -> strong as sonnet-4-6 -> sonnet-5, which is still a real step up.
+AGENT_BLOCK_OPUS = os.getenv("AGENT_BLOCK_OPUS", "1") not in ("0", "false", "False")
+
+# ── No live LLM calls from the test suite ────────────────────────────────────
+# Under `manage.py test`, strip every gateway credential source so any code path
+# that reaches an LLM *without* being patched raises ImproperlyConfigured instead of
+# quietly making a real, billable network call. This is the same discipline as the
+# frontend's MSW `onUnhandledRequest: "error"`: an unmocked dependency should fail
+# loudly. It caught integrations.summarize_email genuinely calling the gateway from a
+# test once the ANTHROPIC_API_KEY gate was removed.
+_RUNNING_TESTS = "test" in sys.argv or os.getenv("DJANGO_RUNNING_TESTS") == "1"
+if _RUNNING_TESTS:
+    AGENT_GATEWAY_TOKEN_COMMAND = ""
+    ANTHROPIC_API_KEY = ""
 
 # base_url is passed explicitly rather than left to the SDK's ANTHROPIC_BASE_URL fallback:
 # Claude Code's managed settings export that variable, so a bare client would silently
@@ -299,16 +340,26 @@ AGENT_GATEWAY_BASE_URL = os.getenv(
 AGENT_MODEL_TIERS: dict[str, dict[str, str]] = {
     "bedrock": {
         "default": os.getenv("AGENT_MODEL_BEDROCK_DEFAULT", "us.anthropic.claude-sonnet-4-6"),
-        # Opus 4.8, not Opus 5: the BedrockAccess role lists an Opus 5 inference profile
-        # but invoking it 403s ("not authorized to perform the required AWS Marketplace
-        # actions"). Switch this to us.anthropic.claude-opus-5 once that subscription
-        # exists — the generous strong-tier max_tokens below already accounts for it.
-        "strong": os.getenv("AGENT_MODEL_BEDROCK_STRONG", "us.anthropic.claude-opus-4-8"),
+        # Sonnet 5, not Opus: Opus is disabled (AGENT_BLOCK_OPUS) on cost grounds, and
+        # core.llm substitutes a non-Opus model anyway if this is pointed back at one.
+        "strong": os.getenv("AGENT_MODEL_BEDROCK_STRONG", "us.anthropic.claude-sonnet-5"),
+        # Voice (ConversationRelay) gets its own tier: turn-taking latency dominates
+        # quality on a phone call, and voice must never escalate mid-call — an Opus
+        # round that thinks by default would add many seconds of silence. This also
+        # replaces the retired claude-3-5-haiku-20241022 that realtime/llm.py was
+        # pinned to (retired 2026-02-19).
+        "voice": os.getenv("AGENT_MODEL_BEDROCK_VOICE", "us.anthropic.claude-haiku-4-5"),
     },
+    # Verified against GET /v1/models on 2026-08-31: all three resolve to Anthropic
+    # and support streaming with tool use, which every agent loop here depends on.
+    # Deliberately NOT `et-router` / `claude-router` — see AGENT_REQUIRE_ANTHROPIC_MODEL.
     "gateway": {
-        # Populate once a LiteLLM virtual key exists and /v1/models has been queried.
-        "default": os.getenv("AGENT_MODEL_GATEWAY_DEFAULT", ""),
-        "strong": os.getenv("AGENT_MODEL_GATEWAY_STRONG", ""),
+        "default": os.getenv("AGENT_MODEL_GATEWAY_DEFAULT", "claude-sonnet-4-6"),
+        # Sonnet 5 is the strongest non-Opus model the gateway publishes; verified
+        # 2026-08-31 to stream with tool use.
+        "strong": os.getenv("AGENT_MODEL_GATEWAY_STRONG", "claude-sonnet-5"),
+        # Lowest latency of the three, which is what turn-taking on a phone call needs.
+        "voice": os.getenv("AGENT_MODEL_GATEWAY_VOICE", "claude-haiku-4-5"),
     },
 }
 
@@ -352,8 +403,43 @@ TWILIO_CONVERSATIONS_SERVICE_SID = os.getenv("TWILIO_CONVERSATIONS_SERVICE_SID",
 # embedded in the TwiML <ConversationRelay url="wss://host/ws/voice-relay/?relay_token=..."/>.
 # Leave empty in local dev to disable the check; MUST be set in production.
 VOICE_RELAY_TOKEN = os.getenv("VOICE_RELAY_TOKEN", "")
-# Claude model to use for ConversationRelay voice sessions via AWS Bedrock.
-VOICE_BEDROCK_MODEL_ID = os.getenv("VOICE_BEDROCK_MODEL_ID", "anthropic.claude-3-5-haiku-20241022:0")
+
+# ── Voice agent loop ─────────────────────────────────────────────────────────
+# The model comes from AGENT_MODEL_TIERS[...]["voice"] above, not from a separate
+# id here (the old VOICE_BEDROCK_MODEL_ID pinned a model retired 2026-02-19).
+#
+# Long spoken answers are the enemy, so max_tokens is far below the chat tiers.
+VOICE_MAX_TOKENS = int(os.getenv("VOICE_MAX_TOKENS", "512"))
+# Chat allows 10 tool rounds; three covers search → act → confirm, which is the
+# realistic ceiling for a spoken request, and bounds worst-case dead air.
+VOICE_MAX_TOOL_ROUNDS = int(os.getenv("VOICE_MAX_TOOL_ROUNDS", "3"))
+# Checked at the top of each round — never used to cancel a stream mid-flight, which
+# would strand a last:false frame with no terminator and wedge TTS for the rest of
+# the call. Over budget forces a final wrap-up round instead.
+VOICE_TURN_BUDGET_SECONDS = float(os.getenv("VOICE_TURN_BUDGET_SECONDS", "20"))
+VOICE_TOOL_TIMEOUT_SECONDS = float(os.getenv("VOICE_TOOL_TIMEOUT_SECONDS", "8"))
+# How long a spoken "are you sure?" stays answerable before it is dropped.
+VOICE_CONFIRM_TTL_SECONDS = float(os.getenv("VOICE_CONFIRM_TTL_SECONDS", "90"))
+# TwiML POST → dial → WS connect → setup frame is normally < 5s. 120s absorbs a cold
+# worker or a slow carrier leg while keeping the replay window small.
+VOICE_IDENTITY_MAX_AGE = int(os.getenv("VOICE_IDENTITY_MAX_AGE", "120"))
+# Skills are injected into the voice system prompt so they fire with zero discovery
+# round-trips; these bound the prompt growth.
+VOICE_SKILL_INVENTORY_LIMIT = int(os.getenv("VOICE_SKILL_INVENTORY_LIMIT", "25"))
+VOICE_SKILL_DESCRIPTION_CHARS = int(os.getenv("VOICE_SKILL_DESCRIPTION_CHARS", "200"))
+
+# ── ConversationRelay quality knobs ──────────────────────────────────────────
+# Everything audible defaults to today's behaviour, so no env change = no audible
+# change. ElevenLabs / Deepgram are vendor dependencies with per-use cost: enable
+# them deliberately in prod after an A/B, not by shipping.
+VOICE_TTS_PROVIDER = os.getenv("VOICE_TTS_PROVIDER", "")
+VOICE_TTS_VOICE = os.getenv("VOICE_TTS_VOICE", "")
+VOICE_STT_PROVIDER = os.getenv("VOICE_STT_PROVIDER", "")
+VOICE_STT_MODEL = os.getenv("VOICE_STT_MODEL", "")
+# Speech hints — the highest-leverage accuracy knob for this domain, since the
+# agent's inputs are mostly proper nouns (account names, people).
+VOICE_HINTS_ACCOUNT_LIMIT = int(os.getenv("VOICE_HINTS_ACCOUNT_LIMIT", "60"))
+VOICE_HINTS_MAX_CHARS = int(os.getenv("VOICE_HINTS_MAX_CHARS", "1000"))
 
 # ── Google ────────────────────────────────────────────────────────────────────
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
@@ -390,7 +476,22 @@ AIRTABLE_TABLE_APPLETS = os.getenv("AIRTABLE_TABLE_APPLETS", "")
 # ── Salesforce ────────────────────────────────────────────────────────────────
 SALESFORCE_CLIENT_ID = os.getenv("SALESFORCE_CLIENT_ID", "")
 SALESFORCE_CLIENT_SECRET = os.getenv("SALESFORCE_CLIENT_SECRET", "")
-SALESFORCE_INSTANCE_URL = os.getenv("SALESFORCE_INSTANCE_URL", "https://login.salesforce.com")
+# The org's API host — a My Domain URL, e.g. https://acme.my.salesforce.com, or for a
+# sandbox https://acme--dev.sandbox.my.salesforce.com. Must NOT be a *.lightning.force.com
+# URL: that is the Lightning UI host, which 302s on /services/oauth2/token, so OAuth and
+# every REST call fail in a way that reads like a credentials problem.
+#
+# This is only the *fallback*. Once a user connects, the `instance_url` from their token
+# response is stored on SalesforceConfig and takes precedence — see
+# salesforce_sync.client.resolve_instance_url.
+SALESFORCE_INSTANCE_URL = os.getenv(
+    "SALESFORCE_INSTANCE_URL", "https://login.salesforce.com"
+).rstrip("/")
+# Host that serves /services/oauth2/authorize. Usually the same as above; a sandbox that
+# requires the generic login host sets this to https://test.salesforce.com.
+SALESFORCE_LOGIN_URL = os.getenv(
+    "SALESFORCE_LOGIN_URL", SALESFORCE_INSTANCE_URL
+).rstrip("/")
 SALESFORCE_REDIRECT_URI = os.getenv(
     "SALESFORCE_REDIRECT_URI", "http://localhost:8000/api/v1/integrations/salesforce/callback/"
 )

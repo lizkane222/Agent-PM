@@ -3,7 +3,8 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { http, HttpResponse } from "msw";
 import { server } from "../../test/msw-server";
-import { mockTeamMembers } from "../../test/handlers/team";
+import { mockTeamMembers, mockTeamMemberDocuments, mockUserProfile } from "../../test/handlers/team";
+import { useCurrentUser } from "../../context/CurrentUserContext";
 
 // ── Mock cross-cutting deps ──────────────────────────────────────────────────
 
@@ -14,7 +15,7 @@ vi.mock("../../lib/appLog", () => ({
 }));
 
 vi.mock("../../context/CurrentUserContext", () => ({
-  useCurrentUser: () => null,
+  useCurrentUser: vi.fn(() => null),
   CurrentUserProvider: ({ children }: { children: React.ReactNode }) => children,
 }));
 
@@ -44,6 +45,7 @@ async function renderPage() {
 describe("TeamPage", () => {
   beforeEach(() => {
     vi.resetModules();
+    vi.mocked(useCurrentUser).mockReturnValue(null);
   });
 
   it("shows loading state initially", async () => {
@@ -121,5 +123,110 @@ describe("TeamPage", () => {
     // The modal stays open so the user can correct the email, rather than
     // silently closing on a failed save.
     expect(screen.getByText("Add Team Member")).toBeInTheDocument();
+  });
+
+  // ── Linked docs ──────────────────────────────────────────────────────────
+
+  it("shows linked docs in the detail sidebar", async () => {
+    server.use(
+      http.get(`/api/v1/team/members/${mockTeamMembers[0].id}/documents/`, () =>
+        HttpResponse.json(mockTeamMemberDocuments)
+      )
+    );
+    await renderPage();
+    await waitFor(() => screen.getByText(mockTeamMembers[0].full_name));
+    fireEvent.click(screen.getByText(mockTeamMembers[0].full_name));
+
+    await waitFor(() =>
+      expect(screen.getByText(mockTeamMemberDocuments[0].name)).toBeInTheDocument()
+    );
+  });
+
+  it("no add/remove controls when viewing someone else's docs", async () => {
+    // mockTeamMembers[0].user === 1; a different viewer (id 999) is not the owner and not staff.
+    vi.mocked(useCurrentUser).mockReturnValue({ ...mockUserProfile, id: 999 });
+    server.use(
+      http.get(`/api/v1/team/members/${mockTeamMembers[0].id}/documents/`, () =>
+        HttpResponse.json(mockTeamMemberDocuments)
+      )
+    );
+    await renderPage();
+    await waitFor(() => screen.getByText(mockTeamMembers[0].full_name));
+    fireEvent.click(screen.getByText(mockTeamMembers[0].full_name));
+
+    await waitFor(() =>
+      expect(screen.getByText(mockTeamMemberDocuments[0].name)).toBeInTheDocument()
+    );
+    expect(screen.queryByLabelText(`Remove ${mockTeamMemberDocuments[0].name}`)).not.toBeInTheDocument();
+    expect(screen.queryByPlaceholderText("Doc name (e.g. Coverage doc)")).not.toBeInTheDocument();
+  });
+
+  it("viewing your own profile shows the add-doc form and adding a doc calls the API", async () => {
+    // mockTeamMembers[0].user === mockUserProfile.id === 1 — this is the member's own profile.
+    vi.mocked(useCurrentUser).mockReturnValue(mockUserProfile);
+    server.use(
+      http.get(`/api/v1/team/members/${mockTeamMembers[0].id}/documents/`, () =>
+        HttpResponse.json([])
+      )
+    );
+    let postedBody: unknown = null;
+    server.use(
+      http.post(`/api/v1/team/members/${mockTeamMembers[0].id}/documents/`, async ({ request }) => {
+        postedBody = await request.json();
+        return HttpResponse.json({ ...mockTeamMemberDocuments[0], ...(postedBody as object) }, { status: 201 });
+      })
+    );
+
+    await renderPage();
+    await waitFor(() => screen.getByText(mockTeamMembers[0].full_name));
+    fireEvent.click(screen.getByText(mockTeamMembers[0].full_name));
+
+    await waitFor(() => expect(screen.getByText("No linked docs.")).toBeInTheDocument());
+
+    fireEvent.change(screen.getByPlaceholderText("Doc name (e.g. Coverage doc)"), {
+      target: { value: "Coverage doc" },
+    });
+    fireEvent.change(screen.getByPlaceholderText("https://..."), {
+      target: { value: "https://docs.example.com/coverage" },
+    });
+    fireEvent.click(screen.getByText("+ Add doc"));
+
+    await waitFor(() =>
+      expect(postedBody).toEqual({ name: "Coverage doc", url: "https://docs.example.com/coverage" })
+    );
+  });
+
+  it("removing a doc calls the API and removes it from the list", async () => {
+    vi.mocked(useCurrentUser).mockReturnValue(mockUserProfile);
+    server.use(
+      http.get(`/api/v1/team/members/${mockTeamMembers[0].id}/documents/`, () =>
+        HttpResponse.json(mockTeamMemberDocuments)
+      )
+    );
+    let deleteCalled = false;
+    server.use(
+      http.delete(`/api/v1/team/member-documents/${mockTeamMemberDocuments[0].id}/`, () => {
+        deleteCalled = true;
+        server.use(
+          http.get(`/api/v1/team/members/${mockTeamMembers[0].id}/documents/`, () =>
+            HttpResponse.json([])
+          )
+        );
+        return new HttpResponse(null, { status: 204 });
+      })
+    );
+
+    await renderPage();
+    await waitFor(() => screen.getByText(mockTeamMembers[0].full_name));
+    fireEvent.click(screen.getByText(mockTeamMembers[0].full_name));
+
+    await waitFor(() =>
+      expect(screen.getByText(mockTeamMemberDocuments[0].name)).toBeInTheDocument()
+    );
+
+    fireEvent.click(screen.getByLabelText(`Remove ${mockTeamMemberDocuments[0].name}`));
+
+    await waitFor(() => expect(deleteCalled).toBe(true));
+    await waitFor(() => expect(screen.getByText("No linked docs.")).toBeInTheDocument());
   });
 });

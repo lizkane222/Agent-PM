@@ -707,8 +707,15 @@ export default function MeetingDetail({ event, attended = true, onToggleAttendan
       .catch(() => {});
   }, [event.id, event.calendar_id, event.agentpm_airtable_id]);
 
-  // WebSocket — receive real-time note updates from other editors
+  // WebSocket — receive real-time note updates from other editors.
+  // Synthetic overlay events (Airtable meetings, scheduled action items, reminders
+  // rendered on the calendar with no backing CalendarEvent row — see CalendarPage.tsx's
+  // synthesis effects) get a non-positive `id`, the same convention `ev.id > 0` already
+  // uses for comment resource_id. There is no real row for the consumer to attach to,
+  // and the backend route only matches a positive integer, so the connection would just
+  // fail loudly in the console.
   useEffect(() => {
+    if (event.id <= 0) return;
     const token = getAccessToken();
     const qs = token ? `?token=${encodeURIComponent(token)}` : "";
     const wsBase = window.location.origin.replace(/^http/, "ws");
@@ -742,6 +749,23 @@ export default function MeetingDetail({ event, attended = true, onToggleAttendan
   }, [event.id]);
 
   const eventUid = String(event.google_event_id || event.id);
+
+  // Every piece of state below is scoped to one event, and `loadMatch` is async — so
+  // without this the previous meeting's account, action items and summary stay on screen
+  // until the new match lands. Worse than a stale render: `result.this_meeting.id` is
+  // what MeetingSummarySection saves through, so a paste in that window is written to
+  // the *previous* meeting's Airtable row. Cleared on an identity change only, so the
+  // `reloadTrigger` refetch (after an account link) still refreshes in place.
+  const prevUidRef = useRef(eventUid);
+  useEffect(() => {
+    if (prevUidRef.current === eventUid) return;
+    prevUidRef.current = eventUid;
+    setResult(null);
+    setActionItems([]);
+    setSfProjects([]);
+    setAccountTeamMembers([]);
+    setWorkSessions([]);
+  }, [eventUid]);
 
   const loadMatch = useCallback(async () => {
     setLoading(true);
@@ -2047,10 +2071,20 @@ function MeetingSummarySection({ eventId, meetingId, existingNotes, existingZoom
     resolvedMeetingId.current = data.id;
   }
 
+  // Re-initialize when the target event/meeting changes as well as when its notes text
+  // does — the identity half is what the other two summary panels already check, and
+  // without it switching from a meeting whose notes were just pasted to one that has no
+  // notes leaves both `existing*` props undefined, so the guard never fires: the previous
+  // meeting's notes stay on screen and `resolvedMeetingId` keeps pointing at its row.
+  const prevEventRef = useRef(eventId);
+  const prevMeetingRef = useRef(meetingId);
   const prevExistingRef = useRef(existingNotes);
   const prevExistingZoomRef = useRef(existingZoomNotes);
   useEffect(() => {
-    if (existingNotes !== prevExistingRef.current || existingZoomNotes !== prevExistingZoomRef.current) {
+    const identityChanged = eventId !== prevEventRef.current || meetingId !== prevMeetingRef.current;
+    if (identityChanged || existingNotes !== prevExistingRef.current || existingZoomNotes !== prevExistingZoomRef.current) {
+      prevEventRef.current = eventId;
+      prevMeetingRef.current = meetingId;
       prevExistingRef.current = existingNotes;
       prevExistingZoomRef.current = existingZoomNotes;
       resolvedMeetingId.current = meetingId;
@@ -2061,7 +2095,7 @@ function MeetingSummarySection({ eventId, meetingId, existingNotes, existingZoom
       setNotesBySource(store);
       showSource(preferredMeetingSource(store.gong, store.zoom), store);
     }
-  }, [existingNotes, existingZoomNotes, meetingId]);
+  }, [eventId, existingNotes, existingZoomNotes, meetingId]);
 
   async function persistAndNotify(text: string, parsed: GongItem[]) {
     const notified = new Set<number>();
@@ -2256,6 +2290,18 @@ function MeetingNotesSection({
   useEffect(() => {
     teamApi.listMembers().then(({ data }) => setTeamMembers(data.results ?? [])).catch(() => {});
   }, []);
+
+  // An unsent draft belongs to the event it was typed against. The editor is built once
+  // (`value` alone does not push into ProseMirror), so the ref's clear() is what actually
+  // empties it — without this, Enter on the next event posts the previous one's text.
+  const prevEventIdRef = useRef(eventId);
+  useEffect(() => {
+    if (prevEventIdRef.current === eventId) return;
+    prevEventIdRef.current = eventId;
+    setDraft("");
+    setSaveError(false);
+    draftEditorRef.current?.clear();
+  }, [eventId]);
 
   async function handleAddNote() {
     const text = draft.trim();

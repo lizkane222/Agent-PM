@@ -1,13 +1,19 @@
 """Tests for realtime app ViewSets."""
 
+import re
 from unittest.mock import patch
+from urllib.parse import urlencode
 
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from django.test import override_settings
 from rest_framework.test import APITestCase
 
+from accounts.models import Account
 from realtime.models import AgentActivityEvent, VoiceSession
+from realtime.views import _FIXED_HINTS
+from realtime.voice_identity import IdentityError, read_identity_token
+from team.models import TeamMember
 
 User = get_user_model()
 
@@ -237,3 +243,168 @@ class AgentActivityEventViewSetTests(APITestCase):
         self.assertTrue(
             AgentActivityEvent.objects.filter(user=self.alice, event_type="comment_reply").exists()
         )
+
+
+class VoiceTwiMLIdentityTests(APITestCase):
+    """
+    The <Parameter name="identity_token"> that carries the caller's Django user to
+    the relay consumer, and the ConversationRelay quality attributes.
+
+    Same anon-throttle caveat as VoiceTwiMLViewTests — cache.clear() in setUp.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(username="twiml_caller", password="pass")
+        self.other = User.objects.create_user(username="twiml_other", password="pass")
+
+    def _post(self, **form):
+        body = urlencode(form)
+        with patch("twilio.request_validator.RequestValidator.validate", return_value=True):
+            return self.client.post(
+                "/api/v1/realtime/voice/twiml/",
+                data=body,
+                content_type="application/x-www-form-urlencoded",
+            )
+
+    def _member(self, user):
+        """A TeamMember row for `user` — Account.team_members is an M2M to team.TeamMember."""
+        return TeamMember.objects.create(
+            user=user, full_name=user.username, email=f"{user.username}@example.com"
+        )
+
+    def _param_value(self, body):
+        match = re.search(r'<Parameter name="identity_token" value="([^"]+)"', body)
+        return match.group(1) if match else None
+
+    # ── identity parameter ────────────────────────────────────────────────────
+
+    def test_client_identity_mints_a_readable_token(self):
+        body = self._post(**{"From": f"client:{self.user.pk}", "CallSid": CALL_SID_ALICE}).content.decode()
+        token = self._param_value(body)
+        self.assertIsNotNone(token, body)
+        self.assertEqual(read_identity_token(token, CALL_SID_ALICE), self.user.pk)
+
+    def test_minted_token_is_bound_to_this_call_only(self):
+        body = self._post(**{"From": f"client:{self.user.pk}", "CallSid": CALL_SID_ALICE}).content.decode()
+        with self.assertRaises(IdentityError):
+            read_identity_token(self._param_value(body), CALL_SID_BOB)
+
+    def test_pstn_caller_gets_no_parameter_but_still_valid_twiml(self):
+        response = self._post(**{"From": "+15551234567", "CallSid": CALL_SID_ALICE})
+        body = response.content.decode()
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("<Parameter", body)
+        self.assertIn("<ConversationRelay", body)
+
+    def test_unknown_pk_gets_no_parameter_and_still_200(self):
+        response = self._post(**{"From": f"client:{self.user.pk + 9999}", "CallSid": CALL_SID_ALICE})
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("<Parameter", response.content.decode())
+
+    def test_inactive_user_gets_no_parameter(self):
+        self.user.is_active = False
+        self.user.save(update_fields=["is_active"])
+        response = self._post(**{"From": f"client:{self.user.pk}", "CallSid": CALL_SID_ALICE})
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("<Parameter", response.content.decode())
+
+    def test_missing_call_sid_gets_no_parameter(self):
+        """A token with nothing to bind to would be replayable on any call."""
+        response = self._post(**{"From": f"client:{self.user.pk}"})
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("<Parameter", response.content.decode())
+
+    # ── relay quality attributes ──────────────────────────────────────────────
+
+    def test_relay_enables_dtmf_detection(self):
+        """Required by the confirmation gate's "press 1" path."""
+        body = self._post(**{"From": f"client:{self.user.pk}", "CallSid": CALL_SID_ALICE}).content.decode()
+        self.assertIn('dtmfDetection="true"', body)
+
+    def test_relay_is_interruptible_and_preemptible(self):
+        body = self._post().content.decode()
+        self.assertIn('interruptible="speech"', body)
+        self.assertIn('preemptible="true"', body)
+        self.assertIn('interruptSensitivity="medium"', body)
+
+    def test_relay_reports_input_during_agent_speech(self):
+        body = self._post().content.decode()
+        self.assertIn('reportInputDuringAgentSpeech="true"', body)
+
+    def test_relay_does_not_ignore_backchannel(self):
+        """
+        ignoreBackchannel would suppress "yeah" — the primary affirmative token the
+        confirmation gate matches on. Asserted so nobody "optimizes" it back in.
+        """
+        self.assertNotIn("ignoreBackchannel", self._post().content.decode())
+
+    def test_relay_does_not_enable_partial_prompts_or_profanity_filter(self):
+        body = self._post().content.decode()
+        self.assertNotIn("partialPrompts", body)
+        self.assertNotIn("profanityFilter", body)
+
+    def test_welcome_greeting_is_interruptible(self):
+        self.assertIn('welcomeGreetingInterruptible="speech"', self._post().content.decode())
+
+    @override_settings(VOICE_TTS_PROVIDER="", VOICE_STT_PROVIDER="")
+    def test_vendor_providers_are_omitted_by_default(self):
+        """No env change must mean no audible change."""
+        body = self._post().content.decode()
+        self.assertNotIn("ttsProvider", body)
+        self.assertNotIn("transcriptionProvider", body)
+
+    @override_settings(
+        VOICE_TTS_PROVIDER="ElevenLabs",
+        VOICE_TTS_VOICE="some-voice-id",
+        VOICE_STT_PROVIDER="Deepgram",
+        VOICE_STT_MODEL="nova-3-general",
+    )
+    def test_vendor_providers_are_emitted_when_configured(self):
+        body = self._post().content.decode()
+        self.assertIn('ttsProvider="ElevenLabs"', body)
+        self.assertIn('voice="some-voice-id"', body)
+        self.assertIn('transcriptionProvider="Deepgram"', body)
+        self.assertIn('speechModel="nova-3-general"', body)
+
+    # ── hints ─────────────────────────────────────────────────────────────────
+
+    def test_hints_include_fixed_domain_vocabulary(self):
+        body = self._post().content.decode()
+        self.assertIn("hints=", body)
+        self.assertIn("Agent PM", body)
+
+    def test_hints_include_the_callers_accounts_and_not_another_users(self):
+        mine = Account.objects.create(company_name="Zylotech Industries")
+        theirs = Account.objects.create(company_name="Nobody Elses Corp")
+        mine.team_members.add(self._member(self.user))
+        theirs.team_members.add(self._member(self.other))
+
+        body = self._post(**{"From": f"client:{self.user.pk}", "CallSid": CALL_SID_ALICE}).content.decode()
+        self.assertIn("Zylotech Industries", body)
+        self.assertNotIn("Nobody Elses Corp", body)
+
+    @override_settings(VOICE_HINTS_MAX_CHARS=60)
+    def test_hints_truncate_on_a_comma_boundary(self):
+        body = self._post().content.decode()
+        hints = re.search(r'hints="([^"]*)"', body).group(1)
+        self.assertLessEqual(len(hints), 60)
+        # No hint was cut mid-word: every emitted hint is a whole fixed hint.
+        for hint in hints.split(","):
+            self.assertIn(hint, _FIXED_HINTS)
+
+    def test_hints_are_deduplicated_case_insensitively(self):
+        account = Account.objects.create(company_name="airtable")
+        account.team_members.add(self._member(self.user))
+        body = self._post(**{"From": f"client:{self.user.pk}", "CallSid": CALL_SID_ALICE}).content.decode()
+        hints = re.search(r'hints="([^"]*)"', body).group(1).split(",")
+        lowered = [h.lower() for h in hints]
+        self.assertEqual(len(lowered), len(set(lowered)))
+
+    def test_account_names_containing_a_comma_do_not_split_into_two_hints(self):
+        """Commas are the separator, so one would become two bogus hints."""
+        account = Account.objects.create(company_name="Acme, Inc")
+        account.team_members.add(self._member(self.user))
+        body = self._post(**{"From": f"client:{self.user.pk}", "CallSid": CALL_SID_ALICE}).content.decode()
+        hints = re.search(r'hints="([^"]*)"', body).group(1).split(",")
+        self.assertIn("Acme Inc", hints)

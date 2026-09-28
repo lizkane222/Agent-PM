@@ -66,8 +66,13 @@ class SalesforceProject(models.Model):
 
 
 class SalesforceTeamMember(models.Model):
-    """Cloud Coach Project Member — maps to a local TeamMember."""
-    sf_id = models.CharField(max_length=32, unique=True)
+    """Cloud Coach Project Member — maps to a local TeamMember.
+
+    Also holds role-lookup links written by `sync.sync_project_roles`, whose `sf_id`
+    is the synthesized key `role:<project sf_id>:<role field name>` rather than a real
+    Salesforce record id — hence the 128-char width.
+    """
+    sf_id = models.CharField(max_length=128, unique=True)
     project = models.ForeignKey(
         SalesforceProject, on_delete=models.CASCADE, related_name="members"
     )

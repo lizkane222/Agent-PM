@@ -96,6 +96,9 @@ export const mockArtifact: AccountArtifact = {
   file_url: null,
   mime_type: "",
   file_size: null,
+  description: "",
+  references: [],
+  used_in: [],
   uploaded_by: null,
   uploaded_by_username: null,
   created_at: "2026-01-01T00:00:00Z",
@@ -113,6 +116,9 @@ export const mockCodeArtifact: AccountArtifact = {
   file_url: "https://storage.example.com/utils.js",
   mime_type: "text/javascript",
   file_size: 2048,
+  description: "",
+  references: [],
+  used_in: [],
   uploaded_by: 1,
   uploaded_by_username: "alice",
   created_at: "2026-01-01T00:00:00Z",
@@ -233,6 +239,13 @@ export const accountHandlers = [
   http.get("/api/v1/accounts/accounts/:id/artifacts/", () =>
     HttpResponse.json([mockArtifact, mockCodeArtifact])
   ),
+  http.post("/api/v1/accounts/accounts/:id/artifacts/", async ({ request, params }) => {
+    const body = await request.json() as Partial<AccountArtifact>;
+    return HttpResponse.json(
+      { ...mockArtifact, id: 42, account: Number(params.id), ...body },
+      { status: 201 }
+    );
+  }),
   http.patch("/api/v1/accounts/artifacts/:id/", async ({ request }) => {
     const body = await request.json() as Partial<AccountArtifact>;
     return HttpResponse.json({ ...mockArtifact, ...body });

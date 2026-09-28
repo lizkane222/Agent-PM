@@ -6,6 +6,12 @@ import { AppErrorProvider } from "../../context/AppErrorContext";
 import { mockCalendarEvents } from "../../test/handlers/scheduler";
 import { mockActionItem } from "../../test/handlers/action_items";
 import { mockUserProfile } from "../../test/handlers/team";
+import { mockArtifact, mockCodeArtifact } from "../../test/handlers/accounts";
+import {
+  mockPlannedEntry,
+  mockSkippedEvent,
+  weekPlanReport,
+} from "../../test/handlers/salesforce";
 import {
   DARK_TEXT,
   DEFAULT_CATEGORY_COLORS,
@@ -31,7 +37,7 @@ vi.mock("@fullcalendar/react", async () => {
     props: Record<string, unknown>,
     _ref: unknown,
   ) {
-    const { datesSet, events, eventDidMount, select, eventClick, customButtons, headerToolbar } = props as {
+    const { datesSet, events, eventDidMount, select, eventClick, customButtons, headerToolbar, drop } = props as {
       datesSet?: (info: {
         startStr: string;
         endStr: string;
@@ -49,6 +55,7 @@ vi.mock("@fullcalendar/react", async () => {
       eventDidMount?: (info: { event: unknown; el: HTMLElement }) => void;
       select?: (info: { startStr: string; endStr: string }) => void;
       eventClick?: (info: { event: unknown }) => void;
+      drop?: (info: { dateStr: string }) => void;
     };
 
     const calledRef = React.useRef(new Set<string>());
@@ -96,6 +103,34 @@ vi.mock("@fullcalendar/react", async () => {
       React.createElement("button", {
         "data-testid": "trigger-date-select",
         onClick: () => select?.({ startStr: "2026-07-28T10:00:00", endStr: "2026-07-28T11:00:00" }),
+      }),
+      // Test-only trigger for a week change. The real FullCalendar calls `datesSet`
+      // every time the user pages to another week; the mount-only effect above cannot
+      // exercise that, and week navigation is exactly where the "past weeks are empty"
+      // bug lives. The target range is read off a global so a test can aim it.
+      React.createElement("button", {
+        "data-testid": "trigger-dates-set",
+        onClick: () => {
+          const g = globalThis as Record<string, unknown>;
+          datesSet?.({
+            startStr: (g.__TEST_RANGE_START__ as string) ?? "2026-07-21T00:00:00.000Z",
+            endStr: (g.__TEST_RANGE_END__ as string) ?? "2026-07-28T00:00:00.000Z",
+            view: { type: "timeGridWeek" },
+          });
+        },
+      }),
+      // Test-only trigger for FullCalendar's `drop` prop — dragging an action item from the
+      // sidebar onto the grid. The real event carries a dateStr and the dragged id is read
+      // off `window[CALENDAR_DRAG_KEY]`, which a test sets before clicking.
+      React.createElement("button", {
+        "data-testid": "trigger-item-drop",
+        "data-drop-date": (globalThis as Record<string, unknown>).__TEST_DROP_DATE__ ?? "",
+        onClick: () =>
+          drop?.({
+            dateStr:
+              ((globalThis as Record<string, unknown>).__TEST_DROP_DATE__ as string) ??
+              "2026-07-30T09:00:00",
+          }),
       }),
       events?.map((ev) =>
         React.createElement("div", {
@@ -200,17 +235,32 @@ vi.mock("../../components/calendar/AccountsSidebar", async () => {
       onShowUnlinkedView?: () => void;
       unlinkedCount?: number;
       isUnlinkedView?: boolean;
+      onLogTimeMode?: (accountName: string | null) => void;
+      logTimeModeAccount?: string | null;
     }) {
-      return props.onShowUnlinkedView
-        ? React.createElement(
-            "button",
-            {
-              onClick: props.onShowUnlinkedView,
-              "data-unlinked-active": props.isUnlinkedView ? "true" : "false",
-            },
-            `Unlinked (${props.unlinkedCount ?? 0})`,
-          )
-        : null;
+      if (!props.onShowUnlinkedView) return null;
+      return React.createElement("div", null, [
+        React.createElement(
+          "button",
+          {
+            key: "unlinked",
+            onClick: props.onShowUnlinkedView,
+            "data-unlinked-active": props.isUnlinkedView ? "true" : "false",
+          },
+          `Unlinked (${props.unlinkedCount ?? 0})`,
+        ),
+        // The real footer button that enters Log Time mode. Stubbed with a fixed
+        // account so a test can reach the panel without driving account selection.
+        React.createElement(
+          "button",
+          {
+            key: "logtime",
+            "data-testid": "enter-log-time",
+            onClick: () => props.onLogTimeMode?.(props.logTimeModeAccount ? null : "Acme Corp"),
+          },
+          props.logTimeModeAccount ? "Exit Log Time" : "Log Time to Salesforce",
+        ),
+      ]);
     },
   };
 });
@@ -223,7 +273,15 @@ vi.mock("../../hooks/useLogGlow", () => ({ useLogGlow: () => {} }));
 vi.mock("../../components/comments/CommentContext", () => ({
   useCommentContext: () => ({ openComments: vi.fn() }),
 }));
-vi.mock("../../lib/appLog", () => ({ addLog: vi.fn() }));
+vi.mock("../../lib/appLog", () => ({
+  addLog: vi.fn(),
+  getLogsForResource: vi.fn(() => []),
+  patchLog: vi.fn(),
+  getLogs: vi.fn(() => []),
+  syncLogsFromBackend: vi.fn(async () => {}),
+  addBackendLog: vi.fn(),
+  LOG_STORAGE_KEY: "appActivityLog",
+}));
 vi.mock("../../assets/icons/Calendar.svg?react", () => ({ default: () => null }));
 vi.mock("../../assets/icons/Corporate.svg?react", () => ({ default: () => null }));
 
@@ -291,6 +349,27 @@ describe("CalendarPage", () => {
       expect(screen.getByText("Q3 Planning")).toBeInTheDocument();
       expect(screen.getByText("Customer Demo")).toBeInTheDocument();
     });
+  });
+
+  it("requests both account lists with a widened page_size, so the Create Event account picker isn't truncated", async () => {
+    const requested: string[] = [];
+    server.use(
+      http.get("/api/v1/airtable/accounts/", ({ request }) => {
+        requested.push(request.url);
+        return HttpResponse.json({ results: [] });
+      }),
+      http.get("/api/v1/accounts/accounts/", ({ request }) => {
+        requested.push(request.url);
+        return HttpResponse.json({ results: [], count: 0 });
+      }),
+    );
+    renderPage();
+    await waitFor(() => expect(requested.length).toBeGreaterThanOrEqual(2));
+
+    // Both endpoints paginate at 50 by default; allAccountsRef feeds the Create Event
+    // modal's account picker, so without a widened page_size accounts past the 50th
+    // silently never appear there.
+    for (const url of requested) expect(url).toContain("page_size=500");
   });
 
   describe("event colors", () => {
@@ -935,6 +1014,27 @@ describe("CalendarPage", () => {
     });
   });
 
+  it("restores the prior content view after Log Time mode is closed, instead of leaving the grid stuck on one account", async () => {
+    renderPage();
+    const wrap = () => document.querySelector("[data-content-view]");
+    const logTimeBtn = await screen.findByTestId("enter-log-time");
+
+    // Starting from "all", entering Log Time force-switches the grid to that account only.
+    expect(wrap()).toHaveAttribute("data-content-view", "all");
+    fireEvent.click(logTimeBtn);
+    await waitFor(() => {
+      expect(wrap()).toHaveAttribute("data-content-view", "accounts");
+      expect(screen.getByTestId("enter-log-time")).toHaveTextContent("Exit Log Time");
+    });
+
+    // Closing it must put the grid back to "all" — not leave it silently filtered to
+    // one account, which is what made the calendar look empty after Log Time was used.
+    fireEvent.click(screen.getByTestId("enter-log-time"));
+    await waitFor(() => {
+      expect(wrap()).toHaveAttribute("data-content-view", "all");
+    });
+  });
+
   it("drag-selecting a date range opens the create-event modal and Save creates the event", async () => {
     let createdBody: Record<string, unknown> | null = null;
     server.use(
@@ -1471,5 +1571,1038 @@ describe("CalendarPage — editing an event", () => {
       await screen.findByText("Copy details");
       expect(screen.queryByText("Convert to…")).not.toBeInTheDocument();
     });
+  });
+
+  // ── Log Week → Cloud Coach ──────────────────────────────────────────────────
+  //
+  // The panel under test is CalendarPage's own local `LogTimePanel` (~L2844), not the
+  // unreachable twin in components/calendar/LogTimePanel.tsx. Request counts are
+  // asserted at the network layer via MSW rather than by mocking lib/api.ts, because
+  // "one request instead of N" is precisely the behaviour that changed.
+  describe("Log Week", () => {
+    async function enterLogTimeMode() {
+      renderPage();
+      const enter = await screen.findByTestId("enter-log-time");
+      fireEvent.click(enter);
+      return await screen.findByText("Log Week");
+    }
+
+    it("logs the week in exactly one request", async () => {
+      const bodies: unknown[] = [];
+      server.use(
+        http.post("/api/v1/salesforce/log-week/", async ({ request }) => {
+          bodies.push(await request.json());
+          return HttpResponse.json(weekPlanReport({ entries: [mockPlannedEntry()] }));
+        }),
+        // Present so a regression back to the per-entry fan-out is visible as a
+        // non-empty list rather than an unhandled-request error.
+        http.post("/api/v1/salesforce/log-time/", () => {
+          bodies.push("log-time");
+          return HttpResponse.json({}, { status: 201 });
+        }),
+      );
+
+      const button = await enterLogTimeMode();
+      fireEvent.click(button);
+
+      await waitFor(() => expect(bodies.length).toBe(1));
+      expect(bodies).not.toContain("log-time");
+    });
+
+    it("sends the week start and the account it is scoped to", async () => {
+      let body: Record<string, unknown> = {};
+      server.use(
+        http.post("/api/v1/salesforce/log-week/", async ({ request }) => {
+          body = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json(weekPlanReport());
+        }),
+      );
+
+      fireEvent.click(await enterLogTimeMode());
+
+      await waitFor(() => expect(body.account_name).toBe("Acme Corp"));
+      expect(typeof body.week_start).toBe("string");
+    });
+
+    it("omits entries when no project has been dragged onto a day", async () => {
+      // An empty array would read as "log nothing"; omitting it is what asks the server
+      // to resolve event → account → project itself.
+      let body: Record<string, unknown> = {};
+      server.use(
+        http.post("/api/v1/salesforce/log-week/", async ({ request }) => {
+          body = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json(weekPlanReport());
+        }),
+      );
+
+      fireEvent.click(await enterLogTimeMode());
+
+      await waitFor(() => expect(body.week_start).toBeDefined());
+      expect(body.entries).toBeUndefined();
+    });
+
+    it("shows the warning modal with the counts the server reported", async () => {
+      server.use(
+        http.post("/api/v1/salesforce/log-week/", () =>
+          HttpResponse.json(
+            weekPlanReport({
+              entries: [mockPlannedEntry()],
+              unlinked_events: [
+                mockSkippedEvent({ event_id: 1, title: "Mystery sync" }),
+                mockSkippedEvent({ event_id: 2, title: "Coffee chat" }),
+              ],
+              not_attended_events: [
+                mockSkippedEvent({ event_id: 3, title: "Skipped standup", reason: "did_not_attend" }),
+              ],
+            }),
+          ),
+        ),
+      );
+
+      fireEvent.click(await enterLogTimeMode());
+
+      const row = await screen.findByTestId("warning-unlinked");
+      expect(row).toHaveTextContent("2 calendar items not linked to an account");
+      expect(row).toHaveTextContent("Mystery sync");
+      expect(screen.getByTestId("warning-not_attended")).toHaveTextContent("1 calendar item");
+    });
+
+    it("shows no modal when the week logged cleanly", async () => {
+      server.use(
+        http.post("/api/v1/salesforce/log-week/", () =>
+          HttpResponse.json(weekPlanReport({ entries: [mockPlannedEntry()] })),
+        ),
+      );
+
+      fireEvent.click(await enterLogTimeMode());
+
+      await screen.findByText("✓ Week Logged");
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    });
+
+    it("dismisses the modal", async () => {
+      server.use(
+        http.post("/api/v1/salesforce/log-week/", () =>
+          HttpResponse.json(weekPlanReport({ unlinked_events: [mockSkippedEvent()] })),
+        ),
+      );
+
+      fireEvent.click(await enterLogTimeMode());
+      fireEvent.click(await screen.findByText("Got it"));
+
+      await waitFor(() => expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument());
+    });
+
+    it("keeps the modal after the panel is closed", async () => {
+      // The report is held on the page, not in the panel, so exiting Log Time mode
+      // straight after logging does not take the warning down with it.
+      server.use(
+        http.post("/api/v1/salesforce/log-week/", () =>
+          HttpResponse.json(weekPlanReport({ unlinked_events: [mockSkippedEvent()] })),
+        ),
+      );
+
+      fireEvent.click(await enterLogTimeMode());
+      await screen.findByRole("alertdialog");
+      fireEvent.click(screen.getByTestId("enter-log-time")); // now "Exit Log Time"
+
+      await waitFor(() => expect(screen.queryByText("Log Week")).not.toBeInTheDocument());
+      expect(screen.getByRole("alertdialog")).toBeInTheDocument();
+    });
+
+    it("is clickable before any project is assigned", async () => {
+      // It used to be disabled until a project had been dragged onto a day, which made
+      // "click Log Week and it logs my week" impossible on a fresh panel.
+      const button = await enterLogTimeMode();
+      expect(button).not.toBeDisabled();
+    });
+
+    it("stays retryable after a failed request", async () => {
+      let attempts = 0;
+      server.use(
+        http.post("/api/v1/salesforce/log-week/", () => {
+          attempts += 1;
+          return attempts === 1
+            ? HttpResponse.json({ detail: "Could not reach Salesforce." }, { status: 502 })
+            : HttpResponse.json(weekPlanReport({ entries: [mockPlannedEntry()] }));
+        }),
+      );
+
+      const button = await enterLogTimeMode();
+      fireEvent.click(button);
+
+      await waitFor(() => expect(button).not.toBeDisabled());
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+
+      fireEvent.click(button);
+      await screen.findByText("✓ Week Logged");
+      expect(attempts).toBe(2);
+    });
+  });
+});
+
+// ── Artifacts: linked to an event, gated on a linked account ──
+
+describe("CalendarPage — linking artifacts to an event", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+    localStorage.clear();
+    server.use(
+      http.get("/api/v1/airtable/accounts/", () => HttpResponse.json({ results: [] })),
+      http.get("/api/v1/accounts/accounts/", () => HttpResponse.json({ results: [], count: 0 })),
+      http.get("/api/v1/accounts/admin-account/", () => HttpResponse.json({ id: 1, company_name: "Admin" })),
+    );
+  });
+
+  /** Same fixture shape as the "editing an event" describe block above: PK 7, uid "gcal-7". */
+  function serveEvent(overrides: Record<string, unknown> = {}) {
+    server.use(
+      http.get("/api/v1/scheduler/events/", () =>
+        HttpResponse.json([
+          {
+            ...mockCalendarEvents[0],
+            id: 7,
+            google_event_id: "gcal-7",
+            title: "Q3 Planning",
+            event_category: "meeting",
+            attendees: [],
+            is_synced: true,
+            artifact_ids: [],
+            ...overrides,
+          },
+        ]),
+      ),
+    );
+  }
+
+  /** Links "gcal-7" to account id 1 — the same account id `mockArtifact`/`mockCodeArtifact`
+   *  belong to, and the id `EventDetailPanel` will pass to `accountsApi.listArtifacts`.
+   *  `handleEventClick` resolves the link via the singular GET, not the batch POST. */
+  function linkEventToAccount() {
+    server.use(
+      http.get("/api/v1/airtable/event-link/", ({ request }) => {
+        const uid = new URL(request.url).searchParams.get("event_uid");
+        if (uid === "gcal-7") {
+          return HttpResponse.json({ linked: true, airtable_account_id: 1, account_name: "Acme Corp" });
+        }
+        return HttpResponse.json({ linked: false });
+      }),
+    );
+  }
+
+  function captureDetailsPatch() {
+    const seen: { body: Record<string, unknown> | null; id: string; calls: number } = {
+      body: null, id: "", calls: 0,
+    };
+    server.use(
+      http.patch("/api/v1/scheduler/events/:id/details/", async ({ request, params }) => {
+        seen.body = (await request.json()) as Record<string, unknown>;
+        seen.id = String(params.id);
+        seen.calls += 1;
+        return HttpResponse.json({ ...mockCalendarEvents[0], id: 7, google_event_id: "gcal-7", ...seen.body });
+      }),
+    );
+    return seen;
+  }
+
+  async function eventEl() {
+    return waitFor(() => {
+      const found = document.querySelector("[data-testid='calendar-event']");
+      expect(found).not.toBeNull();
+      return found as HTMLElement;
+    });
+  }
+
+  /** A plain click selects the event and opens the read-mode panel — distinct from
+   *  right-click → Edit, which opens the editable form and has no Artifacts section.
+   *  Scoped to the panel's own heading: "Q3 Planning" also renders as the grid's event
+   *  title text, so an unscoped `findByText` matches both and throws. */
+  async function openReadPanel() {
+    renderPage();
+    fireEvent.click(await eventEl());
+    return screen.findByRole("heading", { name: "Q3 Planning" });
+  }
+
+  it("shows no Artifacts section when no account is linked to the event", async () => {
+    serveEvent();
+    await openReadPanel();
+
+    await screen.findByText("Drop an account here to link");
+    expect(screen.queryByText("Artifacts")).not.toBeInTheDocument();
+  });
+
+  it("shows the Artifacts section, populated with the linked account's artifacts, once an account is linked", async () => {
+    serveEvent();
+    linkEventToAccount();
+    await openReadPanel();
+
+    expect(await screen.findByText("Artifacts")).toBeInTheDocument();
+    expect(await screen.findByText(mockArtifact.name)).toBeInTheDocument();
+    expect(await screen.findByText(mockCodeArtifact.name)).toBeInTheDocument();
+  });
+
+  it("toggling an artifact PATCHes /details/ with the updated artifact_ids array", async () => {
+    const patch = captureDetailsPatch();
+    serveEvent();
+    linkEventToAccount();
+    await openReadPanel();
+
+    await screen.findByText("Artifacts");
+    const checkbox = (await screen.findByText(mockArtifact.name))
+      .closest("label")
+      ?.querySelector("input[type=checkbox]") as HTMLInputElement;
+    fireEvent.click(checkbox);
+
+    await waitFor(() => expect(patch.body).toEqual({ artifact_ids: [mockArtifact.id] }));
+    expect(patch.id).toBe("7");
+  });
+
+  it("unchecking an already-linked artifact PATCHes it out of artifact_ids", async () => {
+    const patch = captureDetailsPatch();
+    serveEvent({ artifact_ids: [mockArtifact.id] });
+    linkEventToAccount();
+    await openReadPanel();
+
+    const checkbox = (await screen.findByText(mockArtifact.name))
+      .closest("label")
+      ?.querySelector("input[type=checkbox]") as HTMLInputElement;
+    await waitFor(() => expect(checkbox).toBeChecked());
+    fireEvent.click(checkbox);
+
+    await waitFor(() => expect(patch.body).toEqual({ artifact_ids: [] }));
+  });
+
+  it("creating a new artifact POSTs to the account's artifacts endpoint, then PATCHes the event to link it", async () => {
+    const patch = captureDetailsPatch();
+    let postedTo = "";
+    let postedBody: Record<string, unknown> | null = null;
+    server.use(
+      http.post("/api/v1/accounts/accounts/:id/artifacts/", async ({ request, params }) => {
+        postedTo = String(params.id);
+        postedBody = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json(
+          { ...mockArtifact, id: 55, account: Number(params.id), ...postedBody },
+          { status: 201 },
+        );
+      }),
+    );
+    serveEvent();
+    linkEventToAccount();
+    await openReadPanel();
+
+    await screen.findByText("Artifacts");
+    fireEvent.click(screen.getByText("+ New artifact"));
+    fireEvent.change(screen.getByPlaceholderText("Artifact name"), { target: { value: "Runbook" } });
+    fireEvent.change(screen.getByPlaceholderText("https://…"), { target: { value: "https://example.com/runbook" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+
+    await waitFor(() => expect(postedTo).toBe("1"));
+    expect(postedBody).toEqual(expect.objectContaining({ name: "Runbook", url: "https://example.com/runbook" }));
+    await waitFor(() => expect(patch.body).toEqual({ artifact_ids: [55] }));
+  });
+});
+
+describe("CalendarPage — action item modal (not inline editing)", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+    localStorage.clear();
+    server.use(
+      http.get("/api/v1/airtable/action-items/:id/attachments/", () => HttpResponse.json([])),
+    );
+  });
+
+  function serveScheduledActionItem(overrides: Record<string, unknown> = {}) {
+    server.use(
+      http.get("/api/v1/scheduler/events/", () =>
+        HttpResponse.json([
+          {
+            ...mockCalendarEvents[0],
+            id: 9,
+            google_event_id: "scheduled-recAAA001",
+            title: "Fix billing",
+            ...overrides,
+          },
+        ]),
+      ),
+    );
+  }
+
+  async function eventEl() {
+    return waitFor(() => {
+      const found = document.querySelector("[data-testid='calendar-event']");
+      expect(found).not.toBeNull();
+      return found as HTMLElement;
+    });
+  }
+
+  // "Fix billing" renders in several places at once (the calendar chip, the panel
+  // header, the sidebar card) — this is specifically the read-mode body <p> inside
+  // EventDetailPanel, the one whose onDoubleClick opens the shared modal.
+  async function gridBodyText(text: string) {
+    return waitFor(() => {
+      const match = Array.from(document.querySelectorAll("p")).find(
+        (el) => el.textContent === text && el.className === "text-[var(--twilio-navy)] font-medium leading-snug",
+      );
+      expect(match).toBeTruthy();
+      return match as HTMLElement;
+    });
+  }
+
+  it("sidebar: clicking an action item card opens the shared modal, not an inline field form", async () => {
+    render(<AppErrorProvider><CalendarPage /></AppErrorProvider>);
+    fireEvent.click(screen.getAllByRole("button", { name: /Action Items/i })[0]);
+
+    const taskText = await screen.findByText("Fix billing");
+    fireEvent.click(taskText);
+
+    expect(await screen.findByTestId("action-item-modal-panel")).toBeInTheDocument();
+  });
+
+  it("grid: double-clicking the scheduled item's body opens the shared modal, not an inline field form", async () => {
+    serveScheduledActionItem();
+    render(<AppErrorProvider><CalendarPage /></AppErrorProvider>);
+
+    fireEvent.click(await eventEl());
+    const taskText = await gridBodyText("Fix billing");
+    fireEvent.doubleClick(taskText);
+
+    expect(await screen.findByTestId("action-item-modal-panel")).toBeInTheDocument();
+  });
+
+  it("grid: clicking the 'Open action item' footer button opens the shared modal", async () => {
+    serveScheduledActionItem();
+    render(<AppErrorProvider><CalendarPage /></AppErrorProvider>);
+
+    fireEvent.click(await eventEl());
+    await gridBodyText("Fix billing");
+    fireEvent.click(screen.getByRole("button", { name: "Open action item" }));
+
+    expect(await screen.findByTestId("action-item-modal-panel")).toBeInTheDocument();
+  });
+
+  it("grid: double-clicking the scheduled-time row still opens the time-only editor, independent of the modal", async () => {
+    serveScheduledActionItem();
+    render(<AppErrorProvider><CalendarPage /></AppErrorProvider>);
+
+    fireEvent.click(await eventEl());
+    const taskText = await gridBodyText("Fix billing");
+    const bodyBlock = taskText.parentElement as HTMLElement;
+    const timeRow = bodyBlock.previousElementSibling as HTMLElement;
+
+    fireEvent.doubleClick(timeRow);
+
+    expect(document.querySelectorAll('input[type="time"]').length).toBe(2);
+    expect(screen.queryByTestId("action-item-modal-panel")).not.toBeInTheDocument();
+  });
+
+  it("saving via the modal updates the sidebar list with a single save, and propagates the change", async () => {
+    let saveCount = 0;
+    server.use(
+      http.patch("/api/v1/airtable/action-items/:airtableId/fields/", () => {
+        saveCount += 1;
+        return HttpResponse.json(mockActionItem);
+      }),
+    );
+
+    render(<AppErrorProvider><CalendarPage /></AppErrorProvider>);
+    fireEvent.click(screen.getAllByRole("button", { name: /Action Items/i })[0]);
+
+    const taskText = await screen.findByText("Fix billing");
+    fireEvent.click(taskText);
+    await screen.findByTestId("action-item-modal-panel");
+
+    const dispatchSpy = vi.spyOn(window, "dispatchEvent");
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() =>
+      expect(screen.queryByTestId("action-item-modal-panel")).not.toBeInTheDocument(),
+    );
+
+    // Exactly one save request — ActionItemModal.handleSave is the only writer;
+    // the sidebar's onUpdated must not re-PATCH on top of it.
+    expect(saveCount).toBe(1);
+
+    // At least one actionItemsUpdated broadcast reaches listeners (the sidebar's own
+    // explicit dispatch, on top of lib/api.ts's response-interceptor broadcast for any
+    // non-GET to an action-items endpoint — both are expected, not a duplicate save).
+    const updates = dispatchSpy.mock.calls.filter(
+      ([e]) => e instanceof StorageEvent && (e as StorageEvent).key === "actionItemsUpdated",
+    );
+    expect(updates.length).toBeGreaterThanOrEqual(1);
+    dispatchSpy.mockRestore();
+  });
+});
+
+// ── Scheduled items survive a Google sync ─────────────────────────────────────
+//
+// The reported bug: "clicking the Sync Google Calendar button seems to have removed the
+// action items that I had already added to the calendar."
+//
+// Root cause: a scheduling lived only in `localStorage`, and `handleSync` deleted that entry
+// after pushing to Google, trusting the pull to bring it back as a database row. When the
+// round trip did not complete the scheduling existed nowhere. Every test in this block is a
+// guard on some part of that no longer being possible.
+
+describe("scheduled action items are database rows and survive a sync", () => {
+  const DRAG_KEY = "calendarDragActionItemId";
+  const LEGACY_ITEMS_KEY = "scheduledActionItems";
+  const LEGACY_REMINDERS_KEY = "scheduledReminders";
+
+  /** A work_tracking row as it exists straight after a drop: real id, not yet in Google. */
+  function scheduledRow(overrides: Partial<(typeof mockCalendarEvents)[number]> = {}) {
+    return {
+      ...mockCalendarEvents[0],
+      id: 501,
+      title: "Provision SQL Traits",
+      start_datetime: "2026-07-30T09:00:00Z",
+      end_datetime: "2026-07-30T09:15:00Z",
+      calendar_id: "work_tracking",
+      agentpm_airtable_id: "rec9AwGLeyC2jMn2I",
+      google_event_id: "",
+      is_synced: false,
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    sessionStorage.clear();
+    localStorage.clear();
+    (globalThis as Record<string, unknown>).__TEST_DROP_DATE__ = "2026-07-30T09:00:00";
+  });
+
+  it("dropping an action item POSTs a work_tracking event carrying the airtable id", async () => {
+    const posted: Array<Record<string, unknown>> = [];
+    server.use(
+      http.post("/api/v1/scheduler/events/", async ({ request }) => {
+        const body = await request.json() as Record<string, unknown>;
+        posted.push(body);
+        return HttpResponse.json({ ...scheduledRow(), ...body }, { status: 201 });
+      }),
+    );
+
+    renderPage();
+    await screen.findByTestId("fullcalendar");
+
+    const w = window as unknown as Record<string, string>;
+    w[DRAG_KEY] = "rec9AwGLeyC2jMn2I";
+    w[`${DRAG_KEY}_task`] = "Provision SQL Traits";
+    fireEvent.click(screen.getByTestId("trigger-item-drop"));
+
+    await waitFor(() => expect(posted).toHaveLength(1));
+    expect(posted[0]).toMatchObject({
+      calendar_id: "work_tracking",
+      agentpm_airtable_id: "rec9AwGLeyC2jMn2I",
+      title: "Provision SQL Traits",
+    });
+  });
+
+  it("a drop that the server rejects tells the user nothing was saved", async () => {
+    // The original bug was silent. A failed write must never look like a success.
+    server.use(
+      http.post("/api/v1/scheduler/events/", () => new HttpResponse(null, { status: 500 })),
+    );
+
+    renderPage();
+    await screen.findByTestId("fullcalendar");
+
+    const w = window as unknown as Record<string, string>;
+    w[DRAG_KEY] = "rec9AwGLeyC2jMn2I";
+    w[`${DRAG_KEY}_task`] = "Provision SQL Traits";
+    fireEvent.click(screen.getByTestId("trigger-item-drop"));
+
+    await waitFor(() =>
+      expect(screen.getByText(/nothing was saved/i)).toBeInTheDocument(),
+    );
+  });
+
+  it("a scheduled action item is STILL on the grid after Sync Google Calendar", async () => {
+    // The headline regression guard.
+    let syncCalls = 0;
+    server.use(
+      http.get("/api/v1/scheduler/events/", () =>
+        HttpResponse.json([...mockCalendarEvents, scheduledRow()]),
+      ),
+      http.post("/api/v1/integrations/google/sync/", () => {
+        syncCalls += 1;
+        return HttpResponse.json({ detail: "Sync complete.", event_count: 3 });
+      }),
+    );
+
+    renderPage();
+    // Present before the sync.
+    await waitFor(() =>
+      expect(screen.getByText(/Provision SQL Traits/)).toBeInTheDocument(),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Sync Google Calendar" }));
+    await waitFor(() => expect(syncCalls).toBe(1));
+    // Wait for the sync to finish so the post-sync refetch has settled.
+    await waitFor(
+      () => expect(screen.getByRole("button", { name: "Sync Google Calendar" })).toBeInTheDocument(),
+      { timeout: 4000 },
+    );
+
+    expect(screen.getByText(/Provision SQL Traits/)).toBeInTheDocument();
+  });
+
+  it("Sync issues no DELETE and no localStorage push — measured at the network layer", async () => {
+    const methods: string[] = [];
+    server.use(
+      http.get("/api/v1/scheduler/events/", () =>
+        HttpResponse.json([...mockCalendarEvents, scheduledRow()]),
+      ),
+      http.post("/api/v1/integrations/google/sync/", () =>
+        HttpResponse.json({ detail: "Sync complete.", event_count: 3 }),
+      ),
+      // If handleSync still ran its old push step, this would be hit.
+      http.post("/api/v1/integrations/google/push-action-items/", () => {
+        methods.push("PUSH");
+        return HttpResponse.json({ results: [] });
+      }),
+      http.delete("/api/v1/scheduler/events/:id/", () => {
+        methods.push("DELETE");
+        return new HttpResponse(null, { status: 204 });
+      }),
+    );
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText(/Provision SQL Traits/)).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "Sync Google Calendar" }));
+    await waitFor(
+      () => expect(screen.getByRole("button", { name: "Sync Google Calendar" })).toBeInTheDocument(),
+      { timeout: 4000 },
+    );
+
+    // The push-then-prune dance is gone: the server owns mirroring to Google now.
+    expect(methods).toEqual([]);
+  });
+
+  it("keeps rendering the scheduled item while a slow sync is still in flight", async () => {
+    // Guards against the class of fake test the 2026-08-19 log entry records: MSW answers in a
+    // microtask, so a blank-then-restore would be invisible unless the response is held open.
+    let release: (() => void) | null = null;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    server.use(
+      http.get("/api/v1/scheduler/events/", () =>
+        HttpResponse.json([...mockCalendarEvents, scheduledRow()]),
+      ),
+      http.post("/api/v1/integrations/google/sync/", async () => {
+        await held;
+        return HttpResponse.json({ detail: "Sync complete.", event_count: 3 });
+      }),
+    );
+
+    renderPage();
+    await waitFor(() => expect(screen.getByText(/Provision SQL Traits/)).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "Sync Google Calendar" }));
+    await waitFor(() => expect(screen.getByText("Syncing…")).toBeInTheDocument());
+
+    // Mid-sync, the item must not have been removed from the grid.
+    expect(screen.getByText(/Provision SQL Traits/)).toBeInTheDocument();
+
+    release!();
+    await waitFor(
+      () => expect(screen.getByRole("button", { name: "Sync Google Calendar" })).toBeInTheDocument(),
+      { timeout: 4000 },
+    );
+    expect(screen.getByText(/Provision SQL Traits/)).toBeInTheDocument();
+  });
+
+  it("a row that has not reached Google yet is still editable on the grid", async () => {
+    // Every DB-backed branch used to require `is_synced`, so a freshly-dropped block was
+    // un-draggable and un-editable until a sync happened to run.
+    server.use(
+      http.get("/api/v1/scheduler/events/", () =>
+        HttpResponse.json([scheduledRow({ is_synced: false, google_event_id: "" })]),
+      ),
+    );
+
+    renderPage();
+    const el = await screen.findByTestId("calendar-event");
+
+    // `editable` is what FullCalendar reads to allow the drag; the stub surfaces the id, so
+    // assert through the context menu, which is only offered for a real row.
+    fireEvent.contextMenu(el);
+    await waitFor(() => expect(screen.getByText("Edit")).toBeInTheDocument());
+  });
+
+  describe("one-time migration of localStorage-only schedulings", () => {
+    it("creates a database row for a surviving legacy entry and clears the key", async () => {
+      const posted: Array<Record<string, unknown>> = [];
+      localStorage.setItem(LEGACY_ITEMS_KEY, JSON.stringify([
+        {
+          airtableId: "recLEGACY",
+          task: "Composite Keys Data Graph Issue",
+          accountName: null,
+          start: "2026-07-30T09:00:00Z",
+          end: "2026-07-30T09:15:00Z",
+        },
+      ]));
+      server.use(
+        http.post("/api/v1/scheduler/events/", async ({ request }) => {
+          const body = await request.json() as Record<string, unknown>;
+          posted.push(body);
+          return HttpResponse.json({ ...scheduledRow(), ...body }, { status: 201 });
+        }),
+      );
+
+      renderPage();
+      await screen.findByTestId("fullcalendar");
+
+      await waitFor(() => expect(posted).toHaveLength(1));
+      expect(posted[0]).toMatchObject({
+        calendar_id: "work_tracking",
+        agentpm_airtable_id: "recLEGACY",
+      });
+      await waitFor(() =>
+        expect(localStorage.getItem(LEGACY_ITEMS_KEY)).toBeNull(),
+      );
+    });
+
+    it("migrates a legacy entry whose action item is Done rather than discarding it", async () => {
+      // Loss path 3: the mount prune fetched "Open,In Progress,Blocked,Backlogged,Complete"
+      // — Done is absent — and deleted every entry not in that set. So marking an item Done
+      // erased its calendar blocks. `recDONE` is deliberately absent from the action-items
+      // handler's response, exactly as a Done item was.
+      const posted: Array<Record<string, unknown>> = [];
+      localStorage.setItem(LEGACY_ITEMS_KEY, JSON.stringify([
+        { airtableId: "recDONE", task: "Finished work", start: "2026-07-30T09:00:00Z", end: "" },
+      ]));
+      server.use(
+        http.get("/api/v1/airtable/action-items/", () => HttpResponse.json([])),
+        http.post("/api/v1/scheduler/events/", async ({ request }) => {
+          const body = await request.json() as Record<string, unknown>;
+          posted.push(body);
+          return HttpResponse.json({ ...scheduledRow(), ...body }, { status: 201 });
+        }),
+      );
+
+      renderPage();
+      await screen.findByTestId("fullcalendar");
+
+      await waitFor(() => expect(posted).toHaveLength(1));
+      expect(posted[0]).toMatchObject({ agentpm_airtable_id: "recDONE" });
+    });
+
+    it("KEEPS the legacy key when the migration write fails", async () => {
+      // Clearing on partial success is the original bug. It must not reappear here.
+      localStorage.setItem(LEGACY_ITEMS_KEY, JSON.stringify([
+        { airtableId: "recLEGACY", task: "One", start: "2026-07-30T09:00:00Z", end: "" },
+      ]));
+      server.use(
+        http.post("/api/v1/scheduler/events/", () => new HttpResponse(null, { status: 500 })),
+      );
+
+      renderPage();
+      await screen.findByTestId("fullcalendar");
+
+      // Give the migration time to run and fail.
+      await waitFor(() => expect(screen.getByTestId("fullcalendar")).toBeInTheDocument());
+      await new Promise((r) => setTimeout(r, 50));
+      expect(localStorage.getItem(LEGACY_ITEMS_KEY)).not.toBeNull();
+    });
+
+    it("migrates a legacy reminder to a reminders-calendar row", async () => {
+      const posted: Array<Record<string, unknown>> = [];
+      localStorage.setItem(LEGACY_REMINDERS_KEY, JSON.stringify([
+        { reminderId: 1, title: "Follow up with client", start: "2026-07-30T09:00:00Z", end: "" },
+      ]));
+      server.use(
+        http.post("/api/v1/scheduler/events/", async ({ request }) => {
+          const body = await request.json() as Record<string, unknown>;
+          posted.push(body);
+          return HttpResponse.json({ ...scheduledRow(), ...body }, { status: 201 });
+        }),
+      );
+
+      renderPage();
+      await screen.findByTestId("fullcalendar");
+
+      await waitFor(() => expect(posted).toHaveLength(1));
+      expect(posted[0]).toMatchObject({ calendar_id: "reminders", reminder: 1 });
+    });
+
+    it("does not re-create a row when the legacy entry already has one", async () => {
+      let posts = 0;
+      localStorage.setItem(LEGACY_ITEMS_KEY, JSON.stringify([
+        {
+          airtableId: "rec9AwGLeyC2jMn2I",
+          task: "Provision SQL Traits",
+          start: "2026-07-30T09:00:00Z",
+          end: "",
+        },
+      ]));
+      server.use(
+        http.get("/api/v1/scheduler/events/", () => HttpResponse.json([scheduledRow()])),
+        http.post("/api/v1/scheduler/events/", async () => {
+          posts += 1;
+          return HttpResponse.json(scheduledRow(), { status: 201 });
+        }),
+      );
+
+      renderPage();
+      await waitFor(() => expect(screen.getByText(/Provision SQL Traits/)).toBeInTheDocument());
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(posts).toBe(0);
+      await waitFor(() => expect(localStorage.getItem(LEGACY_ITEMS_KEY)).toBeNull());
+    });
+  });
+});
+
+// ── Week navigation: past weeks must keep showing their events ────────────────
+//
+// Reported as "I clicked Sync Google Calendar which updated this week, but going back
+// in time the previous weeks' data is not there." The data was never lost: the DB and
+// the API both return 50-66 events for each of the last 7 weeks. Two client-side faults
+// made them invisible.
+
+describe("CalendarPage — navigating to earlier weeks", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+    localStorage.clear();
+    const g = globalThis as Record<string, unknown>;
+    delete g.__TEST_RANGE_START__;
+    delete g.__TEST_RANGE_END__;
+    server.use(
+      http.get("/api/v1/airtable/accounts/", () => HttpResponse.json({ results: [] })),
+      http.get("/api/v1/accounts/accounts/", () => HttpResponse.json({ results: [], count: 0 })),
+      http.get("/api/v1/accounts/admin-account/", () => HttpResponse.json({ id: 1, company_name: "Admin" })),
+    );
+  });
+
+  /** The 6 historical week ranges the page prewarms, built exactly as it builds them. */
+  function historicalWeekRanges() {
+    const now = new Date();
+    const thisWeek = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    thisWeek.setDate(thisWeek.getDate() - thisWeek.getDay());
+    return Array.from({ length: 6 }, (_, i) => {
+      const start = new Date(thisWeek);
+      start.setDate(start.getDate() - 7 * (i + 1));
+      const end = new Date(start);
+      end.setDate(end.getDate() + 7);
+      return { startIso: start.toISOString(), endIso: end.toISOString() };
+    });
+  }
+
+  function historicalWeekStarts(): string[] {
+    return historicalWeekRanges().map((r) => r.startIso.slice(0, 10));
+  }
+
+  function aimAt(start: string, end: string) {
+    const g = globalThis as Record<string, unknown>;
+    g.__TEST_RANGE_START__ = start;
+    g.__TEST_RANGE_END__ = end;
+  }
+
+  /** Serve a distinct event per requested week, so "which week is on screen" is assertable. */
+  function servePerWeek() {
+    server.use(
+      http.get("/api/v1/scheduler/events/", ({ request }) => {
+        const start = new URL(request.url).searchParams.get("start") ?? "";
+        const week = start.slice(0, 10);
+        return HttpResponse.json([
+          { ...mockCalendarEvents[0], id: 900, google_event_id: `gcal-${week}`, title: `Event for ${week}` },
+        ]);
+      }),
+    );
+  }
+
+  it("shows the earlier week's events after paging back", async () => {
+    servePerWeek();
+    renderPage();
+    await screen.findByText(/Event for 2026-07-28/);
+
+    aimAt("2026-06-16T00:00:00.000Z", "2026-06-23T00:00:00.000Z");
+    fireEvent.click(screen.getByTestId("trigger-dates-set"));
+
+    await screen.findByText(/Event for 2026-06-16/);
+  });
+
+  it("still renders an earlier week after an event was edited on the current one", async () => {
+    // The latch bug: saveEventDetails sets localMutationRef and never clears it, so every
+    // later fetch resolved and was then thrown away. One edit made all subsequent week
+    // navigation render nothing, for the rest of the session.
+    servePerWeek();
+    server.use(
+      http.patch("/api/v1/scheduler/events/:id/details/", () =>
+        HttpResponse.json({ ...mockCalendarEvents[0], id: 900, title: "Renamed" }),
+      ),
+    );
+    renderPage();
+    fireEvent.click(await screen.findByText(/Event for 2026-07-28/));
+
+    // Rename it through the detail panel — the same path the right-click "Convert to…"
+    // and the edit form both use.
+    const editBtn = await screen.findByText(/Edit event/);
+    fireEvent.click(editBtn);
+    const title = await screen.findByDisplayValue(/Event for 2026-07-28/);
+    fireEvent.change(title, { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByRole("button", { name: /^Save$/ }));
+    await waitFor(() => expect(screen.queryByDisplayValue("Renamed")).not.toBeInTheDocument());
+
+    aimAt("2026-06-16T00:00:00.000Z", "2026-06-23T00:00:00.000Z");
+    fireEvent.click(screen.getByTestId("trigger-dates-set"));
+
+    await screen.findByText(/Event for 2026-06-16/);
+  });
+
+  it("still renders an earlier week after toggling attendance", async () => {
+    // Same latch, reached through the other unclosed site (toggleAttendance).
+    servePerWeek();
+    server.use(
+      http.patch("/api/v1/scheduler/events/:id/attendance/", () =>
+        HttpResponse.json({ ...mockCalendarEvents[0], id: 900, attended: false }),
+      ),
+    );
+    renderPage();
+    fireEvent.click(await screen.findByText(/Event for 2026-07-28/));
+    fireEvent.click(await screen.findByTestId("attendance-toggle"));
+    await waitFor(() =>
+      expect(screen.getByTestId("attendance-toggle")).toHaveAttribute("data-attended", "false"),
+    );
+
+    aimAt("2026-06-16T00:00:00.000Z", "2026-06-23T00:00:00.000Z");
+    fireEvent.click(screen.getByTestId("trigger-dates-set"));
+
+    await screen.findByText(/Event for 2026-06-16/);
+  });
+
+  it("does not write one week's events into another week's cache entry", async () => {
+    // The cache-write effect keys on `visibleRange`, but `visibleRange` and `events` are
+    // two separate state updates: after paging, the new range was briefly paired with the
+    // OLD events and persisted under the new week's key. Revisiting then served the wrong
+    // week from cache.
+    servePerWeek();
+    renderPage();
+    await screen.findByText(/Event for 2026-07-28/);
+
+    aimAt("2026-06-16T00:00:00.000Z", "2026-06-23T00:00:00.000Z");
+    fireEvent.click(screen.getByTestId("trigger-dates-set"));
+    await screen.findByText(/Event for 2026-06-16/);
+
+    // Asserted as a property rather than against a literal key: the key is derived from
+    // the range's LOCAL day, so hard-coding one would only hold in timezones west of UTC.
+    // Each cached entry must hold exactly one week's events — never a mix, and never a
+    // different week's than its own key.
+    const byKey = new Map<string, string[]>();
+    for (let i = 0; i < sessionStorage.length; i++) {
+      const k = sessionStorage.key(i);
+      if (!k?.startsWith("calEvents::")) continue;
+      const { data } = JSON.parse(sessionStorage.getItem(k)!) as { data: Array<{ title: string }> };
+      byKey.set(k, [...new Set(data.map((e) => e.title))]);
+    }
+    for (const [key, titles] of byKey) {
+      expect(titles.length, `${key} holds more than one week: ${titles.join(", ")}`).toBe(1);
+    }
+    const allTitles = [...byKey.values()].flat();
+    expect(allTitles).toContain("Event for 2026-07-28");
+    expect(allTitles).toContain("Event for 2026-06-16");
+    // Two distinct weeks ⇒ two distinct entries.
+    expect(new Set(allTitles).size).toBe(new Set(byKey.keys()).size);
+  });
+
+  it("prewarms the last 6 weeks, so paging back does not fetch again", async () => {
+    // "make it so that all weeks going back 6 weeks are visible in the UI ... this should
+    // simply persist across a user's session if no updates were made to those events."
+    const asked: string[] = [];
+    server.use(
+      http.get("/api/v1/scheduler/events/", ({ request }) => {
+        const week = (new URL(request.url).searchParams.get("start") ?? "").slice(0, 10);
+        asked.push(week);
+        return HttpResponse.json([
+          { ...mockCalendarEvents[0], id: 900, google_event_id: `gcal-${week}`, title: `Event for ${week}` },
+        ]);
+      }),
+    );
+    renderPage();
+    await screen.findByText(/Event for 2026-07-28/);
+
+    // The six historical week-starts, fetched one at a time. Counted by week rather than
+    // by total request count: a pre-existing effect also fetches the last 3 weeks (for
+    // account-link fading), so a bare total would be asserting that effect too.
+    const wanted = historicalWeekStarts();
+    await waitFor(() => {
+      for (const w of wanted) expect(asked).toContain(w);
+    });
+
+    // Every prewarmed week is now readable from the cache without another request.
+    const before = asked.length;
+    for (const { startIso, endIso } of historicalWeekRanges()) {
+      aimAt(startIso, endIso);
+      fireEvent.click(screen.getByTestId("trigger-dates-set"));
+      // eslint-disable-next-line no-await-in-loop
+      await waitFor(() => expect(asked.length).toBe(before));
+    }
+  });
+
+  it("keeps a finished week cached past the 5-minute TTL that still applies to this week", async () => {
+    // A week that has ended cannot change on its own, and any sync clears the whole
+    // cache — so re-requesting it every 5 minutes is pure waste. The current week keeps
+    // the short TTL because it is still being edited.
+    let calls = 0;
+    server.use(
+      http.get("/api/v1/scheduler/events/", ({ request }) => {
+        calls++;
+        const week = (new URL(request.url).searchParams.get("start") ?? "").slice(0, 10);
+        return HttpResponse.json([
+          { ...mockCalendarEvents[0], id: 900, google_event_id: `gcal-${week}`, title: `Event for ${week}` },
+        ]);
+      }),
+    );
+    renderPage();
+    await screen.findByText(/Event for 2026-07-28/);
+    await waitFor(() => expect(sessionStorage.length).toBeGreaterThanOrEqual(7));
+
+    // Age every cache entry well past the 5-minute TTL.
+    const stale = Date.now() - 60 * 60 * 1000;
+    for (let i = 0; i < sessionStorage.length; i++) {
+      const k = sessionStorage.key(i);
+      if (!k?.startsWith("calEvents::")) continue;
+      const parsed = JSON.parse(sessionStorage.getItem(k)!) as { ts: number; data: unknown };
+      sessionStorage.setItem(k, JSON.stringify({ ...parsed, ts: stale }));
+    }
+
+    const afterPrewarm = calls;
+    const { startIso, endIso } = historicalWeekRanges()[0];
+    aimAt(startIso, endIso);
+    fireEvent.click(screen.getByTestId("trigger-dates-set"));
+
+    // Served from cache despite being an hour stale — it is a finished week.
+    await waitFor(() => expect(screen.getByTestId("fullcalendar")).toBeInTheDocument());
+    expect(calls).toBe(afterPrewarm);
+  });
+
+  it("serves a previously-visited week from cache for the whole session, with no refetch", async () => {
+    // "This should simply persist across a user's session if no updates were made."
+    let calls = 0;
+    server.use(
+      http.get("/api/v1/scheduler/events/", ({ request }) => {
+        calls++;
+        const week = (new URL(request.url).searchParams.get("start") ?? "").slice(0, 10);
+        return HttpResponse.json([
+          { ...mockCalendarEvents[0], id: 900, google_event_id: `gcal-${week}`, title: `Event for ${week}` },
+        ]);
+      }),
+    );
+    renderPage();
+    await screen.findByText(/Event for 2026-07-28/);
+
+    aimAt("2026-06-16T00:00:00.000Z", "2026-06-23T00:00:00.000Z");
+    fireEvent.click(screen.getByTestId("trigger-dates-set"));
+    await screen.findByText(/Event for 2026-06-16/);
+    const afterFirstVisit = calls;
+
+    // Back to the original week, then forward again — both already fetched this session.
+    aimAt("2026-07-28T00:00:00.000Z", "2026-08-04T00:00:00.000Z");
+    fireEvent.click(screen.getByTestId("trigger-dates-set"));
+    await screen.findByText(/Event for 2026-07-28/);
+    aimAt("2026-06-16T00:00:00.000Z", "2026-06-23T00:00:00.000Z");
+    fireEvent.click(screen.getByTestId("trigger-dates-set"));
+    await screen.findByText(/Event for 2026-06-16/);
+
+    expect(calls).toBe(afterFirstVisit);
   });
 });

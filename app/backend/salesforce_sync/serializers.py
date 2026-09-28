@@ -65,6 +65,29 @@ class LogTimeSerializer(serializers.Serializer):
     description = serializers.CharField(allow_blank=True, default="")
 
 
+class LogWeekEntrySerializer(serializers.Serializer):
+    """One client-supplied time-log line — see `log_week._plan_from_client_entries`."""
+    date = serializers.DateField()
+    project_sf_id = serializers.CharField()
+    project_name = serializers.CharField(allow_blank=True, required=False, default="")
+    minutes = serializers.IntegerField(min_value=0)
+    description = serializers.CharField(allow_blank=True, required=False, default="")
+    titles = serializers.ListField(
+        child=serializers.CharField(allow_blank=True), required=False, default=list
+    )
+
+
+class LogWeekSerializer(serializers.Serializer):
+    # Blank/absent means "the current week" — resolved by `cloudcoach.parse_week_start`,
+    # which also snaps any mid-week date back to its Monday. Kept as a CharField rather
+    # than a DateField so a malformed value reaches that helper and produces the
+    # endpoint's own 400 message instead of DRF's generic one.
+    week_start = serializers.CharField(allow_blank=True, required=False, default="")
+    account_name = serializers.CharField(allow_blank=True, required=False, default="")
+    entries = LogWeekEntrySerializer(many=True, required=False)
+    dry_run = serializers.BooleanField(required=False, default=False)
+
+
 class ChatterPostSerializer(serializers.Serializer):
     record_id = serializers.CharField()
     body = serializers.CharField()

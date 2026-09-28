@@ -4,6 +4,8 @@ from datetime import date
 from pathlib import Path
 
 
+from accounts.views import _sanitized_html_upload
+from core.html_sanitize import is_html_filename
 from core.mixins import _staff_sees_all
 from core.pagination import ClientPageSizePagination
 from core.query_params import csv_int_params, csv_params
@@ -28,6 +30,7 @@ from .serializers import (
 from .matching import match_event_to_account, set_manual_categorization
 from .sync import sync_all
 from .airtable_client import get_table, TABLE_ACTION_ITEMS
+from . import write_back
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +204,8 @@ class AirtableAccountViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(instance, data=data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
+        if "segment_workspaces" in data:
+            write_back.push_account_segment_workspaces(instance)
         return Response(serializer.data)
 
 
@@ -671,10 +676,12 @@ class AirtableActionItemViewSet(viewsets.ModelViewSet):
             url_val = request.data.get("url", "")
             file_obj = request.FILES.get("file")
 
+            # Kept in step with the account-artifact list in accounts/views.py: .html /
+            # .htm / .xhtml are accepted and sanitized, everything else here stays blocked.
             _BLOCKED_EXTENSIONS = {
                 ".py", ".sh", ".bash", ".exe", ".bat", ".cmd", ".ps1",
                 ".php", ".rb", ".pl", ".js", ".jsx", ".ts", ".tsx",
-                ".html", ".htm", ".svg", ".xml",
+                ".svg", ".xml",
             }
             _MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB
 
@@ -684,6 +691,12 @@ class AirtableActionItemViewSet(viewsets.ModelViewSet):
                 ext = Path(file_obj.name).suffix.lower()
                 if ext in _BLOCKED_EXTENSIONS:
                     return Response({"error": f"File type '{ext}' is not permitted."}, status=400)
+                if is_html_filename(file_obj.name):
+                    file_obj = _sanitized_html_upload(file_obj)
+                    if file_obj is None:
+                        return Response(
+                            {"error": "That HTML file could not be read as text."}, status=400
+                        )
 
             kwargs = {
                 "action_item": item,
@@ -691,6 +704,11 @@ class AirtableActionItemViewSet(viewsets.ModelViewSet):
                 "artifact_type": artifact_type,
                 "name": name,
             }
+            source_artifact_id = request.data.get("source_artifact")
+            if source_artifact_id:
+                from accounts.models import AccountArtifact
+                if AccountArtifact.objects.filter(pk=source_artifact_id).exists():
+                    kwargs["source_artifact_id"] = source_artifact_id
             if file_obj:
                 kwargs["file"] = file_obj
                 kwargs["mime_type"] = file_obj.content_type or ""
@@ -907,7 +925,8 @@ def update_action_item_status(request, airtable_id):
 def update_action_item_fields(request, airtable_id):
     """
     Update arbitrary fields on an action item — writes to local DB and Airtable.
-    Body may include: task, status, priority, due_date, estimated_time, time_spent, notes
+    Body may include: task, status, priority, due_date, estimated_time, time_spent,
+    slack_thread_url, notes
     """
     item = AirtableActionItem.objects.filter(airtable_id=airtable_id).first()
     if not item:
@@ -924,6 +943,7 @@ def update_action_item_fields(request, airtable_id):
         "due_date": "Due Date",
         "estimated_time": "Estimated Time",
         "time_spent": "Time Spent",
+        "slack_thread_url": "Slack Thread URL",
     }
     airtable_payload = {}
     local_fields = []

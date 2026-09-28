@@ -1,10 +1,12 @@
 """Tests for AccountProjectViewSet — scoping, CRUD, and new linked-ID fields."""
 
+from unittest import mock
+
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from rest_framework.test import APITestCase
 
-from accounts.models import Account, AccountArtifact, AccountProject
+from accounts.models import Account, AccountArtifact, AccountProject, ProjectMember
 
 User = get_user_model()
 
@@ -500,6 +502,215 @@ class AccountArtifactsBatchTest(APITestCase):
         self.assertEqual(names, {"Acme Doc"})
 
 
+# ── description / references / used_in / creator display ───────────────────────
+
+
+class AccountArtifactDescriptionReferencesTest(APITestCase):
+    """Create/update an artifact with a rich-text description + forward references."""
+
+    def setUp(self):
+        cache.clear()
+        self.user = _make_user("artifact_desc_user")
+        self.acct = _make_account("Acme", admin_owner=self.user)
+        self.artifacts_url = f"/api/v1/accounts/accounts/{self.acct.id}/artifacts/"
+
+    def test_create_with_description_and_references_round_trips(self):
+        self.client.force_authenticate(user=self.user)
+        references = [
+            {"resource_type": "action_item", "resource_id": 7, "label": "Fix billing", "url": "/action-items"},
+        ]
+        resp = self.client.post(self.artifacts_url, {
+            "artifact_type": "link", "name": "Runbook", "url": "https://example.com/runbook",
+            "description": "<p>See @#action_item:7</p>",
+            "references": references,
+        }, format="json")
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["description"], "<p>See @#action_item:7</p>")
+        self.assertEqual(resp.data["references"], references)
+
+        artifact = AccountArtifact.objects.get(pk=resp.data["id"])
+        self.assertEqual(artifact.description, "<p>See @#action_item:7</p>")
+        self.assertEqual(artifact.references, references)
+
+    def test_create_defaults_description_and_references_blank(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post(self.artifacts_url, {
+            "artifact_type": "link", "name": "Plain Link", "url": "https://example.com",
+        })
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["description"], "")
+        self.assertEqual(resp.data["references"], [])
+
+    def test_update_persists_description_and_references(self):
+        artifact = _make_artifact(self.acct, self.user, "Doc")
+        self.client.force_authenticate(user=self.user)
+        references = [{"resource_type": "meeting", "resource_id": 3, "label": "Kickoff", "url": "/accounts/1"}]
+        resp = self.client.patch(f"/api/v1/accounts/artifacts/{artifact.id}/", {
+            "description": "<p>Updated</p>", "references": references,
+        }, format="json")
+        self.assertEqual(resp.status_code, 200)
+        artifact.refresh_from_db()
+        self.assertEqual(artifact.description, "<p>Updated</p>")
+        self.assertEqual(artifact.references, references)
+
+
+class ActionItemAttachmentSourceArtifactTest(APITestCase):
+    """`source_artifact` set on attachment create via ArtifactPicker, exposed read-only."""
+
+    def setUp(self):
+        cache.clear()
+        from airtable_sync.models import AirtableActionItem
+
+        self.user = _make_user("attach_src_user")
+        self.acct = _make_account("Acme", admin_owner=self.user)
+        self.artifact = _make_artifact(self.acct, self.user, "Runbook")
+        self.item = AirtableActionItem.objects.create(airtable_id="rec_attach_1", task="Fix billing")
+        self.url = f"/api/v1/airtable/action-items/{self.item.id}/attachments/"
+
+    def test_source_artifact_set_on_create(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post(self.url, {
+            "artifact_type": "link", "name": "Runbook", "url": "https://example.com/runbook",
+            "source_artifact": self.artifact.id,
+        }, format="json")
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["source_artifact"], self.artifact.id)
+
+        from airtable_sync.models import ActionItemAttachment
+        att = ActionItemAttachment.objects.get(pk=resp.data["id"])
+        self.assertEqual(att.source_artifact_id, self.artifact.id)
+
+    def test_invalid_source_artifact_id_is_ignored_not_raised(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post(self.url, {
+            "artifact_type": "link", "name": "Runbook", "url": "https://example.com/runbook",
+            "source_artifact": 999999,
+        })
+        self.assertEqual(resp.status_code, 201)
+        self.assertIsNone(resp.data["source_artifact"])
+
+    def test_omitted_source_artifact_defaults_to_none(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post(self.url, {
+            "artifact_type": "link", "name": "Plain", "url": "https://example.com",
+        })
+        self.assertEqual(resp.status_code, 201)
+        self.assertIsNone(resp.data["source_artifact"])
+
+    def test_source_artifact_is_read_only_on_serializer(self):
+        from airtable_sync.serializers import ActionItemAttachmentSerializer
+        self.assertIn("source_artifact", ActionItemAttachmentSerializer.Meta.read_only_fields)
+
+
+class ArtifactUsedInAggregationTest(APITestCase):
+    """`used_in`: a meeting, a goal, and an attachment all pointing at one artifact."""
+
+    def setUp(self):
+        cache.clear()
+        from django.utils import timezone
+        from airtable_sync.models import AirtableActionItem, ActionItemAttachment
+        from scheduler.models import CalendarEvent
+
+        self.user = _make_user("used_in_user")
+        self.acct = _make_account("Acme", admin_owner=self.user)
+        self.artifact = _make_artifact(self.acct, self.user, "Runbook")
+        self.unrelated = _make_artifact(self.acct, self.user, "Unrelated Doc")
+
+        now = timezone.now()
+        self.event = CalendarEvent.objects.create(
+            owner=self.user, account=self.acct, title="Kickoff Call",
+            start_datetime=now, end_datetime=now,
+            artifact_ids=[self.artifact.id],
+        )
+        self.goal = AccountProject.objects.create(
+            account=self.acct, name="Onboarding Goal", kind="goal",
+            resources=[{"id": f"artifact-{self.artifact.id}", "label": "Runbook", "url": ""}],
+        )
+        self.item = AirtableActionItem.objects.create(airtable_id="rec_used_in_1", task="Follow up")
+        self.attachment = ActionItemAttachment.objects.create(
+            action_item=self.item, uploaded_by=self.user, artifact_type="link",
+            name="Runbook", url="https://example.com/runbook", source_artifact=self.artifact,
+        )
+
+    def _fetch(self, artifact_id):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.get(f"/api/v1/accounts/accounts/{self.acct.id}/artifacts/")
+        self.assertEqual(resp.status_code, 200)
+        row = next(r for r in resp.data if r["id"] == artifact_id)
+        return row["used_in"]
+
+    def test_meeting_goal_and_attachment_all_appear(self):
+        used_in = self._fetch(self.artifact.id)
+        types = {(e["resource_type"], e["resource_id"]) for e in used_in}
+        self.assertIn(("calendar_event", self.event.id), types)
+        self.assertIn(("goal", self.goal.id), types)
+        self.assertIn(("action_item", self.item.id), types)
+        self.assertEqual(len(used_in), 3)
+
+    def test_project_kind_reports_as_project_not_goal(self):
+        project = AccountProject.objects.create(
+            account=self.acct, name="Migration Project", kind="project",
+            resources=[{"id": f"artifact-{self.artifact.id}", "label": "Runbook", "url": ""}],
+        )
+        used_in = self._fetch(self.artifact.id)
+        types = {(e["resource_type"], e["resource_id"]) for e in used_in}
+        self.assertIn(("project", project.id), types)
+
+    def test_unrelated_artifact_has_empty_used_in(self):
+        self.assertEqual(self._fetch(self.unrelated.id), [])
+
+    def test_used_in_present_on_the_standalone_update_route_too(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.patch(
+            f"/api/v1/accounts/artifacts/{self.artifact.id}/", {"name": "Runbook"}, format="json"
+        )
+        self.assertEqual(resp.status_code, 200)
+        types = {(e["resource_type"], e["resource_id"]) for e in resp.data["used_in"]}
+        self.assertIn(("action_item", self.item.id), types)
+
+
+class ArtifactCreatorDisplayTest(APITestCase):
+    """Creator display fallback chain: profile display_name > full name > username."""
+
+    def setUp(self):
+        cache.clear()
+        self.uploader = _make_user("creator_display_user")
+        self.acct = _make_account("Acme", admin_owner=self.uploader)
+
+    def _uploaded_by_username(self):
+        self.client.force_authenticate(user=self.uploader)
+        resp = self.client.get(f"/api/v1/accounts/accounts/{self.acct.id}/artifacts/")
+        self.assertEqual(resp.status_code, 200)
+        return resp.data[0]["uploaded_by_username"]
+
+    def test_falls_back_to_username_with_no_name_set(self):
+        _make_artifact(self.acct, self.uploader, "Doc")
+        self.assertEqual(self._uploaded_by_username(), "creator_display_user")
+
+    def test_prefers_full_name_over_username(self):
+        self.uploader.first_name = "Ada"
+        self.uploader.last_name = "Lovelace"
+        self.uploader.save()
+        _make_artifact(self.acct, self.uploader, "Doc")
+        self.assertEqual(self._uploaded_by_username(), "Ada Lovelace")
+
+    def test_prefers_profile_display_name_over_full_name(self):
+        from team.models import UserProfile
+
+        self.uploader.first_name = "Ada"
+        self.uploader.last_name = "Lovelace"
+        self.uploader.save()
+        UserProfile.objects.create(user=self.uploader, display_name="Ada L.")
+        _make_artifact(self.acct, self.uploader, "Doc")
+        self.assertEqual(self._uploaded_by_username(), "Ada L.")
+
+    def test_no_uploader_gives_none(self):
+        artifact = _make_artifact(self.acct, self.uploader, "Doc")
+        artifact.uploaded_by = None
+        artifact.save()
+        self.assertIsNone(self._uploaded_by_username())
+
+
 # ── sf_project_id round trip ────────────────────────────────────────────────────
 
 
@@ -703,3 +914,445 @@ class ProjectMemberViewSetTests(APITestCase):
         resp = self.client.get(PROJECT_MEMBERS_URL)
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.data["count"], 2)
+
+
+# ── Cloud Coach membership push ───────────────────────────────────────────────
+#
+# Linking a person to an account or a project should also add them in Cloud Coach, so they
+# can log time against it. The push is deliberately **best effort**: the local link is
+# valid whether or not Salesforce accepted it, and discarding it because a third party was
+# unreachable would cost the user work they just did. Every test below asserts the local
+# row survives.
+
+SYNC_MEMBERS_URL = "/api/v1/accounts/projects/{pk}/sync-members-to-salesforce/"
+
+
+def _pushed(member_name="Someone", project_name="P"):
+    return {
+        "status": "pushed",
+        "mechanism": "role_field",
+        "field": "Deliverability__c",
+        "member_name": member_name,
+        "project_name": project_name,
+        "message": f"{member_name} added to {project_name} in Cloud Coach.",
+    }
+
+
+class AccountMemberDropCloudCoachPushTest(APITestCase):
+    """A team member dragged onto an account on the Accounts page."""
+
+    def setUp(self):
+        cache.clear()
+        self.user = _make_user("cc_dropper")
+        self.account = _make_account("Acme CC", admin_owner=self.user)
+        self.owner_member = _make_team_member(self.user)
+        self.account.team_members.add(self.owner_member)
+        self.new_user = _make_user("cc_newbie")
+        self.new_member = _make_team_member(self.new_user)
+        # `_validate_account_write_fks` only lets a non-staff caller add TeamMembers they
+        # already share an account with — which is exactly what the Accounts page's member
+        # panel lists. Sharing a second account reproduces that, rather than weakening the
+        # guard to suit the test.
+        # A plain shared account, not a second admin_owner one: Account.admin_owner is
+        # unique, so a user can only ever own one.
+        self.shared = _make_account("Shared CC")
+        self.shared.team_members.add(self.owner_member, self.new_member)
+        self.client.force_authenticate(user=self.user)
+
+    def _patch_members(self, member_ids):
+        return self.client.patch(
+            f"{ACCOUNTS_URL}{self.account.id}/",
+            {"team_member_ids": member_ids},
+            format="json",
+        )
+
+    def test_a_single_linked_project_pushes_the_new_member(self):
+        project = _make_project(self.account, "Only Project", sf_project_id="a0B000000000001")
+
+        with mock.patch(
+            "salesforce_sync.project_members.push_member_to_project",
+            return_value=_pushed(self.new_member.full_name, project.name),
+        ) as push:
+            resp = self._patch_members([self.owner_member.id, self.new_member.id])
+
+        self.assertEqual(resp.status_code, 200)
+        push.assert_called_once()
+        self.assertEqual(push.call_args[0][1], "a0B000000000001")
+        self.assertEqual(push.call_args[0][2], self.new_member)
+        # The outcome rides back on the response so the page can show a toast.
+        self.assertEqual(len(resp.data["cloud_coach_pushes"]), 1)
+        # And the local per-project membership is recorded too.
+        self.assertTrue(
+            ProjectMember.objects.filter(project=project, team_member=self.new_member).exists()
+        )
+
+    def test_several_linked_projects_push_nothing(self):
+        # With more than one there is no defensible guess, so the link stays local and the
+        # user assigns them on the account page.
+        _make_project(self.account, "First", sf_project_id="a0B000000000001")
+        _make_project(self.account, "Second", sf_project_id="a0B000000000002")
+
+        with mock.patch("salesforce_sync.project_members.push_member_to_project") as push:
+            resp = self._patch_members([self.owner_member.id, self.new_member.id])
+
+        push.assert_not_called()
+        self.assertNotIn("cloud_coach_pushes", resp.data)
+        self.assertIn(self.new_member, self.account.team_members.all())
+
+    def test_a_project_with_no_salesforce_id_pushes_nothing(self):
+        _make_project(self.account, "Local Only")
+
+        with mock.patch("salesforce_sync.project_members.push_member_to_project") as push:
+            self._patch_members([self.owner_member.id, self.new_member.id])
+
+        push.assert_not_called()
+
+    def test_an_account_with_no_projects_pushes_nothing(self):
+        with mock.patch("salesforce_sync.project_members.push_member_to_project") as push:
+            self._patch_members([self.owner_member.id, self.new_member.id])
+
+        push.assert_not_called()
+
+    def test_only_newly_added_members_are_pushed(self):
+        # Re-saving the account must not re-push everyone already on it.
+        _make_project(self.account, "Only", sf_project_id="a0B000000000001")
+
+        with mock.patch("salesforce_sync.project_members.push_member_to_project") as push:
+            self._patch_members([self.owner_member.id])
+
+        push.assert_not_called()
+
+    def test_a_salesforce_failure_still_links_the_member_locally(self):
+        _make_project(self.account, "Only", sf_project_id="a0B000000000001")
+
+        with mock.patch(
+            "salesforce_sync.project_members.push_member_to_project",
+            side_effect=RuntimeError("Salesforce down"),
+        ):
+            resp = self._patch_members([self.owner_member.id, self.new_member.id])
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(self.new_member, self.account.team_members.all())
+        self.assertEqual(resp.data["cloud_coach_pushes"][0]["status"], "error")
+
+    def test_an_unrelated_account_patch_carries_no_push_key(self):
+        # Guards the response shape: every existing consumer must see a byte-identical body.
+        _make_project(self.account, "Only", sf_project_id="a0B000000000001")
+
+        resp = self.client.patch(
+            f"{ACCOUNTS_URL}{self.account.id}/", {"industry": "Tech"}, format="json"
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotIn("cloud_coach_pushes", resp.data)
+
+
+class ProjectMemberCloudCoachPushTest(APITestCase):
+    """Assigning a member to a specific project on the account page."""
+
+    def setUp(self):
+        cache.clear()
+        self.user = _make_user("cc_assigner")
+        self.account = _make_account("Acme CC2", admin_owner=self.user)
+        self.member = _make_team_member(self.user)
+        self.account.team_members.add(self.member)
+        self.project = _make_project(
+            self.account, "Assigned Project", sf_project_id="a0B000000000007"
+        )
+        self.client.force_authenticate(user=self.user)
+
+    def _create(self):
+        return self.client.post(
+            PROJECT_MEMBERS_URL,
+            {"project": self.project.id, "team_member": self.member.id},
+            format="json",
+        )
+
+    def test_creating_a_project_member_pushes_to_cloud_coach(self):
+        with mock.patch(
+            "salesforce_sync.project_members.push_member_to_project",
+            return_value=_pushed(self.member.full_name, self.project.name),
+        ) as push:
+            resp = self._create()
+
+        self.assertEqual(resp.status_code, 201)
+        push.assert_called_once_with(self.user, "a0B000000000007", self.member)
+        self.assertEqual(resp.data["cloud_coach"]["status"], "pushed")
+
+    def test_a_project_with_no_salesforce_id_pushes_nothing(self):
+        self.project.sf_project_id = ""
+        self.project.save(update_fields=["sf_project_id"])
+
+        with mock.patch("salesforce_sync.project_members.push_member_to_project") as push:
+            resp = self._create()
+
+        self.assertEqual(resp.status_code, 201)
+        push.assert_not_called()
+        self.assertNotIn("cloud_coach", resp.data)
+
+    def test_a_salesforce_failure_still_creates_the_local_row(self):
+        with mock.patch(
+            "salesforce_sync.project_members.push_member_to_project",
+            side_effect=RuntimeError("Salesforce down"),
+        ):
+            resp = self._create()
+
+        self.assertEqual(resp.status_code, 201)
+        self.assertTrue(
+            ProjectMember.objects.filter(project=self.project, team_member=self.member).exists()
+        )
+        self.assertEqual(resp.data["cloud_coach"]["status"], "error")
+
+    def test_removing_a_member_does_not_touch_salesforce(self):
+        # Clearing a named project role or deleting a Resource Assignment is destructive
+        # and was not asked for.
+        pm = ProjectMember.objects.create(project=self.project, team_member=self.member)
+
+        with mock.patch("salesforce_sync.project_members.push_member_to_project") as push:
+            resp = self.client.delete(f"{PROJECT_MEMBERS_URL}{pm.id}/")
+
+        self.assertEqual(resp.status_code, 204)
+        push.assert_not_called()
+
+
+class SyncMembersToSalesforceActionTest(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.user = _make_user("cc_syncer")
+        self.account = _make_account("Acme CC3", admin_owner=self.user)
+        self.member = _make_team_member(self.user)
+        self.account.team_members.add(self.member)
+        self.project = _make_project(
+            self.account, "Backfill Project", sf_project_id="a0B000000000009"
+        )
+        ProjectMember.objects.create(project=self.project, team_member=self.member)
+        self.url = SYNC_MEMBERS_URL.format(pk=self.project.id)
+
+    def test_requires_auth(self):
+        resp = self.client.post(self.url, {"dry_run": True}, format="json")
+        self.assertEqual(resp.status_code, 401)
+
+    def test_dry_run_previews_without_writing(self):
+        self.client.force_authenticate(user=self.user)
+        with mock.patch(
+            "salesforce_sync.project_members.sync_project_members",
+            return_value={"status": "ok", "dry_run": True, "counts": {"pushed": 1}, "results": []},
+        ) as sync:
+            resp = self.client.post(self.url, {"dry_run": True}, format="json")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(sync.call_args.kwargs["dry_run"])
+        self.assertTrue(resp.data["dry_run"])
+
+    def test_a_real_run_defaults_dry_run_off(self):
+        self.client.force_authenticate(user=self.user)
+        with mock.patch(
+            "salesforce_sync.project_members.sync_project_members",
+            return_value={"status": "ok", "dry_run": False, "counts": {}, "results": []},
+        ) as sync:
+            self.client.post(self.url, {}, format="json")
+
+        self.assertFalse(sync.call_args.kwargs["dry_run"])
+
+    def test_a_non_member_cannot_sync(self):
+        outsider = _make_user("cc_outsider")
+        self.client.force_authenticate(user=outsider)
+        resp = self.client.post(self.url, {"dry_run": True}, format="json")
+        self.assertIn(resp.status_code, [403, 404])
+
+    def test_a_disconnected_salesforce_is_a_400(self):
+        self.client.force_authenticate(user=self.user)
+        with mock.patch(
+            "salesforce_sync.project_members.sync_project_members",
+            side_effect=PermissionError("not connected"),
+        ):
+            resp = self.client.post(self.url, {"dry_run": True}, format="json")
+
+        self.assertEqual(resp.status_code, 400)
+
+    def test_an_unexpected_failure_is_a_502_with_a_fixed_message(self):
+        self.client.force_authenticate(user=self.user)
+        with mock.patch(
+            "salesforce_sync.project_members.sync_project_members",
+            side_effect=RuntimeError("token boom"),
+        ):
+            resp = self.client.post(self.url, {"dry_run": True}, format="json")
+
+        self.assertEqual(resp.status_code, 502)
+        self.assertNotIn("token boom", resp.data["detail"])
+
+
+class AccountProjectBlankNameTests(APITestCase):
+    """
+    A goal must be creatable with no name yet.
+
+    "+ Add Goal" in ProjectGoals.tsx creates the row first and lets the user type
+    the name into the card afterwards. While `name` was required, DRF rejected
+    every one of those POSTs with 400 and the frontend discarded the error, so no
+    goal ever persisted — the bug this class pins.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.user = _make_user("blankname_user", is_staff=True)
+        self.client.force_authenticate(user=self.user)
+        self.account = _make_account("Siemens")
+
+    def test_a_goal_can_be_created_with_a_blank_name(self):
+        resp = self.client.post(
+            PROJECTS_URL,
+            {"account": self.account.id, "name": "", "kind": "goal"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertEqual(resp.data["name"], "")
+        self.assertEqual(resp.data["kind"], "goal")
+
+    def test_a_goal_created_blank_can_then_be_named(self):
+        created = self.client.post(
+            PROJECTS_URL,
+            {"account": self.account.id, "name": "", "kind": "goal"},
+            format="json",
+        )
+        pk = created.data["id"]
+        resp = self.client.patch(f"{PROJECTS_URL}{pk}/", {"name": "Reduce churn"}, format="json")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(AccountProject.objects.get(pk=pk).name, "Reduce churn")
+
+    def test_name_may_be_omitted_entirely(self):
+        resp = self.client.post(
+            PROJECTS_URL, {"account": self.account.id, "kind": "goal"}, format="json",
+        )
+        self.assertEqual(resp.status_code, 201, resp.data)
+
+    def test_a_blank_goal_round_trips_its_linked_ids(self):
+        """The linked arrays are the payload that was being lost with the 400."""
+        resp = self.client.post(
+            PROJECTS_URL,
+            {
+                "account": self.account.id, "name": "", "kind": "goal",
+                "action_ids": ["rec1", "rec2"],
+                "resources": [{"id": "r1", "label": "Design doc", "url": "https://x.test"}],
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201, resp.data)
+        row = AccountProject.objects.get(pk=resp.data["id"])
+        self.assertEqual(row.action_ids, ["rec1", "rec2"])
+        self.assertEqual(row.resources[0]["label"], "Design doc")
+
+
+class AccountArtifactHtmlUploadTests(APITestCase):
+    """POST /accounts/accounts/<pk>/artifacts/ must accept .html and store it sanitized."""
+
+    def setUp(self):
+        cache.clear()
+        self.user = _make_user("html_upload_user", is_staff=True)
+        self.client.force_authenticate(user=self.user)
+        self.account = _make_account("Acme")
+        self.url = f"/api/v1/accounts/accounts/{self.account.id}/artifacts/"
+
+    def _upload(self, filename, body: bytes):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        return self.client.post(
+            self.url,
+            {
+                "artifact_type": "file",
+                "name": filename,
+                "file": SimpleUploadedFile(filename, body, content_type="text/html"),
+            },
+            format="multipart",
+        )
+
+    def test_an_html_upload_is_accepted(self):
+        resp = self._upload("report.html", b"<html><body><h1>Q3</h1></body></html>")
+        self.assertEqual(resp.status_code, 201, resp.data)
+
+    def test_the_stored_html_has_its_scripts_removed(self):
+        resp = self._upload(
+            "evil.html",
+            b'<html><body><p>keep</p><script>alert(1)</script>'
+            b'<img src="/a.png" onerror="alert(2)"></body></html>',
+        )
+        self.assertEqual(resp.status_code, 201, resp.data)
+        artifact = AccountArtifact.objects.get(pk=resp.data["id"])
+        stored = artifact.file.read().decode("utf-8")
+        self.assertNotIn("<script", stored.lower())
+        self.assertNotIn("alert(1)", stored)
+        self.assertNotIn("onerror", stored.lower())
+        self.assertIn("keep", stored)
+        artifact.file.delete(save=False)
+
+    def test_a_benign_html_upload_keeps_its_content(self):
+        resp = self._upload(
+            "report.html",
+            b"<html><body><h1>Q3 Summary</h1><table><tr><td>MRR</td></tr></table></body></html>",
+        )
+        artifact = AccountArtifact.objects.get(pk=resp.data["id"])
+        stored = artifact.file.read().decode("utf-8")
+        self.assertIn("Q3 Summary", stored)
+        self.assertIn("<table>", stored)
+        artifact.file.delete(save=False)
+
+    def test_still_blocked_extensions_are_still_rejected(self):
+        for name in ("script.js", "hack.py", "run.sh", "vector.svg"):
+            resp = self._upload(name, b"payload")
+            self.assertEqual(resp.status_code, 400, f"{name} should be rejected")
+            self.assertIn("not permitted", resp.data["error"])
+
+    def test_undecodable_html_is_rejected_rather_than_stored_unexamined(self):
+        resp = self._upload("broken.html", b"\xff\xfe\x00\x00\xd8\x00binary")
+        self.assertIn(resp.status_code, (201, 400))
+        if resp.status_code == 201:
+            AccountArtifact.objects.get(pk=resp.data["id"]).file.delete(save=False)
+
+
+class MediaSecurityHeadersMiddlewareTests(APITestCase):
+    """
+    The second of the two layers guarding uploaded HTML.
+
+    Scoped to HTML content types on purpose: a blanket sandbox would also hit
+    PDFs, whose browser viewers need scripting, turning a header into a visible
+    regression.
+    """
+
+    def _response(self, content_type):
+        from django.http import HttpResponse
+        from core.middleware import MediaSecurityHeadersMiddleware
+        from django.test import RequestFactory
+
+        middleware = MediaSecurityHeadersMiddleware(
+            lambda request: HttpResponse(b"x", content_type=content_type)
+        )
+        return middleware(RequestFactory().get("/media/account_artifacts/2026/09/x"))
+
+    def test_html_media_is_sandboxed(self):
+        resp = self._response("text/html")
+        csp = resp["Content-Security-Policy"]
+        self.assertIn("sandbox", csp)
+        self.assertIn("default-src 'none'", csp)
+        # No allow-scripts token — that is what makes script execution impossible.
+        self.assertNotIn("allow-scripts", csp)
+        self.assertEqual(resp["X-Content-Type-Options"], "nosniff")
+
+    def test_pdf_media_is_not_sandboxed(self):
+        resp = self._response("application/pdf")
+        self.assertNotIn("Content-Security-Policy", resp)
+        self.assertEqual(resp["X-Content-Type-Options"], "nosniff")
+
+    def test_images_are_not_sandboxed_but_do_get_nosniff(self):
+        resp = self._response("image/png")
+        self.assertNotIn("Content-Security-Policy", resp)
+        self.assertEqual(resp["X-Content-Type-Options"], "nosniff")
+
+    def test_non_media_paths_are_untouched(self):
+        from django.http import HttpResponse
+        from core.middleware import MediaSecurityHeadersMiddleware
+        from django.test import RequestFactory
+
+        middleware = MediaSecurityHeadersMiddleware(
+            lambda request: HttpResponse(b"x", content_type="text/html")
+        )
+        resp = middleware(RequestFactory().get("/api/v1/accounts/accounts/"))
+        self.assertNotIn("Content-Security-Policy", resp)
+        self.assertNotIn("X-Content-Type-Options", resp)

@@ -239,6 +239,7 @@ export function ActionItemCard({
           meetings={meetings}
           onClose={() => setModalOpen(false)}
           onUpdated={(updated) => { onUpdated?.(updated); setModalOpen(false); }}
+          onAutosaved={(updated) => onUpdated?.(updated)}
           onConverted={() => { onUpdated?.({ ...item, status: "Done" } as AirtableActionItem); setModalOpen(false); }}
           onDeleted={(id) => { onDeleted?.(id); setModalOpen(false); }}
         />

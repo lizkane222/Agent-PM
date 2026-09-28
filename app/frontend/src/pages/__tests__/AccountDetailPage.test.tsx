@@ -4,7 +4,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { http, HttpResponse } from "msw";
 import { server } from "../../test/msw-server";
-import { mockAccount, mockAccountNote, mockAirtableAccount, mockProject, mockProjectMember } from "../../test/handlers/accounts";
+import { mockAccount, mockAccountNote, mockAirtableAccount, mockArtifact, mockProject, mockProjectMember } from "../../test/handlers/accounts";
 import type { Account } from "../../types";
 import { mockTeamMembers } from "../../test/handlers/team";
 
@@ -145,8 +145,26 @@ const itemNone  = makeItem({ airtable_id: "recCCC003", id: 3, task: "Unassigned 
 const itemBeforeMeeting = makeItem({ airtable_id: "recD001", id: 4, task: "Before task", assignee_name: "Alice Smith", due_date: daysFromNow(5) });
 const itemAfterMeeting  = makeItem({ airtable_id: "recE002", id: 5, task: "After task",  assignee_name: "Bob Jones",   due_date: daysFromNow(20) });
 
+/**
+ * Register the page's mount-time handlers.
+ *
+ * The action-items list is served from a mutable array, and the status PATCH writes into
+ * it — i.e. the fake behaves like the real server rather than like a snapshot. Any
+ * mutation on this page broadcasts `actionItemsUpdated`, which triggers a silent refetch;
+ * against a static handler that refetch answers with the PRE-mutation statuses and
+ * reverts the optimistic update, so a drag test could never observe its own drop. That is
+ * a defect in the fixture, not in the page: the reverting refetch is the fake insisting
+ * nothing changed.
+ */
 function registerHandlers(items = [itemAlice, itemBob, itemNone]) {
+  const live = items.map((i) => ({ ...i }));
   server.use(
+    http.patch("/api/v1/airtable/action-items/:id/status/", async ({ request, params }) => {
+      const body = (await request.json()) as { status?: string };
+      const row = live.find((i) => i.airtable_id === String(params.id) || String(i.id) === String(params.id));
+      if (row && body.status) row.status = body.status as typeof row.status;
+      return HttpResponse.json(row ?? {});
+    }),
     http.get("/api/v1/accounts/accounts/:id/", () => HttpResponse.json(mockAccountWithMembers)),
     http.get("/api/v1/accounts/accounts/:id/notes/", () => HttpResponse.json([])),
     http.get("/api/v1/accounts/accounts/:id/calendar-events/", () => HttpResponse.json([])),
@@ -156,7 +174,7 @@ function registerHandlers(items = [itemAlice, itemBob, itemNone]) {
     http.get("/api/v1/accounts/projects/", () => HttpResponse.json({ results: [], count: 0 })),
     http.get("/api/v1/team/members/", () => HttpResponse.json({ results: mockTeamMembers, count: mockTeamMembers.length })),
     http.get("/api/v1/team/profiles/me/", () => new HttpResponse(null, { status: 404 })),
-    http.get("/api/v1/airtable/action-items/", () => HttpResponse.json(items)),
+    http.get("/api/v1/airtable/action-items/", () => HttpResponse.json(live)),
     http.get("/api/v1/airtable/meetings/", () => HttpResponse.json({ results: [mockMeetingFuture] })),
     http.get("/api/v1/airtable/accounts/", () => HttpResponse.json({ results: [mockAirtableAccount] })),
     http.get("/api/v1/airtable/action-items/field-options/", () =>
@@ -260,6 +278,85 @@ describe("AccountDetailPage — Project Goals", () => {
     await renderPage();
     await screen.findByRole("button", { name: /Segment Data Deletion/i });
     expect(await screen.findByTitle("Ashley Shadday")).toBeInTheDocument();
+  });
+
+  it("excludes an action item claimed by a project from the drag-source strip, and restores it when removed", async () => {
+    server.use(
+      http.get("/api/v1/accounts/projects/", () => HttpResponse.json({
+        results: [{ ...mockProject, id: 7, name: "Segment Data Deletion", action_ids: [itemAlice.airtable_id] }],
+        count: 1,
+      })),
+    );
+    await renderPage();
+
+    const projectRow = await screen.findByTestId("project-row-7");
+    // Claimed by the project — must not appear in the drag-source strip above.
+    const stripLabel = screen.getByText(/Drag to a goal section below/i);
+    const stripContainer = stripLabel.parentElement as HTMLElement;
+    expect(within(stripContainer).queryByText("Alice task")).not.toBeInTheDocument();
+    // It does render, collapsed, under the project that claims it.
+    expect(within(projectRow).getByText("Alice task")).toBeInTheDocument();
+
+    // Remove it from the project via its ✕.
+    const collapsedRow = within(projectRow).getByText("Alice task").closest("[draggable]") as HTMLElement;
+    fireEvent.click(within(collapsedRow).getByText("✕"));
+
+    await waitFor(() => {
+      expect(within(stripContainer).getByText("Alice task")).toBeInTheDocument();
+    });
+  });
+
+  it("flushes an action item dragged onto a brand-new goal while its create request is still in flight", async () => {
+    server.use(
+      http.get("/api/v1/accounts/projects/", () => HttpResponse.json({
+        results: [{ ...mockProject, id: 7, name: "Segment Data Deletion" }], count: 1,
+      })),
+    );
+
+    let createdBody: Record<string, unknown> | null = null;
+    let resolveCreate: (() => void) | null = null;
+    const patchBodies: Array<{ id: string; body: Record<string, unknown> }> = [];
+    server.use(
+      http.post("/api/v1/accounts/projects/", async ({ request }) => {
+        createdBody = (await request.json()) as Record<string, unknown>;
+        return new Promise((resolve) => {
+          resolveCreate = () => resolve(HttpResponse.json({ ...createdBody, id: 99 }, { status: 201 }));
+        });
+      }),
+      http.patch("/api/v1/accounts/projects/:id/", async ({ request, params }) => {
+        const body = (await request.json()) as Record<string, unknown>;
+        patchBodies.push({ id: String(params.id), body });
+        return HttpResponse.json({ id: Number(params.id), ...body });
+      }),
+    );
+
+    await renderPage();
+    const projectRow = await screen.findByTestId("project-row-7");
+
+    // Create a new goal under this project. The create POST is held open by
+    // resolveCreate, so the goal exists only client-side (a uid, not a real id) below.
+    fireEvent.click(within(projectRow).getByText("+ Add Goal"));
+    await waitFor(() => expect(createdBody).not.toBeNull());
+
+    const goalRows = within(projectRow).getAllByTestId((id) => id.startsWith("goal-row-"));
+    expect(goalRows).toHaveLength(1);
+    const newGoalRow = goalRows[0];
+
+    // Drag "Alice task" (from the strip above) onto the not-yet-persisted goal.
+    fireEvent.drop(newGoalRow, {
+      dataTransfer: {
+        getData: (key: string) => (key === "goalActionId" ? itemAlice.airtable_id : ""),
+        types: ["goalactionid"],
+      },
+    });
+
+    // Now let the create POST resolve.
+    resolveCreate!();
+
+    await waitFor(() => expect(patchBodies.length).toBeGreaterThan(0));
+    const flush = patchBodies[patchBodies.length - 1];
+    expect(flush.id).toBe("99");
+    expect(flush.body.action_ids).toEqual([itemAlice.airtable_id]);
   });
 });
 
@@ -471,9 +568,6 @@ describe("AccountDetailPage — kanban views", () => {
         makeItem({ airtable_id: "recP2", id: 2, task: "Just moved", status: "Open", created_at: "2020-01-01T00:00:00Z" }),
         makeItem({ airtable_id: "recP1", id: 1, task: "Already running", status: "In Progress", created_at: "2026-01-01T00:00:00Z" }),
       ]);
-      server.use(
-        http.patch("/api/v1/airtable/action-items/:id/status/", () => HttpResponse.json({}))
-      );
       await renderPage();
       const section = await getSection();
       await waitFor(() => within(section).getByText("Just moved"));
@@ -496,9 +590,6 @@ describe("AccountDetailPage — kanban views", () => {
         makeItem({ airtable_id: "recQ1", id: 1, task: "Dragged second", status: "Open", created_at: "2026-01-01T00:00:00Z" }),
         makeItem({ airtable_id: "recQ2", id: 2, task: "Dragged first", status: "Open", created_at: "2026-02-01T00:00:00Z" }),
       ]);
-      server.use(
-        http.patch("/api/v1/airtable/action-items/:id/status/", () => HttpResponse.json({}))
-      );
       await renderPage();
       const section = await getSection();
       await waitFor(() => within(section).getByText("Dragged first"));
@@ -595,6 +686,51 @@ describe("AccountDetailPage — kanban views", () => {
       // A linked account never falls back to the name scope.
       expect(calls.every((c) => c.name === null)).toBe(true);
     });
+  });
+});
+
+// ── Action item modal: drag files to attach ────────────────────────────────────
+
+describe("AccountDetailPage — action item modal file drop", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    localStorage.clear();
+    registerHandlers();
+    server.use(
+      http.get("/api/v1/airtable/action-items/:id/attachments/", () => HttpResponse.json([])),
+    );
+  });
+
+  it("uploads a file dragged onto the modal, same as the + File button", async () => {
+    server.use(
+      http.post("/api/v1/airtable/action-items/:id/attachments/", () =>
+        HttpResponse.json({ id: 42, artifact_type: "file", name: "dragged.pdf", url: "", file_url: "u" }, { status: 201 })
+      )
+    );
+    await renderPage();
+    const section = await getSection();
+    await waitFor(() => within(section).getByText("Alice task"));
+    fireEvent.click(within(section).getByText("Alice task"));
+
+    const panel = await screen.findByTestId("action-item-modal-panel");
+    const file = new File(["hello"], "dragged.pdf", { type: "application/pdf" });
+    fireEvent.drop(panel, { dataTransfer: { types: ["Files"], files: [file] } });
+
+    await waitFor(() => expect(within(panel).getByText("dragged.pdf")).toBeInTheDocument());
+  });
+
+  it("shows a drop overlay while a file is dragged over the modal", async () => {
+    await renderPage();
+    const section = await getSection();
+    await waitFor(() => within(section).getByText("Alice task"));
+    fireEvent.click(within(section).getByText("Alice task"));
+
+    const panel = await screen.findByTestId("action-item-modal-panel");
+    fireEvent.dragEnter(panel, { dataTransfer: { types: ["Files"], files: [] } });
+    expect(within(panel).getByText("Drop files to attach")).toBeInTheDocument();
+
+    fireEvent.drop(panel, { dataTransfer: { types: ["Files"], files: [] } });
+    expect(within(panel).queryByText("Drop files to attach")).not.toBeInTheDocument();
   });
 });
 
@@ -887,5 +1023,170 @@ describe("AccountDetailPage — Enter adds a note", () => {
     await waitFor(() => expect(calls).toBe(1));
     await new Promise((r) => setTimeout(r, 30));
     expect(calls).toBe(1);
+  });
+});
+
+// ── Meeting summary "@" mention detection ──────────────────────────────────────
+//
+// Regression coverage for: pasting meeting summary notes on the Account Detail page
+// prefixed every word with "@" instead of only known account-team members' names.
+// mockAccountWithMembers.team_members is fixed to [Alice Smith, Bob Jones] (see above),
+// so these tests vary only the org-wide /team/members/ roster to prove detectMentions
+// is scoped to the account's own team, not every member in the org.
+
+describe("AccountDetailPage — meeting summary mention detection", () => {
+  // AccountTimeline only renders weekday columns (see buildDayWindow in
+  // AccountDetailPage.tsx), so a meeting date landing on a Sat/Sun has nowhere to
+  // render and the "Q3 Review" button silently never appears. FUTURE_MEETING_DATE
+  // (today + 10 days) is a fixed offset that happens to land on a weekend on some
+  // days of the year — walk forward to the next weekday instead of reusing it.
+  function nextWeekdayMeetingDate(daysAhead: number): string {
+    const d = new Date();
+    d.setDate(d.getDate() + daysAhead);
+    while (d.getDay() === 0 || d.getDay() === 6) d.setDate(d.getDate() + 1);
+    return d.toISOString().slice(0, 10);
+  }
+  const weekdayMeeting = { ...mockMeetingFuture, date: nextWeekdayMeetingDate(5) };
+
+  beforeEach(() => {
+    vi.resetModules();
+    localStorage.clear();
+    registerHandlers();
+    server.use(
+      http.get("/api/v1/airtable/meetings/", () => HttpResponse.json({ results: [weekdayMeeting] })),
+      http.post("/api/v1/integrations/slack/notify-mention/", () =>
+        HttpResponse.json({ detail: "ok" })
+      )
+    );
+  });
+
+  async function openMeetingSummaryPanel() {
+    await renderPage();
+    const meetingBtn = await screen.findByRole("button", { name: "Q3 Review" });
+    fireEvent.click(meetingBtn);
+    return await screen.findByPlaceholderText(/Paste your Gong notes/i);
+  }
+
+  function exactParagraph(text: string) {
+    return (_content: string, el: Element | null) =>
+      el?.tagName === "P" && el.textContent === text;
+  }
+
+  it("does not @-prefix every word when a team member has a blank full_name", async () => {
+    const blankNameMember = { ...mockTeamMembers[0], id: 50, full_name: "   ", email: "blank@example.com" };
+    server.use(
+      http.get("/api/v1/team/members/", () =>
+        HttpResponse.json({ results: [...mockTeamMembers, blankNameMember], count: mockTeamMembers.length + 1 })
+      )
+    );
+
+    const textarea = await openMeetingSummaryPanel();
+    fireEvent.change(textarea, { target: { value: "Widgets are shipping today" } });
+    fireEvent.click(screen.getByRole("button", { name: "Parse & Save" }));
+
+    // If the blank name degenerated the match into a zero-width regex, this exact
+    // sentence would never appear — every word would have picked up an "@" prefix.
+    await screen.findByText(exactParagraph("Widgets are shipping today"));
+  });
+
+  it("does not @-prefix a name that is in the org roster but not on this account's team", async () => {
+    const outsideMember = { ...mockTeamMembers[0], id: 99, full_name: "Carol Diaz", email: "carol@example.com" };
+    server.use(
+      http.get("/api/v1/team/members/", () =>
+        HttpResponse.json({ results: [...mockTeamMembers, outsideMember], count: mockTeamMembers.length + 1 })
+      )
+    );
+
+    const textarea = await openMeetingSummaryPanel();
+    fireEvent.change(textarea, { target: { value: "Carol Diaz will follow up" } });
+    fireEvent.click(screen.getByRole("button", { name: "Parse & Save" }));
+
+    await screen.findByText(exactParagraph("Carol Diaz will follow up"));
+    expect(screen.queryByText(exactParagraph("@Carol Diaz will follow up"))).not.toBeInTheDocument();
+  });
+
+  it("@-prefixes a name that IS on this account's team", async () => {
+    const textarea = await openMeetingSummaryPanel();
+    fireEvent.change(textarea, { target: { value: "Alice Smith will follow up" } });
+    fireEvent.click(screen.getByRole("button", { name: "Parse & Save" }));
+
+    await screen.findByText(exactParagraph("@Alice Smith will follow up"));
+  });
+});
+
+// ── Artifacts: description, creator, linked records ───────────────────────────
+// The page keeps its own local ArtifactsPanel / AddArtifactModal / ArtifactViewer
+// (additive-edits-only per CLAUDE.md), so the shared component's suite does not
+// cover these surfaces — they are asserted separately here.
+
+describe("AccountDetailPage — artifact description, creator and linked records", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    localStorage.clear();
+    registerHandlers();
+  });
+
+  it("shows who added an artifact, and a used-in count when it is referenced elsewhere", async () => {
+    server.use(
+      http.get("/api/v1/accounts/accounts/:id/artifacts/", () =>
+        HttpResponse.json([{
+          ...mockArtifact,
+          uploaded_by_username: "bob",
+          used_in: [
+            { resource_type: "calendar_event", resource_id: 7, label: "Kickoff call", url: "/calendar" },
+            { resource_type: "action_item", resource_id: 9, label: "Send SOW", url: "/action-items" },
+          ],
+        }])
+      ),
+    );
+    await renderPage();
+    await waitFor(() => expect(screen.getByText("bob")).toBeInTheDocument());
+    expect(screen.getByText("used in 2")).toBeInTheDocument();
+  });
+
+  it("the viewer shows the description and both link directions", async () => {
+    server.use(
+      http.get("/api/v1/accounts/accounts/:id/artifacts/", () =>
+        HttpResponse.json([{
+          ...mockArtifact,
+          description: "<p>Signed contract</p>",
+          uploaded_by_username: "bob",
+          references: [{ resource_type: "meeting", resource_id: 2, label: "Weekly sync", url: "/calendar" }],
+          used_in: [{ resource_type: "project", resource_id: 3, label: "Segment rollout", url: "/accounts/1" }],
+        }])
+      ),
+    );
+    await renderPage();
+    await waitFor(() => screen.getByText("Product Spec"));
+    fireEvent.click(screen.getByText("Product Spec"));
+
+    const panel = await screen.findByTestId("artifact-details");
+    expect(panel).toHaveTextContent("Signed contract");
+    expect(panel).toHaveTextContent("Mentions in description");
+    expect(panel).toHaveTextContent("Weekly sync");
+    expect(panel).toHaveTextContent("Used in");
+    expect(panel).toHaveTextContent("Segment rollout");
+  });
+
+  it("the add-artifact modal sends the typed description with the new link", async () => {
+    const posted: Record<string, unknown>[] = [];
+    server.use(
+      http.get("/api/v1/accounts/accounts/:id/artifacts/", () => HttpResponse.json([])),
+      http.post("/api/v1/accounts/accounts/:id/artifacts/", async ({ request }) => {
+        const body = await request.json() as Record<string, unknown>;
+        posted.push(body);
+        return HttpResponse.json({ ...mockArtifact, id: 99, ...body }, { status: 201 });
+      }),
+    );
+    await renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "+ Link" }));
+
+    fireEvent.change(screen.getByPlaceholderText("https://…"), { target: { value: "https://example.com/doc" } });
+    const editors = screen.getAllByTestId("description-editor");
+    fireEvent.change(editors[editors.length - 1], { target: { value: "The source of truth" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add link" }));
+
+    await waitFor(() => expect(posted).toHaveLength(1));
+    expect(posted[0].description).toBe("The source of truth");
   });
 });

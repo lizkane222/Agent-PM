@@ -4,6 +4,7 @@ import { http, HttpResponse } from "msw";
 import { server } from "../../../test/msw-server";
 import { ActionItemModal } from "../ActionItemModal";
 import { getLogsForResource } from "../../../lib/appLog";
+import { apiClient } from "../../../lib/api";
 import type { AirtableActionItem } from "../../../types";
 
 vi.mock("../../comments/CommentContext", () => ({
@@ -123,27 +124,54 @@ describe("ActionItemModal attachments", () => {
     expect(within(attachmentsSection()).getByText(/Attachments \(1\)/)).toBeInTheDocument();
   });
 
+  /**
+   * Asserted on the `FormData` axios was handed, not on the intercepted request body.
+   *
+   * `request.formData()` cannot work here, and not because of anything the app does. Axios
+   * deliberately leaves `Content-Type` for the platform to fill in with its multipart
+   * boundary, but under jsdom the adapter stringifies the `FormData` — the intercepted body
+   * is the literal text `"[object FormData]"` with `Content-Type: text/plain`, so undici
+   * throws `Content-Type was not one of "multipart/form-data"...` before any assertion runs.
+   * Verified against the live server by hand: a real upload returns 201 with the file
+   * stored, so the failure was the harness, never the upload.
+   *
+   * Reading the `FormData` off the outgoing request config keeps what the test is actually
+   * for — that the request carries `artifact_type=file`, the name, and the file itself —
+   * without asserting on a body only this environment mangles. An axios request
+   * interceptor sees the real object before the adapter stringifies it. The sibling test
+   * above already covers the response path.
+   */
   it("sends the file as multipart with artifact_type=file", async () => {
-    let seenType: string | null = null;
-    let seenName: string | null = null;
-    let seenFilename: string | null = null;
+    let sent: FormData | null = null;
+    const interceptorId = apiClient.interceptors.request.use((config) => {
+      if (config.data instanceof FormData && String(config.url).includes("/attachments/")) {
+        sent = config.data;
+      }
+      return config;
+    });
+
     server.use(
-      http.post(ATTACHMENTS_URL, async ({ request }) => {
-        const fd = await request.formData();
-        seenType = String(fd.get("artifact_type"));
-        seenName = String(fd.get("name"));
-        seenFilename = (fd.get("file") as File)?.name ?? null;
-        return HttpResponse.json({ id: 1, artifact_type: "file", name: "notes.pdf", url: "", file_url: "u" }, { status: 201 });
-      })
+      http.post(ATTACHMENTS_URL, () =>
+        HttpResponse.json({ id: 1, artifact_type: "file", name: "notes.pdf", url: "", file_url: "u" }, { status: 201 })
+      )
     );
     renderModal();
     await waitFor(() => expect(screen.getByText("+ File")).toBeInTheDocument());
 
     chooseFile();
 
-    await waitFor(() => expect(seenType).toBe("file"));
-    expect(seenName).toBe("notes.pdf");
-    expect(seenFilename).toBe("notes.pdf");
+    // The attachment renders only if the POST succeeded, so this also pins the round trip.
+    await waitFor(() => expect(screen.getByText("notes.pdf")).toBeInTheDocument());
+
+    try {
+      const fd = sent as FormData | null;
+      expect(fd).not.toBeNull();
+      expect(fd!.get("artifact_type")).toBe("file");
+      expect(fd!.get("name")).toBe("notes.pdf");
+      expect((fd!.get("file") as File)?.name).toBe("notes.pdf");
+    } finally {
+      apiClient.interceptors.request.eject(interceptorId);
+    }
   });
 
   // The bug was invisible because the rejection was swallowed: the user picked a file and
@@ -276,6 +304,78 @@ describe("ActionItemModal attachments", () => {
     expect(screen.queryByText("Checklist")).not.toBeInTheDocument();
   });
 
+  // ── Drag and drop files ──────────────────────────────────────────────────────
+
+  it("uploads a file dragged onto the modal, same as the + File button", async () => {
+    server.use(
+      http.post(ATTACHMENTS_URL, () =>
+        HttpResponse.json({ id: 42, artifact_type: "file", name: "dragged.pdf", url: "", file_url: "u" }, { status: 201 })
+      )
+    );
+    renderModal();
+    await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
+
+    const panel = screen.getByTestId("action-item-modal-panel");
+    const file = new File(["hello"], "dragged.pdf", { type: "application/pdf" });
+    fireEvent.drop(panel, { dataTransfer: { types: ["Files"], files: [file] } });
+
+    await waitFor(() => expect(screen.getByText("dragged.pdf")).toBeInTheDocument());
+  });
+
+  it("shows a drop overlay while a file is dragged over, and clears it on drop", async () => {
+    renderModal();
+    await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
+
+    const panel = screen.getByTestId("action-item-modal-panel");
+    fireEvent.dragEnter(panel, { dataTransfer: { types: ["Files"], files: [] } });
+    expect(screen.getByText("Drop files to attach")).toBeInTheDocument();
+
+    // No file payload here on purpose — the upload path itself is covered by the test
+    // above; this one only pins that the overlay clears on drop.
+    fireEvent.drop(panel, { dataTransfer: { types: ["Files"], files: [] } });
+    expect(screen.queryByText("Drop files to attach")).not.toBeInTheDocument();
+  });
+
+  it("clears the drop overlay on dragLeave without uploading anything", async () => {
+    const patches: unknown[] = [];
+    server.use(http.post(ATTACHMENTS_URL, () => { patches.push(1); return HttpResponse.json({}, { status: 201 }); }));
+    renderModal();
+    await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
+
+    const panel = screen.getByTestId("action-item-modal-panel");
+    fireEvent.dragEnter(panel, { dataTransfer: { types: ["Files"], files: [] } });
+    expect(screen.getByText("Drop files to attach")).toBeInTheDocument();
+
+    fireEvent.dragLeave(panel, { dataTransfer: { types: ["Files"], files: [] } });
+    expect(screen.queryByText("Drop files to attach")).not.toBeInTheDocument();
+    expect(patches).toHaveLength(0);
+  });
+
+  it("ignores a drag that carries no files (e.g. dragging a card over the modal)", async () => {
+    renderModal();
+    await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
+
+    const panel = screen.getByTestId("action-item-modal-panel");
+    fireEvent.dragEnter(panel, { dataTransfer: { types: ["text/plain"], files: [] } });
+    expect(screen.queryByText("Drop files to attach")).not.toBeInTheDocument();
+  });
+
+  it("does not accept a file drop on an unsaved local-* draft", async () => {
+    const patches: unknown[] = [];
+    server.use(http.post(ATTACHMENTS_URL, () => { patches.push(1); return HttpResponse.json({}, { status: 201 }); }));
+    render(<ActionItemModal item={{ ...mockItem, airtable_id: "local-1" }} accountId={1} onClose={vi.fn()} />);
+    await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
+
+    const panel = screen.getByTestId("action-item-modal-panel");
+    const file = new File(["hello"], "dragged.pdf", { type: "application/pdf" });
+    fireEvent.dragEnter(panel, { dataTransfer: { types: ["Files"], files: [] } });
+    expect(screen.queryByText("Drop files to attach")).not.toBeInTheDocument();
+
+    fireEvent.drop(panel, { dataTransfer: { types: ["Files"], files: [file] } });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(patches).toHaveLength(0);
+  });
+
   // ── Slack link ──────────────────────────────────────────────────────────────
 
   it("saves a pasted Slack link straight away, without waiting for Save", async () => {
@@ -286,8 +386,8 @@ describe("ActionItemModal attachments", () => {
         return HttpResponse.json({ ...mockItem, slack_thread_url: SLACK_URL });
       })
     );
-    const onUpdated = vi.fn();
-    render(<ActionItemModal item={mockItem} accountId={1} onClose={vi.fn()} onUpdated={onUpdated} />);
+    const onAutosaved = vi.fn();
+    render(<ActionItemModal item={mockItem} accountId={1} onClose={vi.fn()} onAutosaved={onAutosaved} />);
     await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
 
     fireEvent.click(screen.getByRole("button", { name: /^Slack$/ }));
@@ -297,9 +397,33 @@ describe("ActionItemModal attachments", () => {
     // Every other field on this form is a draft you review before saving. A pasted link is
     // not — before this it was dropped on the floor with no sign anything went wrong.
     await waitFor(() => expect(patches).toEqual([{ slack_thread_url: SLACK_URL }]));
-    expect(onUpdated).toHaveBeenCalled();
+    expect(onAutosaved).toHaveBeenCalled();
     // The chip replacing the input is the only confirmation the user gets.
     await waitFor(() => expect(screen.getByText("Slack ↗")).toBeInTheDocument());
+  });
+
+  // Regression: callers close the modal in response to `onUpdated` (the explicit Save
+  // button). A pasted Slack link used to fire that same callback, so the modal closed itself
+  // the instant a link landed — "paste a link and the modal just closes" was the report.
+  it("does not fire onUpdated for a pasted Slack link — only onAutosaved", async () => {
+    server.use(
+      http.patch("/api/v1/airtable/action-items/:id/fields/", () =>
+        HttpResponse.json({ ...mockItem, slack_thread_url: SLACK_URL })
+      )
+    );
+    const onUpdated = vi.fn();
+    const onAutosaved = vi.fn();
+    render(
+      <ActionItemModal item={mockItem} accountId={1} onClose={vi.fn()} onUpdated={onUpdated} onAutosaved={onAutosaved} />
+    );
+    await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: /^Slack$/ }));
+    const input = screen.getByPlaceholderText("https://…");
+    fireEvent.paste(input, { clipboardData: { getData: () => SLACK_URL } });
+
+    await waitFor(() => expect(onAutosaved).toHaveBeenCalled());
+    expect(onUpdated).not.toHaveBeenCalled();
   });
 
   it("does not write when the pill is opened and dismissed with Escape", async () => {

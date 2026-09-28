@@ -28,10 +28,31 @@ def _get_credential(user):
         raise PermissionError("Salesforce not connected for this user.")
 
 
+def resolve_instance_url(user) -> str:
+    """
+    The API host for this user, preferring what Salesforce itself told us.
+
+    The token response carries an `instance_url`, and it is authoritative: a real org's My
+    Domain host differs from the login host, and a sandbox differs again. Falling back to
+    `settings.SALESFORCE_INSTANCE_URL` covers a user connected before that value was stored.
+
+    Historically this function did not exist and every call used the setting, so a wrong or
+    UI-host value there (e.g. `*.lightning.force.com`, which 302s on
+    `/services/oauth2/token`) broke the integration no matter what Salesforce returned.
+    """
+    from django.conf import settings
+
+    try:
+        stored = (user.sf_config.instance_url or "").strip()
+    except Exception:
+        stored = ""
+    return (stored or settings.SALESFORCE_INSTANCE_URL).rstrip("/")
+
+
 def _refresh_token(cred):
     from django.conf import settings
     resp = requests.post(
-        f"{settings.SALESFORCE_INSTANCE_URL}/services/oauth2/token",
+        f"{resolve_instance_url(cred.user) or settings.SALESFORCE_INSTANCE_URL}/services/oauth2/token",
         data={
             "grant_type": "refresh_token",
             "client_id": settings.SALESFORCE_CLIENT_ID,
@@ -52,10 +73,9 @@ def _refresh_token(cred):
 def get_client(user):
     """Return a configured simple_salesforce Salesforce instance for this user."""
     from simple_salesforce import Salesforce
-    from django.conf import settings
 
     cred = _get_credential(user)
-    instance_url = settings.SALESFORCE_INSTANCE_URL.rstrip("/")
+    instance_url = resolve_instance_url(user)
 
     try:
         sf = Salesforce(

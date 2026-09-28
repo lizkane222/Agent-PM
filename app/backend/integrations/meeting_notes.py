@@ -68,7 +68,9 @@ MAX_SUMMARIES = 25
 EMAIL_WINDOW_BEFORE = timedelta(days=1)
 EMAIL_WINDOW_AFTER = timedelta(days=3)
 
-SUMMARY_MODEL = "claude-opus-5"
+# Resolved from AGENT_MODEL_TIERS at call time via core.llm; this stays only as an
+# explicit override hook (set to a concrete id to pin one).
+SUMMARY_MODEL = ""
 
 FUZZY_THRESHOLD = 0.72
 # Below this length a normalised title is too generic for containment to mean anything
@@ -488,17 +490,16 @@ def summarize_email(body: str, meeting_name: str, source: str) -> str:
     if not body:
         return ""
 
-    api_key = getattr(settings, "ANTHROPIC_API_KEY", "")
-    if not api_key:
-        logger.info("meeting_notes: ANTHROPIC_API_KEY unset — using unsummarised recap text")
-        return fallback_bullets(body)
-
+    # Claude is a normaliser with a fallback here, not a hard dependency: if the
+    # backend is unreachable or unconfigured we still store the vendor's own text,
+    # which is what the user would otherwise have pasted by hand. Losing the recap
+    # entirely would be worse than losing the formatting.
     try:
-        import anthropic
+        from core.llm import TIER_DEFAULT, build_sync_client, model_for_tier
 
-        client = anthropic.Anthropic(api_key=api_key)
+        client = build_sync_client()
         message = client.messages.create(
-            model=SUMMARY_MODEL,
+            model=SUMMARY_MODEL or model_for_tier(TIER_DEFAULT),
             max_tokens=2000,
             messages=[{
                 "role": "user",

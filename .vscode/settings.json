@@ -1,0 +1,13 @@
+{
+  // This repo's backend venv lives at app/backend/.venv. Pointing the editor at it
+  // explicitly because the venv is not at the workspace root, so auto-discovery does
+  // not find it — which is why requirements.txt showed a "not installed in the
+  // selected environment" hint for every declared package.
+  "python.defaultInterpreterPath": "${workspaceFolder}/app/backend/.venv/bin/python",
+  "python.terminal.activateEnvironment": true,
+  "python.testing.unittestEnabled": false,
+  "python.analysis.extraPaths": ["${workspaceFolder}/app/backend"],
+  "files.exclude": {
+    "**/__pycache__": true
+  }
+}

@@ -2,18 +2,21 @@
 
 from rest_framework import serializers
 
+from comments.serializers import _user_display_name
+
 from .models import Account, AccountArtifact, AccountNote, AccountProject, AccountQuickLink, AccountRole, CustomerContact, CustomerContactNote, ProjectMember
 
 
 class AccountArtifactSerializer(serializers.ModelSerializer):
     uploaded_by_username = serializers.SerializerMethodField()
     file_url = serializers.SerializerMethodField()
+    used_in = serializers.SerializerMethodField()
 
     class Meta:
         model = AccountArtifact
         fields = [
             "id", "account", "artifact_type", "name", "url", "secondary_url", "icon_key",
-            "file_url", "mime_type", "file_size",
+            "file_url", "mime_type", "file_size", "description", "references", "used_in",
             "uploaded_by", "uploaded_by_username",
             "created_at", "updated_at",
         ]
@@ -21,15 +24,18 @@ class AccountArtifactSerializer(serializers.ModelSerializer):
         # client-supplied value could misrepresent the artifact in the UI or
         # bypass storage quotas.
         read_only_fields = [
-            "id", "uploaded_by", "uploaded_by_username", "file_url",
+            "id", "uploaded_by", "uploaded_by_username", "file_url", "used_in",
             "mime_type", "file_size",
             "created_at", "updated_at",
         ]
 
     def get_uploaded_by_username(self, obj):
         if obj.uploaded_by:
-            return getattr(obj.uploaded_by, "get_full_name", lambda: None)() or obj.uploaded_by.username
+            return _user_display_name(obj.uploaded_by)
         return None
+
+    def get_used_in(self, obj):
+        return self.context.get("used_in_map", {}).get(obj.id, [])
 
     def get_file_url(self, obj):
         if obj.file:

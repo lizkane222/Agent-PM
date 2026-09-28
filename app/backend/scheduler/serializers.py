@@ -32,14 +32,26 @@ class CalendarEventSerializer(serializers.ModelSerializer):
             "event_category",
             "attended",
             "agentpm_airtable_id",
+            "reminder",
             "references",
+            "artifact_ids",
             "created_at",
             "updated_at",
         ]
         # `attended` is written through the dedicated `attendance` action, which is
         # owner-scoped and free of the account-membership check that guards this
         # serializer's normal update path.
-        read_only_fields = ["id", "owner", "google_event_id", "attended", "agentpm_airtable_id", "created_at", "updated_at"]
+        #
+        # `agentpm_airtable_id` and `reminder` stay read-only here because the Airtable and
+        # Google syncs own them on an existing row — but `perform_create` assigns both on the
+        # model directly (the same thing `attendance` does with the equally read-only
+        # `attended`), so scheduling an action item or a reminder onto the calendar can record
+        # what it is a scheduled occurrence *of*. Without that, the link is silently dropped
+        # and the row comes back as an untitled work-tracking block belonging to nothing.
+        read_only_fields = [
+            "id", "owner", "google_event_id", "attended",
+            "agentpm_airtable_id", "reminder", "created_at", "updated_at",
+        ]
 
 
 class ActionItemSerializer(serializers.ModelSerializer):

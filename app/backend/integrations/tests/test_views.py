@@ -1,8 +1,10 @@
 """Tests for the Confluence, JIRA, and Zendesk OAuth views."""
+from datetime import timedelta as _td
 from unittest.mock import MagicMock, patch
 
 from django.contrib.auth import get_user_model
 from django.core import signing
+from django.core.cache import cache
 from django.test import override_settings
 from rest_framework.test import APITestCase
 
@@ -786,6 +788,171 @@ class GoogleCalendarBiDirectionalSyncTest(APITestCase):
         # Verify that list (pull) was still called despite patch (push) failure
         service_mock.events.return_value.list.assert_called_once()
 
+    def test_a_non_httperror_push_failure_does_not_abort_the_sync(self):
+        """A transient failure (network timeout, connection reset, ...) on one push
+        must not escape and abort the whole sync — same contract as an HttpError,
+        just a different exception type. Regression test for a real reported 500:
+        the old handler only caught HttpError, so anything else propagated out of
+        _push_event_to_google, out of _sync_google_calendar, and back to the view
+        as an unhandled 500.
+        """
+        from datetime import timedelta
+        from scheduler.models import CalendarEvent
+        from integrations.models import SyncState
+
+        # Two synced, recently-edited events — both attempt a push this sync.
+        event_a = CalendarEvent.objects.create(
+            owner=self.user,
+            google_event_id="flaky-event-a",
+            title="Flaky A",
+            start_datetime=self.now + timedelta(hours=1),
+            end_datetime=self.now + timedelta(hours=2),
+            status="confirmed",
+            is_synced=True,
+            calendar_id="primary",
+        )
+        event_b = CalendarEvent.objects.create(
+            owner=self.user,
+            google_event_id="flaky-event-b",
+            title="Flaky B",
+            start_datetime=self.now + timedelta(hours=3),
+            end_datetime=self.now + timedelta(hours=4),
+            status="confirmed",
+            is_synced=True,
+            calendar_id="primary",
+        )
+
+        SyncState.objects.update_or_create(
+            user=self.user,
+            provider="google",
+            resource="calendar",
+            defaults={"last_synced_at": self.now - timedelta(minutes=5)},
+        )
+
+        from integrations import views as integrations_views
+
+        service_mock = MagicMock()
+        # The first push raises a non-HttpError exception (e.g. a network-level
+        # failure); the second push should still be attempted and succeed.
+        service_mock.events.return_value.patch.return_value.execute.side_effect = [
+            ConnectionError("connection reset by peer"),
+            {},
+        ]
+        service_mock.events.return_value.list.return_value.execute.return_value = {
+            "items": [
+                {
+                    "id": "flaky-event-a",
+                    "summary": "Flaky A",
+                    "status": "confirmed",
+                    "start": {"dateTime": str(event_a.start_datetime)},
+                    "end": {"dateTime": str(event_a.end_datetime)},
+                },
+                {
+                    "id": "flaky-event-b",
+                    "summary": "Flaky B",
+                    "status": "confirmed",
+                    "start": {"dateTime": str(event_b.start_datetime)},
+                    "end": {"dateTime": str(event_b.end_datetime)},
+                },
+            ],
+            "nextPageToken": None,
+        }
+
+        with patch("googleapiclient.discovery.build", return_value=service_mock):
+            # Must not raise, despite the first push blowing up with a plain
+            # ConnectionError rather than an HttpError.
+            integrations_views._sync_google_calendar(self.user, MagicMock())
+
+        # Both pushes were attempted — the first one's failure didn't stop the loop.
+        self.assertEqual(service_mock.events.return_value.patch.return_value.execute.call_count, 2)
+        # The pull still completed.
+        service_mock.events.return_value.list.assert_called_once()
+
+    def test_an_unchanged_pulled_event_does_not_bump_updated_at(self):
+        """PHASE 2's pull must not mark every untouched event as if it had just been
+        locally edited. update_or_create() calls .save() on the existing row, which
+        bumps `updated_at` (auto_now=True) even when nothing about the row reflects a
+        real local edit — that falsely makes PHASE 1 re-push the entire calendar back
+        to Google on every subsequent sync. Regression test for that bug: a pull that
+        brings back identical data must leave updated_at untouched, while a pull that
+        brings back genuinely different data must still update the row.
+        """
+        from datetime import timedelta
+        from scheduler.models import CalendarEvent
+        from integrations.models import SyncState
+
+        event = CalendarEvent.objects.create(
+            owner=self.user,
+            google_event_id="stable-event",
+            title="Stable",
+            start_datetime=self.now + timedelta(hours=1),
+            end_datetime=self.now + timedelta(hours=2),
+            status="confirmed",
+            is_synced=True,
+            calendar_id="primary",
+        )
+        # Push updated_at into the past so it's clearly distinguishable from "now",
+        # and so this event does NOT look like a "recent local edit" for PHASE 1.
+        stale_updated_at = self.now - timedelta(days=3)
+        CalendarEvent.objects.filter(pk=event.pk).update(updated_at=stale_updated_at)
+
+        SyncState.objects.update_or_create(
+            user=self.user,
+            provider="google",
+            resource="calendar",
+            defaults={"last_synced_at": self.now - timedelta(days=3)},
+        )
+
+        from integrations import views as integrations_views
+
+        service_mock = MagicMock()
+        service_mock.events.return_value.list.return_value.execute.return_value = {
+            "items": [
+                {
+                    "id": "stable-event",
+                    # Identical to what's already stored — nothing actually changed.
+                    "summary": "Stable",
+                    "status": "confirmed",
+                    "start": {"dateTime": str(event.start_datetime)},
+                    "end": {"dateTime": str(event.end_datetime)},
+                }
+            ],
+            "nextPageToken": None,
+        }
+
+        with patch("googleapiclient.discovery.build", return_value=service_mock):
+            integrations_views._sync_google_calendar(self.user, MagicMock())
+
+        event.refresh_from_db()
+        self.assertEqual(event.updated_at, stale_updated_at)
+
+        # A second sync where Google genuinely has a new title must still update the
+        # real field value — proving the .filter().update() swap didn't silently break
+        # real field writes while fixing the false-positive updated_at bump.
+        service_mock.events.return_value.list.return_value.execute.return_value = {
+            "items": [
+                {
+                    "id": "stable-event",
+                    "summary": "Renamed On Google",
+                    "status": "confirmed",
+                    "start": {"dateTime": str(event.start_datetime)},
+                    "end": {"dateTime": str(event.end_datetime)},
+                }
+            ],
+            "nextPageToken": None,
+        }
+        SyncState.objects.update_or_create(
+            user=self.user,
+            provider="google",
+            resource="calendar",
+            defaults={"last_synced_at": self.now - timedelta(minutes=1)},
+        )
+        with patch("googleapiclient.discovery.build", return_value=service_mock):
+            integrations_views._sync_google_calendar(self.user, MagicMock())
+
+        event.refresh_from_db()
+        self.assertEqual(event.title, "Renamed On Google")
+
 
 class GoogleCalendarSyncViewEndpointTest(APITestCase):
     """`POST /api/v1/integrations/google/sync/` — the manual "Sync Google Calendar"
@@ -1229,3 +1396,559 @@ class GoogleOAuthErrorCategorization(APITestCase):
 
         self.assertEqual(category, "unknown")
         self.assertIn("Token exchange failed", message)
+
+
+# ── Salesforce OAuth callback: identity capture ────────────────────────────────
+
+SALESFORCE_SETTINGS = {
+    "SALESFORCE_CLIENT_ID": "sf-id",
+    "SALESFORCE_CLIENT_SECRET": "sf-secret",
+    "SALESFORCE_REDIRECT_URI": "http://localhost:8000/api/v1/integrations/salesforce/callback/",
+    "SALESFORCE_INSTANCE_URL": "https://twlo--jarvisdc.sandbox.my.salesforce.com",
+    "SALESFORCE_LOGIN_URL": "https://twlo--jarvisdc.sandbox.my.salesforce.com",
+}
+
+
+class ExtractSfUserIdTest(APITestCase):
+    """
+    The token response's `id` is `https://<login host>/id/<org id>/<user id>`, so the
+    Salesforce User id is free — no API call. It is worth parsing carefully: the only
+    other source is `chatter/users/me`, which 404s in an org with Chatter disabled, and a
+    blank `sf_user_id` silently disables the role-matched project fallback in
+    `log_week._role_project_ids`, empties `SalesforceProjectViewSet`, and strips
+    `Resource__c` off every time entry.
+    """
+
+    def test_an_18_char_id_is_extracted(self):
+        from integrations.views import extract_sf_user_id
+
+        self.assertEqual(
+            extract_sf_user_id(
+                "https://login.salesforce.com/id/00D000000000001EAA/005000000000001AAA"
+            ),
+            "005000000000001AAA",
+        )
+
+    def test_a_15_char_id_is_extracted(self):
+        from integrations.views import extract_sf_user_id
+
+        self.assertEqual(
+            extract_sf_user_id("https://login.salesforce.com/id/00D000000000001/005000000000001"),
+            "005000000000001",
+        )
+
+    def test_a_trailing_slash_does_not_swallow_the_id(self):
+        from integrations.views import extract_sf_user_id
+
+        self.assertEqual(
+            extract_sf_user_id(
+                "https://login.salesforce.com/id/00D000000000001EAA/005000000000001AAA/"
+            ),
+            "005000000000001AAA",
+        )
+
+    def test_a_missing_identity_url_is_blank_not_an_error(self):
+        from integrations.views import extract_sf_user_id
+
+        self.assertEqual(extract_sf_user_id(None), "")
+        self.assertEqual(extract_sf_user_id(""), "")
+
+    def test_a_non_user_key_prefix_is_rejected(self):
+        # 00D is the Org prefix. Storing it would look plausible and match nothing.
+        from integrations.views import extract_sf_user_id
+
+        self.assertEqual(
+            extract_sf_user_id("https://login.salesforce.com/id/00D000000000001EAA"), ""
+        )
+
+    def test_a_malformed_last_segment_is_rejected(self):
+        from integrations.views import extract_sf_user_id
+
+        self.assertEqual(extract_sf_user_id("https://login.salesforce.com/id/"), "")
+        self.assertEqual(extract_sf_user_id("not-a-url"), "")
+
+
+@override_settings(**SALESFORCE_SETTINGS)
+class SalesforceOAuthCallbackIdentityTest(APITestCase):
+    """
+    The callback is `AllowAny`, so every test here spends from the process-wide anon
+    throttle bucket (20/min). Adding this class alone was enough to push the file past
+    it and 429 the Zendesk callback tests that happen to run later — the same failure
+    mode `realtime`'s `VoiceTwiMLViewTests` hit. Cleared on both sides so this class is
+    neither a victim nor a cause.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(username="liz", password="pass")
+        self.state = signing.dumps({"uid": self.user.pk}, salt="sf-oauth")
+
+    def tearDown(self):
+        cache.clear()
+
+    def _callback(self, payload):
+        mock_resp = MagicMock(ok=True)
+        mock_resp.json.return_value = payload
+        # sync_all builds a real client, so it is patched out — this test is about what the
+        # callback stores, not about syncing.
+        with patch("integrations.views.requests.post", return_value=mock_resp), patch(
+            "salesforce_sync.sync.sync_all"
+        ):
+            return self.client.get(
+                "/api/v1/integrations/salesforce/callback/",
+                {"code": "abc", "state": self.state},
+            )
+
+    def _config(self):
+        from salesforce_sync.models import SalesforceConfig
+
+        return SalesforceConfig.objects.get(user=self.user)
+
+    def test_the_instance_url_and_user_id_are_both_stored(self):
+        resp = self._callback({
+            "access_token": "tok",
+            "refresh_token": "ref",
+            "instance_url": "https://twlo--jarvisdc.sandbox.my.salesforce.com",
+            "id": "https://test.salesforce.com/id/00D000000000001EAA/005000000000001AAA",
+        })
+
+        self.assertEqual(resp.status_code, 200)
+        config = self._config()
+        self.assertEqual(
+            config.instance_url, "https://twlo--jarvisdc.sandbox.my.salesforce.com"
+        )
+        self.assertEqual(config.sf_user_id, "005000000000001AAA")
+
+    def test_a_trailing_slash_is_stripped_from_the_instance_url(self):
+        # The stored value is concatenated with /services/... paths, so a trailing slash
+        # would produce a double slash in every REST URL.
+        self._callback({
+            "access_token": "tok",
+            "instance_url": "https://twlo--jarvisdc.sandbox.my.salesforce.com/",
+            "id": "https://test.salesforce.com/id/00D000000000001EAA/005000000000001AAA",
+        })
+
+        self.assertEqual(
+            self._config().instance_url, "https://twlo--jarvisdc.sandbox.my.salesforce.com"
+        )
+
+    def test_a_token_response_without_an_identity_url_still_stores_the_host(self):
+        self._callback({
+            "access_token": "tok",
+            "instance_url": "https://twlo--jarvisdc.sandbox.my.salesforce.com",
+        })
+
+        config = self._config()
+        self.assertEqual(
+            config.instance_url, "https://twlo--jarvisdc.sandbox.my.salesforce.com"
+        )
+        self.assertEqual(config.sf_user_id, "")
+
+    def test_a_previously_stored_user_id_is_not_blanked_by_a_reconnect(self):
+        from salesforce_sync.models import SalesforceConfig
+
+        SalesforceConfig.objects.create(
+            user=self.user,
+            instance_url="https://twlo--jarvisdc.sandbox.my.salesforce.com",
+            sf_user_id="005000000000001AAA",
+        )
+
+        # A reconnect whose token response omits `id` must not clear what is already known;
+        # only non-blank values are written into the defaults.
+        self._callback({
+            "access_token": "tok",
+            "instance_url": "https://twlo--jarvisdc.sandbox.my.salesforce.com",
+        })
+
+        self.assertEqual(self._config().sf_user_id, "005000000000001AAA")
+
+    def test_the_credential_is_still_stored_when_the_config_write_fails(self):
+        # The OAuth credential is the thing the user just earned; a SalesforceConfig
+        # problem must not cost them the connection.
+        with patch(
+            "salesforce_sync.models.SalesforceConfig.objects.update_or_create",
+            side_effect=RuntimeError("db unhappy"),
+        ):
+            resp = self._callback({
+                "access_token": "tok",
+                "instance_url": "https://twlo--jarvisdc.sandbox.my.salesforce.com",
+                "id": "https://test.salesforce.com/id/00D000000000001EAA/005000000000001AAA",
+            })
+
+        self.assertEqual(resp.status_code, 200)
+        from integrations.models import OAuthCredential
+
+        self.assertTrue(
+            OAuthCredential.objects.filter(user=self.user, provider="salesforce").exists()
+        )
+
+
+# ── Google Calendar sync: reconciliation must not destroy local work ──────────
+
+class GoogleCalendarReconcileMissingEventsTest(APITestCase):
+    """`_reconcile_missing_google_events` — what happens to rows Google did not return.
+
+    The block this replaces deleted every `is_synced=True` row in `primary`/`work_tracking`
+    absent from the pull response, with no window check and no `google_event_id` check. That
+    destroyed user data three separate ways, one test each below.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(username="reconcile_user", password="{PASSWORD}")
+
+    def tearDown(self):
+        cache.clear()
+
+    # -- helpers ----------------------------------------------------------------
+
+    def _run_sync(self, items, insert_id="g-repushed"):
+        from integrations import views as integrations_views
+
+        service = MagicMock()
+        service.events.return_value.list.return_value.execute.return_value = {
+            "items": items,
+            "nextPageToken": None,
+        }
+        # A real dict, not the default MagicMock: PHASE 1b reads `.get("id")` off this and
+        # writes it to a CharField, and a MagicMock there fails as an "aggregate function".
+        service.events.return_value.insert.return_value.execute.return_value = {"id": insert_id}
+        with patch("googleapiclient.discovery.build", return_value=service):
+            integrations_views._sync_google_calendar(self.user, MagicMock())
+        return service
+
+    def _google_item(self, event_id="g-keeper"):
+        """An unrelated event, so `seen_ids` is non-empty and reconciliation actually runs."""
+        from django.utils import timezone
+
+        start = timezone.now()
+        return {
+            "id": event_id,
+            "summary": "Some meeting",
+            "status": "confirmed",
+            "start": {"dateTime": start.isoformat()},
+            "end": {"dateTime": (start + _td(hours=1)).isoformat()},
+        }
+
+    def _event(self, **kwargs):
+        from django.utils import timezone
+        from scheduler.models import CalendarEvent
+
+        start = kwargs.pop("start", timezone.now())
+        defaults = {
+            "owner": self.user,
+            "title": "Scheduled work",
+            "start_datetime": start,
+            "end_datetime": start + _td(hours=1),
+            "calendar_id": "work_tracking",
+            "is_synced": True,
+            "google_event_id": "g-gone",
+            "agentpm_airtable_id": "recABC",
+        }
+        defaults.update(kwargs)
+        return CalendarEvent.objects.create(**defaults)
+
+    def _reload(self, event):
+        from scheduler.models import CalendarEvent
+
+        return CalendarEvent.objects.filter(pk=event.pk).first()
+
+    # -- the three data-loss paths ---------------------------------------------
+
+    def test_a_row_never_pushed_to_google_is_left_alone(self):
+        """Google cannot omit an event it was never told about.
+
+        A blank `google_event_id` still matched `.exclude(google_event_id__in=seen_ids)`, so a
+        locally-created row was deleted by the very first sync that ran after it was made.
+        """
+        event = self._event(google_event_id="", is_synced=True)
+        self._run_sync([self._google_item()])
+        self.assertIsNotNone(self._reload(event), "a never-pushed row must survive the sync")
+
+    def test_a_row_outside_the_pull_window_is_left_alone(self):
+        """The pull asks for now ±90 days, so anything outside it is absent by construction."""
+        from django.utils import timezone
+
+        event = self._event(start=timezone.now() + _td(days=200), google_event_id="g-far")
+        self._run_sync([self._google_item()])
+        self.assertIsNotNone(
+            self._reload(event), "an out-of-window row must not be deleted for being absent"
+        )
+
+    def test_an_agentpm_owned_row_is_unlinked_not_deleted(self):
+        """work_tracking / reminders rows are originals here and copies in Google.
+
+        Missing from Google means the mirror is stale, so the row is kept and de-linked ready
+        for the next sync to re-push. This is the bound that makes the reported bug impossible.
+        """
+        event = self._event(google_event_id="g-vanished")
+        self._run_sync([self._google_item()])
+
+        refreshed = self._reload(event)
+        self.assertIsNotNone(refreshed, "an AgentPM-owned row must never be deleted")
+        self.assertEqual(refreshed.google_event_id, "")
+        self.assertFalse(refreshed.is_synced)
+
+    def test_an_unlinked_row_is_repushed_by_the_next_sync(self):
+        """The unlink has to be self-healing, or it just defers the divergence."""
+        event = self._event(google_event_id="g-vanished")
+        self._run_sync([self._google_item()])
+
+        service = self._run_sync([self._google_item()])
+        inserted = service.events.return_value.insert
+        self.assertTrue(inserted.called, "the unlinked row should be re-inserted into Google")
+        body = inserted.call_args.kwargs["body"]
+        self.assertEqual(
+            body["extendedProperties"]["private"]["agentpm_source"], "action_item"
+        )
+        self.assertEqual(
+            body["extendedProperties"]["private"]["agentpm_airtable_id"], "recABC"
+        )
+
+    def test_a_scheduled_reminder_row_is_also_unlinked_not_deleted(self):
+        from scheduler.models import Reminder
+        from django.utils import timezone
+
+        reminder = Reminder.objects.create(
+            created_by=self.user, title="Ping Dan", due_at=timezone.now()
+        )
+        event = self._event(
+            calendar_id="reminders",
+            agentpm_airtable_id="",
+            reminder=reminder,
+            google_event_id="g-rem-gone",
+        )
+        self._run_sync([self._google_item()])
+
+        refreshed = self._reload(event)
+        self.assertIsNotNone(refreshed)
+        self.assertEqual(refreshed.google_event_id, "")
+
+    # -- the behaviour that must NOT regress ----------------------------------
+
+    def test_a_plain_in_window_meeting_google_omits_is_still_deleted(self):
+        """Google really is authoritative for ordinary meetings — don't break that."""
+        event = self._event(
+            calendar_id="primary", agentpm_airtable_id="", google_event_id="g-deleted-in-google"
+        )
+        self._run_sync([self._google_item()])
+        self.assertIsNone(self._reload(event), "a deleted Google meeting should still be removed")
+
+    def test_nothing_is_reconciled_when_google_returns_no_items(self):
+        """An empty response is a probable transient failure, not an empty calendar."""
+        event = self._event(calendar_id="primary", agentpm_airtable_id="")
+        self._run_sync([])
+        self.assertIsNotNone(self._reload(event))
+
+
+class GoogleCalendarPushNewAgentpmEventsTest(APITestCase):
+    """PHASE 1b — the sync, not the client, mirrors newly-scheduled rows to Google."""
+
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(username="push_new_user", password="{PASSWORD}")
+
+    def tearDown(self):
+        cache.clear()
+
+    def _service(self, insert_ids):
+        service = MagicMock()
+        service.events.return_value.list.return_value.execute.return_value = {
+            "items": [], "nextPageToken": None,
+        }
+        service.events.return_value.insert.return_value.execute.side_effect = insert_ids
+        return service
+
+    def _pending(self, title, **kwargs):
+        from django.utils import timezone
+        from scheduler.models import CalendarEvent
+
+        start = kwargs.pop("start", timezone.now() + _td(days=1))
+        defaults = {
+            "owner": self.user,
+            "title": title,
+            "start_datetime": start,
+            "end_datetime": start + _td(hours=1),
+            "calendar_id": "work_tracking",
+            "google_event_id": "",
+            "is_synced": False,
+            "agentpm_airtable_id": f"rec-{title}",
+        }
+        defaults.update(kwargs)
+        return CalendarEvent.objects.create(**defaults)
+
+    def _run(self, service):
+        from integrations import views as integrations_views
+
+        with patch("googleapiclient.discovery.build", return_value=service):
+            integrations_views._sync_google_calendar(self.user, MagicMock())
+
+    def test_an_unsynced_row_is_inserted_and_marked_synced(self):
+        event = self._pending("Provision SQL Traits")
+        self._run(self._service([{"id": "g-new-1"}]))
+
+        event.refresh_from_db()
+        self.assertEqual(event.google_event_id, "g-new-1")
+        self.assertTrue(event.is_synced)
+
+    def test_the_insert_carries_the_extended_properties_the_pull_needs(self):
+        """Without these the pull classifies it "primary" and it becomes a meeting."""
+        self._pending("Create Diagram")
+        service = self._service([{"id": "g-new-2"}])
+        self._run(service)
+
+        body = service.events.return_value.insert.call_args.kwargs["body"]
+        private = body["extendedProperties"]["private"]
+        self.assertEqual(private["agentpm_source"], "action_item")
+        self.assertEqual(private["agentpm_airtable_id"], "rec-Create Diagram")
+
+    def test_a_reminder_row_is_pushed_with_the_reminder_source(self):
+        from django.utils import timezone
+        from scheduler.models import Reminder
+
+        reminder = Reminder.objects.create(
+            created_by=self.user, title="Call back", due_at=timezone.now()
+        )
+        self._pending(
+            "Call back", calendar_id="reminders", agentpm_airtable_id="", reminder=reminder
+        )
+        service = self._service([{"id": "g-rem-1"}])
+        self._run(service)
+
+        private = service.events.return_value.insert.call_args.kwargs["body"]["extendedProperties"]["private"]
+        self.assertEqual(private["agentpm_source"], "reminder")
+        self.assertEqual(private["agentpm_reminder_id"], str(reminder.pk))
+
+    def test_one_failing_insert_does_not_abort_the_rest(self):
+        """A batch of schedulings must not be lost to a single flaky call."""
+        first = self._pending("aaa-fails")
+        second = self._pending("bbb-succeeds")
+        service = self._service([RuntimeError("google down"), {"id": "g-ok"}])
+        self._run(service)
+
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertEqual(first.google_event_id, "", "the failed row stays pending for a retry")
+        self.assertEqual(second.google_event_id, "g-ok")
+
+    def test_an_out_of_window_row_is_not_pushed(self):
+        from django.utils import timezone
+
+        event = self._pending("far future", start=timezone.now() + _td(days=200))
+        service = self._service([{"id": "g-nope"}])
+        self._run(service)
+
+        event.refresh_from_db()
+        self.assertEqual(event.google_event_id, "")
+
+    def test_a_plain_primary_row_is_not_pushed_by_this_phase(self):
+        """`primary` creates already push at create time via CalendarEventViewSet."""
+        event = self._pending("meeting", calendar_id="primary", agentpm_airtable_id="")
+        service = self._service([{"id": "g-should-not"}])
+        self._run(service)
+
+        event.refresh_from_db()
+        self.assertEqual(event.google_event_id, "")
+
+
+class ParseStartMinuteTest(APITestCase):
+    """`_parse_start_minute` — a failed parse must never read as "duplicate exists"."""
+
+    def test_it_truncates_to_the_minute(self):
+        from integrations.views import _parse_start_minute
+
+        parsed = _parse_start_minute("2026-09-15T11:30:45+00:00")
+        self.assertEqual((parsed.second, parsed.microsecond), (0, 0))
+        self.assertEqual((parsed.hour, parsed.minute), (11, 30))
+
+    def test_it_accepts_a_trailing_z(self):
+        from integrations.views import _parse_start_minute
+
+        self.assertIsNotNone(_parse_start_minute("2026-09-15T11:30:00Z"))
+
+    def test_a_naive_string_is_treated_as_utc(self):
+        from integrations.views import _parse_start_minute
+
+        self.assertIsNotNone(_parse_start_minute("2026-09-15T11:30:00").tzinfo)
+
+    def test_unparseable_input_returns_none(self):
+        from integrations.views import _parse_start_minute
+
+        for bad in ("", None, "not a date", "2026-13-45T99:99:99"):
+            self.assertIsNone(_parse_start_minute(bad), bad)
+
+
+class GoogleActionItemsPushDedupTest(APITestCase):
+    """The push view must treat a second occurrence as a new event, not a duplicate.
+
+    Matching on `agentpm_airtable_id` alone answered a *new* scheduling with the *first*
+    occurrence's google_event_id. The caller read that as confirmation and dropped its own
+    copy, so the new scheduling existed nowhere. This is loss path 1 from the bug report.
+    """
+
+    URL = "/api/v1/integrations/google/push-action-items/"
+
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(username="push_dedup", password="{PASSWORD}")
+        self.client.force_authenticate(self.user)
+        from integrations.models import OAuthCredential
+
+        OAuthCredential.objects.create(
+            user=self.user, provider="google", access_token="t",
+            refresh_token="r", scopes="https://www.googleapis.com/auth/calendar",
+            is_active=True,
+        )
+
+    def tearDown(self):
+        cache.clear()
+
+    def _existing(self, start, google_event_id="g-first"):
+        from scheduler.models import CalendarEvent
+
+        return CalendarEvent.objects.create(
+            owner=self.user, title="Composite Keys", calendar_id="work_tracking",
+            start_datetime=start, end_datetime=start + _td(hours=1),
+            is_synced=True, google_event_id=google_event_id, agentpm_airtable_id="recDUP",
+        )
+
+    def _push(self, start_iso, service):
+        with patch("googleapiclient.discovery.build", return_value=service):
+            return self.client.post(self.URL, {"items": [{
+                "airtableId": "recDUP",
+                "start": start_iso,
+                "end": start_iso.replace("T09:", "T10:"),
+                "task": "Composite Keys",
+            }]}, format="json")
+
+    def _service(self, new_id="g-second"):
+        service = MagicMock()
+        service.events.return_value.insert.return_value.execute.return_value = {"id": new_id}
+        return service
+
+    def test_a_second_occurrence_creates_a_new_google_event(self):
+        import datetime
+
+        self._existing(datetime.datetime(2026, 9, 2, 9, 0, tzinfo=datetime.timezone.utc))
+        service = self._service()
+        resp = self._push("2026-09-03T09:00:00+00:00", service)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(
+            service.events.return_value.insert.called,
+            "a different start must produce a real Google insert",
+        )
+        self.assertEqual(resp.data["results"][0]["googleEventId"], "g-second")
+
+    def test_the_same_start_minute_still_dedups(self):
+        import datetime
+
+        self._existing(datetime.datetime(2026, 9, 2, 9, 0, tzinfo=datetime.timezone.utc))
+        service = self._service()
+        resp = self._push("2026-09-02T09:00:00+00:00", service)
+
+        self.assertFalse(
+            service.events.return_value.insert.called,
+            "a genuine same-slot duplicate must not create a second Google event",
+        )
+        self.assertEqual(resp.data["results"][0]["googleEventId"], "g-first")

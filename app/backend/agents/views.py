@@ -11,6 +11,8 @@ from botocore import exceptions as botocore_exceptions
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ImproperlyConfigured
+
+from core.llm import GatewayCredentialError
 from django.db.models import Q, Sum
 from django.http import HttpResponse, StreamingHttpResponse
 from rest_framework import status, viewsets
@@ -50,12 +52,27 @@ def classify_agent_error(exc: BaseException, ref: str) -> str:
     Deliberately coarse: no exception text is interpolated, so nothing sensitive
     (tokens, ARNs, request bodies) can leak. `ref` correlates with the server log.
     """
-    if isinstance(exc, _BEDROCK_CREDENTIAL_ERRORS):
-        profile = os.environ.get("AWS_PROFILE", "twilio-devex-bedrock")
+    # Checked before the generic ImproperlyConfigured branch below, which it subclasses.
+    # This is the gateway's equivalent of an expired SSO token, and it is the one
+    # credential failure the user can resolve without touching the server.
+    if isinstance(exc, GatewayCredentialError):
         return (
-            f"[Model credentials expired. Run `aws sso login --profile {profile}` "
-            f"and try again. (ref {ref})]"
+            f"[Model credentials unavailable. Re-authenticate to the LiteLLM gateway by "
+            f"running `{settings.AGENT_GATEWAY_TOKEN_COMMAND or 'the gateway token helper'}` "
+            f"in a terminal, then try again. (ref {ref})]"
         )
+    if isinstance(exc, _BEDROCK_CREDENTIAL_ERRORS):
+        # Only advise `aws sso login` when Bedrock is actually the configured backend.
+        # This message used to be unconditional, so after the move to the gateway it
+        # sent people to re-authenticate against AWS for a failure that had nothing to
+        # do with AWS — which is exactly how it was reported.
+        if settings.AGENT_BACKEND == "bedrock":
+            profile = os.environ.get("AWS_PROFILE", "twilio-devex-bedrock")
+            return (
+                f"[Model credentials expired. Run `aws sso login --profile {profile}` "
+                f"and try again. (ref {ref})]"
+            )
+        return f"[Model credentials unavailable — check the gateway token. (ref {ref})]"
     if isinstance(exc, ImproperlyConfigured):
         return f"[Agent is misconfigured — see server logs. (ref {ref})]"
     if isinstance(exc, (anthropic.AuthenticationError, anthropic.PermissionDeniedError)):

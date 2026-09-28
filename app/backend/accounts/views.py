@@ -10,6 +10,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 
+from core.html_sanitize import is_html_filename, sanitize_html
 from core.mixins import _staff_sees_all
 from core.pagination import ClientPageSizePagination
 from core.query_params import csv_int_params
@@ -18,10 +19,46 @@ from realtime.sync import publish_activity_event
 from scheduler.models import Reminder
 from scheduler.serializers import ActionItemSerializer, CalendarEventSerializer, ReminderSerializer
 
+from .artifact_links import used_in_map
 from .models import Account, AccountArtifact, AccountNote, AccountProject, AccountQuickLink, AccountRole, CustomerContact, CustomerContactNote, ProjectMember
 from .serializers import AccountArtifactSerializer, AccountNoteSerializer, AccountProjectSerializer, AccountQuickLinkSerializer, AccountRoleSerializer, AccountSerializer, CustomerContactNoteSerializer, CustomerContactSerializer, ProjectMemberSerializer
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitized_html_upload(file_obj):
+    """
+    Replace an uploaded HTML file with a sanitized copy of itself.
+
+    Returns a new in-memory file to store, or None when the bytes are not
+    decodable as text (which is not a valid HTML document, so it is rejected
+    rather than stored unexamined).
+
+    Sanitizing at upload rather than at render is deliberate: MEDIA_ROOT files
+    are also reachable directly under /media/, a path that carries none of the
+    response headers `artifact_file` sets, so the bytes on disk have to be safe
+    on their own.
+    """
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    raw = file_obj.read()
+    file_obj.seek(0)
+    for encoding in ("utf-8", "utf-16", "latin-1"):
+        try:
+            markup = raw.decode(encoding)
+            break
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    else:
+        return None
+
+    cleaned = sanitize_html(markup).encode("utf-8")
+    if len(cleaned) != len(raw):
+        logger.info(
+            "Sanitized HTML upload '%s': %d bytes in, %d bytes out",
+            file_obj.name, len(raw), len(cleaned),
+        )
+    return SimpleUploadedFile(file_obj.name, cleaned, content_type="text/html")
 
 
 def _assert_account_membership(user, account):
@@ -168,17 +205,90 @@ class AccountViewSet(viewsets.ModelViewSet):
     def perform_update(self, serializer):
         self._require_account_owner(serializer.instance)
         self._validate_account_write_fks(serializer)
+        # Captured before save so newly-added team members can be identified. Dragging a
+        # member onto an account on the Accounts page arrives here as a `team_member_ids`
+        # PATCH, and that is the trigger for the Cloud Coach push below.
+        before_member_ids = set(
+            serializer.instance.team_members.values_list("pk", flat=True)
+        )
         account = serializer.save()
         try:
             from airtable_sync.write_back import push_account_update
             push_account_update(account)
         except Exception:
             logger.exception("Airtable write-through failed for account update '%s'", account.company_name)
+        self._cloud_coach_pushes = self._push_new_members_to_cloud_coach(
+            account, before_member_ids
+        )
         publish_activity_event(
             self.request.user, "account.updated",
             "**Updated** Account",
             detail=account.company_name,
         )
+
+    def _push_new_members_to_cloud_coach(self, account, before_member_ids: set) -> list[dict]:
+        """
+        Newly-linked team members get added to the account's Cloud Coach project.
+
+        Only when the account has **exactly one** project carrying an `sf_project_id`.
+        With several, there is no defensible guess about which one the person belongs to,
+        so the link stays local and the user assigns them on the account page — which
+        routes through ProjectMemberViewSet and pushes from there.
+
+        An explicit call rather than an `m2m_changed` signal: this codebase uses no Django
+        signals anywhere, and a signal firing Salesforce writes from any `.set()` — the
+        admin, a data migration, a future importer — is a far worse surprise than a call
+        you can read here.
+        """
+        added_ids = set(account.team_members.values_list("pk", flat=True)) - before_member_ids
+        if not added_ids:
+            return []
+
+        linked = list(
+            AccountProject.objects.filter(account=account, kind="project")
+            .exclude(sf_project_id="")
+        )
+        if len(linked) != 1:
+            return []
+        project = linked[0]
+
+        from salesforce_sync.project_members import push_member_to_project
+        from team.models import TeamMember
+
+        results = []
+        for member in TeamMember.objects.filter(pk__in=added_ids):
+            # Record the local per-project membership too, so the account page reflects it
+            # and a later backfill does not re-push.
+            ProjectMember.objects.get_or_create(
+                project=project, team_member=member,
+                defaults={"added_by": self.request.user},
+            )
+            try:
+                results.append(push_member_to_project(self.request.user, project.sf_project_id, member))
+            except Exception:
+                # Best effort by design: the local link is valid whether or not Salesforce
+                # accepted it, and losing it because a third party was unreachable would
+                # be the wrong trade.
+                logger.exception(
+                    "Cloud Coach member push failed for %s on %s", member.email, project.name
+                )
+                results.append({
+                    "status": "error",
+                    "member_name": member.full_name,
+                    "project_name": project.name,
+                    "message": "Could not reach Salesforce to add them to the project.",
+                })
+        return results
+
+    def update(self, request, *args, **kwargs):
+        """Attach any Cloud Coach push outcomes to the response without changing its shape."""
+        self._cloud_coach_pushes = []
+        response = super().update(request, *args, **kwargs)
+        # Only added when something was actually pushed, so every existing consumer of this
+        # endpoint sees a byte-identical body.
+        if self._cloud_coach_pushes and isinstance(response.data, dict):
+            response.data["cloud_coach_pushes"] = self._cloud_coach_pushes
+        return response
 
     def perform_destroy(self, instance):
         self._require_account_owner(instance)
@@ -268,10 +378,13 @@ class AccountViewSet(viewsets.ModelViewSet):
             url_val = request.data.get("url", "")
             file_obj = request.FILES.get("file")
 
+            # .html / .htm / .xhtml are NOT here: they are accepted and sanitized below,
+            # then served under a sandboxing CSP. The rest stay blocked — they are either
+            # executable on a server or render as script-capable documents in the browser.
             _BLOCKED_EXTENSIONS = {
                 ".py", ".sh", ".bash", ".exe", ".bat", ".cmd", ".ps1",
                 ".php", ".rb", ".pl", ".js", ".jsx", ".ts", ".tsx",
-                ".html", ".htm", ".svg", ".xml",
+                ".svg", ".xml",
             }
             _MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB
 
@@ -281,6 +394,12 @@ class AccountViewSet(viewsets.ModelViewSet):
                 ext = Path(file_obj.name).suffix.lower()
                 if ext in _BLOCKED_EXTENSIONS:
                     return Response({"error": f"File type '{ext}' is not permitted."}, status=400)
+                if is_html_filename(file_obj.name):
+                    file_obj = _sanitized_html_upload(file_obj)
+                    if file_obj is None:
+                        return Response(
+                            {"error": "That HTML file could not be read as text."}, status=400
+                        )
 
             kwargs = {
                 "account": account,
@@ -289,6 +408,8 @@ class AccountViewSet(viewsets.ModelViewSet):
                 "name": name,
                 "icon_key": request.data.get("icon_key", ""),
                 "secondary_url": request.data.get("secondary_url", ""),
+                "description": request.data.get("description", ""),
+                "references": request.data.get("references", []),
             }
             if file_obj:
                 kwargs["file"] = file_obj
@@ -313,8 +434,12 @@ class AccountViewSet(viewsets.ModelViewSet):
             )
             return Response(AccountArtifactSerializer(artifact, context={"request": request}).data, status=201)
 
-        artifacts = account.artifacts.select_related("uploaded_by").all()
-        return Response(AccountArtifactSerializer(artifacts, many=True, context={"request": request}).data)
+        artifacts = list(account.artifacts.select_related("uploaded_by").all())
+        context = {
+            "request": request,
+            "used_in_map": used_in_map([a.id for a in artifacts], [account.id]),
+        }
+        return Response(AccountArtifactSerializer(artifacts, many=True, context=context).data)
 
     @action(detail=False, methods=["get"], url_path="artifacts-batch")
     def artifacts_batch(self, request):
@@ -333,13 +458,19 @@ class AccountViewSet(viewsets.ModelViewSet):
         if not account_ids:
             return Response([])
         visible = self.get_queryset().filter(pk__in=account_ids)
-        artifacts = (
+        artifacts = list(
             AccountArtifact.objects.filter(account__in=visible)
             .select_related("uploaded_by", "account")
             .order_by("account_id", "id")
         )
+        context = {
+            "request": request,
+            "used_in_map": used_in_map(
+                [a.id for a in artifacts], visible.values_list("id", flat=True)
+            ),
+        }
         return Response(
-            AccountArtifactSerializer(artifacts, many=True, context={"request": request}).data
+            AccountArtifactSerializer(artifacts, many=True, context=context).data
         )
 
     @action(detail=True, methods=["get", "post"], url_path="action-items")
@@ -472,6 +603,22 @@ class AccountArtifactViewSet(
         return AccountArtifact.objects.filter(
             uploaded_by=self.request.user
         ).select_related("account")
+
+    def get_serializer_context(self):
+        # Only meaningful on update: the pk in the URL already identifies an
+        # existing artifact, so its `used_in` can be computed for the response.
+        # On create there is no instance yet — nothing could reference it, so
+        # the map is left absent and the serializer's `.get(..., [])` covers it.
+        context = super().get_serializer_context()
+        pk = self.kwargs.get("pk")
+        if pk:
+            account_id = (
+                AccountArtifact.objects.filter(pk=pk)
+                .values_list("account_id", flat=True)
+                .first()
+            )
+            context["used_in_map"] = used_in_map([pk], [account_id] if account_id else [])
+        return context
 
     def perform_create(self, serializer):
         artifact_type = self.request.data.get("artifact_type", "link")
@@ -719,6 +866,37 @@ class AccountProjectViewSet(viewsets.ModelViewSet):
         _assert_account_membership(self.request.user, target)
         serializer.save()
 
+    @action(detail=True, methods=["post"], url_path="sync-members-to-salesforce")
+    def sync_members_to_salesforce(self, request, pk=None):
+        """
+        POST {"dry_run": bool} — reconcile this project's members with Cloud Coach.
+
+        The backfill for members linked before the auto-push existed. `dry_run: true`
+        resolves the full plan per member without writing, which is also the only safe way
+        to see which mechanism this org will actually use before letting it near real
+        projects — the membership model here is unverified (see
+        `salesforce_sync/project_members.py`).
+        """
+        project = self.get_object()
+        _assert_account_membership(request.user, project.account)
+
+        dry_run = bool(request.data.get("dry_run", False))
+        from salesforce_sync.project_members import sync_project_members
+        try:
+            result = sync_project_members(request.user, project, dry_run=dry_run)
+        except PermissionError:
+            return Response(
+                {"detail": "Salesforce is not connected for this user."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except Exception:
+            logger.exception("Cloud Coach member sync failed for project %s", project.pk)
+            return Response(
+                {"detail": "An unexpected error occurred."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response(result)
+
     @action(detail=False, methods=["post"], url_path="fetch-salesforce")
     def fetch_salesforce(self, request):
         """
@@ -863,8 +1041,48 @@ class ProjectMemberViewSet(
     def perform_create(self, serializer):
         project = serializer.validated_data.get("project")
         _assert_account_membership(self.request.user, project.account if project else None)
-        serializer.save(added_by=self.request.user)
+        member = serializer.save(added_by=self.request.user)
+        self._cloud_coach = self._push_to_cloud_coach(member)
+
+    def _push_to_cloud_coach(self, member) -> dict | None:
+        """
+        Add the person to the project in Cloud Coach, so they can log time against it.
+
+        Best effort: a Salesforce failure never fails the local create. The local link is
+        valid regardless, and discarding it because a third party was unreachable would
+        cost the user work they just did.
+        """
+        sf_project_id = (member.project.sf_project_id or "").strip()
+        if not sf_project_id:
+            return None
+        from salesforce_sync.project_members import push_member_to_project
+        try:
+            return push_member_to_project(
+                self.request.user, sf_project_id, member.team_member
+            )
+        except Exception:
+            logger.exception(
+                "Cloud Coach member push failed for %s on %s",
+                member.team_member.email, member.project.name,
+            )
+            return {
+                "status": "error",
+                "member_name": member.team_member.full_name,
+                "project_name": member.project.name,
+                "message": "Could not reach Salesforce to add them to the project.",
+            }
+
+    def create(self, request, *args, **kwargs):
+        """Return the push outcome alongside the created row, leaving its shape intact."""
+        self._cloud_coach = None
+        response = super().create(request, *args, **kwargs)
+        if self._cloud_coach and isinstance(response.data, dict):
+            response.data["cloud_coach"] = self._cloud_coach
+        return response
 
     def perform_destroy(self, instance):
+        # Deliberately does NOT remove them in Cloud Coach. Clearing a named project role
+        # or deleting a Resource Assignment is destructive and was not asked for; a local
+        # un-link should not quietly rewrite a shared Salesforce record.
         _assert_account_membership(self.request.user, instance.project.account)
         instance.delete()

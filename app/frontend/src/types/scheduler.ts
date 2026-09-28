@@ -59,6 +59,14 @@ export interface CalendarEvent {
    */
   attended?: boolean | null;
   agentpm_airtable_id: string;
+  /**
+   * The Reminder this event is a scheduled occurrence of, when the user dropped a reminder
+   * onto the calendar grid. Set at create time only — read-only on the serializer thereafter,
+   * the same as `agentpm_airtable_id`. Paired with `calendar_id === "reminders"`.
+   */
+  reminder?: number | null;
+  /** AccountArtifact ids linked to this event. Only meaningful when `account` is set. */
+  artifact_ids?: number[];
   created_at: string;
   updated_at: string;
 }

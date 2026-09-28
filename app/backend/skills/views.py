@@ -9,20 +9,7 @@ import textwrap
 import time
 from pathlib import Path
 
-import anthropic
-import httpx
-import truststore
 from django.conf import settings
-
-truststore.inject_into_ssl()
-
-
-def _bedrock_client() -> anthropic.AnthropicBedrock:
-    """Return an AnthropicBedrock client with the corporate CA bundle (Zscaler)."""
-    import os
-    ca = os.environ.get("AWS_CA_BUNDLE")
-    http_client = httpx.Client(verify=ca) if ca else httpx.Client()
-    return anthropic.AnthropicBedrock(http_client=http_client)
 from django.db.models import Q
 from django.utils import timezone
 from rest_framework import status, viewsets
@@ -32,10 +19,26 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from agents.mcp_server import mcp_server
+from core.llm import TIER_DEFAULT, build_sync_client, model_for_tier
 from .models import AgentSkill, ClaudeSkill, SkillInvocation
 from .serializers import AgentSkillSerializer, ClaudeSkillSerializer, SkillInvocationSerializer
 
 logger = logging.getLogger(__name__)
+
+
+def _llm_client():
+    """
+    Blocking Anthropic client for the configured backend (core.llm).
+
+    Was a hardcoded AnthropicBedrock; routed through core.llm so switching backend is
+    one env var rather than an edit in each of the six places that built a client.
+    """
+    return build_sync_client()
+
+
+def _review_model() -> str:
+    """Resolved per call, not cached at import, so override_settings works in tests."""
+    return model_for_tier(TIER_DEFAULT)
 
 # ── Review helpers ─────────────────────────────────────────────────────────────
 
@@ -60,20 +63,17 @@ _REVIEW_SYSTEM = textwrap.dedent("""\
     }
 """)
 
-_REVIEW_MODEL = "us.anthropic.claude-sonnet-4-6"
-
-
 def _claude_review_skill(skill: ClaudeSkill) -> dict:
     # truststore.inject_into_ssl() (called at module load) injects the system
     # CA bundle (including corporate Zscaler CA) so TLS verification is intact.
-    client = _bedrock_client()
+    client = _llm_client()
     prompt = (
         f"Skill name: {skill.name}\n"
         f"Description: {skill.description}\n\n"
         f"```python\n{skill.code}\n```"
     )
     response = client.messages.create(
-        model=_REVIEW_MODEL,
+        model=_review_model(),
         max_tokens=1024,
         system=_REVIEW_SYSTEM,
         messages=[{"role": "user", "content": prompt}],
@@ -174,14 +174,14 @@ _FIX_SYSTEM = textwrap.dedent("""\
 
 def _claude_generate_code(name: str, description: str) -> str:
     """Ask Claude to generate Python skill code from a name and description."""
-    client = _bedrock_client()
+    client = _llm_client()
     prompt = (
         f"Skill name: {name}\n"
         f"Description: {description}\n\n"
         f"Write the async def Python function for this skill."
     )
     response = client.messages.create(
-        model=_REVIEW_MODEL,
+        model=_review_model(),
         max_tokens=4096,
         system=_GENERATE_SYSTEM,
         messages=[{"role": "user", "content": prompt}],
@@ -196,7 +196,7 @@ def _claude_generate_code(name: str, description: str) -> str:
 
 def _claude_fix_code(skill: ClaudeSkill) -> str:
     """Ask Claude to rewrite skill code to address prior review feedback."""
-    client = _bedrock_client()
+    client = _llm_client()
     feedback_block = skill.review_feedback or ""
     if skill.review_suggestions:
         feedback_block += f"\n\nSuggestions: {skill.review_suggestions}"
@@ -208,7 +208,7 @@ def _claude_fix_code(skill: ClaudeSkill) -> str:
         f"Rewrite the function to fix all issues described above."
     )
     response = client.messages.create(
-        model=_REVIEW_MODEL,
+        model=_review_model(),
         max_tokens=4096,
         system=_FIX_SYSTEM,
         messages=[{"role": "user", "content": prompt}],
@@ -612,16 +612,16 @@ _AGENT_SKILL_GENERATE_SYSTEM = textwrap.dedent("""\
     Output valid JSON only, no markdown fences, no preamble.
 """)
 
-_PLATFORM_TOOL_CATALOG = [
-    "create_action_item", "update_action_item", "delete_action_item",
-    "create_calendar_event", "update_calendar_event", "delete_calendar_event",
-    "get_airtable_records", "search_records", "update_meeting", "delete_meeting",
-    "update_account", "add_account_note", "get_meeting_notes_from_email",
-]
+# Derived from the registry rather than hand-listed, so a new tool can't be missing
+# here while present in the prompt (or vice versa). Membership is declared per tool
+# via @mcp_server.tool(skill_safe=...) and is a deliberate policy decision: the set is
+# the same curated 13 as before, notably excluding send_sms / make_phone_call, so a
+# skill author cannot wire up outbound communication.
+_PLATFORM_TOOL_CATALOG = mcp_server.skill_safe_tools()
 
 
 def _claude_review_agent_skill(skill: AgentSkill) -> dict:
-    client = _bedrock_client()
+    client = _llm_client()
     scripts_text = ""
     for s in (skill.scripts or []):
         scripts_text += f"\n### {s.get('filename','script')} ({s.get('language','?')})\n```\n{s.get('code','')}\n```"
@@ -633,7 +633,7 @@ def _claude_review_agent_skill(skill: AgentSkill) -> dict:
         + (f"\nScripts:{scripts_text}" if scripts_text else "")
     )
     response = client.messages.create(
-        model=_REVIEW_MODEL,
+        model=_review_model(),
         max_tokens=1024,
         system=_AGENT_SKILL_REVIEW_SYSTEM,
         messages=[{"role": "user", "content": prompt}],
@@ -647,12 +647,12 @@ def _claude_review_agent_skill(skill: AgentSkill) -> dict:
 
 
 def _claude_generate_agent_skill(description: str) -> dict:
-    client = _bedrock_client()
+    client = _llm_client()
     system = _AGENT_SKILL_GENERATE_SYSTEM.replace(
         "{allowed_tools_catalog}", ", ".join(_PLATFORM_TOOL_CATALOG)
     )
     response = client.messages.create(
-        model=_REVIEW_MODEL,
+        model=_review_model(),
         max_tokens=4096,
         system=system,
         messages=[{"role": "user", "content": description}],

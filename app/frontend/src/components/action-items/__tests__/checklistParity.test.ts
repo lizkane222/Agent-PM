@@ -17,14 +17,21 @@ import { resolve } from "node:path";
 
 const SRC = resolve(__dirname, "../../..");
 
-/** Every surface that renders editable action item detail. */
+/**
+ * Every surface that renders editable action item detail.
+ *
+ * `components/calendar/ActionItemsSidebar.tsx` is deliberately **not** here any more, and
+ * neither is `pages/CalendarPage.tsx`'s local copy of it. Both calendar sidebars are now
+ * collapsed-only: clicking a card opens `ActionItemModal` (already in this list, and the
+ * surface that renders the checklist), so neither is an editable detail surface. Enforced by
+ * `components/calendar/__tests__/sidebarOrderingParity.test.ts`, which asserts neither copy
+ * reintroduces an inline editor.
+ */
 const DETAIL_SURFACES = [
   "components/account/ActionItemModal.tsx",
   "components/account/ActionItemSidePanelContent.tsx",
-  "components/calendar/ActionItemsSidebar.tsx",
   "pages/ActionItemsPage.tsx",
   "pages/AccountDetailPage.tsx",
-  "pages/CalendarPage.tsx",
 ];
 
 function read(relativePath: string): string {

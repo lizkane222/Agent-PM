@@ -9,6 +9,7 @@ import { addLog } from "../lib/appLog";
 import { useLogGlow } from "../hooks/useLogGlow";
 import { useCurrentUser } from "../context/CurrentUserContext";
 import { useTeam } from "../hooks/useTeam";
+import { useTeamMemberDocs } from "../hooks/useTeamMemberDocs";
 
 type ViewMode = "cards" | "list" | "table";
 
@@ -490,12 +491,14 @@ function MemberModal({
 function MemberDetailSidebar({
   member,
   accounts,
+  canManageDocs,
   onClose,
   onEdit,
   onRemoveFromAccount,
 }: {
   member: TeamMember;
   accounts: Account[];
+  canManageDocs: boolean;
   onClose: () => void;
   onEdit: () => void;
   onRemoveFromAccount: (accountId: number) => void;
@@ -506,6 +509,23 @@ function MemberDetailSidebar({
   const linkedAccounts = accounts.filter((a) =>
     (a.team_members ?? []).some((m) => m.id === member.id)
   );
+
+  const { data: docs, addDocument, removeDocument } = useTeamMemberDocs(member.id);
+  const [newDocName, setNewDocName] = useState("");
+  const [newDocUrl, setNewDocUrl] = useState("");
+  const [addingDoc, setAddingDoc] = useState(false);
+
+  const handleAddDoc = async () => {
+    if (!newDocName.trim() || !newDocUrl.trim()) return;
+    setAddingDoc(true);
+    try {
+      await addDocument({ name: newDocName.trim(), url: newDocUrl.trim() });
+      setNewDocName("");
+      setNewDocUrl("");
+    } finally {
+      setAddingDoc(false);
+    }
+  };
 
   return (
     <>
@@ -644,6 +664,68 @@ function MemberDetailSidebar({
                     </button>
                   </div>
                 ))}
+              </div>
+            )}
+          </div>
+
+          {/* Linked docs */}
+          <div>
+            <p className="text-[11px] font-bold uppercase tracking-wider mb-2" style={{ color: "var(--text-secondary, #888)" }}>
+              Linked Docs {docs.length > 0 && <span className="normal-case font-normal">({docs.length})</span>}
+            </p>
+            {docs.length === 0 ? (
+              <p className="text-sm" style={{ color: "var(--text-secondary, #aaa)" }}>No linked docs.</p>
+            ) : (
+              <div className="space-y-2">
+                {docs.map((doc) => (
+                  <div key={doc.id} className="rounded-lg px-3 py-2.5 flex items-center gap-3" style={{ background: "var(--bg, #f5f5f5)", border: "1px solid var(--border, rgba(0,0,0,0.07))" }}>
+                    <div className="flex-1 min-w-0">
+                      <a href={doc.url} target="_blank" rel="noreferrer" className="text-sm font-semibold break-words block" style={{ color: "var(--twilio-red, #e22)" }}>
+                        {doc.name}
+                      </a>
+                    </div>
+                    {canManageDocs && (
+                      <button
+                        onClick={() => removeDocument(doc.id)}
+                        className="shrink-0 text-[var(--twilio-gray-60)] hover:text-red-600 transition-colors ml-1"
+                        aria-label={`Remove ${doc.name}`}
+                        title={`Remove ${doc.name}`}
+                      >
+                        <svg viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5">
+                          <path d="M4.293 4.293a1 1 0 011.414 0L8 6.586l2.293-2.293a1 1 0 111.414 1.414L9.414 8l2.293 2.293a1 1 0 01-1.414 1.414L8 9.414l-2.293 2.293a1 1 0 01-1.414-1.414L6.586 8 4.293 5.707a1 1 0 010-1.414z"/>
+                        </svg>
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+            {canManageDocs && (
+              <div className="mt-2 space-y-1.5">
+                <input
+                  type="text"
+                  placeholder="Doc name (e.g. Coverage doc)"
+                  value={newDocName}
+                  onChange={(e) => setNewDocName(e.target.value)}
+                  className="w-full text-sm rounded-md px-2.5 py-1.5"
+                  style={{ border: "1px solid var(--border, rgba(0,0,0,0.12))" }}
+                />
+                <input
+                  type="text"
+                  placeholder="https://..."
+                  value={newDocUrl}
+                  onChange={(e) => setNewDocUrl(e.target.value)}
+                  className="w-full text-sm rounded-md px-2.5 py-1.5"
+                  style={{ border: "1px solid var(--border, rgba(0,0,0,0.12))" }}
+                />
+                <button
+                  onClick={handleAddDoc}
+                  disabled={addingDoc || !newDocName.trim() || !newDocUrl.trim()}
+                  className="w-full text-sm font-semibold rounded-md px-2.5 py-1.5 disabled:opacity-50"
+                  style={{ background: "var(--bg, #f5f5f5)", color: "var(--twilio-navy)", border: "1px solid var(--border, rgba(0,0,0,0.12))" }}
+                >
+                  + Add doc
+                </button>
               </div>
             )}
           </div>
@@ -1173,6 +1255,7 @@ export default function TeamPage() {
         <MemberDetailSidebar
           member={selectedMember}
           accounts={accounts}
+          canManageDocs={isStaffAdmin || selectedMember.user === currentUser?.id}
           onClose={() => setSelectedMember(null)}
           onEdit={() => { setModal(selectedMember); setSelectedMember(null); }}
           onRemoveFromAccount={async (accountId) => {

@@ -3,7 +3,7 @@
 from django.contrib.auth import get_user_model
 from rest_framework.test import APITestCase
 
-from team.models import Team, TeamMember, TeamMembership, UserProfile
+from team.models import Team, TeamMember, TeamMemberDocument, TeamMembership, UserProfile
 
 User = get_user_model()
 
@@ -166,6 +166,115 @@ class TeamMemberPaginationTest(APITestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.data["count"], 60)
         self.assertEqual(len(resp.data["results"]), 60)
+
+
+# ── Linked docs on a team member's profile ────────────────────────────────────
+
+def member_documents_url(pk):
+    return f"/api/v1/team/members/{pk}/documents/"
+
+
+def document_detail_url(pk):
+    return f"/api/v1/team/member-documents/{pk}/"
+
+
+class TeamMemberDocumentTests(APITestCase):
+    """Docs on a TeamMember profile — viewable by anyone, editable by self or staff."""
+
+    def setUp(self):
+        self.staff = _make_user("docstaff", is_staff=True)
+        self.owner_user = _make_user("docowner")
+        self.other_user = _make_user("docother")
+        self.owner_member = TeamMember.objects.create(
+            full_name="Doc Owner", email="docowner-member@example.com", user=self.owner_user
+        )
+        # Not in any shared team with owner_user/other_user, and staff_view_override
+        # is off by default on non-staff — this member is outside normal scoping.
+        self.doc = TeamMemberDocument.objects.create(
+            team_member=self.owner_member, name="Coverage doc", url="https://docs.example.com/coverage",
+            added_by=self.owner_user,
+        )
+
+    def test_unauthenticated_list_returns_401(self):
+        resp = self.client.get(member_documents_url(self.owner_member.id))
+        self.assertEqual(resp.status_code, 401)
+
+    def test_unauthenticated_create_returns_401(self):
+        resp = self.client.post(
+            member_documents_url(self.owner_member.id), {"name": "x", "url": "https://x"}, format="json"
+        )
+        self.assertEqual(resp.status_code, 401)
+
+    def test_any_authenticated_user_can_view_docs_outside_normal_scoping(self):
+        self.client.force_authenticate(user=self.other_user)
+        resp = self.client.get(member_documents_url(self.owner_member.id))
+        self.assertEqual(resp.status_code, 200)
+        names = [d["name"] for d in resp.data]
+        self.assertIn("Coverage doc", names)
+
+    def test_owner_can_add_a_document(self):
+        self.client.force_authenticate(user=self.owner_user)
+        resp = self.client.post(
+            member_documents_url(self.owner_member.id),
+            {"name": "OOO notes", "url": "https://docs.example.com/ooo"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertTrue(
+            TeamMemberDocument.objects.filter(team_member=self.owner_member, name="OOO notes").exists()
+        )
+
+    def test_non_owner_non_staff_cannot_add_a_document(self):
+        self.client.force_authenticate(user=self.other_user)
+        resp = self.client.post(
+            member_documents_url(self.owner_member.id),
+            {"name": "Sneaky doc", "url": "https://evil.example.com"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_staff_can_add_a_document_for_anyone(self):
+        self.client.force_authenticate(user=self.staff)
+        resp = self.client.post(
+            member_documents_url(self.owner_member.id),
+            {"name": "Added by staff", "url": "https://docs.example.com/staff"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+
+    def test_owner_can_update_own_document(self):
+        self.client.force_authenticate(user=self.owner_user)
+        resp = self.client.patch(document_detail_url(self.doc.id), {"name": "Renamed"}, format="json")
+        self.assertEqual(resp.status_code, 200)
+        self.doc.refresh_from_db()
+        self.assertEqual(self.doc.name, "Renamed")
+
+    def test_non_owner_non_staff_update_returns_404(self):
+        self.client.force_authenticate(user=self.other_user)
+        resp = self.client.patch(document_detail_url(self.doc.id), {"name": "Hacked"}, format="json")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_staff_can_update_any_document(self):
+        self.client.force_authenticate(user=self.staff)
+        resp = self.client.patch(document_detail_url(self.doc.id), {"name": "Staff edit"}, format="json")
+        self.assertEqual(resp.status_code, 200)
+
+    def test_owner_can_delete_own_document(self):
+        self.client.force_authenticate(user=self.owner_user)
+        resp = self.client.delete(document_detail_url(self.doc.id))
+        self.assertEqual(resp.status_code, 204)
+        self.assertFalse(TeamMemberDocument.objects.filter(pk=self.doc.id).exists())
+
+    def test_non_owner_non_staff_delete_returns_404(self):
+        self.client.force_authenticate(user=self.other_user)
+        resp = self.client.delete(document_detail_url(self.doc.id))
+        self.assertEqual(resp.status_code, 404)
+        self.assertTrue(TeamMemberDocument.objects.filter(pk=self.doc.id).exists())
+
+    def test_staff_can_delete_any_document(self):
+        self.client.force_authenticate(user=self.staff)
+        resp = self.client.delete(document_detail_url(self.doc.id))
+        self.assertEqual(resp.status_code, 204)
 
 
 # ── Calendar color preferences ────────────────────────────────────────────────

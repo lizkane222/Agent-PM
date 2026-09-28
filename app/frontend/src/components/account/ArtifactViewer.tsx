@@ -2,6 +2,8 @@ import { useEffect } from "react";
 import type { AccountArtifact } from "../../types";
 import { ArtifactIcon } from "./ArtifactIcon";
 import { resolveEmojiShortcodes } from "../../lib/emojiShortcodes";
+import { plainToHtml, sanitizeHtml } from "../../lib/noteHelpers";
+import LinkedRecordsList from "../shared/LinkedRecordsList";
 
 export function ArtifactViewer({
   artifact,
@@ -19,6 +21,9 @@ export function ArtifactViewer({
   }, [onClose]);
 
   const href = artifact.file_url ?? artifact.url ?? "";
+  const references = artifact.references ?? [];
+  const usedIn = artifact.used_in ?? [];
+  const hasDetails = Boolean(artifact.description?.trim()) || references.length > 0 || usedIn.length > 0 || Boolean(artifact.uploaded_by_username);
 
   return (
     <div className="fixed inset-0 z-50 flex flex-col bg-black/70 backdrop-blur-sm" onClick={onClose}>
@@ -54,7 +59,8 @@ export function ArtifactViewer({
         </div>
       </div>
 
-      <div style={{ flex: 1, overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center" }} onClick={(e) => e.stopPropagation()}>
+      <div style={{ flex: 1, overflow: "hidden", display: "flex", minHeight: 0 }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ flex: 1, overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center" }}>
         {canPreview && artifact.mime_type.startsWith("image/") ? (
           <img src={href} alt={artifact.name} style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }} />
         ) : canPreview ? (
@@ -70,6 +76,36 @@ export function ArtifactViewer({
               Open file ↗
             </a>
           </div>
+        )}
+        </div>
+
+        {hasDetails && (
+          <aside
+            data-testid="artifact-details"
+            style={{ width: "300px", flexShrink: 0, background: "#fff", overflowY: "auto", padding: "16px", borderLeft: "1px solid rgba(0,0,0,0.08)" }}
+          >
+            {artifact.uploaded_by_username && (
+              <div className="flex items-center gap-2 mb-3">
+                <span className="w-6 h-6 rounded-full bg-indigo-600 text-white text-[10px] font-bold flex items-center justify-center shrink-0">
+                  {artifact.uploaded_by_username[0].toUpperCase()}
+                </span>
+                <span className="text-xs text-gray-600">
+                  Added by <span className="font-semibold text-gray-800">{artifact.uploaded_by_username}</span>
+                </span>
+              </div>
+            )}
+            {artifact.description?.trim() && (
+              <div className="mb-3">
+                <p className="text-[9px] font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide">Description</p>
+                <div
+                  className="mt-1 text-xs text-[var(--twilio-navy)] prose-sm"
+                  dangerouslySetInnerHTML={{ __html: sanitizeHtml(plainToHtml(artifact.description)) }}
+                />
+              </div>
+            )}
+            <LinkedRecordsList title="Mentions in description" references={references} className="mb-3" />
+            <LinkedRecordsList title="Used in" references={usedIn} />
+          </aside>
         )}
       </div>
     </div>
