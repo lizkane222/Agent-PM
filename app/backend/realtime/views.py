@@ -29,6 +29,11 @@ from .voice_identity import (
 )
 from core.mixins import TwilioSignatureRequiredMixin  # shared, single canonical copy
 from core.pagination import ClientPageSizePagination
+from comments.serializers import _user_display_name
+from rest_framework.decorators import action
+
+# Cap for the shared per-record feed; one card never needs more than this.
+RESOURCE_ACTIVITY_LIMIT = 200
 
 logger = logging.getLogger(__name__)
 
@@ -336,3 +341,40 @@ class AgentActivityEventViewSet(viewsets.ModelViewSet):
             if AgentActivityEvent.objects.filter(user=self.request.user, client_id=client_id).exists():
                 return
         serializer.save(user=self.request.user)
+
+    @action(detail=False, methods=["get"], url_path="for-resource")
+    def for_resource(self, request):
+        """GET /realtime/activity/for-resource/?type=action_item&id=<airtable_id>
+
+        Every user's activity for one record — the shared counterpart to the owner-scoped
+        list. The activity log is written client-side under each writer's own user, so the
+        list route alone can never show a teammate's edit on a shared action item.
+
+        Visibility follows the record, not the event: the caller must be able to see the
+        action item (same Admin-privacy rule as the action-items list). An unknown or hidden
+        record answers with an empty list, so existence cannot be probed.
+        """
+        resource_type = request.query_params.get("type", "")
+        resource_id = request.query_params.get("id", "")
+        if resource_type != "action_item" or not resource_id:
+            return Response({"results": []})
+
+        from airtable_sync.models import AirtableActionItem
+        from airtable_sync.views import _exclude_private_admin_items
+        visible = _exclude_private_admin_items(
+            AirtableActionItem.objects.filter(airtable_id=resource_id), request.user
+        ).exists()
+        if not visible:
+            return Response({"results": []})
+
+        events = (
+            AgentActivityEvent.objects
+            .filter(metadata__resource__type=resource_type, metadata__resource__id=resource_id)
+            .select_related("user", "user__profile")
+            .order_by("-created_at")[:RESOURCE_ACTIVITY_LIMIT]
+        )
+        data = AgentActivityEventSerializer(events, many=True).data
+        for row, ev in zip(data, events):
+            row["actor_id"] = ev.user_id
+            row["actor_display"] = _user_display_name(ev.user)
+        return Response({"results": data})

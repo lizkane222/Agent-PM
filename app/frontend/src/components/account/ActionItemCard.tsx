@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { ASSIGN_MEMBER_DRAG_TYPE, assignActionItemToMember, readMemberDragData } from "../../lib/actionItemAssign";
 import type { AirtableActionItem, AirtableMeeting, TeamMember } from "../../types";
 import { airtableApi } from "../../lib/api";
 import { logActionItemUpdate } from "../../lib/actionItemLog";
@@ -113,17 +114,13 @@ export function ActionItemCard({
   async function handleDrop(e: React.DragEvent) {
     setDragOver(false);
 
-    const memberRaw = e.dataTransfer.getData("assignmemberdrop");
-    if (memberRaw) {
+    const member = readMemberDragData(e);
+    if (member) {
       e.preventDefault();
       e.stopPropagation();
       try {
-        const { name, id } = JSON.parse(memberRaw) as { name: string; id: number };
-        const { data: updated } = await airtableApi.updateActionItemFields(item.airtable_id, {
-          assignee_name: name,
-          assignee_airtable_id: String(id),
-        });
-        logActionItemUpdate(item, { assignee_name: name });
+        const updated = await assignActionItemToMember(item, member);
+        if (!updated) return;
         onUpdated?.(updated);
         setAssignFlash(true);
         setTimeout(() => setAssignFlash(false), 1500);
@@ -152,7 +149,7 @@ export function ActionItemCard({
         draggable={!!onDragStart}
         onDragStart={onDragStart}
         onDragOver={(e) => {
-          if (e.dataTransfer.types.includes("artifactdrop") || e.dataTransfer.types.includes("assignmemberdrop")) {
+          if (e.dataTransfer.types.includes("artifactdrop") || e.dataTransfer.types.includes(ASSIGN_MEMBER_DRAG_TYPE)) {
             e.preventDefault();
             e.stopPropagation();
             setDragOver(true);

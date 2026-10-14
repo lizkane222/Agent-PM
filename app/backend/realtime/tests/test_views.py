@@ -408,3 +408,60 @@ class VoiceTwiMLIdentityTests(APITestCase):
         body = self._post(**{"From": f"client:{self.user.pk}", "CallSid": CALL_SID_ALICE}).content.decode()
         hints = re.search(r'hints="([^"]*)"', body).group(1).split(",")
         self.assertIn("Acme Inc", hints)
+
+
+class ResourceActivityFeedTests(APITestCase):
+    """GET /realtime/activity/for-resource/ — every user's activity on one action item."""
+
+    URL = "/api/v1/realtime/activity/for-resource/"
+
+    def setUp(self):
+        from airtable_sync.models import AirtableAccount, AirtableActionItem
+        self.alice = User.objects.create_user(username="alice_feed", password="{PASSWORD}")
+        self.bob = User.objects.create_user(username="bob_feed", password="{PASSWORD}", first_name="Bob", last_name="B")
+        acct = AirtableAccount.objects.create(airtable_id="recFEED", name="Acme Corp")
+        self.item = AirtableActionItem.objects.create(airtable_id="recItem1", account=acct, task="Fix it")
+        admin = AirtableAccount.objects.create(airtable_id="recADM", name="Admin")
+        self.private = AirtableActionItem.objects.create(
+            airtable_id="recPriv", account=admin, task="Mine", assignee_airtable_id="usrBOB",
+        )
+
+    def _event(self, user, rid, title):
+        return AgentActivityEvent.objects.create(
+            user=user, event_type="action_item", title=title,
+            metadata={"resource": {"type": "action_item", "id": rid}},
+        )
+
+    def test_unauthenticated_returns_401(self):
+        self.assertEqual(self.client.get(self.URL, {"type": "action_item", "id": "recItem1"}).status_code, 401)
+
+    def test_includes_other_users_events_with_actor(self):
+        self._event(self.alice, "recItem1", "alice edit")
+        self._event(self.bob, "recItem1", "bob reassigned")
+        self._event(self.bob, "recOther", "unrelated")
+        self.client.force_authenticate(user=self.alice)
+        resp = self.client.get(self.URL, {"type": "action_item", "id": "recItem1"})
+        self.assertEqual(resp.status_code, 200)
+        by_title = {r["title"]: r for r in resp.data["results"]}
+        self.assertEqual(set(by_title), {"alice edit", "bob reassigned"})
+        self.assertEqual(by_title["bob reassigned"]["actor_display"], "Bob B")
+        self.assertEqual(by_title["bob reassigned"]["actor_id"], self.bob.pk)
+
+    def test_hidden_item_returns_empty(self):
+        self._event(self.bob, "recPriv", "bob private")
+        self.client.force_authenticate(user=self.alice)
+        resp = self.client.get(self.URL, {"type": "action_item", "id": "recPriv"})
+        self.assertEqual(resp.data["results"], [])
+
+    def test_unknown_item_and_unsupported_type_return_empty(self):
+        self._event(self.bob, "recNope", "ghost")
+        self.client.force_authenticate(user=self.alice)
+        self.assertEqual(self.client.get(self.URL, {"type": "action_item", "id": "recNope"}).data["results"], [])
+        self.assertEqual(self.client.get(self.URL, {"type": "account", "id": "1"}).data["results"], [])
+        self.assertEqual(self.client.get(self.URL).data["results"], [])
+
+    def test_owner_scoped_list_is_unchanged(self):
+        self._event(self.bob, "recItem1", "bob reassigned")
+        self.client.force_authenticate(user=self.alice)
+        titles = [e["title"] for e in self.client.get("/api/v1/realtime/activity/").data["results"]]
+        self.assertNotIn("bob reassigned", titles)

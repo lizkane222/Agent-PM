@@ -833,6 +833,12 @@ export const realtimeApi = {
   getSyncToken: () => apiClient.get<SyncToken>("/realtime/sync-token/"),
   listActivity: (params?: { event_type?: string; since?: string; page_size?: number }) =>
     apiClient.get<PaginatedResponse<AgentActivityEvent>>("/realtime/activity/", { params }),
+  /** Every user's activity on one record (not just the caller's), newest first. */
+  listActivityForResource: (type: string, id: string | number) =>
+    apiClient.get<{ results: (AgentActivityEvent & { actor_id: number; actor_display: string })[] }>(
+      "/realtime/activity/for-resource/",
+      { params: { type, id: String(id) }, noCache: true },
+    ),
   createActivity: (data: {
     event_type: string;
     title: string;

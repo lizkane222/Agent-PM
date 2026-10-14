@@ -196,6 +196,7 @@ class AccountViewSet(viewsets.ModelViewSet):
                 account.save(update_fields=["airtable_id"])
         except Exception:
             logger.exception("Airtable write-through failed for new account '%s'", account.company_name)
+        self._ensure_airtable_mirror(account)
         publish_activity_event(
             self.request.user, "account.created",
             "**Created** Account",
@@ -217,6 +218,7 @@ class AccountViewSet(viewsets.ModelViewSet):
             push_account_update(account)
         except Exception:
             logger.exception("Airtable write-through failed for account update '%s'", account.company_name)
+        self._ensure_airtable_mirror(account)
         self._cloud_coach_pushes = self._push_new_members_to_cloud_coach(
             account, before_member_ids
         )
@@ -225,6 +227,16 @@ class AccountViewSet(viewsets.ModelViewSet):
             "**Updated** Account",
             detail=account.company_name,
         )
+
+    @staticmethod
+    def _ensure_airtable_mirror(account):
+        """Action items FK to AirtableAccount, which only the pull sync used to write —
+        so a new account could not be linked until the next sync. Best effort."""
+        try:
+            from airtable_sync.account_mirror import ensure_airtable_account_mirror
+            ensure_airtable_account_mirror(account)
+        except Exception:
+            logger.exception("Failed to mirror account '%s' to AirtableAccount", account.company_name)
 
     def _push_new_members_to_cloud_coach(self, account, before_member_ids: set) -> list[dict]:
         """

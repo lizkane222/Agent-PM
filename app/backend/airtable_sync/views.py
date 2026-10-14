@@ -27,6 +27,7 @@ from .serializers import (
     ManualCategorizationSerializer,
     EventContextSerializer,
 )
+from .account_mirror import resolve_airtable_account
 from .matching import match_event_to_account, set_manual_categorization
 from .sync import sync_all
 from .airtable_client import get_table, TABLE_ACTION_ITEMS
@@ -106,14 +107,25 @@ def _can_write_action_item(user, item) -> bool:
     items while field edits on the very same item succeeded.
 
     Allowed when the caller is staff (with staff data visibility), when the item has no
-    assignee at all — nobody owns it — or when the caller *is* the assignee.
+    assignee at all — nobody owns it, so anyone who can see it may update or reassign it —
+    or when the caller *is* the assignee.
+
+    "Is the assignee" accepts two id shapes, because both are live in the data: the
+    Airtable collaborator id (``usr…``, written by the Airtable sync) and the TeamMember pk
+    (written by every in-app assignee picker, which sends ``String(member.id)``). Matching
+    only the first meant that assigning an item to a teammate in the UI locked it against
+    everyone but staff — including the person it was just assigned to.
     """
     if _staff_sees_all(user):
         return True
-    if not item.assignee_airtable_id:
+    assignee = item.assignee_airtable_id
+    if not assignee:
         return True
     user_collab_id = getattr(getattr(user, "profile", None), "airtable_collaborator_id", None)
-    return bool(user_collab_id) and item.assignee_airtable_id == user_collab_id
+    if user_collab_id and assignee == user_collab_id:
+        return True
+    team_member_id = getattr(getattr(user, "team_member", None), "pk", None)
+    return team_member_id is not None and assignee == str(team_member_id)
 
 
 def _action_items_for_account(account, user):
@@ -529,10 +541,15 @@ class AirtableActionItemViewSet(viewsets.ModelViewSet):
     def create(self, request, *args, **kwargs):
         # Resolve account FK from account_name if the integer id wasn't sent
         data = request.data.copy()
-        if not data.get("account") and data.get("account_name"):
-            acct = AirtableAccount.objects.filter(name__iexact=data["account_name"]).first()
-            if acct:
-                data["account"] = acct.pk
+        if not data.get("account") and (data.get("account_name") or "").strip():
+            acct = resolve_airtable_account(name=data["account_name"])
+            if acct is None:
+                # Saving it unlinked would silently drop the account the user picked.
+                return Response(
+                    {"error": f"Unknown account \"{data['account_name']}\" — the action item was not created."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            data["account"] = acct.pk
         serializer = self.get_serializer(data=data)
         serializer.is_valid(raise_exception=True)
 
@@ -982,43 +999,29 @@ def update_action_item_fields(request, airtable_id):
             else:
                 airtable_payload[at_field] = val
 
-    # Account FK — resolve by PK, then fall back to name lookup.
-    if "account" in request.data:
-        raw = request.data["account"]
-        if raw in (None, "", "null"):
+    # Account FK — resolve by PK, then by name (creating the AirtableAccount mirror
+    # for an app-created account if needed). `account: null` alongside a non-blank
+    # `account_name` is a name-only link, not a clear: the frontend sends a null PK
+    # for accounts that have no mirror yet.
+    if "account" in request.data or "account_name" in request.data:
+        raw = request.data.get("account")
+        name_hint = (request.data.get("account_name") or "").strip()
+        if raw in (None, "", "null") and not name_hint:
             item.account = None
             local_fields.append("account")
             airtable_payload["Account"] = []
         else:
-            acct = None
-            try:
-                acct = AirtableAccount.objects.get(pk=int(raw))
-            except (AirtableAccount.DoesNotExist, ValueError, TypeError):
-                # PK lookup failed — try resolving via account_name as a fallback
-                name_hint = request.data.get("account_name", "")
-                if name_hint:
-                    acct = AirtableAccount.objects.filter(name__iexact=name_hint).first()
-                if acct is None:
-                    logger.warning("update_action_item_fields: unknown account pk=%s name=%s", raw, name_hint)
-            if acct is not None:
-                item.account = acct
-                local_fields.append("account")
-                if acct.airtable_id:
-                    airtable_payload["Account"] = [acct.airtable_id]
-    elif "account_name" in request.data and "account" not in request.data:
-        # account_name sent without an account PK — resolve by name
-        name_hint = request.data.get("account_name", "")
-        if name_hint:
-            acct = AirtableAccount.objects.filter(name__iexact=name_hint).first()
-            if acct is not None:
-                item.account = acct
-                local_fields.append("account")
-                if acct.airtable_id:
-                    airtable_payload["Account"] = [acct.airtable_id]
-        else:
-            item.account = None
+            acct = resolve_airtable_account(pk=raw, name=name_hint)
+            if acct is None:
+                logger.warning("update_action_item_fields: unknown account pk=%s name=%s", raw, name_hint)
+                return Response(
+                    {"error": f"Unknown account \"{name_hint or raw}\" — nothing was saved."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            item.account = acct
             local_fields.append("account")
-            airtable_payload["Account"] = []
+            if acct.airtable_id:
+                airtable_payload["Account"] = [acct.airtable_id]
 
     # Linked meeting FK — link a Done action item to a meeting for timeline pinning.
     if "linked_meeting" in request.data:

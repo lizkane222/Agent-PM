@@ -26,7 +26,28 @@ export const mockReplyNotification: AgentActivityEvent = {
   created_at: "2026-08-05T12:00:00Z",
 };
 
+/** Shared per-record activity feed. Default is empty so existing card DOM is unchanged. */
+export function resourceActivityResponse(
+  rows: Array<Partial<AgentActivityEvent> & { actor_display: string; title: string }>,
+) {
+  return {
+    results: rows.map((r, i) => ({
+      id: 900 + i,
+      event_type: "action_item",
+      detail: "",
+      metadata: {},
+      sync_document_id: "",
+      client_id: `srv-client-${i}`,
+      client_ts: null,
+      created_at: "2026-10-01T12:00:00Z",
+      actor_id: 2,
+      ...r,
+    })),
+  };
+}
+
 export const realtimeHandlers = [
+  http.get("/api/v1/realtime/activity/for-resource/", () => HttpResponse.json({ results: [] })),
   http.get("/api/v1/realtime/activity/", () =>
     HttpResponse.json({ results: [], count: 0 })
   ),

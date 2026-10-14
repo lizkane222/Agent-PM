@@ -23,6 +23,9 @@ export interface LogEntry {
   resource?: LogResource;
   // Opaque snapshot enabling a "Restore" undo for conversion operations
   restoreData?: Record<string, unknown>;
+  // Who made the change. Set only on entries fetched from the shared per-record feed,
+  // which includes teammates' edits; locally-written entries are always the current user.
+  actor?: string;
 }
 
 const STORAGE_KEY = "appActivityLog";
@@ -137,6 +140,43 @@ export function addBackendLog(entry: { id: string; ts: number; category: string;
   };
   writeAll([...existing, full]);
   window.dispatchEvent(new StorageEvent("storage", { key: STORAGE_KEY, newValue: "1" }));
+}
+
+/**
+ * Activity on one record from *every* user, merged with this browser's local entries.
+ *
+ * Local entries are the current user's own writes (and keep their restoreData); the server
+ * feed adds teammates' edits on shared records such as unassigned action items. Deduped by
+ * client id, newest first. A failed fetch falls back to local entries alone.
+ */
+export async function fetchSharedLogsForResource(
+  type: LogResource["type"],
+  id: number | string,
+): Promise<LogEntry[]> {
+  const local = getLogsForResource(type, id);
+  let remote: LogEntry[] = [];
+  try {
+    const resp = await realtimeApi.listActivityForResource(type, id);
+    remote = (resp.data.results ?? []).map((ev) => {
+      const meta = ev.metadata as { links?: { label: string; path: string }[]; resource?: LogResource };
+      return {
+        id: ev.client_id || `srv-${ev.id}`,
+        ts: ev.client_ts ?? new Date(ev.created_at).getTime(),
+        category: ev.event_type as LogCategory,
+        message: ev.title,
+        links: meta?.links,
+        resource: meta?.resource,
+        actor: ev.actor_display,
+      };
+    });
+  } catch {
+    return local;
+  }
+  const byId = new Map<string, LogEntry>();
+  for (const e of remote) byId.set(e.id, e);
+  // Local wins on fields it owns (restoreData), but keeps the server's actor label.
+  for (const e of local) byId.set(e.id, { ...byId.get(e.id), ...e, actor: byId.get(e.id)?.actor });
+  return [...byId.values()].sort((a, b) => b.ts - a.ts);
 }
 
 export { STORAGE_KEY as LOG_STORAGE_KEY };

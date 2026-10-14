@@ -3393,3 +3393,106 @@ session did, and why only this one lost anything.
   window still costs one request per week.
 - Nothing has been exercised against a real Google Calendar — ngrok is still Zscaler-blocked
   (2026-08-31), so `_sync_google_calendar` remains covered only by the mocked suite.
+
+---
+
+### 2026-10-06 — Unassigned action items are shared; the activity log shows teammates' edits
+
+**What was already true:** `_can_write_action_item` already let anyone who can see an unassigned
+item edit it (fields, status, reassignment, steps, attachments, time). The account-membership
+check on the viewset PATCH still applies, so "anyone" means anyone on the account.
+
+**Two real gaps fixed**
+1. **Assigning in the app locked the item against its new assignee.** Every in-app assignee
+   picker writes `assignee_airtable_id = String(TeamMember.id)` (dev DB: 11 items hold a bare pk
+   like `"67"`), but the write rule only matched `profile.airtable_collaborator_id` (`usr…`).
+   So once an unassigned item was assigned to a teammate, only staff could touch it. The rule
+   now also accepts `user.team_member.pk`. Another person's item is still 403.
+2. **The card's activity log only showed your own edits.** `addLog()` stores entries in
+   localStorage and POSTs them under the writer's own user; `/realtime/activity/` is
+   owner-scoped. New `GET /realtime/activity/for-resource/?type=action_item&id=<airtable_id>`
+   returns every user's events for one item, with `actor_display`, gated on the caller being
+   able to see the item (Admin privacy rule via `_exclude_private_admin_items`; hidden or unknown
+   → empty, not 404). `ActivityLogSection` merges it with local entries for `action_item` only
+   and renders "by <name>" on server-sourced rows. Edits were already logged by
+   `logActionItemUpdate`, including "Reassigned to …".
+
+**Test-harness note:** six page tests mock `lib/appLog` wholesale; each needed
+`fetchSharedLogsForResource` added to its mock.
+
+**Verified:** 1360/1360 backend (12 new), frontend 1380/1394 (7 new). The 14 failures
+(`ActionItemModal` ×13, `AccountDetailPage` file-drop ×1) are identical on a stashed clean tree.
+`npm run build` clean. Daphne restarted **standalone** (not under `concurrently`); live probe of
+the new route returned real events.
+
+---
+
+### 2026-10-07 — Action items could not be linked to a newly created account
+
+**Symptom**
+An action item created on a brand-new account's page ("Archistrator") came back with no account
+and dropped off that page. Creating it on the Action Items page, or reassigning it in the modal,
+also left it under "No Account". Every request returned 200/201, so there was no error anywhere.
+
+**Root cause**
+Action items FK to `AirtableAccount`, not `accounts.Account`, and the only code that wrote
+`AirtableAccount` rows was the pull sync (`sync.sync_accounts`). An account created in the app is
+pushed to Airtable and gets its `airtable_id` straight away, but it had **no mirror row until the
+next successful pull**. So `create` (lookup by name), `/fields/` (lookup by PK, then name) and the
+modal (which sends `account: null` for an account with no mirror) all found nothing. They then
+quietly saved the item with no account: `create` dropped the name, `/fields/` logged a warning and
+returned 200 with the old value, and `account: null` cleared the link outright.
+
+**What changed**
+- `airtable_sync/account_mirror.py` (new): `ensure_airtable_account_mirror(account)` and
+  `resolve_airtable_account(pk, name)` (tries the mirror PK, then the mirror name, then a Django
+  `Account` by name, creating its mirror when needed).
+- `AccountViewSet.perform_create` / `perform_update` create or refresh the mirror (best effort).
+- `AirtableActionItemViewSet.create` and `update_action_item_fields` resolve through the helper. An
+  account name that matches nothing now returns **400**, where before the item was saved unlinked.
+  `account: null` with a non-blank `account_name` is now treated as a name-only link, not a clear;
+  a clear needs both to be blank.
+- Migration `airtable_sync/0017` backfills mirrors for existing app-created accounts (fixed
+  Archistrator, `recFnRj2nVwxSoZRZ`). Backup at `/tmp/db.sqlite3.pre-account-mirror`.
+- `NewActionItemCard` and AccountDetailPage's local copy had no `catch`, so a failed create
+  vanished silently. They now `reportError` the server message and keep the form filled.
+
+**Verified**
+- 1368/1368 backend (8 new `AppCreatedAccountLinkingTests`, sabotage-checked), 1396/1396
+  frontend (2 new `NewActionItemCard.test.tsx`), `npm run build` clean. Daphne restarted
+  standalone; Vite unaffected.
+
+**Left open**
+- The two "Mermaid Integration" items created during the bug (ids 254/255) are still unlinked and
+  are duplicates of each other. Reassign one in the modal (this now also pushes the link to
+  Airtable) and delete the other.
+
+---
+
+### 2026-10-07 — Account Detail: drag a team member onto an action item to assign it
+
+**What changed** (frontend only)
+- `lib/actionItemAssign.ts` (new) — `ASSIGN_MEMBER_DRAG_TYPE` (`"assignmemberdrop"`, the type
+  `components/account/ActionItemCard.tsx` already accepted but nothing ever produced),
+  `setMemberDragData` / `isMemberDrag` / `readMemberDragData`, and `assignActionItemToMember`
+  (PATCH `/fields/` with `assignee_airtable_id = String(TeamMember.id)` + `assignee_name`, then
+  `logActionItemUpdate` → "Reassigned to …"). Shared by both cards so the payload and log line
+  can't drift.
+- `AccountDetailPage.tsx` (additive): the member filter chips in the Action Items view bar are
+  now `draggable`; the page's **local** `ActionItemCard` (the one the kanban actually renders)
+  accepts the drop with the same outline/"✓ Assigned" feedback the shared card uses. Clicking a
+  chip still filters.
+
+**Key decisions**
+- The drop handler `stopPropagation`s, so the status column's `onDrop` never runs; a test pins
+  zero status PATCHes.
+- No-op (no request) when the item is already assigned to that member, or is a `local-*` blank.
+- A failed PATCH goes to `reportError`, not silence. The permission rule is unchanged: an item
+  assigned to someone else still 403s for non-staff.
+
+**Test-harness note:** `registerHandlers` now also serves `/fields/` PATCHes from the mutable
+`live` array (exported as `fieldPatches`), for the same reason the status PATCH does — the
+post-mutation refetch otherwise reverts the change.
+
+**Verified:** 7 new tests in `AccountDetailPage.test.tsx`; frontend 1389/1403, with the failing
+set byte-identical to the 14 pre-existing failures. `npm run build` clean. No backend change.

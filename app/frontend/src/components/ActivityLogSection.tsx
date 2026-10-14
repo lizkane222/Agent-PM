@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { getLogsForResource, LOG_STORAGE_KEY } from "../lib/appLog";
+import { fetchSharedLogsForResource, getLogsForResource, LOG_STORAGE_KEY } from "../lib/appLog";
 import type { LogEntry, LogResource } from "../lib/appLog";
 
 const CATEGORY_COLOR: Record<string, string> = {
@@ -39,19 +39,39 @@ export default function ActivityLogSection({ resourceType, resourceId, variant =
   );
   const [restoringId, setRestoringId] = useState<string | null>(null);
 
+  // Action items are shared records: anyone on the account can edit an unassigned one, so
+  // the log must include teammates' entries, which only the server has. Other resource
+  // types stay local-only, as before.
+  const shared = resourceType === "action_item" && !String(resourceId).startsWith("local-");
+
   useEffect(() => {
+    let cancelled = false;
     setEntries(getLogsForResource(resourceType, resourceId));
-  }, [resourceType, resourceId]);
+    if (shared) {
+      void fetchSharedLogsForResource(resourceType, resourceId).then((all) => {
+        if (!cancelled) setEntries(all);
+      });
+    }
+    return () => { cancelled = true; };
+  }, [resourceType, resourceId, shared]);
 
   useEffect(() => {
     function onStorage(e: StorageEvent) {
       if (e.key === LOG_STORAGE_KEY) {
-        setEntries(getLogsForResource(resourceType, resourceId));
+        // Merge the fresh local entry in immediately; keep teammates' entries already shown.
+        const local = getLogsForResource(resourceType, resourceId);
+        setEntries((prev) => {
+          if (!shared) return local;
+          const localIds = new Set(local.map((x) => x.id));
+          const actors = new Map(prev.map((x) => [x.id, x.actor]));
+          return [...local.map((x) => ({ ...x, actor: actors.get(x.id) })), ...prev.filter((x) => !localIds.has(x.id))]
+            .sort((a, b) => b.ts - a.ts);
+        });
       }
     }
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
-  }, [resourceType, resourceId]);
+  }, [resourceType, resourceId, shared]);
 
   const body = (
     <>
@@ -75,6 +95,11 @@ export default function ActivityLogSection({ resourceType, resourceId, variant =
                 <p className="text-xs leading-snug" style={{ color: "var(--twilio-navy)" }}>
                   {entry.message}
                 </p>
+                {entry.actor && (
+                  <p className="text-[10px] mt-0.5" style={{ color: "var(--twilio-gray-60)" }} data-testid="activity-actor">
+                    by {entry.actor}
+                  </p>
+                )}
                 <div className="flex flex-wrap gap-2 mt-1 items-center">
                   {entry.links && entry.links.map((link) => (
                     <Link
