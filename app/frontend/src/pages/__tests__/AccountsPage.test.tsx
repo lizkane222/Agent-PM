@@ -28,6 +28,7 @@ vi.mock("../../components/comments/CommentContext", () => ({
 
 vi.mock("../../lib/appLog", () => ({
   addLog: vi.fn(),
+  fetchSharedLogsForResource: vi.fn(async () => []),
   getLogs: vi.fn(() => []),
   getLogsForResource: vi.fn(() => []),
 }));

@@ -16,6 +16,7 @@ import { ROLE_META, getTitleRole } from "../lib/titleRoles";
 import { useLogGlow } from "../hooks/useLogGlow";
 import { addLog } from "../lib/appLog";
 import { logActionItemUpdate } from "../lib/actionItemLog";
+import { assignActionItemToMember, isMemberDrag, readMemberDragData, setMemberDragData } from "../lib/actionItemAssign";
 import { useScheduledOccurrences } from "../hooks/useScheduledOccurrences";
 import { useActionItemFieldOptions } from "../hooks/useActionItemFieldOptions";
 import { useCurrentUser } from "../context/CurrentUserContext";
@@ -361,6 +362,7 @@ function NewActionItemCard({
   const { status: statusOptions } = useActionItemFieldOptions();
   const [form, setForm] = useState<Partial<AirtableActionItem>>(BLANK_NEW_FORM());
   const [saving, setSaving] = useState(false);
+  const { reportError } = useAppError();
   const memberNames = ["Unassigned", ...teamMembers.map((m) => m.full_name)] as string[];
 
   const set = (patch: Partial<AirtableActionItem>) => setForm((f) => ({ ...f, ...patch }));
@@ -378,6 +380,10 @@ function NewActionItemCard({
       } as Parameters<typeof airtableApi.createActionItem>[0]);
       onSave(data);
       setForm(BLANK_NEW_FORM());
+    } catch (err: unknown) {
+      // Keep the form filled so nothing typed is lost, and say why it didn't save.
+      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
+      reportError(msg ?? "Failed to create action item — nothing was saved.", "AccountDetailPage");
     } finally {
       setSaving(false);
     }
@@ -934,12 +940,48 @@ function ActionItemCard({
   const canPin = !item.airtable_id.startsWith("local-");
   const isPinnedToFocus = canPin && isPinned(item.airtable_id);
   const commentItem = useCommentMenuItem("action_item", canPin ? item.id : null, item.task ?? "", ctxPos);
+  const { reportError } = useAppError();
+  // Drop a team member (from the Action Items filter chips) onto the card to assign it.
+  // Only a saved item accepts it — a local-* blank has no row to PATCH.
+  const [memberDragOver, setMemberDragOver] = useState(false);
+  const [assignFlash, setAssignFlash] = useState(false);
+
+  async function handleMemberDrop(e: React.DragEvent) {
+    const member = readMemberDragData(e);
+    if (!member) return;
+    // Stop here so the column's kanban onDrop doesn't also run.
+    e.preventDefault();
+    e.stopPropagation();
+    setMemberDragOver(false);
+    try {
+      const updated = await assignActionItemToMember(item, member);
+      if (!updated) return;
+      onUpdated?.(updated);
+      setAssignFlash(true);
+      setTimeout(() => setAssignFlash(false), 1500);
+    } catch {
+      reportError(`Could not assign "${item.task || "Untitled"}" to ${member.name}.`, "action-item-assign");
+    }
+  }
 
   return (
     <>
       <div
         draggable={!!onDragStart}
         onDragStart={onDragStart}
+        onDragOver={(e) => {
+          if (canPin && isMemberDrag(e)) {
+            e.preventDefault();
+            e.stopPropagation();
+            e.dataTransfer.dropEffect = "copy";
+            setMemberDragOver(true);
+          }
+        }}
+        onDragLeave={(e) => {
+          if (!e.currentTarget.contains(e.relatedTarget as Node)) setMemberDragOver(false);
+        }}
+        onDrop={(e) => { if (canPin) void handleMemberDrop(e); }}
+        data-testid={`account-action-card-${item.airtable_id}`}
         onClick={() => setModalOpen(true)}
         onContextMenu={(e) => {
           // `canPin` doubles as "this row exists server-side", which is also the
@@ -952,8 +994,10 @@ function ActionItemCard({
         className="rounded-lg select-none flex flex-col gap-1.5 cursor-pointer hover:shadow-md transition-shadow shrink-0"
         style={{
           position: "relative",
-          background: "#F4F4F6",
+          background: assignFlash ? "#f0fdf4" : memberDragOver ? "#eef2ff" : "#F4F4F6",
           borderLeft: `3px solid ${accent}`,
+          outline: memberDragOver ? "2px solid #6366f1" : "none",
+          outlineOffset: "-1px",
           padding: "8px 10px",
           boxShadow: "0 1px 3px rgba(0,0,0,0.08)",
           width: "208px",
@@ -988,6 +1032,7 @@ function ActionItemCard({
             </span>
           )}
         </div>
+        {assignFlash && <span className="text-[10px] font-semibold text-emerald-600">✓ Assigned</span>}
         <ActionItemCardOccurrences airtableId={item.airtable_id} />
         <CommentPreviewList
           resourceType="action_item"
@@ -5801,7 +5846,7 @@ export default function AccountDetailPage() {
           <p className="text-xs font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide mb-1">
             Action Items
             <span className="ml-2 text-[10px] font-normal normal-case" style={{ color: "var(--twilio-gray-60)" }}>
-              {actionItems.length > 0 ? "drag to goals or timeline · drag a note here" : "drag a note here to create one"}
+              {actionItems.length > 0 ? "drag to goals or timeline · drag a note here · drag a name onto a card to assign" : "drag a note here to create one"}
             </span>
           </p>
           {/* Kanban view selector bar */}
@@ -5830,7 +5875,11 @@ export default function AccountDetailPage() {
                 {internalMembers.map(m => (
                   <button
                     key={m.id}
-                    className={`px-2 py-0.5 rounded text-xs font-medium ${activeMembers?.has(m.full_name) ? "bg-indigo-600 text-white" : "bg-gray-100 text-gray-600 hover:bg-gray-200"}`}
+                    draggable
+                    onDragStart={(e) => setMemberDragData(e, { id: m.id, name: m.full_name })}
+                    title={`Filter by ${m.full_name} · drag onto an action item to assign`}
+                    data-testid={`assign-member-chip-${m.id}`}
+                    className={`px-2 py-0.5 rounded text-xs font-medium cursor-grab active:cursor-grabbing ${activeMembers?.has(m.full_name) ? "bg-indigo-600 text-white" : "bg-gray-100 text-gray-600 hover:bg-gray-200"}`}
                     onClick={() => {
                       setKanbanViewMode("all");
                       setKanbanMemberFilter(prev => {

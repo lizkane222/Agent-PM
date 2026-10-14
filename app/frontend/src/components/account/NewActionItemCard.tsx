@@ -2,6 +2,7 @@ import { useState } from "react";
 import { airtableApi } from "../../lib/api";
 import type { AirtableActionItem, TeamMember } from "../../types";
 import { useCurrentUser } from "../../context/CurrentUserContext";
+import { useAppError } from "../../context/AppErrorContext";
 import { useActionItemFieldOptions } from "../../hooks/useActionItemFieldOptions";
 import { AccPillSelect, AccPillDate, AccPillNumber, AccPillUrl } from "../shared/PillInputs";
 
@@ -58,6 +59,7 @@ export function NewActionItemCard({
   const { status: statusOptions } = useActionItemFieldOptions();
   const [form, setForm] = useState<Partial<AirtableActionItem>>(BLANK_NEW_FORM());
   const [saving, setSaving] = useState(false);
+  const { reportError } = useAppError();
   const memberNames = ["Unassigned", ...teamMembers.map((m) => m.full_name)] as string[];
 
   const set = (patch: Partial<AirtableActionItem>) => setForm((f) => ({ ...f, ...patch }));
@@ -75,6 +77,10 @@ export function NewActionItemCard({
       } as Parameters<typeof airtableApi.createActionItem>[0]);
       onSave(data);
       setForm(BLANK_NEW_FORM());
+    } catch (err: unknown) {
+      // Keep the form filled so nothing typed is lost, and say why it didn't save.
+      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
+      reportError(msg ?? "Failed to create action item — nothing was saved.", "NewActionItemCard");
     } finally {
       setSaving(false);
     }

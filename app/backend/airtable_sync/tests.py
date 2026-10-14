@@ -1971,3 +1971,201 @@ class CalendarEventAccountLinkAdminDisplayNameTests(APITestCase):
         body = resp.json()
         self.assertEqual(body["evt-admin-3"]["account_name"], "Admin")
         self.assertEqual(body["evt-acme-3"]["account_name"], "Acme Corp")
+
+
+class UnassignedAndTeamMemberAssigneeWriteTests(APITestCase):
+    """Who may update — and reassign — an action item.
+
+    Unassigned items are shared: anyone who can see one may edit it, including assigning it
+    to someone else. And "the assignee" may be stored as either an Airtable collaborator id
+    (``usr…``, from the sync) or a TeamMember pk (from every in-app assignee picker); the
+    latter used to lock the item against its own assignee.
+    """
+
+    FIELDS = "/api/v1/airtable/action-items/{}/fields/"
+
+    def setUp(self):
+        cache.clear()
+        from team.models import TeamMember, UserProfile
+        self.me = User.objects.create_user("writer_me", password="{PASSWORD}")
+        UserProfile.objects.create(user=self.me, airtable_collaborator_id="usrMINE", staff_view_override=False)
+        self.my_member = TeamMember.objects.create(user=self.me, full_name="Me Writer", email="me@x.test")
+        self.other = User.objects.create_user("writer_other", password="{PASSWORD}")
+        self.other_member = TeamMember.objects.create(user=self.other, full_name="Other Person", email="o@x.test")
+        self.account = AirtableAccount.objects.create(airtable_id="recWACCT", name="Acme Corp")
+        from accounts.models import Account
+        Account.objects.create(company_name="Acme Corp", airtable_id="recWACCT").team_members.add(self.my_member)
+        self.client.force_authenticate(user=self.me)
+
+    def _item(self, assignee, airtable_id="recW1"):
+        return AirtableActionItem.objects.create(
+            airtable_id=airtable_id, account=self.account, task="Task", assignee_airtable_id=assignee,
+        )
+
+    def test_unauthenticated_is_401(self):
+        self.client.force_authenticate(user=None)
+        item = self._item("")
+        resp = self.client.patch(self.FIELDS.format(item.airtable_id), {"task": "x"}, format="json")
+        self.assertEqual(resp.status_code, 401)
+
+    @patch("airtable_sync.views.get_table")
+    def test_anyone_can_assign_an_unassigned_item_to_someone_else(self, mock_get_table):
+        mock_get_table.return_value = MagicMock()
+        item = self._item("")
+        resp = self.client.patch(
+            self.FIELDS.format(item.airtable_id),
+            {"assignee_airtable_id": str(self.other_member.pk), "assignee_name": "Other Person"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.data)
+        item.refresh_from_db()
+        self.assertEqual(item.assignee_airtable_id, str(self.other_member.pk))
+        self.assertEqual(item.assignee_name, "Other Person")
+
+    @patch("airtable_sync.views.get_table")
+    def test_viewset_patch_on_unassigned_item_is_allowed(self, mock_get_table):
+        mock_get_table.return_value = MagicMock()
+        item = self._item("")
+        resp = self.client.patch(f"/api/v1/airtable/action-items/{item.pk}/", {"priority": "High"}, format="json")
+        self.assertEqual(resp.status_code, 200, getattr(resp, "data", None))
+
+    @patch("airtable_sync.views.get_table")
+    def test_item_assigned_by_team_member_pk_is_writable_by_that_member(self, mock_get_table):
+        mock_get_table.return_value = MagicMock()
+        item = self._item(str(self.my_member.pk))
+        resp = self.client.patch(self.FIELDS.format(item.airtable_id), {"task": "Renamed"}, format="json")
+        self.assertEqual(resp.status_code, 200, resp.data)
+
+    @patch("airtable_sync.views.get_table")
+    def test_item_assigned_to_another_team_member_is_still_denied(self, mock_get_table):
+        mock_get_table.return_value = MagicMock()
+        item = self._item(str(self.other_member.pk))
+        resp = self.client.patch(self.FIELDS.format(item.airtable_id), {"task": "Renamed"}, format="json")
+        self.assertEqual(resp.status_code, 403)
+
+    @patch("airtable_sync.views.get_table")
+    def test_item_assigned_to_another_collaborator_is_still_denied(self, mock_get_table):
+        mock_get_table.return_value = MagicMock()
+        item = self._item("usrSOMEONEELSE")
+        resp = self.client.patch(self.FIELDS.format(item.airtable_id), {"task": "Renamed"}, format="json")
+        self.assertEqual(resp.status_code, 403)
+
+    def test_user_without_team_member_cannot_match_a_pk_assignee(self):
+        from airtable_sync.views import _can_write_action_item
+        loner = User.objects.create_user("loner", password="{PASSWORD}")
+        item = self._item(str(self.other_member.pk))
+        self.assertFalse(_can_write_action_item(loner, item))
+
+
+class AppCreatedAccountLinkingTests(APITestCase):
+    """Regression: an account created in the app had an `airtable_id` but no
+    AirtableAccount mirror until the next pull sync, so every attempt to attach an
+    action item to it (create from the account page, create on the action items
+    page, reassign in the modal) resolved no account and saved the item unlinked
+    with a 200/201 — no error anywhere."""
+
+    def setUp(self):
+        cache.clear()
+        from accounts.models import Account
+        from team.models import TeamMember
+        self.user = User.objects.create_user("owner", password="pass", is_staff=True)
+        self.client.force_authenticate(user=self.user)
+        self.member = TeamMember.objects.create(full_name="Owner", email="owner@example.com", user=self.user)
+        self.account = Account.objects.create(company_name="Archistrator", airtable_id="recNEWACCT", created_by=self.user)
+        self.account.team_members.add(self.member)
+
+    @patch("airtable_sync.write_back.push_action_item_create", return_value="recITEM1")
+    @patch("airtable_sync.sync.mirror_action_item_to_scheduler")
+    def test_create_by_account_name_links_unmirrored_account(self, _mirror, _push):
+        self.assertFalse(AirtableAccount.objects.filter(airtable_id="recNEWACCT").exists())
+        resp = self.client.post(
+            "/api/v1/airtable/action-items/",
+            {"task": "Mermaid Integration", "status": "Open", "priority": "Medium", "account_name": "Archistrator"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201, resp.data)
+        item = AirtableActionItem.objects.get(airtable_id="recITEM1")
+        self.assertIsNotNone(item.account)
+        self.assertEqual(item.account.airtable_id, "recNEWACCT")
+        self.assertEqual(resp.data["account_name"], "Archistrator")
+
+    @patch("airtable_sync.write_back.push_action_item_create", return_value="recITEM2")
+    def test_create_with_unknown_account_name_is_rejected_not_saved_unlinked(self, push):
+        resp = self.client.post(
+            "/api/v1/airtable/action-items/",
+            {"task": "X", "status": "Open", "priority": "Medium", "account_name": "Nonexistent Co"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("Nonexistent Co", resp.data["error"])
+        push.assert_not_called()
+        self.assertFalse(AirtableActionItem.objects.filter(task="X").exists())
+
+    @patch("airtable_sync.views.get_table")
+    def test_reassign_with_null_pk_and_name_links_unmirrored_account(self, mock_get_table):
+        """The modal sends `account: null` for an account with no mirror — that is a
+        name-only link, not a clear."""
+        mock_get_table.return_value = MagicMock()
+        item = AirtableActionItem.objects.create(airtable_id="recORPHAN", task="Mermaid Integration")
+        resp = self.client.patch(
+            f"/api/v1/airtable/action-items/{item.airtable_id}/fields/",
+            {"account": None, "account_name": "Archistrator"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.data)
+        item.refresh_from_db()
+        self.assertEqual(item.account.airtable_id, "recNEWACCT")
+        self.assertEqual(resp.data["account_name"], "Archistrator")
+
+    @patch("airtable_sync.views.get_table")
+    def test_reassign_to_unknown_account_returns_400(self, mock_get_table):
+        mock_get_table.return_value = MagicMock()
+        acct = AirtableAccount.objects.create(airtable_id="recOLD", name="Old Co")
+        item = AirtableActionItem.objects.create(airtable_id="recKEEP", task="T", account=acct)
+        resp = self.client.patch(
+            f"/api/v1/airtable/action-items/{item.airtable_id}/fields/",
+            {"account": 99999, "account_name": "Nonexistent Co"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        item.refresh_from_db()
+        self.assertEqual(item.account_id, acct.pk)
+
+    @patch("airtable_sync.views.get_table")
+    def test_clearing_the_account_still_works(self, mock_get_table):
+        mock_get_table.return_value = MagicMock()
+        acct = AirtableAccount.objects.create(airtable_id="recOLD2", name="Old Co")
+        item = AirtableActionItem.objects.create(airtable_id="recCLR", task="T", account=acct)
+        resp = self.client.patch(
+            f"/api/v1/airtable/action-items/{item.airtable_id}/fields/",
+            {"account": None, "account_name": None},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        item.refresh_from_db()
+        self.assertIsNone(item.account)
+
+    def test_ensure_mirror_is_idempotent_and_tracks_renames(self):
+        from .account_mirror import ensure_airtable_account_mirror
+        m1 = ensure_airtable_account_mirror(self.account)
+        m2 = ensure_airtable_account_mirror(self.account)
+        self.assertEqual(m1.pk, m2.pk)
+        self.account.company_name = "Archistrator Inc"
+        ensure_airtable_account_mirror(self.account)
+        m1.refresh_from_db()
+        self.assertEqual(m1.name, "Archistrator Inc")
+        self.assertEqual(AirtableAccount.objects.filter(airtable_id="recNEWACCT").count(), 1)
+
+    def test_ensure_mirror_skips_accounts_without_airtable_id(self):
+        from accounts.models import Account
+        from .account_mirror import ensure_airtable_account_mirror
+        a = Account.objects.create(company_name="Local only", created_by=self.user)
+        self.assertIsNone(ensure_airtable_account_mirror(a))
+        self.assertFalse(AirtableAccount.objects.filter(name="Local only").exists())
+
+    @patch("airtable_sync.write_back.push_account_create", return_value="recCREATED")
+    def test_creating_an_account_creates_its_mirror(self, _push):
+        resp = self.client.post("/api/v1/accounts/accounts/", {"company_name": "Brand New"}, format="json")
+        self.assertEqual(resp.status_code, 201, resp.data)
+        mirror = AirtableAccount.objects.get(airtable_id="recCREATED")
+        self.assertEqual(mirror.name, "Brand New")

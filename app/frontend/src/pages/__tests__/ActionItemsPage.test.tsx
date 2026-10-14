@@ -50,6 +50,7 @@ vi.mock("../../context/ExportContext", () => ({
 
 vi.mock("../../lib/appLog", () => ({
   addLog: vi.fn(),
+  fetchSharedLogsForResource: vi.fn(async () => []),
   getLogs: vi.fn(() => []),
   getLogsForResource: vi.fn(() => []),
   syncLogsFromBackend: vi.fn(),

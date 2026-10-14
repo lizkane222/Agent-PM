@@ -16,6 +16,7 @@ global.ResizeObserver = class ResizeObserver {
 
 vi.mock("../../lib/appLog", () => ({
   addLog: vi.fn(),
+  fetchSharedLogsForResource: vi.fn(async () => []),
   getLogs: vi.fn(() => []),
   getLogsForResource: vi.fn(() => []),
   syncLogsFromBackend: vi.fn(),
@@ -156,9 +157,22 @@ const itemAfterMeeting  = makeItem({ airtable_id: "recE002", id: 5, task: "After
  * a defect in the fixture, not in the page: the reverting refetch is the fake insisting
  * nothing changed.
  */
+/** Every `/fields/` PATCH the page sent, in order. Reset by each registerHandlers call. */
+let fieldPatches: Array<{ id: string; body: Record<string, unknown> }> = [];
+
 function registerHandlers(items = [itemAlice, itemBob, itemNone]) {
   const live = items.map((i) => ({ ...i }));
+  fieldPatches = [];
   server.use(
+    // Same reason as the status PATCH below: write into `live` so the post-mutation
+    // refetch returns the change instead of reverting it.
+    http.patch("/api/v1/airtable/action-items/:id/fields/", async ({ request, params }) => {
+      const body = (await request.json()) as Record<string, unknown>;
+      fieldPatches.push({ id: String(params.id), body });
+      const row = live.find((i) => i.airtable_id === String(params.id));
+      if (row) Object.assign(row, body);
+      return HttpResponse.json(row ?? {});
+    }),
     http.patch("/api/v1/airtable/action-items/:id/status/", async ({ request, params }) => {
       const body = (await request.json()) as { status?: string };
       const row = live.find((i) => i.airtable_id === String(params.id) || String(i.id) === String(params.id));
@@ -1188,5 +1202,96 @@ describe("AccountDetailPage — artifact description, creator and linked records
 
     await waitFor(() => expect(posted).toHaveLength(1));
     expect(posted[0].description).toBe("The source of truth");
+  });
+});
+
+// ── Drag a team member onto an action item to assign it ──────────────────────
+
+/** A DataTransfer stand-in that carries data from dragstart to drop (jsdom has none). */
+function makeMemberDataTransfer() {
+  const store: Record<string, string> = {};
+  return {
+    setData: (k: string, v: string) => { store[k.toLowerCase()] = v; },
+    getData: (k: string) => store[k.toLowerCase()] ?? "",
+    get types() { return Object.keys(store); },
+    effectAllowed: "all",
+    dropEffect: "none",
+  };
+}
+
+describe("AccountDetailPage — drag a team member onto an action item", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    localStorage.clear();
+    registerHandlers();
+  });
+
+  async function dragMemberOnto(memberId: number, airtableId: string) {
+    await renderPage();
+    const section = await getSection();
+    const chip = await within(section).findByTestId(`assign-member-chip-${memberId}`);
+    const card = await within(section).findByTestId(`account-action-card-${airtableId}`);
+    const dt = makeMemberDataTransfer();
+    fireEvent.dragStart(chip, { dataTransfer: dt });
+    fireEvent.dragOver(card, { dataTransfer: dt });
+    fireEvent.drop(card, { dataTransfer: dt });
+    return { section, card };
+  }
+
+  it("member chips in the Action Items bar are draggable", async () => {
+    await renderPage();
+    const section = await getSection();
+    const chip = await within(section).findByTestId("assign-member-chip-2");
+    expect(chip).toHaveAttribute("draggable", "true");
+    expect(chip).toHaveTextContent("Bob Jones");
+  });
+
+  it("dropping a member on a card PATCHes the assignee to that member", async () => {
+    await dragMemberOnto(2, "recCCC003");
+    await waitFor(() => expect(fieldPatches).toHaveLength(1));
+    expect(fieldPatches[0].id).toBe("recCCC003");
+    expect(fieldPatches[0].body).toEqual({ assignee_name: "Bob Jones", assignee_airtable_id: "2" });
+  });
+
+  it("shows the new assignee and a confirmation on the card", async () => {
+    const { card } = await dragMemberOnto(2, "recCCC003");
+    expect(await within(card).findByText("✓ Assigned")).toBeInTheDocument();
+    expect(within(card).getByText("Bob Jones")).toBeInTheDocument();
+  });
+
+  it("logs the reassignment to the activity log", async () => {
+    const { addLog } = await import("../../lib/appLog");
+    vi.mocked(addLog).mockClear();
+    await dragMemberOnto(2, "recCCC003");
+    await waitFor(() => expect(addLog).toHaveBeenCalledWith(expect.objectContaining({
+      message: expect.stringContaining("Reassigned to Bob Jones"),
+      resource: { type: "action_item", id: "recCCC003" },
+    })));
+  });
+
+  it("does not move the card between status columns", async () => {
+    let statusPatches = 0;
+    server.use(http.patch("/api/v1/airtable/action-items/:id/status/", () => { statusPatches++; return HttpResponse.json({}); }));
+    await dragMemberOnto(2, "recCCC003");
+    await waitFor(() => expect(fieldPatches).toHaveLength(1));
+    expect(statusPatches).toBe(0);
+  });
+
+  it("dropping the member it's already assigned to sends nothing", async () => {
+    registerHandlers([itemAlice, makeItem({ ...itemBob, assignee_airtable_id: "2" }), itemNone]);
+    await dragMemberOnto(2, "recBBB002");
+    await new Promise((r) => setTimeout(r, 50));
+    expect(fieldPatches).toHaveLength(0);
+  });
+
+  it("surfaces a failed assignment instead of failing silently", async () => {
+    server.use(
+      http.patch("/api/v1/airtable/action-items/:id/fields/", () =>
+        HttpResponse.json({ error: "You can only modify action items assigned to you." }, { status: 403 })),
+    );
+    const { card } = await dragMemberOnto(2, "recAAA001");
+    await new Promise((r) => setTimeout(r, 50));
+    expect(within(card).queryByText("✓ Assigned")).not.toBeInTheDocument();
+    expect(within(card).getByText("Alice Smith")).toBeInTheDocument();
   });
 });
