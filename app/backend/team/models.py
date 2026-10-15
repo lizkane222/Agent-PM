@@ -81,6 +81,28 @@ class UserProfile(models.Model):
     # Null means push notifications are not registered for this browser/device.
     push_subscription = models.JSONField(null=True, blank=True)
 
+    # ── Access level ──────────────────────────────────────────────────────────
+    # The app's authorisation tier (enforced via core.mixins.access_level & friends):
+    #   basic — edits their own records; on an account they belong to may edit its fields
+    #           and assign action items to its team, but may only add/remove *themselves*
+    #           as an account member.
+    #   pm    — additionally assigns anyone to accounts (and accounts to anyone).
+    #   admin — full access, including other users' access levels and the staff data view.
+    # Changed only through the Admin-only /team/profiles/<id>/access-level/ endpoint.
+    ACCESS_BASIC, ACCESS_PM, ACCESS_ADMIN = "basic", "pm", "admin"
+    ACCESS_LEVEL_CHOICES = [(ACCESS_BASIC, "Basic"), (ACCESS_PM, "PM"), (ACCESS_ADMIN, "Admin")]
+    access_level = models.CharField(max_length=10, choices=ACCESS_LEVEL_CHOICES, default=ACCESS_BASIC)
+
+    def save(self, *args, **kwargs):
+        # A brand-new profile for a Django staff user starts as Admin, matching the data
+        # migration — profiles are created lazily (first /me/ visit, fixtures, admin), and a
+        # Basic default would otherwise silently demote every newly-provisioned staff user.
+        # Existing rows are never touched: after creation the level is only ever what an
+        # Admin set it to.
+        if self._state.adding and self.access_level == self.ACCESS_BASIC and getattr(self.user, "is_staff", False):
+            self.access_level = self.ACCESS_ADMIN
+        super().save(*args, **kwargs)
+
     # ── Staff view mode ───────────────────────────────────────────────────────
     # When True (default), staff users see all records. When False, staff users
     # see only the records they are personally assigned to — same as a regular user.

@@ -2,7 +2,7 @@
  * SettingsPage — OAuth connections, Twilio config, and notification preferences.
  */
 
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { integrationsApi, teamApi } from "../lib/api";
 import { logout } from "../lib/auth";
@@ -10,6 +10,18 @@ import SettingsIcon from "../assets/icons/Settings.svg?react";
 import { useNotificationDefaults } from "../context/NotificationDefaultsContext";
 import type { OAuthCredential, UserProfile } from "../types";
 import TagInput from "../components/shared/TagInput";
+import IntegrationVoteModal, { type IntegrationVote } from "../components/settings/IntegrationVoteModal";
+import PhoneNumberInput from "../components/settings/PhoneNumberInput";
+import UserAccessPanel from "../components/settings/UserAccessPanel";
+import { CHANNEL_LABEL, channelsToTest, type NotificationSnapshot, type TestChannel } from "../lib/notificationTests";
+import { isValidE164 } from "../lib/phone";
+
+/** Integration availability for this deployment, shared with every ConnectionCard. */
+type ProviderAvailability = Record<string, { configured: boolean; my_vote: IntegrationVote | null; yes_votes: number }>;
+const AvailabilityContext = createContext<{ providers: ProviderAvailability | null; onVoted: (provider: string, vote: IntegrationVote) => void }>({
+  providers: null,
+  onVoted: () => {},
+});
 
 function _urlBase64ToUint8Array(base64String: string): Uint8Array {
   const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
@@ -56,6 +68,13 @@ function ConnectionCard({
   const [confirmDisconnect, setConfirmDisconnect] = useState(false);
   const [disconnecting, setDisconnecting] = useState(false);
   const [disconnectError, setDisconnectError] = useState<string | null>(null);
+  const [voteOpen, setVoteOpen] = useState(false);
+  const availability = useContext(AvailabilityContext);
+  const providerInfo = provider ? availability.providers?.[provider] : undefined;
+  // Not configured on this server: Connect opens the vote modal instead of a dead OAuth link
+  // (which used to land on Django's debug 404 listing every route, or a raw alert()).
+  const notConfigured = !!providerInfo && !providerInfo.configured && !isConnected;
+  const handleConnect = notConfigured ? () => setVoteOpen(true) : onConnect;
 
   async function runTest() {
     if (!onTest) return;
@@ -119,7 +138,7 @@ function ConnectionCard({
             </span>
           ) : (
             <button
-              onClick={onConnect}
+              onClick={handleConnect}
               className="rounded-md bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-indigo-700"
             >
               Connect
@@ -161,6 +180,15 @@ function ConnectionCard({
       )}
       {afterContent && (
         <div className="mt-3 border-t border-gray-50 pt-3">{afterContent}</div>
+      )}
+      {voteOpen && provider && (
+        <IntegrationVoteModal
+          provider={provider}
+          name={name}
+          currentVote={providerInfo?.my_vote ?? null}
+          onClose={() => setVoteOpen(false)}
+          onVoted={(v) => availability.onVoted(provider, v)}
+        />
       )}
     </div>
   );
@@ -253,7 +281,12 @@ export default function SettingsPage() {
   const [gmailConfig, setGmailConfig] = useState<{ label_name?: string; keywords?: string[]; block_keywords?: string[] }>({});
   const [gmailConfigIsSaving, setGmailConfigIsSaving] = useState(false);
   const [gmailConfigSaveSuccess, setGmailConfigSaveSuccess] = useState(false);
-  const [scraperStatus, setScraperStatus] = useState<{ confluence: boolean; jira: boolean; zendesk: boolean; gong: boolean; notion: boolean } | null>(null);
+  const [scraperStatus, setScraperStatus] = useState<{ confluence: boolean; jira: boolean; zendesk: boolean; gong: boolean; notion: boolean; hints?: Partial<Record<string, string>> } | null>(null);
+  const [providerAvailability, setProviderAvailability] = useState<ProviderAvailability | null>(null);
+  // Notification settings as last saved — "updated" options are measured against this.
+  const savedNotifRef = useRef<NotificationSnapshot | null>(null);
+  const [testResults, setTestResults] = useState<{ channel: TestChannel; status: "sent" | "skipped" | "failed"; detail: string }[]>([]);
+  const [phoneError, setPhoneError] = useState<string | null>(null);
   const pushRegistered = useRef(false);
   const { defaults: notifDefaults, setDefaults: setNotifDefaults } = useNotificationDefaults();
 
@@ -268,6 +301,14 @@ export default function SettingsPage() {
         setCredentials(statusRes.data.connected);
         setProfile(profileRes.data);
         setScraperStatus(scraperRes.data);
+        savedNotifRef.current = {
+          notify_default_in_app: profileRes.data.notify_default_in_app,
+          notify_default_slack: profileRes.data.notify_default_slack,
+          notify_default_push: profileRes.data.notify_default_push,
+          notify_default_sms: profileRes.data.notify_default_sms,
+          notification_email: profileRes.data.notification_email,
+          notification_slack: profileRes.data.notification_slack,
+        };
         // Load Gmail config from profile
         if (profileRes.data.gmail_watch_config) {
           setGmailConfig(profileRes.data.gmail_watch_config);
@@ -282,6 +323,18 @@ export default function SettingsPage() {
         setIsLoading(false);
       }
     })();
+  }, []);
+
+  useEffect(() => {
+    integrationsApi.getAvailability()
+      .then(({ data }) => setProviderAvailability(data.providers))
+      .catch(() => { /* without it every card keeps its normal Connect */ });
+  }, []);
+
+  const handleVoted = useCallback((provider: string, vote: IntegrationVote) => {
+    setProviderAvailability((prev) => prev && prev[provider]
+      ? { ...prev, [provider]: { ...prev[provider], my_vote: vote } }
+      : prev);
   }, []);
 
   const isConnected = (provider: string) =>
@@ -351,8 +404,22 @@ export default function SettingsPage() {
 
   const handleProfileSave = useCallback(async () => {
     if (!profile) return;
+    if (!isValidE164(profile.phone_number ?? "")) {
+      setPhoneError("Enter a valid phone number for the selected country.");
+      return;
+    }
+    setPhoneError(null);
     setIsSavingProfile(true);
     setAirtableSynced(false);
+    setTestResults([]);
+    const current: NotificationSnapshot = {
+      notify_default_in_app: notifDefaults.notify_default_in_app,
+      notify_default_slack: notifDefaults.notify_default_slack,
+      notify_default_push: notifDefaults.notify_default_push,
+      notify_default_sms: notifDefaults.notify_default_sms,
+      notification_email: !!profile.notification_email,
+      notification_slack: !!profile.notification_slack,
+    };
     try {
       const { data } = await teamApi.updateMyProfile({
         display_name: profile.display_name,
@@ -368,12 +435,25 @@ export default function SettingsPage() {
       setSaveSuccess(true);
       if (data.airtable_collaborator_id) setAirtableSynced(true);
       setTimeout(() => setSaveSuccess(false), 4000);
-    } catch {
-      alert("Failed to save profile.");
+      // Test each notification option that changed in this edit and is now on.
+      const toTest = savedNotifRef.current ? channelsToTest(savedNotifRef.current, current) : [];
+      savedNotifRef.current = current;
+      if (toTest.length > 0) {
+        try {
+          const { data: report } = await integrationsApi.sendTestNotifications(toTest);
+          setTestResults(report.results);
+        } catch {
+          setTestResults(toTest.map((channel) => ({ channel, status: "failed", detail: "Couldn't send the test." })));
+        }
+      }
+    } catch (err: unknown) {
+      const phoneMsg = (err as { response?: { data?: { phone_number?: string[] } } })?.response?.data?.phone_number?.[0];
+      if (phoneMsg) setPhoneError(phoneMsg);
+      else alert("Failed to save profile.");
     } finally {
       setIsSavingProfile(false);
     }
-  }, [profile]);
+  }, [profile, notifDefaults]);
 
   const handleGmailWatchRegister = useCallback(async () => {
     setGmailWatchState("registering");
@@ -483,6 +563,7 @@ export default function SettingsPage() {
   }
 
   return (
+    <AvailabilityContext.Provider value={{ providers: providerAvailability, onVoted: handleVoted }}>
     <div className="px-6 py-8 max-w-3xl mx-auto space-y-10">
       <div className="flex items-start justify-between">
         <div>
@@ -765,9 +846,16 @@ export default function SettingsPage() {
             <div key={key} className="py-3 flex items-center justify-between">
               <p className="text-sm font-medium text-[var(--twilio-navy)] capitalize">{key}</p>
               {scraperStatus?.[key] ? (
-                <span className="inline-flex items-center gap-1.5 rounded-full bg-green-50 px-3 py-1 text-sm font-medium text-green-700">
-                  <span className="h-1.5 w-1.5 rounded-full bg-green-500" />
-                  Active
+                <span className="inline-flex items-center gap-2">
+                  {scraperStatus.hints?.[key] && (
+                    <code data-testid={`token-hint-${key}`} className="text-xs text-[var(--twilio-gray-60)] font-mono" title="Token is set (masked)">
+                      {scraperStatus.hints[key]}
+                    </code>
+                  )}
+                  <span className="inline-flex items-center gap-1.5 rounded-full bg-green-50 px-3 py-1 text-sm font-medium text-green-700">
+                    <span className="h-1.5 w-1.5 rounded-full bg-green-500" />
+                    Active
+                  </span>
                 </span>
               ) : (
                 <span className="text-sm text-[var(--twilio-gray-60)]">Token not configured</span>
@@ -857,12 +945,11 @@ export default function SettingsPage() {
                 <label className="block text-sm font-medium text-[var(--twilio-navy)] mb-1">
                   Phone Number
                 </label>
-                <input
-                  type="tel"
+                <PhoneNumberInput
                   value={profile.phone_number ?? ""}
-                  onChange={(e) => setProfile({ ...profile, phone_number: e.target.value })}
-                  className="w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                  onChange={(e164) => { setPhoneError(null); setProfile({ ...profile, phone_number: e164 }); }}
                 />
+                {phoneError && <p role="alert" className="mt-1 text-xs text-red-600">{phoneError}</p>}
               </div>
               <div>
                 <label className="block text-sm font-medium text-[var(--twilio-navy)] mb-1">
@@ -1016,6 +1103,16 @@ export default function SettingsPage() {
                   Airtable collaborator ID not resolved — check AIRTABLE_TABLE_TEAM in .env
                 </span>
               )}
+              {testResults.length > 0 && (
+                <ul data-testid="notification-test-results" className="basis-full space-y-1 text-xs">
+                  {testResults.map((r) => (
+                    <li key={r.channel} className={r.status === "sent" ? "text-green-700" : r.status === "failed" ? "text-red-600" : "text-amber-700"}>
+                      {r.status === "sent" ? "✓" : r.status === "failed" ? "✕" : "–"}{" "}
+                      Test {CHANNEL_LABEL[r.channel]}: {r.status === "sent" ? "sent" : r.detail}
+                    </li>
+                  ))}
+                </ul>
+              )}
               {profile.airtable_collaborator_id && !saveSuccess && (
                 <span className="inline-flex items-center gap-1.5 text-sm text-[var(--twilio-gray-60)]">
                   <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
@@ -1027,8 +1124,8 @@ export default function SettingsPage() {
         </section>
       )}
 
-      {/* Staff view mode — only visible to staff users */}
-      {profile?.is_staff && (
+      {/* Staff view mode + user access — Admins only */}
+      {profile && (profile.access_level ? profile.access_level === "admin" : profile.is_staff) && (
         <section className="bg-white rounded-lg border border-amber-200 shadow-sm">
           <div className="px-6 py-4 border-b border-amber-100 flex items-center gap-2">
             <svg viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4 text-amber-500 shrink-0">
@@ -1064,6 +1161,18 @@ export default function SettingsPage() {
             <p className="text-xs text-[var(--twilio-gray-60)]">
               When turned off, the app behaves as if you were a regular user — you only see accounts you are personally assigned to as a team member. Useful for testing the non-staff experience.
             </p>
+            <div className="pt-4 border-t border-amber-100">
+              <UserAccessPanel />
+            </div>
+            <div className="pt-4 border-t border-amber-100 flex items-center justify-between gap-3">
+              <div>
+                <p className="text-sm font-semibold text-[var(--twilio-navy)]">Admin Data</p>
+                <p className="text-xs text-[var(--twilio-gray-60)] mt-0.5">Browse shared tables: tags, teams, memberships, skill runs, voice calls and Salesforce accounts.</p>
+              </div>
+              <Link to="/settings/admin-data" className="shrink-0 rounded-md border border-gray-300 px-3 py-1.5 text-sm font-medium text-gray-700 hover:bg-gray-50">
+                Open Admin Data
+              </Link>
+            </div>
           </div>
         </section>
       )}
@@ -1110,5 +1219,6 @@ export default function SettingsPage() {
         </div>
       </section>
     </div>
+    </AvailabilityContext.Provider>
   );
 }

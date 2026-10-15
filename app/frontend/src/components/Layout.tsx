@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
+import { bottomNavItems } from "../lib/navItems";
 import { DndContext } from "@dnd-kit/core";
 import GlobalSearch from "./GlobalSearch";
 import { accountsApi, teamApi, agentApi, skillsApi } from "../lib/api";
@@ -424,20 +425,20 @@ export default function Layout() {
 
         {/* Activity Log + Settings + Profile — sit above the animation */}
         <div className="px-3 space-y-1.5 pb-2">
-          {[
-            { to: "/logs", label: "Activity Log", Icon: NotificationIcon },
-            ...(profile?.is_staff ? [{ to: "/admin-data", label: "Admin Data", Icon: SettingsIcon }] : []),
-            { to: "/settings", label: "Settings", Icon: SettingsIcon },
-          ].map(({ to, label, Icon }) => (
+          {bottomNavItems(profile).map(({ to, label, child }) => {
+            const Icon = to === "/logs" ? NotificationIcon : SettingsIcon;
+            return (
             <NavLink
               key={to}
               to={to}
+              // `end` so Settings isn't also highlighted while on its Admin Data child.
+              end={to === "/settings"}
               className="nav-bottom-link"
               style={({ isActive }) => ({
                 display: "flex",
                 alignItems: "center",
                 gap: "10px",
-                padding: "7px 12px",
+                padding: child ? "5px 12px 5px 38px" : "7px 12px",
                 borderRadius: "4px",
                 fontSize: "0.9375rem",
                 fontWeight: isActive ? 600 : 400,
@@ -450,7 +451,8 @@ export default function Layout() {
               <Icon width={16} height={16} style={{ flexShrink: 0 }} />
               <span style={{ color: "#ffffff" }}>{label}</span>
             </NavLink>
-          ))}
+            );
+          })}
         </div>
 
         {/* Sync runner — outside padded section so it spans full sidebar width */}

@@ -15,7 +15,8 @@ asked for, so a project dragged onto a day in the Log Time panel always beats
 whatever the account link would have inferred:
 
     1. explicitly marked did-not-attend        -> skipped, reported
-    2. LogTimeDayAssignment for that user+date -> that project  (manual)
+    2. LogTimeDayAssignment for that user+date -> that project  (manual; account-linked
+       events only, and in a scoped run only projects on that account)
     3. event.account -> AccountProject.sf_project_id            (auto)
     4. event.account -> SalesforceProject the user holds a role on (auto, by name)
     5. no account at all                       -> skipped, reported
@@ -158,12 +159,30 @@ def _manual_assignments(user, week_start: date, week_end: date) -> dict[date, li
     rows = (
         LogTimeDayAssignment.objects
         .filter(user=user, date__gte=week_start, date__lt=week_end)
-        .select_related("project")
+        .select_related("project", "project__account")
         .order_by("date", "position")
     )
     for row in rows:
         out.setdefault(row.date, []).append(row)
     return out
+
+
+def _scoped_assignments(day_rows: list, scope: str) -> list:
+    """Drop assignments to another account's project from a per-account run.
+
+    Day assignments are per user, not per account, so a project dragged onto Tuesday in
+    one account's panel used to capture every other account's Tuesday events too. A
+    project with no mirrored account can't be attributed, so it is kept.
+    """
+    if not scope:
+        return day_rows
+    kept = []
+    for row in day_rows:
+        acct = getattr(row.project, "account", None)
+        name = (getattr(acct, "name", "") or "").strip().lower()
+        if not name or name == scope.lower():
+            kept.append(row)
+    return kept
 
 
 def _my_role_project_sf_ids(user) -> set[str]:
@@ -206,6 +225,7 @@ def _project_for_account(account, role_project_ids: set[str]) -> tuple[str, str]
     explicit = (
         AccountProject.objects
         .filter(account=account)
+        .exclude(kind="goal")  # goals roll up into a project; never a timesheet target
         .exclude(sf_project_id="")
         .order_by("position", "name")
         .first()
@@ -346,7 +366,13 @@ def plan_week(
         if minutes <= 0:
             continue
 
-        day_manual = manual.get(event_date) or []
+        # In a per-account run an event with no account is not filed under a dragged-in
+        # project: the panel never shows it on that account, so logging it there put hours
+        # on an account they didn't belong to. It is reported as unlinked instead. An
+        # unscoped (whole-week / voice) run keeps the old "manual covers the day" rule.
+        day_manual = (
+            _scoped_assignments(manual.get(event_date) or [], scope) if (acct or not scope) else []
+        )
         if len(day_manual) == 1:
             row = day_manual[0]
             project_sf_id, project_name, source = row.project.sf_id, row.project.name, "manual"

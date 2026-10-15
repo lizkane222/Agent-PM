@@ -124,7 +124,9 @@ export default function App() {
           <Route path="skills" element={<ClaudeSkillsPage />} />
           <Route path="discover" element={<DiscoverPage />} />
           <Route path="settings" element={<SettingsPage />} />
-          <Route path="admin-data" element={<AdminDataPage />} />
+          <Route path="settings/admin-data" element={<AdminDataPage />} />
+          {/* Old location — Admin Data now lives under Settings. */}
+          <Route path="admin-data" element={<Navigate to="/settings/admin-data" replace />} />
           <Route path="logs" element={<LogsPage />} />
           <Route path="edit-preview" element={<PageBuilder />} />
           <Route path="profile" element={<ProfilePage />} />

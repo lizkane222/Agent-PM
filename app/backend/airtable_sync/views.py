@@ -506,6 +506,11 @@ class AirtableActionItemViewSet(viewsets.ModelViewSet):
         status_filter = self.request.query_params.get("status")
         if status_filter:
             qs = qs.filter(status__in=status_filter.split(","))
+        # ?airtable_id=recA,recB — direct lookup, so a caller needing one item (the calendar
+        # panel) doesn't download the whole list and filter it client-side.
+        airtable_ids = csv_params(self.request.query_params.get("airtable_id"))
+        if airtable_ids:
+            qs = qs.filter(airtable_id__in=airtable_ids)
         return _exclude_private_admin_items(qs, self.request.user)
 
     def check_object_permissions(self, request, obj):
@@ -961,6 +966,8 @@ def update_action_item_fields(request, airtable_id):
         "estimated_time": "Estimated Time",
         "time_spent": "Time Spent",
         "slack_thread_url": "Slack Thread URL",
+        # Local-only (no Airtable column): a manual correction of the Live Tracking total.
+        "tracked_time": None,
     }
     airtable_payload = {}
     local_fields = []
@@ -992,6 +999,8 @@ def update_action_item_fields(request, airtable_id):
             val = request.data[field]
             setattr(item, field, val)
             local_fields.append(field)
+            if at_field is None:
+                continue
             if field == "status":
                 airtable_payload[at_field] = STATUS_TO_AT.get(val, val)
             elif field == "priority":
@@ -1040,6 +1049,9 @@ def update_action_item_fields(request, airtable_id):
     # Assignee is a collaborator field — send {"id": "usrXXX"} to Airtable.
     if "assignee_airtable_id" in request.data:
         collab_id = request.data["assignee_airtable_id"] or None
+        from .assignment import ASSIGN_DENIED, can_assign
+        if not can_assign(request.user, item.account, collab_id):
+            return Response({"error": ASSIGN_DENIED}, status=status.HTTP_403_FORBIDDEN)
         item.assignee_airtable_id = collab_id or ""
         local_fields.append("assignee_airtable_id")
         if "assignee_name" in request.data:
@@ -1280,3 +1292,78 @@ def trigger_sync(request):
         metadata=result,
     )
     return Response(result)
+
+
+
+# ── Live Tracking timers (server-side; see live_tracking.py) ─────────────────
+
+
+def _timer_item(request):
+    """Resolve + authorise the action item named in the body. Returns (item, error_response)."""
+    airtable_id = (request.data.get("airtable_id") or "").strip()
+    if not airtable_id or airtable_id.startswith("local-"):
+        return None, Response({"error": "airtable_id of a saved action item is required"}, status=status.HTTP_400_BAD_REQUEST)
+    item = AirtableActionItem.objects.select_related("account").filter(airtable_id=airtable_id).first()
+    if not item:
+        return None, Response({"error": "not found"}, status=status.HTTP_404_NOT_FOUND)
+    if not _can_write_action_item(request.user, item):
+        return None, Response({"error": ACTION_ITEM_WRITE_DENIED}, status=status.HTTP_403_FORBIDDEN)
+    return item, None
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def list_running_timers(request):
+    """The caller's running timers — what every tab/device renders as "tracking now"."""
+    from . import live_tracking
+    from .models import ActionItemTimeSession
+
+    rows = (
+        ActionItemTimeSession.objects
+        .filter(user=request.user, ended_at__isnull=True)
+        .select_related("action_item", "action_item__account")
+    )
+    return Response({"results": [live_tracking.serialize(r) for r in rows]})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def start_timer(request):
+    from . import live_tracking
+
+    item, err = _timer_item(request)
+    if err:
+        return err
+    session = live_tracking.start(request.user, item)
+    return Response({"session": live_tracking.serialize(session)}, status=status.HTTP_201_CREATED)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def stop_timer(request):
+    from . import live_tracking
+
+    item, err = _timer_item(request)
+    if err:
+        return err
+    session = live_tracking.stop(request.user, item)
+    if session is None:
+        return Response({"error": "no running timer for this item"}, status=status.HTTP_409_CONFLICT)
+    item.refresh_from_db()
+    return Response({
+        "session": live_tracking.serialize(session),
+        "item": AirtableActionItemSerializer(item, context={"request": request}).data,
+    })
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def cancel_timer(request):
+    from . import live_tracking
+
+    item, err = _timer_item(request)
+    if err:
+        return err
+    if not live_tracking.cancel(request.user, item):
+        return Response({"error": "no running timer for this item"}, status=status.HTTP_409_CONFLICT)
+    return Response(status=status.HTTP_204_NO_CONTENT)

@@ -762,13 +762,13 @@ class CalendarEventGoogleBodyFormatTest(APITestCase):
 
         captured = {}
 
-        def _insert(calendarId, body):
+        def _insert(calendarId, body, **kwargs):
             captured["body"] = body
             call = MagicMock()
             call.execute.return_value = {"id": "g-new-1"}
             return call
 
-        def _patch(calendarId, eventId, body):
+        def _patch(calendarId, eventId, body, **kwargs):
             captured["body"] = body
             call = MagicMock()
             call.execute.return_value = {}
@@ -1103,3 +1103,362 @@ class CalendarEventSourceLinkCreateTest(APITestCase):
                 self.URL, self._payload(agentpm_airtable_id="recNOPUSH"), format="json"
             )
         pushed.assert_not_called()
+
+
+class MeetingInviteGooglePushTest(APITestCase):
+    """Creating/editing a meeting with guests must ask Google to email them.
+
+    Google's `sendUpdates` defaults to "none": attendees were added to the event but
+    nobody was notified, which is why invitees never received anything.
+    """
+
+    def setUp(self):
+        from integrations.models import OAuthCredential
+        cache.clear()
+        self.user = _make_user("organiser")
+        self.client.force_authenticate(user=self.user)
+        OAuthCredential.objects.create(
+            user=self.user, provider="google", is_active=True,
+            access_token="tok", refresh_token="ref", scopes="https://www.googleapis.com/auth/calendar",
+        )
+        self.service = mock.MagicMock()
+        self.service.events.return_value.insert.return_value.execute.return_value = {
+            "id": "g-new-1", "hangoutLink": "https://meet.google.com/abc-defg-hij",
+        }
+        patcher = mock.patch("googleapiclient.discovery.build", return_value=self.service)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _create(self, **extra):
+        body = {
+            "title": "Kickoff",
+            "start_datetime": "2026-10-20T16:00:00Z",
+            "end_datetime": "2026-10-20T17:00:00Z",
+            "calendar_id": "primary",
+            "attendees": [
+                {"email": "ana@example.com", "displayName": "Ana", "responseStatus": "needsAction"},
+                {"email": "ben@example.com", "displayName": "Ben", "responseStatus": "needsAction"},
+            ],
+        }
+        body.update(extra)
+        return self.client.post("/api/v1/scheduler/events/", body, format="json")
+
+    def _insert_kwargs(self):
+        return self.service.events.return_value.insert.call_args.kwargs
+
+    def test_guests_are_emailed_when_send_invites_is_true(self):
+        resp = self._create(send_invites=True)
+        self.assertEqual(resp.status_code, 201, resp.data)
+        kwargs = self._insert_kwargs()
+        self.assertEqual(kwargs["sendUpdates"], "all")
+        self.assertEqual(
+            [a["email"] for a in kwargs["body"]["attendees"]], ["ana@example.com", "ben@example.com"]
+        )
+        self.assertEqual(resp.data["google_sync"], {"status": "ok", "invites_sent": True})
+
+    def test_send_invites_false_adds_guests_without_emailing(self):
+        resp = self._create(send_invites=False)
+        self.assertEqual(self._insert_kwargs()["sendUpdates"], "none")
+        self.assertEqual(resp.data["google_sync"]["invites_sent"], False)
+
+    def test_omitted_flag_defaults_to_sending_when_there_are_guests(self):
+        self._create()
+        self.assertEqual(self._insert_kwargs()["sendUpdates"], "all")
+
+    def test_organiser_is_not_invited_to_their_own_meeting(self):
+        self._create(send_invites=True, attendees=[
+            {"email": "organiser@example.com"}, {"email": "ana@example.com"}, {"email": "ANA@example.com"},
+        ])
+        self.assertEqual([a["email"] for a in self._insert_kwargs()["body"]["attendees"]], ["ana@example.com"])
+
+    def test_meet_placeholder_requests_a_real_conference(self):
+        resp = self._create(send_invites=True, meet_link="https://meet.google.com/new")
+        kwargs = self._insert_kwargs()
+        self.assertEqual(kwargs["conferenceDataVersion"], 1)
+        self.assertEqual(
+            kwargs["body"]["conferenceData"]["createRequest"]["conferenceSolutionKey"], {"type": "hangoutsMeet"}
+        )
+        event = CalendarEvent.objects.get(pk=resp.data["id"])
+        self.assertEqual(event.meet_link, "https://meet.google.com/abc-defg-hij")
+        self.assertEqual(event.google_event_id, "g-new-1")
+
+    def test_no_google_connection_is_reported_not_silent(self):
+        from integrations.models import OAuthCredential
+        OAuthCredential.objects.filter(user=self.user).delete()
+        resp = self._create(send_invites=True)
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["google_sync"], {"status": "not_connected", "invites_sent": False})
+        self.service.events.return_value.insert.assert_not_called()
+
+    def test_google_failure_is_reported_and_the_event_is_kept(self):
+        self.service.events.return_value.insert.return_value.execute.side_effect = RuntimeError("boom")
+        resp = self._create(send_invites=True)
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["google_sync"], {"status": "failed", "invites_sent": False})
+        self.assertTrue(CalendarEvent.objects.filter(pk=resp.data["id"]).exists())
+
+    def test_non_primary_create_has_no_google_sync_key(self):
+        resp = self.client.post("/api/v1/scheduler/events/", {
+            "title": "Block", "start_datetime": "2026-10-20T16:00:00Z",
+            "end_datetime": "2026-10-20T16:15:00Z", "calendar_id": "work_tracking",
+        }, format="json")
+        self.assertEqual(resp.status_code, 201)
+        self.assertNotIn("google_sync", resp.data)
+
+    def test_reschedule_notifies_guests(self):
+        event = CalendarEvent.objects.create(
+            owner=self.user, title="Sync", start_datetime="2026-10-20T16:00:00Z",
+            end_datetime="2026-10-20T17:00:00Z", google_event_id="g-1", is_synced=True,
+            attendees=[{"email": "ana@example.com"}],
+        )
+        resp = self.client.patch(f"/api/v1/scheduler/events/{event.pk}/", {
+            "start_datetime": "2026-10-20T18:00:00Z", "end_datetime": "2026-10-20T19:00:00Z",
+        }, format="json")
+        self.assertEqual(resp.status_code, 200, resp.data)
+        kwargs = self.service.events.return_value.patch.call_args.kwargs
+        self.assertEqual(kwargs["sendUpdates"], "all")
+        self.assertEqual(kwargs["body"]["attendees"], [{"email": "ana@example.com"}])
+
+    def test_adding_a_guest_is_pushed(self):
+        event = CalendarEvent.objects.create(
+            owner=self.user, title="Sync", start_datetime="2026-10-20T16:00:00Z",
+            end_datetime="2026-10-20T17:00:00Z", google_event_id="g-2", is_synced=True,
+            attendees=[{"email": "ana@example.com"}],
+        )
+        self.client.patch(f"/api/v1/scheduler/events/{event.pk}/", {
+            "attendees": [{"email": "ana@example.com"}, {"email": "cy@example.com"}],
+        }, format="json")
+        kwargs = self.service.events.return_value.patch.call_args.kwargs
+        self.assertEqual([a["email"] for a in kwargs["body"]["attendees"]], ["ana@example.com", "cy@example.com"])
+
+
+class CalendarEventSearchTest(APITestCase):
+    """`?search=` powers the calendar search box. Owner scoping still applies."""
+
+    def setUp(self):
+        from accounts.models import Account
+        cache.clear()
+        self.user = _make_user("searcher")
+        self.other = _make_user("someone_else")
+        self.client.force_authenticate(user=self.user)
+        acme = Account.objects.create(company_name="Acme Corp")
+        CalendarEvent.objects.create(owner=self.user, title="Quarterly review", start_datetime="2026-10-01T16:00:00Z",
+                                     end_datetime="2026-10-01T17:00:00Z", account=acme)
+        CalendarEvent.objects.create(owner=self.user, title="Dentist", location="Main St",
+                                     start_datetime="2026-10-02T16:00:00Z", end_datetime="2026-10-02T17:00:00Z")
+        CalendarEvent.objects.create(owner=self.other, title="Dentist (theirs)",
+                                     start_datetime="2026-10-02T16:00:00Z", end_datetime="2026-10-02T17:00:00Z")
+
+    def _titles(self, q):
+        resp = self.client.get("/api/v1/scheduler/events/", {"search": q})
+        self.assertEqual(resp.status_code, 200)
+        return sorted(e["title"] for e in resp.data)
+
+    def test_matches_title_and_location(self):
+        self.assertEqual(self._titles("dentist"), ["Dentist"])
+        self.assertEqual(self._titles("main st"), ["Dentist"])
+
+    def test_matches_account_name(self):
+        self.assertEqual(self._titles("acme"), ["Quarterly review"])
+
+    def test_never_returns_another_users_events(self):
+        self.assertNotIn("Dentist (theirs)", self._titles("dentist"))
+
+    def test_unauthenticated_is_rejected(self):
+        self.client.force_authenticate(user=None)
+        self.assertEqual(self.client.get("/api/v1/scheduler/events/", {"search": "x"}).status_code, 401)
+
+
+class AvailabilityTest(APITestCase):
+    """Compare calendars: busy blocks for everyone, titles only on shared accounts."""
+
+    URL = "/api/v1/scheduler/availability/"
+    RANGE = {"start": "2026-10-19T00:00:00Z", "end": "2026-10-24T00:00:00Z"}
+
+    def setUp(self):
+        from accounts.models import Account
+        from team.models import TeamMember
+        cache.clear()
+        self.me = _make_user("viewer")
+        self.ana = _make_user("ana")
+        self.client.force_authenticate(user=self.me)
+        me_m = TeamMember.objects.create(user=self.me, full_name="Viewer", email=self.me.email)
+        ana_m = TeamMember.objects.create(user=self.ana, full_name="Ana Diaz", email=self.ana.email)
+        self.shared = Account.objects.create(company_name="Shared Co")
+        self.shared.team_members.add(me_m, ana_m)
+        self.private = Account.objects.create(company_name="Ana Only")
+        self.private.team_members.add(ana_m)
+
+        def ev(title, h, **kw):
+            return CalendarEvent.objects.create(
+                owner=self.ana, title=title, start_datetime=f"2026-10-20T{h:02d}:00:00Z",
+                end_datetime=f"2026-10-20T{h + 1:02d}:00:00Z", **kw)
+        ev("Shared QBR", 15, account=self.shared)
+        ev("Ana private deal", 16, account=self.private)
+        ev("Dentist", 17)
+        ev("Cancelled thing", 18, status="cancelled")
+        ev("Skipped", 19, attended=False)
+        ev("Tracking block", 20, calendar_id="work_tracking")
+        CalendarEvent.objects.create(owner=self.ana, title="Next month", start_datetime="2026-11-20T15:00:00Z",
+                                     end_datetime="2026-11-20T16:00:00Z")
+
+    def _get(self, **params):
+        return self.client.get(self.URL, {**self.RANGE, **params})
+
+    def test_app_user_busy_is_masked_except_on_shared_accounts(self):
+        resp = self._get(emails=self.ana.email)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        person = resp.data["people"][0]
+        self.assertEqual((person["source"], person["name"]), ("app", "Ana Diaz"))
+        self.assertEqual([b["title"] for b in person["busy"]], ["Shared QBR", "Busy", "Busy"])
+        self.assertEqual([b["title_visible"] for b in person["busy"]], [True, False, False])
+
+    def test_never_leaks_details(self):
+        busy = self._get(emails=self.ana.email).data["people"][0]["busy"]
+        for block in busy:
+            self.assertEqual(set(block), {"start", "end", "all_day", "title", "title_visible"})
+
+    def test_excludes_non_blocking_and_out_of_range_events(self):
+        titles = [b["title"] for b in self._get(emails=self.ana.email).data["people"][0]["busy"]]
+        self.assertEqual(len(titles), 3)
+
+    def test_viewer_is_skipped(self):
+        self.assertEqual(self._get(emails=self.me.email).data["people"], [])
+
+    def test_non_app_users_go_through_google_freebusy(self):
+        service = mock.MagicMock()
+        service.freebusy.return_value.query.return_value.execute.return_value = {"calendars": {
+            "zed@twilio.com": {"busy": [{"start": "2026-10-21T15:00:00Z", "end": "2026-10-21T16:00:00Z"}]},
+            "nobody@else.com": {"busy": [], "errors": [{"reason": "notFound"}]},
+        }}
+        with mock.patch("scheduler.availability._google_service_for", return_value=service):
+            resp = self._get(emails="zed@twilio.com,nobody@else.com")
+        people = {p["email"]: p for p in resp.data["people"]}
+        self.assertEqual(people["zed@twilio.com"]["busy"][0]["title"], "Busy")
+        self.assertEqual(people["zed@twilio.com"]["source"], "google")
+        self.assertEqual(people["nobody@else.com"]["error"], "notFound")
+        body = service.freebusy.return_value.query.call_args.kwargs["body"]
+        self.assertEqual([i["id"] for i in body["items"]], ["zed@twilio.com", "nobody@else.com"])
+
+    def test_google_not_connected_is_reported(self):
+        with mock.patch("scheduler.availability._google_service_for", return_value=None):
+            person = self._get(emails="zed@twilio.com").data["people"][0]
+        self.assertEqual(person["error"], "not_connected")
+
+    def test_validation(self):
+        self.assertEqual(self.client.get(self.URL, {"emails": self.ana.email}).status_code, 400)
+        self.assertEqual(self._get().status_code, 400)
+        many = ",".join(f"p{i}@x.com" for i in range(9))
+        self.assertEqual(self._get(emails=many).status_code, 400)
+        self.assertEqual(self.client.get(self.URL, {
+            "emails": self.ana.email, "start": "2026-01-01T00:00:00Z", "end": "2026-06-01T00:00:00Z",
+        }).status_code, 400)
+
+    def test_unauthenticated_is_rejected(self):
+        self.client.force_authenticate(user=None)
+        self.assertEqual(self._get(emails=self.ana.email).status_code, 401)
+
+
+class TestNotificationsEndpointTest(APITestCase):
+    URL = "/api/v1/scheduler/notifications/test/"
+
+    def setUp(self):
+        cache.clear()
+        self.user = _make_user("notif_user")
+        self.profile = UserProfile.objects.create(user=self.user, phone_number="+14155550123")
+        self.client.force_authenticate(user=self.user)
+
+    def _post(self, channels):
+        return self.client.post(self.URL, {"channels": channels}, format="json")
+
+    def _by_channel(self, resp):
+        return {r["channel"]: r for r in resp.data["results"]}
+
+    @mock.patch("scheduler.tasks._send_sms")
+    def test_sms_uses_the_reminder_sender(self, send_sms):
+        with self.settings(TWILIO_ACCOUNT_SID="AC1", TWILIO_AUTH_TOKEN="t", TWILIO_PHONE_NUMBER="+15550000000"):
+            resp = self._post(["sms"])
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self._by_channel(resp)["sms"]["status"], "sent")
+        send_sms.assert_called_once()
+
+    @mock.patch("scheduler.tasks._send_sms")
+    def test_missing_phone_is_skipped_with_a_reason(self, send_sms):
+        self.profile.phone_number = ""
+        self.profile.save()
+        with self.settings(TWILIO_ACCOUNT_SID="AC1", TWILIO_AUTH_TOKEN="t", TWILIO_PHONE_NUMBER="+15550000000"):
+            result = self._by_channel(self._post(["sms"]))["sms"]
+        self.assertEqual(result["status"], "skipped")
+        self.assertIn("phone number", result["detail"])
+        send_sms.assert_not_called()
+
+    def test_push_without_a_registered_browser_is_skipped(self):
+        with self.settings(VAPID_PRIVATE_KEY="k", VAPID_PUBLIC_KEY="p"):
+            result = self._by_channel(self._post(["push"]))["push"]
+        self.assertEqual(result["status"], "skipped")
+
+    def test_slack_without_bot_token_is_skipped(self):
+        with self.settings(SLACK_BOT_TOKEN=""):
+            self.assertEqual(self._by_channel(self._post(["slack"]))["slack"]["status"], "skipped")
+
+    def test_email_is_reported_unavailable(self):
+        self.assertEqual(self._by_channel(self._post(["email"]))["email"]["status"], "skipped")
+
+    @mock.patch("scheduler.tasks._send_in_app", side_effect=RuntimeError("secret detail"))
+    def test_failure_is_reported_without_exception_text(self, _send):
+        result = self._by_channel(self._post(["in_app"]))["in_app"]
+        self.assertEqual(result["status"], "failed")
+        self.assertNotIn("secret", result["detail"])
+
+    @mock.patch("scheduler.tasks._send_in_app")
+    def test_in_app_is_sent(self, send):
+        self.assertEqual(self._by_channel(self._post(["in_app"]))["in_app"]["status"], "sent")
+        send.assert_called_once()
+
+    def test_validation(self):
+        self.assertEqual(self._post([]).status_code, 400)
+        self.assertEqual(self._post(["fax"]).status_code, 400)
+
+    def test_unauthenticated_is_rejected(self):
+        self.client.force_authenticate(user=None)
+        self.assertEqual(self._post(["in_app"]).status_code, 401)
+
+
+class MeetingNotesByActionItemTest(APITestCase):
+    """?action_item= lists notes from every calendar block of that action item."""
+
+    URL = "/api/v1/scheduler/meeting-notes/"
+
+    def setUp(self):
+        from airtable_sync.models import AirtableActionItem
+        cache.clear()
+        self.me = _make_user("ainotes_me")
+        self.mate = _make_user("ainotes_mate")
+        AirtableActionItem.objects.create(airtable_id="recNOTE1", task="Shared task")
+        mine = _make_event(self.me, "Block 1", agentpm_airtable_id="recNOTE1")
+        theirs = _make_event(self.mate, "Block 2", agentpm_airtable_id="recNOTE1")
+        other = _make_event(self.me, "Unrelated", agentpm_airtable_id="recOTHER")
+        _make_note(mine, self.me, "my note")
+        _make_note(theirs, self.mate, "teammate note")
+        _make_note(other, self.me, "elsewhere")
+        self.client.force_authenticate(user=self.me)
+
+    def _texts(self, **params):
+        resp = self.client.get(self.URL, params)
+        self.assertEqual(resp.status_code, 200)
+        return sorted(n["text"] for n in resp.data["results"])
+
+    def test_includes_every_block_including_teammates(self):
+        self.assertEqual(self._texts(action_item="recNOTE1"), ["my note", "teammate note"])
+
+    def test_unknown_item_returns_nothing(self):
+        self.assertEqual(self._texts(action_item="recNOPE"), [])
+
+    def test_private_admin_item_is_hidden(self):
+        from airtable_sync.models import AirtableAccount, AirtableActionItem
+        admin = AirtableAccount.objects.create(airtable_id="recADM", name="Admin")
+        AirtableActionItem.objects.filter(airtable_id="recNOTE1").update(account=admin, assignee_airtable_id="usrSOMEONE")
+        self.assertEqual(self._texts(action_item="recNOTE1"), [])
+
+    def test_without_the_filter_owner_scoping_is_unchanged(self):
+        self.assertEqual(self._texts(), ["elsewhere", "my note"])

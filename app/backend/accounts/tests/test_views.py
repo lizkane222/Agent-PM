@@ -20,6 +20,15 @@ def _make_user(username, is_staff=False):
     )
 
 
+def _make_pm(user):
+    """Give `user` the PM tier — the level allowed to put other people on an account."""
+    from team.models import UserProfile
+    profile, _ = UserProfile.objects.get_or_create(user=user)
+    profile.access_level = "pm"
+    profile.save(update_fields=["access_level"])
+    return user
+
+
 def _make_account(name, admin_owner=None):
     return Account.objects.create(company_name=name, admin_owner=admin_owner)
 
@@ -848,6 +857,7 @@ class ProjectMemberViewSetTests(APITestCase):
         other_project = _make_project(self.acct, "Beta")
         other_member = _make_team_member(_make_user("pm_other_member"))
         self.acct.team_members.add(other_member)
+        _make_pm(self.user)  # adding someone other than yourself to a project is PM-level
         self.client.force_authenticate(user=self.user)
         self.client.post(PROJECT_MEMBERS_URL, {"project": self.project.id, "team_member": self.member.id})
         self.client.post(PROJECT_MEMBERS_URL, {"project": other_project.id, "team_member": other_member.id})
@@ -957,6 +967,8 @@ class AccountMemberDropCloudCoachPushTest(APITestCase):
         # unique, so a user can only ever own one.
         self.shared = _make_account("Shared CC")
         self.shared.team_members.add(self.owner_member, self.new_member)
+        # Putting someone else on an account is a PM-level action.
+        _make_pm(self.user)
         self.client.force_authenticate(user=self.user)
 
     def _patch_members(self, member_ids):
@@ -1356,3 +1368,103 @@ class MediaSecurityHeadersMiddlewareTests(APITestCase):
         resp = middleware(RequestFactory().get("/api/v1/accounts/accounts/"))
         self.assertNotIn("Content-Security-Policy", resp)
         self.assertNotIn("X-Content-Type-Options", resp)
+
+
+
+class AccessLevelAccountRulesTest(APITestCase):
+    """Basic / PM / Admin on accounts (accounts/access.py)."""
+
+    def setUp(self):
+        cache.clear()
+        self.basic = _make_user("lvl_basic")
+        self.basic_member = _make_team_member(self.basic)
+        self.other = _make_user("lvl_other")
+        self.other_member = _make_team_member(self.other)
+        self.account = _make_account("Leveled Co")
+        self.account.team_members.add(self.basic_member)
+        self.outsider = _make_user("lvl_outsider")
+
+    def _patch(self, user, body):
+        self.client.force_authenticate(user=user)
+        return self.client.patch(f"{ACCOUNTS_URL}{self.account.id}/", body, format="json")
+
+    def _add(self, user, member):
+        self.client.force_authenticate(user=user)
+        return self.client.post(f"{ACCOUNTS_URL}{self.account.id}/team-members/add/", {"member_id": member.pk}, format="json")
+
+    def test_basic_member_can_edit_account_fields(self):
+        resp = self._patch(self.basic, {"industry": "Retail"})
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.industry, "Retail")
+
+    def test_non_member_cannot_see_or_edit(self):
+        self.assertEqual(self._patch(self.outsider, {"industry": "x"}).status_code, 404)
+
+    def test_basic_cannot_add_someone_else(self):
+        self.assertEqual(self._add(self.basic, self.other_member).status_code, 403)
+        self.assertFalse(self.account.team_members.filter(pk=self.other_member.pk).exists())
+
+    def test_basic_cannot_add_someone_else_via_patch(self):
+        resp = self._patch(self.basic, {"team_member_ids": [self.basic_member.pk, self.other_member.pk]})
+        self.assertEqual(resp.status_code, 403)
+
+    def test_basic_cannot_remove_someone_else(self):
+        self.account.team_members.add(self.other_member)
+        self.client.force_authenticate(user=self.basic)
+        resp = self.client.post(f"{ACCOUNTS_URL}{self.account.id}/team-members/remove/",
+                                {"member_id": self.other_member.pk}, format="json")
+        self.assertEqual(resp.status_code, 403)
+
+    def test_basic_can_remove_themselves(self):
+        self.client.force_authenticate(user=self.basic)
+        resp = self.client.post(f"{ACCOUNTS_URL}{self.account.id}/team-members/remove/",
+                                {"member_id": self.basic_member.pk}, format="json")
+        self.assertEqual(resp.status_code, 200)
+
+    def test_pm_can_add_anyone(self):
+        _make_pm(self.basic)
+        self.assertEqual(self._add(self.basic, self.other_member).status_code, 200)
+        self.assertTrue(self.account.team_members.filter(pk=self.other_member.pk).exists())
+
+    def test_basic_cannot_delete_an_account_they_dont_own(self):
+        self.client.force_authenticate(user=self.basic)
+        self.assertEqual(self.client.delete(f"{ACCOUNTS_URL}{self.account.id}/").status_code, 403)
+
+
+class AccountFieldHistoryTest(APITestCase):
+    """Every account field set / changed / cleared is written to the Activity Log."""
+
+    def setUp(self):
+        cache.clear()
+        self.user = _make_user("hist_user")
+        self.account = Account.objects.create(company_name="History Co", industry="Retail", website="")
+        self.account.team_members.add(_make_team_member(self.user))
+        self.client.force_authenticate(user=self.user)
+
+    def _events(self):
+        from realtime.models import AgentActivityEvent
+        return list(AgentActivityEvent.objects.filter(event_type="account.field_changed").order_by("pk"))
+
+    def test_set_update_and_clear_are_each_logged_with_values(self):
+        resp = self.client.patch(f"{ACCOUNTS_URL}{self.account.id}/", {
+            "website": "https://history.co", "industry": "Fintech",
+        }, format="json")
+        self.assertEqual(resp.status_code, 200, resp.data)
+        changes = {e.metadata["field"]: e.metadata for e in self._events()}
+        self.assertEqual(changes["website"]["action"], "set")
+        self.assertEqual(changes["website"]["to"], "https://history.co")
+        self.assertEqual((changes["industry"]["action"], changes["industry"]["from"], changes["industry"]["to"]),
+                         ("updated", "Retail", "Fintech"))
+        for e in self._events():
+            self.assertEqual(e.metadata["resource"], {"type": "account", "id": str(self.account.pk)})
+
+    def test_clearing_a_field_keeps_the_old_value(self):
+        self.client.patch(f"{ACCOUNTS_URL}{self.account.id}/", {"industry": ""}, format="json")
+        [event] = self._events()
+        self.assertEqual((event.metadata["action"], event.metadata["from"], event.metadata["to"]),
+                         ("cleared", "Retail", ""))
+
+    def test_unchanged_fields_are_not_logged(self):
+        self.client.patch(f"{ACCOUNTS_URL}{self.account.id}/", {"industry": "Retail"}, format="json")
+        self.assertEqual(self._events(), [])

@@ -1,4 +1,5 @@
-import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import { render, screen, waitFor, fireEvent, within, cleanup } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { http, HttpResponse } from "msw";
 import { server } from "../../test/msw-server";
@@ -59,6 +60,18 @@ vi.mock("@fullcalendar/react", async () => {
     };
 
     const calledRef = React.useRef(new Set<string>());
+
+    // Minimal getApi() so page code that navigates (search "jump to") is observable.
+    React.useImperativeHandle(_ref as React.Ref<unknown>, () => ({
+      getApi: () => ({
+        gotoDate: (d: string) => { (window as unknown as Record<string, unknown>).__TEST_GOTO_DATE__ = d; },
+        changeView: () => {},
+        getDate: () => new Date("2026-07-28T00:00:00Z"),
+        view: { type: "timeGridWeek" },
+        refetchEvents: () => {},
+        unselect: () => {},
+      }),
+    }));
 
     // Fire datesSet on mount so CalendarPage's handleDatesSet → fetchEvents runs.
     React.useEffect(() => {
@@ -220,6 +233,25 @@ vi.mock("../../components/calendar/CreateEventModal", async () => {
           },
           props.saving ? "Saving…" : "Create",
         ),
+        React.createElement(
+          "button",
+          {
+            key: "save-invite",
+            onClick: () =>
+              void props.onSave({
+                draft: props.draft,
+                assembledDescription: props.draft.description,
+                attendees: [
+                  { email: "ana@example.com", displayName: "Ana", responseStatus: "needsAction" },
+                  { email: "ben@example.com", displayName: "Ben", responseStatus: "needsAction" },
+                ],
+                meetLink: "",
+                effectiveCategory: props.draft.category,
+                sendInvites: true,
+              }),
+          },
+          "Create and invite",
+        ),
         React.createElement("button", { key: "cancel", onClick: props.onCancel }, "Cancel"),
       ]);
     },
@@ -237,9 +269,22 @@ vi.mock("../../components/calendar/AccountsSidebar", async () => {
       isUnlinkedView?: boolean;
       onLogTimeMode?: (accountName: string | null) => void;
       logTimeModeAccount?: string | null;
+      open?: boolean;
+      onToggle?: () => void;
+      onSelectAccount?: (name: string | null) => void;
     }) {
       if (!props.onShowUnlinkedView) return null;
       return React.createElement("div", null, [
+        React.createElement(
+          "button",
+          { key: "toggle", "data-testid": "toggle-accounts-panel", "data-open": props.open ? "true" : "false", onClick: props.onToggle },
+          "Toggle Accounts",
+        ),
+        React.createElement(
+          "button",
+          { key: "select", "data-testid": "select-account-beta", onClick: () => props.onSelectAccount?.("beta inc") },
+          "Select Beta",
+        ),
         React.createElement(
           "button",
           {
@@ -296,9 +341,11 @@ global.ResizeObserver = class ResizeObserver {
 
 function renderPage() {
   render(
-    <AppErrorProvider>
-      <CalendarPage />
-    </AppErrorProvider>,
+    <MemoryRouter>
+      <AppErrorProvider>
+        <CalendarPage />
+      </AppErrorProvider>
+    </MemoryRouter>,
   );
 }
 
@@ -729,9 +776,11 @@ describe("CalendarPage", () => {
     it("survives a remount, the way navigating away and back does", async () => {
       serveEvent({ attended: false });
       const first = render(
-        <AppErrorProvider>
-          <CalendarPage />
-        </AppErrorProvider>,
+        <MemoryRouter>
+          <AppErrorProvider>
+            <CalendarPage />
+          </AppErrorProvider>
+        </MemoryRouter>,
       );
       await waitFor(() => {
         expect(document.querySelector("[data-testid='calendar-event']"))
@@ -1057,6 +1106,45 @@ describe("CalendarPage", () => {
     await waitFor(() => expect(createdBody?.["title"]).toBe("New Sync"));
     await waitFor(() => expect(screen.queryByTestId("create-event-modal-mock")).not.toBeInTheDocument());
     expect(screen.getByText('Created "New Sync"')).toBeInTheDocument();
+  });
+
+  describe("meeting invites", () => {
+    async function createWithGuests(googleSync: Record<string, unknown>) {
+      let body: Record<string, unknown> | null = null;
+      server.use(
+        http.post("/api/v1/scheduler/events/", async ({ request }) => {
+          body = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json(
+            { ...mockCalendarEvents[0], id: 99, title: "Kickoff", google_sync: googleSync },
+            { status: 201 },
+          );
+        }),
+      );
+      renderPage();
+      await screen.findByTestId("fullcalendar");
+      fireEvent.click(screen.getByTestId("trigger-date-select"));
+      fireEvent.change(await screen.findByTestId("mock-title-input"), { target: { value: "Kickoff" } });
+      fireEvent.click(screen.getByRole("button", { name: "Create and invite" }));
+      await waitFor(() => expect(body).not.toBeNull());
+      return body as unknown as Record<string, unknown>;
+    }
+
+    it("forwards the modal's send-invites answer to the API", async () => {
+      const body = await createWithGuests({ status: "ok", invites_sent: true });
+      expect(body.send_invites).toBe(true);
+      expect((body.attendees as unknown[]).length).toBe(2);
+      expect(await screen.findByText('Created "Kickoff" and emailed 2 guests')).toBeInTheDocument();
+    });
+
+    it("warns when Google is not connected instead of claiming success", async () => {
+      await createWithGuests({ status: "not_connected", invites_sent: false });
+      expect(await screen.findByText(/connect Google Calendar in Settings to send invites/)).toBeInTheDocument();
+    });
+
+    it("warns when Google rejected the event", async () => {
+      await createWithGuests({ status: "failed", invites_sent: false });
+      expect(await screen.findByText(/guests were not invited/)).toBeInTheDocument();
+    });
   });
 
   it("Cancel closes the create-event modal without saving", async () => {
@@ -1950,7 +2038,7 @@ describe("CalendarPage — action item modal (not inline editing)", () => {
   }
 
   it("sidebar: clicking an action item card opens the shared modal, not an inline field form", async () => {
-    render(<AppErrorProvider><CalendarPage /></AppErrorProvider>);
+    render(<MemoryRouter><AppErrorProvider><CalendarPage /></AppErrorProvider></MemoryRouter>);
     fireEvent.click(screen.getAllByRole("button", { name: /Action Items/i })[0]);
 
     const taskText = await screen.findByText("Fix billing");
@@ -1959,9 +2047,19 @@ describe("CalendarPage — action item modal (not inline editing)", () => {
     expect(await screen.findByTestId("action-item-modal-panel")).toBeInTheDocument();
   });
 
+  it("sidebar: the modal is portalled to <body>, not confined to the sliding panel", async () => {
+    render(<MemoryRouter><AppErrorProvider><CalendarPage /></AppErrorProvider></MemoryRouter>);
+    fireEvent.click(screen.getAllByRole("button", { name: /Action Items/i })[0]);
+    fireEvent.click(await screen.findByText("Fix billing"));
+    const panel = await screen.findByTestId("action-item-modal-panel");
+    const slider = document.querySelector(".translate-x-0, .translate-x-full");
+    expect(slider).not.toBeNull();
+    expect(slider!.contains(panel)).toBe(false);
+  });
+
   it("grid: double-clicking the scheduled item's body opens the shared modal, not an inline field form", async () => {
     serveScheduledActionItem();
-    render(<AppErrorProvider><CalendarPage /></AppErrorProvider>);
+    render(<MemoryRouter><AppErrorProvider><CalendarPage /></AppErrorProvider></MemoryRouter>);
 
     fireEvent.click(await eventEl());
     const taskText = await gridBodyText("Fix billing");
@@ -1972,7 +2070,7 @@ describe("CalendarPage — action item modal (not inline editing)", () => {
 
   it("grid: clicking the 'Open action item' footer button opens the shared modal", async () => {
     serveScheduledActionItem();
-    render(<AppErrorProvider><CalendarPage /></AppErrorProvider>);
+    render(<MemoryRouter><AppErrorProvider><CalendarPage /></AppErrorProvider></MemoryRouter>);
 
     fireEvent.click(await eventEl());
     await gridBodyText("Fix billing");
@@ -1983,7 +2081,7 @@ describe("CalendarPage — action item modal (not inline editing)", () => {
 
   it("grid: double-clicking the scheduled-time row still opens the time-only editor, independent of the modal", async () => {
     serveScheduledActionItem();
-    render(<AppErrorProvider><CalendarPage /></AppErrorProvider>);
+    render(<MemoryRouter><AppErrorProvider><CalendarPage /></AppErrorProvider></MemoryRouter>);
 
     fireEvent.click(await eventEl());
     const taskText = await gridBodyText("Fix billing");
@@ -2005,7 +2103,7 @@ describe("CalendarPage — action item modal (not inline editing)", () => {
       }),
     );
 
-    render(<AppErrorProvider><CalendarPage /></AppErrorProvider>);
+    render(<MemoryRouter><AppErrorProvider><CalendarPage /></AppErrorProvider></MemoryRouter>);
     fireEvent.click(screen.getAllByRole("button", { name: /Action Items/i })[0]);
 
     const taskText = await screen.findByText("Fix billing");
@@ -2605,5 +2703,421 @@ describe("CalendarPage — navigating to earlier weeks", () => {
     await screen.findByText(/Event for 2026-06-16/);
 
     expect(calls).toBe(afterFirstVisit);
+  });
+});
+
+
+describe("CalendarPage — action items sidebar follows the selected account", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+    localStorage.clear();
+    server.use(
+      http.get("/api/v1/airtable/action-items/", () =>
+        HttpResponse.json([
+          { ...mockActionItem, id: 1, airtable_id: "recACME1", task: "Acme task", account_name: "Acme Corp", status: "Open" },
+          { ...mockActionItem, id: 2, airtable_id: "recBETA1", task: "Beta task", account_name: "Beta Inc", status: "Open" },
+        ]),
+      ),
+    );
+  });
+
+  async function openSidebar() {
+    render(<MemoryRouter><AppErrorProvider><CalendarPage /></AppErrorProvider></MemoryRouter>);
+    fireEvent.click(screen.getAllByRole("button", { name: /Action Items/i })[0]);
+    await screen.findByText("Acme task");
+  }
+
+  it("shows every account's items when no account is selected", async () => {
+    await openSidebar();
+    expect(screen.getByText("Beta task")).toBeInTheDocument();
+    expect(screen.queryByTestId("sidebar-account-filter")).not.toBeInTheDocument();
+  });
+
+  it("narrows to the selected account (case-insensitively) while the Accounts panel is open", async () => {
+    await openSidebar();
+    const toggle = screen.getByTestId("toggle-accounts-panel");
+    if (toggle.getAttribute("data-open") !== "true") fireEvent.click(toggle);
+    fireEvent.click(screen.getByTestId("select-account-beta"));
+
+    await waitFor(() => expect(screen.queryByText("Acme task")).not.toBeInTheDocument());
+    expect(screen.getByText("Beta task")).toBeInTheDocument();
+    expect(screen.getByTestId("sidebar-account-filter")).toHaveTextContent("beta inc");
+  });
+
+  it("stops filtering once the Accounts panel is closed", async () => {
+    await openSidebar();
+    const toggle = screen.getByTestId("toggle-accounts-panel");
+    if (toggle.getAttribute("data-open") !== "true") fireEvent.click(toggle);
+    fireEvent.click(screen.getByTestId("select-account-beta"));
+    await waitFor(() => expect(screen.queryByText("Acme task")).not.toBeInTheDocument());
+
+    fireEvent.click(screen.getByTestId("toggle-accounts-panel"));
+    expect(await screen.findByText("Acme task")).toBeInTheDocument();
+  });
+});
+
+
+describe("CalendarPage — search", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+    localStorage.clear();
+    delete (window as unknown as Record<string, unknown>).__TEST_GOTO_DATE__;
+  });
+
+  function serveEvents() {
+    let searchParams: URLSearchParams | null = null;
+    server.use(
+      http.get("/api/v1/scheduler/events/", ({ request }) => {
+        const url = new URL(request.url);
+        if (url.searchParams.get("search")) {
+          searchParams = url.searchParams;
+          return HttpResponse.json([
+            { ...mockCalendarEvents[0], id: 501, google_event_id: "g-501", title: "Acme renewal", start_datetime: "2026-12-03T17:00:00Z", end_datetime: "2026-12-03T18:00:00Z" },
+          ]);
+        }
+        return HttpResponse.json([
+          { ...mockCalendarEvents[0], id: 11, google_event_id: "g-11", title: "Acme kickoff" },
+          { ...mockCalendarEvents[0], id: 12, google_event_id: "g-12", title: "Dentist" },
+        ]);
+      }),
+    );
+    return () => searchParams;
+  }
+
+  function gridTitles() {
+    return Array.from(document.querySelectorAll("[data-testid='calendar-event']")).map((el) => el.textContent);
+  }
+
+  it("typing narrows the grid to matching events", async () => {
+    serveEvents();
+    render(<MemoryRouter><AppErrorProvider><CalendarPage /></AppErrorProvider></MemoryRouter>);
+    await waitFor(() => expect(gridTitles().some((t) => t?.includes("Dentist"))).toBe(true));
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search calendar" }), { target: { value: "acme" } });
+
+    await waitFor(() => expect(gridTitles().some((t) => t?.includes("Dentist"))).toBe(false));
+    expect(gridTitles().some((t) => t?.includes("Acme kickoff"))).toBe(true);
+  });
+
+  it("queries the server with ?search= and a window, and picking a result jumps to its date", async () => {
+    const lastSearch = serveEvents();
+    render(<MemoryRouter><AppErrorProvider><CalendarPage /></AppErrorProvider></MemoryRouter>);
+    await screen.findByTestId("fullcalendar");
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search calendar" }), { target: { value: "renewal" } });
+    const result = await screen.findByText("Acme renewal");
+    const params = lastSearch()!;
+    expect(params.get("search")).toBe("renewal");
+    expect(params.get("start")).toBeTruthy();
+    expect(params.get("end")).toBeTruthy();
+
+    fireEvent.click(result);
+    expect((window as unknown as Record<string, unknown>).__TEST_GOTO_DATE__).toBe("2026-12-03T17:00:00Z");
+  });
+
+  it("clearing the box restores every event", async () => {
+    serveEvents();
+    render(<MemoryRouter><AppErrorProvider><CalendarPage /></AppErrorProvider></MemoryRouter>);
+    await waitFor(() => expect(gridTitles().some((t) => t?.includes("Dentist"))).toBe(true));
+    const box = screen.getByRole("searchbox", { name: "Search calendar" });
+    fireEvent.change(box, { target: { value: "acme" } });
+    await waitFor(() => expect(gridTitles().some((t) => t?.includes("Dentist"))).toBe(false));
+    fireEvent.click(screen.getByRole("button", { name: "Clear search" }));
+    await waitFor(() => expect(gridTitles().some((t) => t?.includes("Dentist"))).toBe(true));
+  });
+});
+
+
+describe("CalendarPage — Log Time rows and project auto-import", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+    localStorage.clear();
+  });
+
+  // Local wall-clock times on the panel's first day, so the day bucketing is timezone-proof.
+  const at = (h: number, m = 0) => new Date(2026, 6, 28, h, m).toISOString();
+
+  function serveWeek() {
+    server.use(
+      http.get("/api/v1/scheduler/events/", () =>
+        HttpResponse.json([
+          { ...mockCalendarEvents[0], id: 71, google_event_id: "g-71", title: "Acme standup", account_name: "Acme Corp", calendar_id: "primary", start_datetime: at(9), end_datetime: at(9, 30) },
+          { ...mockCalendarEvents[0], id: 72, google_event_id: "g-72", title: "Zero length", account_name: "Acme Corp", calendar_id: "primary", start_datetime: at(10), end_datetime: at(10) },
+          { ...mockCalendarEvents[0], id: 73, google_event_id: "g-73", title: "Beta review", account_name: "Beta Inc", calendar_id: "primary", start_datetime: at(11), end_datetime: at(12) },
+          { ...mockCalendarEvents[0], id: 74, google_event_id: "g-74", title: "Skipped sync", account_name: "Acme Corp", calendar_id: "primary", attended: false, start_datetime: at(13), end_datetime: at(14) },
+          { ...mockCalendarEvents[0], id: 75, google_event_id: "g-75", title: "Holiday", account_name: "Acme Corp", calendar_id: "primary", all_day: true, start_datetime: at(0), end_datetime: at(23, 59) },
+          { ...mockCalendarEvents[0], id: 76, google_event_id: "", title: "Build widget", calendar_id: "work_tracking", agentpm_airtable_id: "recWIDGET", account_name: "Acme Corp", start_datetime: at(15), end_datetime: at(15, 15) },
+          { ...mockCalendarEvents[0], id: 77, google_event_id: "", title: "Build widget", calendar_id: "work_tracking", agentpm_airtable_id: "recWIDGET", account_name: "Acme Corp", start_datetime: at(16), end_datetime: at(16, 30) },
+          { ...mockCalendarEvents[0], id: 78, google_event_id: "", title: "Beta chore", calendar_id: "work_tracking", agentpm_airtable_id: "recBETA", account_name: "Beta Inc", start_datetime: at(17), end_datetime: at(17, 15) },
+        ]),
+      ),
+      http.get("/api/v1/airtable/action-items/", () =>
+        HttpResponse.json([
+          { ...mockActionItem, id: 1, airtable_id: "recWIDGET", task: "Build widget", account_name: "Acme Corp", time_spent: 99999 },
+          { ...mockActionItem, id: 2, airtable_id: "recBETA", task: "Beta chore", account_name: "Beta Inc" },
+        ]),
+      ),
+      http.get("/api/v1/salesforce/projects/", () => HttpResponse.json({ count: 0, next: null, previous: null, results: [] })),
+      http.get("/api/v1/accounts/projects/", () =>
+        HttpResponse.json({
+          count: 2, next: null, previous: null,
+          results: [
+            { id: 5, account: 1, name: "Widget Rollout", description: "", url: "", position: 0, action_ids: [], meeting_ids: [], goal_ids: ["6"], resources: [], sf_data: {}, sf_project_id: "", kind: "project", created_at: "" },
+            { id: 6, account: 1, name: "Goal: ship v1", description: "", url: "", position: 1, action_ids: ["recWIDGET"], meeting_ids: [], goal_ids: [], resources: [], sf_data: {}, sf_project_id: "", kind: "goal", created_at: "" },
+          ],
+        }),
+      ),
+    );
+  }
+
+  async function openPanel() {
+    render(<MemoryRouter><AppErrorProvider><CalendarPage /></AppErrorProvider></MemoryRouter>);
+    fireEvent.click(await screen.findByTestId("enter-log-time"));
+    await screen.findByText("Log Week");
+    return screen.findByText("Acme standup");
+  }
+
+  it("lists only this account's attended, timed rows", async () => {
+    serveWeek();
+    await openPanel();
+    // Scoped to the panel: the grid and sidebar render the same titles legitimately.
+    const panel = screen.getByText(/Log Time to Salesforce — Acme Corp/).closest(".rounded-2xl") as HTMLElement;
+    for (const hidden of ["Zero length", "Beta review", "Skipped sync", "Holiday", "Beta chore"]) {
+      expect(within(panel).queryByText(hidden)).not.toBeInTheDocument();
+    }
+    expect(within(panel).getAllByText("Build widget").length).toBeGreaterThan(0);
+  });
+
+  it("an action item's time is its calendar blocks that day, not its lifetime time_spent", async () => {
+    serveWeek();
+    await openPanel();
+    // 15m + 30m blocks, summed; time_spent=99999 must not leak in.
+    expect(await screen.findByText("45m")).toBeInTheDocument();
+  });
+
+  it("auto-imports the account-page project an item (via its goal) belongs to", async () => {
+    serveWeek();
+    await openPanel();
+    expect(await screen.findByTestId("auto-project-badge")).toBeInTheDocument();
+    // Goals are not offered as projects to drag; only the parent project appears.
+    expect(screen.queryByText("Goal: ship v1")).not.toBeInTheDocument();
+    expect(screen.getAllByText("Widget Rollout").length).toBeGreaterThanOrEqual(2); // pill + day block
+  });
+
+  it("dismissing an auto project removes it from the day and stays dismissed", async () => {
+    serveWeek();
+    await openPanel();
+    const badge = await screen.findByTestId("auto-project-badge");
+    const block = badge.closest(".rounded-lg") as HTMLElement;
+    fireEvent.click(within(block).getByTitle("Remove"));
+    await waitFor(() => expect(screen.queryByTestId("auto-project-badge")).not.toBeInTheDocument());
+    expect(JSON.parse(localStorage.getItem("logtime::Acme Corp::suppressedAutoProjects") ?? "[]")).toHaveLength(1);
+  });
+
+  it("a removed row stays removed across a remount", async () => {
+    serveWeek();
+    const row = await openPanel();
+    fireEvent.click(within(row.parentElement as HTMLElement).getByTitle("Remove from log"));
+    await waitFor(() => expect(screen.queryByText("Acme standup")).not.toBeInTheDocument());
+    cleanup();
+    serveWeek();
+    render(<MemoryRouter><AppErrorProvider><CalendarPage /></AppErrorProvider></MemoryRouter>);
+    fireEvent.click(await screen.findByTestId("enter-log-time"));
+    await screen.findByText("Log Week");
+    await screen.findAllByText("Build widget");
+    expect(screen.queryByText("Acme standup")).not.toBeInTheDocument();
+  });
+});
+
+
+describe("CalendarPage — Live Tracking overlay", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+    localStorage.clear();
+  });
+
+  it("draws a server-running timer once, hiding its own DB block", async () => {
+    const started = new Date(2026, 6, 28, 9, 0).toISOString();
+    server.use(
+      http.get("/api/v1/airtable/timers/", () =>
+        HttpResponse.json({ results: [{ id: 1, action_item: "recAAA001", task: "Fix billing", account_name: "Acme Corp", started_at: started, ended_at: null, seconds: 0, calendar_event: 900 }] }),
+      ),
+      http.get("/api/v1/scheduler/events/", () =>
+        HttpResponse.json([
+          { ...mockCalendarEvents[0], id: 900, google_event_id: "", title: "Fix billing", calendar_id: "work_tracking", agentpm_airtable_id: "recAAA001", start_datetime: started, end_datetime: new Date(2026, 6, 28, 9, 15).toISOString() },
+          // Sentinel: once it renders, the week's events have loaded (the overlay alone
+          // renders earlier, which would let the assertion pass before the block exists).
+          { ...mockCalendarEvents[0], id: 901, google_event_id: "g-901", title: "Loaded sentinel", calendar_id: "primary", start_datetime: new Date(2026, 6, 28, 11, 0).toISOString(), end_datetime: new Date(2026, 6, 28, 12, 0).toISOString() },
+        ]),
+      ),
+    );
+    render(<MemoryRouter><AppErrorProvider><CalendarPage /></AppErrorProvider></MemoryRouter>);
+    await waitFor(() => {
+      const titles = Array.from(document.querySelectorAll("[data-testid='calendar-event']")).map((el) => el.textContent ?? "");
+      expect(titles.some((t) => t.includes("Loaded sentinel"))).toBe(true);
+    });
+    await waitFor(() => {
+      const titles = Array.from(document.querySelectorAll("[data-testid='calendar-event']")).map((el) => el.textContent ?? "");
+      expect(titles.filter((t) => t.includes("Fix billing"))).toHaveLength(1);
+      expect(titles).toContain("⏱ Fix billing"); // one stopwatch, not "⏱ ⏱"
+    });
+  });
+
+  it("re-reads the visible week when a timer start/stop is broadcast", async () => {
+    let gets = 0;
+    server.use(http.get("/api/v1/scheduler/events/", () => { gets += 1; return HttpResponse.json([]); }));
+    render(<MemoryRouter><AppErrorProvider><CalendarPage /></AppErrorProvider></MemoryRouter>);
+    await screen.findByTestId("fullcalendar");
+    await waitFor(() => expect(gets).toBeGreaterThan(0));
+    const before = gets;
+    // A real start: its POST also clears the 10s GET cache (lib/requestCache.ts), which is
+    // what lets the broadcast refetch reach the network.
+    const { startLiveTimer } = await import("../../lib/liveTimers");
+    await startLiveTimer("recAAA001");
+    await waitFor(() => expect(gets).toBeGreaterThan(before));
+  });
+});
+
+
+describe("CalendarPage — compare calendars", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+    localStorage.clear();
+  });
+
+  function serveAvailability() {
+    const requests: URLSearchParams[] = [];
+    server.use(
+      http.get("/api/v1/team/members/", () =>
+        HttpResponse.json({ count: 1, next: null, previous: null, results: [
+          { id: 7, user: 7, username: "ana", full_name: "Ana Diaz", email: "ana@example.com", title: "SA", department: "", tags: [], manager: null, manager_name: null, slack_handle: "", avatar_url: "", joined_at: null, created_at: "", updated_at: "" },
+        ] }),
+      ),
+      http.get("/api/v1/scheduler/availability/", ({ request }) => {
+        const params = new URL(request.url).searchParams;
+        requests.push(params);
+        return HttpResponse.json({
+          start: params.get("start"), end: params.get("end"),
+          people: (params.get("emails") ?? "").split(",").map((email) => ({
+            email, name: email === "ana@example.com" ? "Ana Diaz" : email, source: "app", error: null,
+            busy: [{ start: new Date(2026, 6, 29, 10).toISOString(), end: new Date(2026, 6, 29, 11).toISOString(), all_day: false, title: "Busy", title_visible: false }],
+          })),
+        });
+      }),
+    );
+    return requests;
+  }
+
+  const gridTitles = () =>
+    Array.from(document.querySelectorAll("[data-testid='calendar-event']")).map((el) => el.textContent ?? "");
+
+  async function compareAna() {
+    render(<MemoryRouter><AppErrorProvider><CalendarPage /></AppErrorProvider></MemoryRouter>);
+    await screen.findByTestId("fullcalendar");
+    fireEvent.focus(screen.getByRole("textbox", { name: "Search for people" }));
+    fireEvent.click(await screen.findByText("Ana Diaz"));
+  }
+
+  it("overlays a teammate's busy time from one batched request", async () => {
+    const requests = serveAvailability();
+    await compareAna();
+    await waitFor(() => expect(gridTitles()).toContain("Ana Diaz: Busy"));
+    expect(requests).toHaveLength(1);
+    expect(requests[0].get("emails")).toBe("ana@example.com");
+    expect(screen.getByTestId("compared-person")).toHaveTextContent("Ana Diaz");
+  });
+
+  it("any typed email can be compared (Google free/busy for non-users)", async () => {
+    const requests = serveAvailability();
+    render(<MemoryRouter><AppErrorProvider><CalendarPage /></AppErrorProvider></MemoryRouter>);
+    await screen.findByTestId("fullcalendar");
+    const box = screen.getByRole("textbox", { name: "Search for people" });
+    fireEvent.change(box, { target: { value: "zed@twilio.com" } });
+    fireEvent.keyDown(box, { key: "Enter" });
+    await waitFor(() => expect(requests.at(-1)?.get("emails")).toBe("zed@twilio.com"));
+  });
+
+  it("existing view filters still apply to compared calendars", async () => {
+    serveAvailability();
+    await compareAna();
+    await waitFor(() => expect(gridTitles()).toContain("Ana Diaz: Busy"));
+    // The toolbar "Action Items" view hides meetings, compared ones included.
+    fireEvent.click(document.querySelector("[data-fc-button='viewActionItems']") as HTMLElement);
+    await waitFor(() => expect(gridTitles()).not.toContain("Ana Diaz: Busy"));
+  });
+
+  it("search narrows compared calendars too", async () => {
+    serveAvailability();
+    await compareAna();
+    await waitFor(() => expect(gridTitles()).toContain("Ana Diaz: Busy"));
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search calendar" }), { target: { value: "nothing-matches" } });
+    await waitFor(() => expect(gridTitles()).not.toContain("Ana Diaz: Busy"));
+  });
+
+  it("removing the last person clears the overlay", async () => {
+    serveAvailability();
+    await compareAna();
+    await waitFor(() => expect(gridTitles()).toContain("Ana Diaz: Busy"));
+    fireEvent.click(screen.getByRole("button", { name: "Stop comparing Ana Diaz" }));
+    await waitFor(() => expect(gridTitles()).not.toContain("Ana Diaz: Busy"));
+    expect(screen.queryByRole("button", { name: "Find free time" })).not.toBeInTheDocument();
+  });
+});
+
+
+describe("CalendarPage — record links in the event panel", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+    localStorage.clear();
+  });
+
+  function serveActionItemBlock(status = "Done") {
+    const lookups: string[] = [];
+    server.use(
+      http.get("/api/v1/scheduler/events/", () =>
+        HttpResponse.json([{ ...mockCalendarEvents[0], id: 9, google_event_id: "", title: "Fix billing", calendar_id: "work_tracking", agentpm_airtable_id: "recAAA001" }]),
+      ),
+      http.get("/api/v1/airtable/action-items/", ({ request }) => {
+        const id = new URL(request.url).searchParams.get("airtable_id");
+        if (id) lookups.push(id);
+        return HttpResponse.json([{ ...mockActionItem, airtable_id: "recAAA001", task: "Fix billing", account_name: "Acme Corp", status }]);
+      }),
+      http.get("/api/v1/accounts/accounts/", () =>
+        HttpResponse.json({ count: 1, next: null, previous: null, results: [{ id: 42, company_name: "Acme Corp" }] }),
+      ),
+      http.get("/api/v1/airtable/action-items/:id/attachments/", () => HttpResponse.json([])),
+    );
+    return lookups;
+  }
+
+  async function openBlock() {
+    renderPage();
+    const el = await waitFor(() => {
+      const found = document.querySelector("[data-testid='calendar-event']");
+      expect(found).not.toBeNull();
+      return found as HTMLElement;
+    });
+    fireEvent.click(el);
+  }
+
+  it("finds a Done item's block by direct lookup and lists the action item", async () => {
+    const lookups = serveActionItemBlock("Done");
+    await openBlock();
+    expect(await screen.findByTestId("panel-action-item-link")).toHaveTextContent("Fix billing");
+    expect(lookups).toContain("recAAA001");
+  });
+
+  it("the action item row opens the action item modal (no navigation)", async () => {
+    serveActionItemBlock();
+    await openBlock();
+    fireEvent.click(await screen.findByTestId("panel-action-item-link"));
+    expect(await screen.findByTestId("action-item-modal-panel")).toBeInTheDocument();
+  });
+
+  it("the account name links to the account page", async () => {
+    serveActionItemBlock();
+    await openBlock();
+    const link = await screen.findByTestId("panel-account-link");
+    expect(link).toHaveAttribute("href", "/accounts/42");
   });
 });

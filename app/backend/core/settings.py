@@ -257,6 +257,10 @@ CELERY_BEAT_SCHEDULE = {
         "task": "salesforce_sync.tasks.sync_salesforce_all_users",
         "schedule": 1800,
     },
+    "google-calendar-sync-every-5-minutes": {
+        "task": "integrations.tasks.sync_all_google_calendars",
+        "schedule": 300,  # backup for Google push notifications; also renews push channels
+    },
     "deliver-due-reminders-every-minute": {
         "task": "scheduler.deliver_due_reminders",
         "schedule": 60,  # every 60 seconds — reminder precision is ~1 minute
@@ -442,6 +446,10 @@ VOICE_HINTS_ACCOUNT_LIMIT = int(os.getenv("VOICE_HINTS_ACCOUNT_LIMIT", "60"))
 VOICE_HINTS_MAX_CHARS = int(os.getenv("VOICE_HINTS_MAX_CHARS", "1000"))
 
 # ── Google ────────────────────────────────────────────────────────────────────
+# Public HTTPS base URL Google Calendar push notifications are delivered to, e.g.
+# "https://agentpm.example.com". Blank (the default, and on a laptop) disables push
+# channels; the 5-minute scheduled sync and the calendar page's own refresh still run.
+GOOGLE_WEBHOOK_BASE_URL = os.getenv("GOOGLE_WEBHOOK_BASE_URL", "")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REDIRECT_URI = os.getenv(

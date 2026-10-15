@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { permissionMessage } from "../lib/permissions";
 import { accountsApi, teamApi } from "../lib/api";
 import CorporateIcon from "../assets/icons/Corporate.svg?react";
 import type { Account, AccountTeamMember, TeamMember, UserProfile } from "../types";
@@ -647,10 +648,15 @@ export default function AccountsPage() {
     if (!accountId) return;
     const existingIds: number[] = JSON.parse(e.dataTransfer.getData("accountTeamMemberIds") || "[]");
     if (existingIds.includes(member.id)) return;
-    const { data } = await accountsApi.updateAccount(accountId, {
-      team_member_ids: [...existingIds, member.id],
-    } as Partial<Account>);
-    setAccounts((prev) => prev.map((a) => (a.id === data.id ? data : a)));
+    try {
+      const { data } = await accountsApi.updateAccount(accountId, {
+        team_member_ids: [...existingIds, member.id],
+      } as Partial<Account>);
+      setAccounts((prev) => prev.map((a) => (a.id === data.id ? data : a)));
+    } catch (err) {
+      // e.g. a Basic user adding someone other than themselves — PM/Admin only.
+      reportError(permissionMessage(err, "Could not add that team member to the account."), "AccountsPage");
+    }
   }
 
   async function handleMemberDrop(e: React.DragEvent, account: Account) {
@@ -675,11 +681,10 @@ export default function AccountsPage() {
           reportError(summarizePush(push), "AccountsPage");
         }
       }
-    } catch {
-      // Previously unguarded, so a rejected drop (e.g. the team-member allowlist in
-      // AccountViewSet._validate_account_write_fks) failed silently and the card simply
-      // never updated.
-      reportError("Could not add that team member to the account.", "AccountsPage");
+    } catch (err) {
+      // Previously unguarded, so a rejected drop (e.g. a Basic user adding someone else,
+      // which accounts/access.py reserves for PM/Admin) failed silently.
+      reportError(permissionMessage(err, "Could not add that team member to the account."), "AccountsPage");
     }
   }
 

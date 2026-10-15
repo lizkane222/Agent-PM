@@ -419,7 +419,13 @@ export const agentApi = {
 export const schedulerApi = {
   listEvents: (params?: Record<string, string>) =>
     apiClient.get<CalendarEvent[]>("/scheduler/events/", { params }),
-  createEvent: (data: Partial<CalendarEvent>) =>
+  /** Compare calendars: busy blocks for up to 8 people (titles only on shared accounts). */
+  getAvailability: (emails: string[], start: string, end: string) =>
+    apiClient.get<{ start: string; end: string; people: import("./availability").PersonAvailability[] }>(
+      "/scheduler/availability/", { params: { emails: emails.join(","), start, end } },
+    ),
+  /** `send_invites` asks Google to email the guests (default: yes when there are any). */
+  createEvent: (data: Partial<CalendarEvent> & { send_invites?: boolean }) =>
     apiClient.post<CalendarEvent>("/scheduler/events/", data),
   updateEvent: (id: number, data: Partial<CalendarEvent>) =>
     apiClient.patch<CalendarEvent>(`/scheduler/events/${id}/`, data),
@@ -472,6 +478,9 @@ export const schedulerApi = {
 
   listMeetingNotes: (eventId: number) =>
     apiClient.get<PaginatedResponse<MeetingNote>>("/scheduler/meeting-notes/", { params: { event: eventId, page_size: 200 } }),
+  /** Notes from every calendar block of one action item (read-only "Calendar notes"). */
+  listMeetingNotesForActionItem: (airtableId: string) =>
+    apiClient.get<PaginatedResponse<MeetingNote>>("/scheduler/meeting-notes/", { params: { action_item: airtableId, page_size: 200 } }),
   /**
    * Batched counterpart to listMeetingNotes — fetches notes for many events in one
    * request. Callers group the flat result by `note.event`. Returns an empty envelope
@@ -502,6 +511,12 @@ export const teamApi = {
     apiClient.get<UserProfile>("/team/profiles/me/", freshConfig(opts)),
   updateMyProfile: (data: Partial<UserProfile>) =>
     apiClient.patch<UserProfile>("/team/profiles/me/", data),
+  /** Admin only: search users with their access level. */
+  listUserDirectory: (search = "") =>
+    apiClient.get<{ results: DirectoryUser[] }>("/team/profiles/directory/", { params: search ? { search } : {}, noCache: true }),
+  /** Admin only. */
+  setAccessLevel: (profileId: number, access_level: AccessLevel) =>
+    apiClient.patch<{ profile_id: number; access_level: AccessLevel }>(`/team/profiles/${profileId}/access-level/`, { access_level }),
   savePushSubscription: (subscription: PushSubscriptionJSON) =>
     apiClient.post<{ push_subscription_active: boolean }>("/team/profiles/me/push-subscription/", subscription),
   deletePushSubscription: () =>
@@ -510,10 +525,11 @@ export const teamApi = {
     apiClient.get<PaginatedResponse<TeamMember>>("/team/members/", { params }),
   listTags: (params?: Record<string, string>) =>
     apiClient.get<PaginatedResponse<Tag>>("/team/tags/", { params }),
+  // Shapes match team/serializers.py (TeamSerializer / TeamMembershipSerializer).
   listTeams: (params?: Record<string, string>) =>
-    apiClient.get<PaginatedResponse<{ id: number; name: string; slug: string; description: string; created_at: string }>>("/team/teams/", { params }),
+    apiClient.get<PaginatedResponse<{ id: number; name: string; description: string; member_count: number; created_at: string }>>("/team/teams/", { params }),
   listMemberships: (params?: Record<string, string>) =>
-    apiClient.get<PaginatedResponse<{ id: number; user: number; user_display: string; team: number; team_name: string; role: string; created_at: string }>>("/team/memberships/", { params }),
+    apiClient.get<PaginatedResponse<{ id: number; user: number; user_email: string; user_display_name: string; team: number; team_name: string; role: string; created_at: string }>>("/team/memberships/", { params }),
   getGmailKeywords: () =>
     apiClient.get<{ keywords: string[] }>("/team/profiles/gmail-keywords/"),
   setGmailKeywords: (keywords: string[]) =>
@@ -798,6 +814,15 @@ export const airtableApi = {
     apiClient.patch<AirtableActionItem>(`/airtable/action-items/${airtableId}/fields/`, fields),
   logTime: (data: { airtable_id: string; account_name: string; task: string; seconds: number }) =>
     apiClient.post<AirtableActionItem>("/airtable/time-logs/", data),
+  // Live Tracking — server-owned timers. Use lib/liveTimers.ts, not these directly.
+  listTimers: () =>
+    apiClient.get<{ results: import("./liveTimers").LiveTimer[] }>("/airtable/timers/", { noCache: true }),
+  startTimer: (airtableId: string) =>
+    apiClient.post<{ session: import("./liveTimers").LiveTimer }>("/airtable/timers/start/", { airtable_id: airtableId }),
+  stopTimer: (airtableId: string) =>
+    apiClient.post<{ session: import("./liveTimers").LiveTimer; item: AirtableActionItem }>("/airtable/timers/stop/", { airtable_id: airtableId }),
+  cancelTimer: (airtableId: string) =>
+    apiClient.post<void>("/airtable/timers/cancel/", { airtable_id: airtableId }),
   triggerSync: () => apiClient.post<{ accounts: number; meetings: number; action_items: number; artifacts: number; action_item_attachments: number }>("/airtable/sync/"),
   listAttachments: (actionItemId: number) =>
     apiClient.get<ActionItemAttachment[]>(`/airtable/action-items/${actionItemId}/attachments/`),
@@ -847,8 +872,8 @@ export const realtimeApi = {
     client_id: string;
     client_ts: number;
   }) => apiClient.post<AgentActivityEvent>("/realtime/activity/", data),
-  listVoiceSessions: () =>
-    apiClient.get<PaginatedResponse<VoiceSession>>("/realtime/voice-sessions/"),
+  listVoiceSessions: (params?: Record<string, string>) =>
+    apiClient.get<PaginatedResponse<VoiceSession>>("/realtime/voice-sessions/", { params }),
 };
 
 export interface SkillFile {
@@ -862,7 +887,7 @@ export const skillsApi = {
   list: () =>
     apiClient.get<PaginatedResponse<ClaudeSkill>>("/skills/skills/"),
   listInvocations: (params?: Record<string, string>) =>
-    apiClient.get<PaginatedResponse<{ id: number; skill: number; skill_name: string; invoked_by: number | null; invoked_by_username: string | null; arguments: unknown; result: unknown; error: string; created_at: string }>>("/skills/invocations/", { params }),
+    apiClient.get<PaginatedResponse<{ id: number; skill: number; skill_name: string; invoked_by: number | null; invoked_by_username: string | null; arguments: unknown; result: unknown; status: string; error: string; duration_ms: number | null; invoked_at: string }>>("/skills/invocations/", { params }),
   get: (id: number) =>
     apiClient.get<ClaudeSkill>(`/skills/skills/${id}/`),
   create: (data: { name: string; description: string; code: string; input_schema?: Record<string, unknown> }) =>
@@ -1123,13 +1148,40 @@ export interface GmailThread {
   calendar_slots?: GmailCalendarSlot[];
 }
 
+export type AccessLevel = "basic" | "pm" | "admin";
+export interface DirectoryUser {
+  profile_id: number;
+  user_id: number;
+  username: string;
+  email: string;
+  display_name: string;
+  access_level: AccessLevel;
+  is_self: boolean;
+}
+
 export const integrationsApi = {
   getStatus: () =>
     apiClient.get<{ connected: OAuthCredential[]; sync_states: unknown[] }>(
       "/integrations/status/"
     ),
+  /** Which integrations can be connected here, plus the caller's votes on the rest. */
+  getAvailability: () =>
+    apiClient.get<{ providers: Record<string, { configured: boolean; my_vote: "yes" | "not_now" | null; yes_votes: number }> }>(
+      "/integrations/availability/", { noCache: true },
+    ),
+  voteIntegration: (provider: string, vote: "yes" | "not_now") =>
+    apiClient.post<{ provider: string; vote: string }>("/integrations/votes/", { provider, vote }),
+  /** Sends a real test on each channel; per-channel sent / skipped (with reason) / failed. */
+  sendTestNotifications: (channels: import("./notificationTests").TestChannel[]) =>
+    apiClient.post<{ results: { channel: import("./notificationTests").TestChannel; status: "sent" | "skipped" | "failed"; detail: string }[] }>(
+      "/scheduler/notifications/test/", { channels },
+    ),
   getScraperStatus: () =>
-    apiClient.get<{ confluence: boolean; jira: boolean; zendesk: boolean; gong: boolean; notion: boolean }>(
+    apiClient.get<{
+      confluence: boolean; jira: boolean; zendesk: boolean; gong: boolean; notion: boolean;
+      /** Masked ("••••••••3f9a") — the full value never reaches the browser. */
+      hints?: Partial<Record<"confluence" | "jira" | "zendesk" | "gong" | "notion", string>>;
+    }>(
       "/integrations/scraper-status/"
     ),
   testGmail: () =>
@@ -1155,8 +1207,11 @@ export const integrationsApi = {
     apiClient.get<{ authorization_url: string; state: string }>(
       "/integrations/google/connect/"
     ),
-  syncGoogleCalendar: () =>
-    apiClient.post<{ detail: string; event_count: number }>("/integrations/google/sync/"),
+  /** `auto: true` for background refreshes — same sync, no activity-log entry. */
+  syncGoogleCalendar: (opts?: { auto?: boolean }) =>
+    apiClient.post<{ detail: string; event_count: number; changed?: number }>(
+      "/integrations/google/sync/", opts?.auto ? { auto: true } : undefined,
+    ),
   pushActionItemsToGoogle: (items: Array<{
     airtableId: string;
     start: string;

@@ -22,5 +22,9 @@ urlpatterns = [
     path("meetings/by-event/<int:event_id>/zoom-notes/", views.update_meeting_zoom_notes, name="airtable-meeting-zoom-notes"),
     path("meetings/<int:meeting_id>/zoom-notes/", views.update_meeting_zoom_notes_by_pk, name="airtable-meeting-zoom-notes-by-pk"),
     path("time-logs/", views.log_time, name="airtable-time-log"),
+    path("timers/", views.list_running_timers, name="airtable-timers"),
+    path("timers/start/", views.start_timer, name="airtable-timer-start"),
+    path("timers/stop/", views.stop_timer, name="airtable-timer-stop"),
+    path("timers/cancel/", views.cancel_timer, name="airtable-timer-cancel"),
     path("sync/", views.trigger_sync, name="airtable-sync"),
 ]

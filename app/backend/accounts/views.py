@@ -113,21 +113,10 @@ class AccountViewSet(viewsets.ModelViewSet):
         return qs
 
     def _require_account_owner(self, instance):
-        """Only the account owner, its admin_owner, or a staff user may perform
-        destructive/ownership-changing operations. Regular team members can
-        still edit sub-resources (notes, artifacts, action items) via the
-        detail routes, which don't route through here."""
-        user = self.request.user
-        if user.is_staff:
-            return
-        if instance.owner_id == getattr(user, "pk", None):
-            return
-        if instance.admin_owner_id == getattr(user, "pk", None):
-            return
-        if instance.created_by_id == getattr(user, "pk", None):
-            return
-        from rest_framework.exceptions import PermissionDenied
-        raise PermissionDenied("Only the account owner may modify or delete this account.")
+        """Delete is limited to the account's owner / creator / admin_owner, or PM and above.
+        Field edits are open to every member (see accounts/access.py)."""
+        from .access import assert_can_delete
+        assert_can_delete(self.request.user, instance)
 
     def _validate_account_write_fks(self, serializer):
         """Block non-staff from writing owner/primary_contact/team_member_ids to
@@ -168,22 +157,14 @@ class AccountViewSet(viewsets.ModelViewSet):
         # non-staff caller from grafting arbitrary teammates onto an account.
         # Concretely: everything not in the allowlist must be empty.
         if "team_members" in vd:
-            incoming = vd.get("team_members") or []
-            if incoming:
-                from team.models import TeamMember
-                incoming_ids = [m.pk for m in incoming]
-                # Allow the caller's own TeamMember (matched by user FK).
-                allowed_qs = TeamMember.objects.filter(pk__in=incoming_ids).filter(
-                    Q(user=user)
-                    | Q(member_accounts__team_members__user=user)
-                    | Q(member_accounts__admin_owner=user)
-                )
-                allowed_ids = set(allowed_qs.values_list("pk", flat=True))
-                disallowed = [pk for pk in incoming_ids if pk not in allowed_ids]
-                if disallowed:
-                    raise PermissionDenied(
-                        "You cannot add team members you don't already share an account with."
-                    )
+            # Membership: Basic may add/remove only themselves; PM and Admin anyone.
+            from .access import assert_can_change_members
+            incoming = {m.pk for m in (vd.get("team_members") or [])}
+            current = (
+                set(serializer.instance.team_members.values_list("pk", flat=True))
+                if serializer.instance is not None else set()
+            )
+            assert_can_change_members(user, incoming - current, current - incoming)
 
     def perform_create(self, serializer):
         self._validate_account_write_fks(serializer)
@@ -204,8 +185,10 @@ class AccountViewSet(viewsets.ModelViewSet):
         )
 
     def perform_update(self, serializer):
-        self._require_account_owner(serializer.instance)
+        from .access import assert_can_edit_fields, log_field_changes, snapshot
+        assert_can_edit_fields(self.request.user, serializer.instance)
         self._validate_account_write_fks(serializer)
+        fields_before = snapshot(serializer.instance)
         # Captured before save so newly-added team members can be identified. Dragging a
         # member onto an account on the Accounts page arrives here as a `team_member_ids`
         # PATCH, and that is the trigger for the Cloud Coach push below.
@@ -213,6 +196,8 @@ class AccountViewSet(viewsets.ModelViewSet):
             serializer.instance.team_members.values_list("pk", flat=True)
         )
         account = serializer.save()
+        # History of every account field: one Activity Log event per set/changed/cleared value.
+        log_field_changes(self.request.user, account, fields_before, snapshot(account))
         try:
             from airtable_sync.write_back import push_account_update
             push_account_update(account)
@@ -553,6 +538,8 @@ class AccountViewSet(viewsets.ModelViewSet):
             member = TeamMember.objects.get(pk=int(member_id))
         except (TeamMember.DoesNotExist, ValueError):
             return Response({"error": "TeamMember not found"}, status=status.HTTP_404_NOT_FOUND)
+        from .access import assert_can_change_members
+        assert_can_change_members(request.user, {member.pk}, set())
         account.team_members.add(member)
         return Response(AccountSerializer(account).data)
 
@@ -571,6 +558,8 @@ class AccountViewSet(viewsets.ModelViewSet):
             member = TeamMember.objects.get(pk=int(member_id))
         except (TeamMember.DoesNotExist, ValueError):
             return Response({"error": "TeamMember not found"}, status=status.HTTP_404_NOT_FOUND)
+        from .access import assert_can_change_members
+        assert_can_change_members(request.user, set(), {member.pk})
         account.team_members.remove(member)
         return Response(AccountSerializer(account).data)
 
@@ -1053,6 +1042,9 @@ class ProjectMemberViewSet(
     def perform_create(self, serializer):
         project = serializer.validated_data.get("project")
         _assert_account_membership(self.request.user, project.account if project else None)
+        from .access import assert_can_change_members
+        target = serializer.validated_data.get("team_member")
+        assert_can_change_members(self.request.user, {target.pk} if target else set(), set())
         member = serializer.save(added_by=self.request.user)
         self._cloud_coach = self._push_to_cloud_coach(member)
 
@@ -1097,4 +1089,6 @@ class ProjectMemberViewSet(
         # or deleting a Resource Assignment is destructive and was not asked for; a local
         # un-link should not quietly rewrite a shared Salesforce record.
         _assert_account_membership(self.request.user, instance.project.account)
+        from .access import assert_can_change_members
+        assert_can_change_members(self.request.user, set(), {instance.team_member_id})
         instance.delete()

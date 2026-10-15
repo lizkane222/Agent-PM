@@ -69,6 +69,16 @@ export interface CalendarEvent {
   artifact_ids?: number[];
   created_at: string;
   updated_at: string;
+  /**
+   * Create-response only, for primary-calendar events: whether the event reached Google
+   * and whether guests were emailed. Absent on list/detail reads.
+   */
+  google_sync?: GoogleSyncResult;
+}
+
+export interface GoogleSyncResult {
+  status: "ok" | "not_connected" | "failed";
+  invites_sent: boolean;
 }
 
 export interface MeetingNote {

@@ -15,7 +15,7 @@ import { ProjectGoals } from "../components/account/ProjectGoals";
 import { ROLE_META, getTitleRole } from "../lib/titleRoles";
 import { useLogGlow } from "../hooks/useLogGlow";
 import { addLog } from "../lib/appLog";
-import { logActionItemUpdate } from "../lib/actionItemLog";
+import { logActionItemUpdate, changedActionItemFields } from "../lib/actionItemLog";
 import { assignActionItemToMember, isMemberDrag, readMemberDragData, setMemberDragData } from "../lib/actionItemAssign";
 import { useScheduledOccurrences } from "../hooks/useScheduledOccurrences";
 import { useActionItemFieldOptions } from "../hooks/useActionItemFieldOptions";
@@ -40,6 +40,7 @@ import { convertActionItemToEvent, restoreConversion } from "../hooks/useConvert
 import RichTextMentionEditor, { type RichTextMentionEditorHandle } from "../components/shared/RichTextMentionEditor";
 import { htmlToPreviewText, sanitizeHtml, plainToHtml } from "../lib/noteHelpers";
 import { useAppError } from "../context/AppErrorContext";
+import { permissionMessage } from "../lib/permissions";
 import CloudCoachPushToast from "../components/shared/CloudCoachPushToast";
 import { isPushOk, summarizePush, type CloudCoachPushResult } from "../lib/cloudCoachPush";
 
@@ -560,8 +561,9 @@ function ActionItemModal({
     setSaving(true);
     setSaveError(null);
     try {
-      const { data } = await airtableApi.updateActionItemFields(item.airtable_id, form as Parameters<typeof airtableApi.updateActionItemFields>[1]);
-      logActionItemUpdate(item, form as Partial<AirtableActionItem>);
+      const changes = changedActionItemFields(item, form);
+      const { data } = await airtableApi.updateActionItemFields(item.airtable_id, changes);
+      logActionItemUpdate(item, changes);
       onUpdated?.(data);
       onClose();
     } catch (err: unknown) {
@@ -2171,6 +2173,7 @@ function AttendeeList({
   onAccountUpdated?: (a: Account) => void;
   onContactsChange?: (c: CustomerContact[]) => void;
 }) {
+  const { reportError } = useAppError();
   const [popover, setPopover] = useState<{ index: number; mode: "pick" | "twilio-search" | "customer-form" } | null>(null);
   const [search, setSearch] = useState("");
   const [addingMember, setAddingMember] = useState(false);
@@ -2195,6 +2198,8 @@ function AttendeeList({
     setAddingMember(true);
     try {
       await accountsApi.addTeamMember(account.id, memberId);
+    } catch (err) {
+      reportError(permissionMessage(err, "Could not add them to the account."), "AttendeeList");
     } finally {
       setAddingMember(false);
       setPopover(null);
@@ -2431,8 +2436,9 @@ function ActionItemSidePanelContent({
     if (saving) return;
     setSaving(true);
     try {
-      const { data } = await airtableApi.updateActionItemFields(item.airtable_id, form as Parameters<typeof airtableApi.updateActionItemFields>[1]);
-      logActionItemUpdate(item, form as Partial<AirtableActionItem>);
+      const changes = changedActionItemFields(item, form);
+      const { data } = await airtableApi.updateActionItemFields(item.airtable_id, changes);
+      logActionItemUpdate(item, changes);
       onUpdated?.(data);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
@@ -5584,8 +5590,12 @@ export default function AccountDetailPage() {
                       {m.full_name.split(" ")[0]}
                       <button
                         onClick={async () => {
-                          const { data } = await accountsApi.removeTeamMember(account.id, m.id);
-                          setAccount(data);
+                          try {
+                            const { data } = await accountsApi.removeTeamMember(account.id, m.id);
+                            setAccount(data);
+                          } catch (err) {
+                            reportError(permissionMessage(err, `Could not remove ${m.full_name}.`), "AccountDetailPage");
+                          }
                         }}
                         className="ml-0.5 leading-none hover:opacity-60"
                         aria-label={`Remove ${m.full_name}`}

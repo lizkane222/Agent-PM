@@ -1,5 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import { accountsApi } from "../../lib/api";
+import { useAppError } from "../../context/AppErrorContext";
+import { permissionMessage } from "../../lib/permissions";
 import type { Attendee, Account, TeamMember, CustomerContact } from "../../types";
 
 function CustomerContactQuickForm({
@@ -49,6 +51,7 @@ export function AttendeeList({
   onAccountUpdated?: (a: Account) => void;
   onContactsChange?: (c: CustomerContact[]) => void;
 }) {
+  const { reportError } = useAppError();
   const [popover, setPopover] = useState<{ index: number; mode: "pick" | "twilio-search" | "customer-form" } | null>(null);
   const [search, setSearch] = useState("");
   const [addingMember, setAddingMember] = useState(false);
@@ -73,6 +76,9 @@ export function AttendeeList({
     setAddingMember(true);
     try {
       await accountsApi.addTeamMember(account.id, memberId);
+    } catch (err) {
+      // Adding someone else to an account is PM/Admin only (accounts/access.py).
+      reportError(permissionMessage(err, "Could not add them to the account."), "AttendeeList");
     } finally {
       setAddingMember(false);
       setPopover(null);

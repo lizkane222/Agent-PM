@@ -7,6 +7,9 @@ from rest_framework import serializers
 
 from .models import Tag, Team, TeamMember, TeamMemberDocument, TeamMembership, UserProfile
 
+# E.164: "+", a non-zero country code digit, 7–15 digits total.
+E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
+
 User = get_user_model()
 
 
@@ -22,12 +25,13 @@ class TeamMembershipSerializer(serializers.ModelSerializer):
     user_display_name = serializers.CharField(
         source="user.profile.display_name", read_only=True, default=""
     )
+    team_name = serializers.CharField(source="team.name", read_only=True)
 
     class Meta:
         model = TeamMembership
         fields = [
             "id", "user", "user_email", "user_display_name",
-            "team", "role", "joined_at", "created_at", "updated_at",
+            "team", "team_name", "role", "joined_at", "created_at", "updated_at",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
 
@@ -101,6 +105,8 @@ class UserProfileSerializer(serializers.ModelSerializer):
             "push_subscription_active",
             # Staff view mode
             "staff_view_override",
+            # Authorisation tier — read-only here; set via the Admin-only access-level action
+            "access_level",
             # Calendar appearance
             "calendar_colors",
             # Gmail watch configuration
@@ -111,13 +117,28 @@ class UserProfileSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = [
             "id", "email", "username", "is_staff", "okta_uid", "airtable_collaborator_id",
-            "push_subscription_active", "created_at", "updated_at",
+            "push_subscription_active", "access_level", "created_at", "updated_at",
         ]
 
     push_subscription_active = serializers.SerializerMethodField()
 
     def get_push_subscription_active(self, obj) -> bool:
         return bool(obj.push_subscription)
+
+    def validate_phone_number(self, value):
+        """Store E.164 (`+<country><number>`), which Twilio requires.
+
+        Spaces, dashes, dots and parentheses are stripped. A number without a country code
+        used to be saved as-is and then fail silently at Twilio when an SMS reminder fired.
+        """
+        if not value:
+            return ""
+        cleaned = re.sub(r"[\s().-]", "", str(value))
+        if not E164_RE.match(cleaned):
+            raise serializers.ValidationError(
+                "Enter the number with its country code, e.g. +1 415 555 0123."
+            )
+        return cleaned
 
     def validate_calendar_colors(self, value):
         """Validate the calendar_colors blob.

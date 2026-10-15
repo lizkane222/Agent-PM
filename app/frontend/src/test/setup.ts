@@ -6,6 +6,7 @@ import { resetRequestCache } from "../lib/requestCache";
 import { resetCommentSummaries } from "../lib/commentSummaryStore";
 import { reloadActionItemZones } from "../hooks/useActionItemZoneSets";
 import { reloadStatusArrivalOrder } from "../hooks/useStatusArrivalOrder";
+import { resetLiveTimers } from "../lib/liveTimers";
 import { resetCreatedEventIds } from "./handlers/scheduler";
 import { accountHandlers } from "./handlers/accounts";
 import { actionItemHandlers } from "./handlers/action_items";
@@ -69,6 +70,9 @@ afterEach(() => {
   // Same trap again for the kanban status arrival order (hooks/useStatusArrivalOrder.ts):
   // a status move recorded by one test would otherwise still order the next test's columns.
   reloadStatusArrivalOrder();
+  // Live Tracking timers (lib/liveTimers.ts) are a module-level cache of the server's
+  // running sessions; a timer started in one test must not still be "running" in the next.
+  resetLiveTimers();
   // The create-event MSW handler hands out ascending ids from a module-level counter, so
   // without this an id assertion depends on how many events earlier tests created.
   resetCreatedEventIds();

@@ -165,11 +165,11 @@ def _action_item_fields(item, account_airtable_id: str | None = None) -> dict:
         due = item.due_date
         fields["Due Date"] = due.isoformat() if hasattr(due, "isoformat") else str(due)
     if item.estimated_time:
-        fields["Estimated Time"] = item.estimated_time // 60
+        fields["Estimated Time"] = item.estimated_time  # seconds; Airtable duration fields are seconds
     if item.time_spent:
-        fields["Time Spent"] = item.time_spent // 60
+        fields["Time Spent"] = item.time_spent  # seconds; Airtable duration fields are seconds
     if item.prep_time:
-        fields["Prep Time"] = item.prep_time // 60
+        fields["Prep Time"] = item.prep_time  # seconds; Airtable duration fields are seconds
     if item.slack_thread_url:
         fields["Slack Thread URL"] = item.slack_thread_url
     if item.marked_done_at:

@@ -1952,3 +1952,148 @@ class GoogleActionItemsPushDedupTest(APITestCase):
             "a genuine same-slot duplicate must not create a second Google event",
         )
         self.assertEqual(resp.data["results"][0]["googleEventId"], "g-first")
+
+
+class IntegrationVotesAndHintsTest(APITestCase):
+    def setUp(self):
+        from django.core.cache import cache
+        cache.clear()
+        self.user = User.objects.create_user("voter", password="{PASSWORD}")
+        self.client.force_authenticate(user=self.user)
+
+    def test_availability_marks_unconfigured_providers(self):
+        resp = self.client.get("/api/v1/integrations/availability/")
+        self.assertEqual(resp.status_code, 200)
+        providers = resp.data["providers"]
+        for p in ("gong", "zoom", "lucidchart"):
+            self.assertFalse(providers[p]["configured"])
+
+    def test_vote_is_recorded_and_can_be_changed(self):
+        self.assertEqual(self.client.post("/api/v1/integrations/votes/", {"provider": "zoom", "vote": "yes"}, format="json").status_code, 200)
+        resp = self.client.get("/api/v1/integrations/availability/")
+        self.assertEqual((resp.data["providers"]["zoom"]["my_vote"], resp.data["providers"]["zoom"]["yes_votes"]), ("yes", 1))
+        self.client.post("/api/v1/integrations/votes/", {"provider": "zoom", "vote": "not_now"}, format="json")
+        resp = self.client.get("/api/v1/integrations/availability/")
+        self.assertEqual((resp.data["providers"]["zoom"]["my_vote"], resp.data["providers"]["zoom"]["yes_votes"]), ("not_now", 0))
+
+    def test_vote_validation(self):
+        self.assertEqual(self.client.post("/api/v1/integrations/votes/", {"provider": "zoom", "vote": "maybe"}, format="json").status_code, 400)
+        self.assertEqual(self.client.post("/api/v1/integrations/votes/", {"provider": "nope", "vote": "yes"}, format="json").status_code, 400)
+        with self.settings(GOOGLE_CLIENT_ID="x", GOOGLE_CLIENT_SECRET="y"):
+            self.assertEqual(self.client.post("/api/v1/integrations/votes/", {"provider": "google", "vote": "yes"}, format="json").status_code, 400)
+
+    def test_scraper_hints_never_reveal_the_token(self):
+        secret = "atl-super-secret-token-9f3a"
+        with self.settings(ATLASSIAN_API_TOKEN=secret, NOTION_INTEGRATION_TOKEN="", GONG_ACCESS_KEY="short"):
+            resp = self.client.get("/api/v1/integrations/scraper-status/")
+        self.assertTrue(resp.data["confluence"])
+        self.assertEqual(resp.data["hints"]["confluence"], "••••••••9f3a")
+        self.assertEqual(resp.data["hints"]["notion"], "")
+        self.assertEqual(resp.data["hints"]["gong"], "••••••••")  # short: no tail at all
+        self.assertNotIn(secret[:-4], str(resp.data))
+
+    def test_unauthenticated_is_rejected(self):
+        self.client.force_authenticate(user=None)
+        self.assertEqual(self.client.get("/api/v1/integrations/availability/").status_code, 401)
+        self.assertEqual(self.client.post("/api/v1/integrations/votes/", {}, format="json").status_code, 401)
+
+
+import datetime as _dt  # noqa: E402
+from django.utils import timezone as _tz  # noqa: E402
+
+
+class GoogleCalendarAutoSyncTest(APITestCase):
+    """Automatic Google → AgentPM sync: webhook, 5-minute job, and push-channel upkeep."""
+
+    WEBHOOK = "/api/v1/integrations/google/calendar-webhook/"
+
+    def setUp(self):
+        from django.core.cache import cache
+        from integrations.models import OAuthCredential, SyncState
+        cache.clear()
+        self.user = User.objects.create_user("autosync", password="{PASSWORD}")
+        OAuthCredential.objects.create(user=self.user, provider="google", is_active=True,
+                                       access_token="t", refresh_token="r", scopes="calendar")
+        SyncState.objects.create(user=self.user, provider="google", resource="calendar_watch",
+                                 sync_token="chan-1|res-1|s3cret",
+                                 last_synced_at=_tz.now() + _dt.timedelta(days=5))
+
+    def _hook(self, **headers):
+        return self.client.post(self.WEBHOOK, **{f"HTTP_{k}": v for k, v in headers.items()})
+
+    @patch("integrations.tasks.sync_google_calendar_for_user.delay")
+    def test_webhook_with_valid_channel_and_token_queues_a_sync(self, delay):
+        resp = self._hook(X_GOOG_CHANNEL_ID="chan-1", X_GOOG_CHANNEL_TOKEN="s3cret", X_GOOG_RESOURCE_STATE="exists")
+        self.assertEqual(resp.status_code, 200)
+        delay.assert_called_once_with(self.user.pk, "webhook")
+
+    @patch("integrations.tasks.sync_google_calendar_for_user.delay")
+    def test_wrong_token_is_ignored(self, delay):
+        resp = self._hook(X_GOOG_CHANNEL_ID="chan-1", X_GOOG_CHANNEL_TOKEN="guess", X_GOOG_RESOURCE_STATE="exists")
+        self.assertEqual(resp.status_code, 200)
+        delay.assert_not_called()
+
+    @patch("integrations.tasks.sync_google_calendar_for_user.delay")
+    def test_handshake_does_not_sync(self, delay):
+        self._hook(X_GOOG_CHANNEL_ID="chan-1", X_GOOG_CHANNEL_TOKEN="s3cret", X_GOOG_RESOURCE_STATE="sync")
+        delay.assert_not_called()
+
+    @patch("integrations.calendar_sync.sync_user_calendar")
+    @patch("integrations.tasks.sync_google_calendar_for_user.delay", side_effect=RuntimeError("no broker"))
+    def test_runs_inline_when_celery_is_unavailable(self, _delay, sync_user):
+        resp = self._hook(X_GOOG_CHANNEL_ID="chan-1", X_GOOG_CHANNEL_TOKEN="s3cret", X_GOOG_RESOURCE_STATE="exists")
+        self.assertEqual(resp.status_code, 200)
+        sync_user.assert_called_once()
+        self.assertEqual(sync_user.call_args.args[0], self.user)
+
+    @patch("integrations.calendar_sync._announce")
+    @patch("integrations.views._sync_google_calendar", return_value={"created": 1, "updated": 0, "deleted": 0, "unlinked": 0})
+    def test_scheduled_job_syncs_connected_users_and_announces_changes(self, sync, announce):
+        from integrations.tasks import sync_all_google_calendars
+        with self.settings(GOOGLE_WEBHOOK_BASE_URL=""):
+            sync_all_google_calendars()
+        sync.assert_called_once()
+        announce.assert_called_once()
+
+    @patch("integrations.calendar_sync._announce")
+    @patch("integrations.views._sync_google_calendar", return_value={"created": 0, "updated": 0, "deleted": 0, "unlinked": 0})
+    def test_no_changes_means_no_announcement(self, _sync, announce):
+        from integrations.tasks import sync_all_google_calendars
+        sync_all_google_calendars()
+        announce.assert_not_called()
+
+    @patch("integrations.views._sync_google_calendar", side_effect=RuntimeError("boom"))
+    def test_one_users_failure_does_not_stop_the_job(self, _sync):
+        from integrations.tasks import sync_all_google_calendars
+        sync_all_google_calendars()  # must not raise
+
+    def test_no_public_url_means_no_push_channel(self):
+        from integrations.calendar_sync import ensure_watch
+        with self.settings(GOOGLE_WEBHOOK_BASE_URL="http://localhost:8000"):
+            self.assertFalse(ensure_watch(self.user))
+
+    @patch("googleapiclient.discovery.build")
+    def test_expiring_channel_is_renewed_and_old_one_stopped(self, build):
+        from integrations.calendar_sync import ensure_watch, parse_watch_state
+        from integrations.models import SyncState
+        SyncState.objects.filter(resource="calendar_watch").update(last_synced_at=_tz.now() + _dt.timedelta(hours=2))
+        service = build.return_value
+        service.events.return_value.watch.return_value.execute.return_value = {"resourceId": "res-2", "expiration": "0"}
+        with self.settings(GOOGLE_WEBHOOK_BASE_URL="https://agentpm.example.com"):
+            self.assertTrue(ensure_watch(self.user))
+        body = service.events.return_value.watch.call_args.kwargs["body"]
+        self.assertEqual(body["address"], "https://agentpm.example.com/api/v1/integrations/google/calendar-webhook/")
+        service.channels.return_value.stop.assert_called_once()
+        state = parse_watch_state(SyncState.objects.get(resource="calendar_watch").sync_token)
+        self.assertEqual(state["resource_id"], "res-2")
+        self.assertNotEqual(state["token"], "s3cret")
+
+    @patch("integrations.views._sync_google_calendar", return_value={"created": 0, "updated": 2, "deleted": 0, "unlinked": 0})
+    def test_manual_sync_reports_changes_and_auto_sync_skips_the_activity_entry(self, _sync):
+        from realtime.models import AgentActivityEvent
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.post("/api/v1/integrations/google/sync/", {"auto": True}, format="json")
+        self.assertEqual((resp.status_code, resp.data["changed"]), (200, 2))
+        self.assertFalse(AgentActivityEvent.objects.filter(event_type="sync.google_calendar").exists())
+        self.client.post("/api/v1/integrations/google/sync/", {}, format="json")
+        self.assertTrue(AgentActivityEvent.objects.filter(event_type="sync.google_calendar").exists())

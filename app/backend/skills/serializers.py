@@ -7,11 +7,12 @@ from .models import AgentSkill, ClaudeSkill, SkillInvocation
 
 class SkillInvocationSerializer(serializers.ModelSerializer):
     skill_name = serializers.CharField(source="skill.name", read_only=True)
+    invoked_by_username = serializers.CharField(source="invoked_by.username", read_only=True, default=None)
 
     class Meta:
         model = SkillInvocation
         fields = [
-            "id", "skill", "skill_name", "session_id", "invoked_by",
+            "id", "skill", "skill_name", "session_id", "invoked_by", "invoked_by_username",
             "arguments", "result", "status", "error", "duration_ms", "invoked_at",
         ]
         read_only_fields = fields

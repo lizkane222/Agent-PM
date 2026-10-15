@@ -60,6 +60,8 @@ export interface UserProfile {
   notify_default_sms: boolean;
   push_subscription_active: boolean;
   staff_view_override: boolean;
+  /** Authorisation tier. Read-only on /me/; Admins change it via teamApi.setAccessLevel. */
+  access_level?: "basic" | "pm" | "admin";
   calendar_colors?: CalendarColorPrefs;
   gmail_watch_config?: GmailWatchConfig;
 }

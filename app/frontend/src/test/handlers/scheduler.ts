@@ -125,6 +125,10 @@ export const mockCalendarEvents: CalendarEvent[] = [
 ];
 
 export const schedulerHandlers = [
+  // Default: no meeting notes. ActionItemModal's "Calendar notes" asks on every open.
+  http.get("/api/v1/scheduler/meeting-notes/", () =>
+    HttpResponse.json({ count: 0, next: null, previous: null, results: [] })
+  ),
   http.get("/api/v1/scheduler/reminders/", () =>
     HttpResponse.json({ results: mockReminders, count: mockReminders.length })
   ),

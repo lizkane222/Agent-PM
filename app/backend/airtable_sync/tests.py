@@ -8,6 +8,7 @@ Airtable API calls are always mocked — tests verify:
 """
 
 from unittest.mock import MagicMock, patch, call
+import datetime as dt
 import uuid
 
 from django.contrib.auth import get_user_model
@@ -2010,6 +2011,9 @@ class UnassignedAndTeamMemberAssigneeWriteTests(APITestCase):
 
     @patch("airtable_sync.views.get_table")
     def test_anyone_can_assign_an_unassigned_item_to_someone_else(self, mock_get_table):
+        # "Anyone" on the item's account — the assignee must be on it too (assignment.py).
+        from accounts.models import Account
+        Account.objects.get(company_name="Acme Corp").team_members.add(self.other_member)
         mock_get_table.return_value = MagicMock()
         item = self._item("")
         resp = self.client.patch(
@@ -2169,3 +2173,302 @@ class AppCreatedAccountLinkingTests(APITestCase):
         self.assertEqual(resp.status_code, 201, resp.data)
         mirror = AirtableAccount.objects.get(airtable_id="recCREATED")
         self.assertEqual(mirror.name, "Brand New")
+
+
+class ActionItemDurationUnitsTests(TestCase):
+    """Airtable's Time Spent / Estimated Time / Prep Time are `duration` fields, which
+    store seconds — the same unit as the local columns. Converting on either side
+    (the old `* 60` on pull, `// 60` on push) inflated or deflated every round trip."""
+
+    @patch("airtable_sync.sync.get_table")
+    def test_pull_stores_airtable_seconds_unchanged(self, mock_get_table):
+        mock_table = MagicMock()
+        mock_table.all.return_value = [{
+            "id": "recDUR001",
+            "fields": {"Task": "Units", "Time Spent": 5400, "Estimated Time": 3600, "Prep Time": 900},
+        }]
+        mock_get_table.return_value = mock_table
+
+        from .sync import sync_action_items
+        sync_action_items()
+
+        item = AirtableActionItem.objects.get(airtable_id="recDUR001")
+        self.assertEqual((item.time_spent, item.estimated_time, item.prep_time), (5400, 3600, 900))
+
+    def test_push_sends_local_seconds_unchanged(self):
+        from .write_back import _action_item_fields
+        item = AirtableActionItem(
+            airtable_id="recDUR002", task="Units", time_spent=5400, estimated_time=3600, prep_time=900,
+        )
+        fields = _action_item_fields(item)
+        self.assertEqual(fields["Time Spent"], 5400)
+        self.assertEqual(fields["Estimated Time"], 3600)
+        self.assertEqual(fields["Prep Time"], 900)
+
+    @patch("airtable_sync.sync.get_table")
+    def test_round_trip_is_stable(self, mock_get_table):
+        from .write_back import _action_item_fields
+        from .sync import sync_action_items
+        pushed = _action_item_fields(AirtableActionItem(airtable_id="recDUR003", task="RT", time_spent=1234))
+        mock_table = MagicMock()
+        mock_table.all.return_value = [{"id": "recDUR003", "fields": pushed}]
+        mock_get_table.return_value = mock_table
+        sync_action_items()
+        self.assertEqual(AirtableActionItem.objects.get(airtable_id="recDUR003").time_spent, 1234)
+
+
+class RepairActionItemDurationsCommandTests(TestCase):
+    def setUp(self):
+        self.big = AirtableActionItem.objects.create(airtable_id="recBIG", task="Inflated", time_spent=6314400)
+        self.ok = AirtableActionItem.objects.create(airtable_id="recOK", task="Fine", time_spent=1380)
+        self.table = MagicMock()
+        self.table.all.return_value = [
+            {"id": "recBIG", "fields": {"Time Spent": 105240}},
+            {"id": "recOK", "fields": {"Time Spent": 23}},
+        ]
+
+    def _run(self, *args):
+        from io import StringIO
+        from django.core.management import call_command
+        out = StringIO()
+        with patch("airtable_sync.management.commands.repair_action_item_durations.get_table",
+                   return_value=self.table):
+            call_command("repair_action_item_durations", *args, stdout=out)
+        return out.getvalue()
+
+    def test_dry_run_writes_nothing(self):
+        out = self._run("--set", "recBIG=900")
+        self.assertIn("Dry run", out)
+        self.big.refresh_from_db()
+        self.assertEqual(self.big.time_spent, 6314400)
+        self.table.update.assert_not_called()
+
+    def test_commit_applies_override_and_pushes_seconds(self):
+        self._run("--set", "recBIG=900", "--commit")
+        self.big.refresh_from_db(); self.ok.refresh_from_db()
+        self.assertEqual(self.big.time_spent, 900)
+        self.assertEqual(self.ok.time_spent, 1380)  # local is authoritative
+        pushed = {c.args[0]: c.args[1] for c in self.table.update.call_args_list}
+        self.assertEqual(pushed["recBIG"]["Time Spent"], 900)
+        self.assertEqual(pushed["recOK"]["Time Spent"], 1380)
+
+    def test_already_consistent_items_are_not_pushed(self):
+        self.table.all.return_value = [
+            {"id": "recBIG", "fields": {"Time Spent": 6314400}},
+            {"id": "recOK", "fields": {"Time Spent": 1380}},
+        ]
+        self._run("--commit")
+        self.table.update.assert_not_called()
+
+    def test_bad_override_is_rejected(self):
+        from django.core.management.base import CommandError
+        with self.assertRaises(CommandError):
+            self._run("--set", "recBIG=abc")
+        with self.assertRaises(CommandError):
+            self._run("--set", "recNOPE=10")
+
+
+class LiveTrackingTimerTests(APITestCase):
+    """Server-side Live Tracking: start/stop, the two totals, and the 15-minute block rule."""
+
+    T0 = dt.datetime(2026, 10, 14, 16, 0, tzinfo=dt.timezone.utc)
+
+    def setUp(self):
+        cache.clear()
+        self.user = make_user("tracker")
+        self.client.force_authenticate(user=self.user)
+        self.item = AirtableActionItem.objects.create(airtable_id="recTRACK1", task="Build widget", time_spent=600)
+        self.get_table = patch("airtable_sync.airtable_client.get_table").start()
+        self.addCleanup(patch.stopall)
+
+    def _at(self, minutes):
+        return self.T0 + dt.timedelta(minutes=minutes)
+
+    def _call(self, action, minutes):
+        with patch("airtable_sync.live_tracking.timezone.now", return_value=self._at(minutes)):
+            return self.client.post(f"/api/v1/airtable/timers/{action}/", {"airtable_id": "recTRACK1"}, format="json")
+
+    def _blocks(self):
+        from scheduler.models import CalendarEvent
+        return list(CalendarEvent.objects.filter(agentpm_airtable_id="recTRACK1", calendar_id="work_tracking")
+                    .order_by("start_datetime"))
+
+    def test_start_puts_a_block_on_the_calendar_immediately(self):
+        resp = self._call("start", 0)
+        self.assertEqual(resp.status_code, 201, resp.data)
+        blocks = self._blocks()
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0].start_datetime, self.T0)
+        self.assertEqual(blocks[0].end_datetime, self._at(15))
+        self.assertEqual(blocks[0].owner, self.user)
+
+    def test_stop_adds_seconds_to_both_totals(self):
+        self._call("start", 0)
+        resp = self._call("stop", 7)
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.item.refresh_from_db()
+        self.assertEqual(self.item.tracked_time, 420)
+        self.assertEqual(self.item.time_spent, 600 + 420)  # manual 600 preserved
+        self.assertEqual(resp.data["item"]["tracked_time"], 420)
+
+    def test_restart_under_15_minutes_reuses_the_block(self):
+        # The agreed example: 9:00–9:05, then 9:40–9:48 → 13 min, one block 9:00–9:15.
+        self._call("start", 0); self._call("stop", 5)
+        self._call("start", 40); self._call("stop", 48)
+        blocks = self._blocks()
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual((blocks[0].start_datetime, blocks[0].end_datetime), (self.T0, self._at(15)))
+        self.item.refresh_from_db()
+        self.assertEqual(self.item.tracked_time, 13 * 60)
+
+    def test_block_grows_in_quarter_hours_while_a_session_runs_past_15(self):
+        self._call("start", 0); self._call("stop", 20)
+        blocks = self._blocks()
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0].end_datetime, self._at(30))
+
+    def test_restart_after_exceeding_15_minutes_opens_a_new_block_at_the_new_start(self):
+        self._call("start", 0); self._call("stop", 20)
+        self._call("start", 60); self._call("stop", 65)
+        blocks = self._blocks()
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(blocks[1].start_datetime, self._at(60))
+        self.assertEqual(blocks[1].end_datetime, self._at(75))
+
+    def test_exactly_15_minutes_is_not_exceeding(self):
+        self._call("start", 0); self._call("stop", 15)
+        self._call("start", 30); self._call("stop", 31)
+        self.assertEqual(len(self._blocks()), 1)
+
+    def test_start_is_idempotent_one_running_timer_per_user_item(self):
+        a = self._call("start", 0).data["session"]["id"]
+        b = self._call("start", 1).data["session"]["id"]
+        self.assertEqual(a, b)
+        self.assertEqual(len(self._blocks()), 1)
+
+    def test_running_timers_are_listed_for_every_tab_and_device(self):
+        self._call("start", 0)
+        resp = self.client.get("/api/v1/airtable/timers/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual([r["action_item"] for r in resp.data["results"]], ["recTRACK1"])
+        self._call("stop", 3)
+        self.assertEqual(self.client.get("/api/v1/airtable/timers/").data["results"], [])
+
+    def test_stop_without_a_running_timer_is_a_conflict(self):
+        self.assertEqual(self._call("stop", 1).status_code, 409)
+
+    def test_cancel_logs_nothing_and_drops_a_fresh_block(self):
+        self._call("start", 0)
+        resp = self._call("cancel", 5)
+        self.assertEqual(resp.status_code, 204)
+        self.item.refresh_from_db()
+        self.assertEqual((self.item.tracked_time, self.item.time_spent), (0, 600))
+        self.assertEqual(self._blocks(), [])
+
+    def test_two_users_tracking_the_same_item_both_count(self):
+        other = make_user("teammate")
+        self._call("start", 0)
+        with patch("airtable_sync.live_tracking.timezone.now", return_value=self._at(0)):
+            self.client.force_authenticate(user=other)
+            self.client.post("/api/v1/airtable/timers/start/", {"airtable_id": "recTRACK1"}, format="json")
+        with patch("airtable_sync.live_tracking.timezone.now", return_value=self._at(10)):
+            self.client.post("/api/v1/airtable/timers/stop/", {"airtable_id": "recTRACK1"}, format="json")
+        self.client.force_authenticate(user=self.user)
+        self._call("stop", 4)
+        self.item.refresh_from_db()
+        self.assertEqual(self.item.tracked_time, 14 * 60)
+        self.assertEqual(self.item.time_spent, 600 + 14 * 60)
+
+    def test_stop_pushes_the_total_to_airtable_in_seconds(self):
+        self._call("start", 0); self._call("stop", 2)
+        self.get_table.return_value.update.assert_called_with("recTRACK1", {"Time Spent": 720})
+
+    def test_another_users_assigned_item_is_denied(self):
+        AirtableActionItem.objects.filter(pk=self.item.pk).update(assignee_airtable_id="usrSOMEONEELSE")
+        self.assertEqual(self._call("start", 0).status_code, 403)
+
+    def test_unauthenticated_is_rejected(self):
+        self.client.force_authenticate(user=None)
+        self.assertEqual(self.client.get("/api/v1/airtable/timers/").status_code, 401)
+
+    def test_local_blank_ids_are_rejected(self):
+        resp = self.client.post("/api/v1/airtable/timers/start/", {"airtable_id": "local-1"}, format="json")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_deleting_a_tracked_block_subtracts_only_its_tracked_seconds(self):
+        self._call("start", 0); self._call("stop", 5)  # block shown as 15 min, 5 min tracked
+        block = self._blocks()[0]
+        resp = self.client.delete(f"/api/v1/scheduler/events/{block.pk}/")
+        self.assertEqual(resp.status_code, 204)
+        self.item.refresh_from_db()
+        self.assertEqual((self.item.tracked_time, self.item.time_spent), (0, 600))
+
+    def test_deleting_a_planned_block_subtracts_nothing(self):
+        from scheduler.models import CalendarEvent
+        planned = CalendarEvent.objects.create(
+            owner=self.user, title="Build widget", calendar_id="work_tracking", agentpm_airtable_id="recTRACK1",
+            start_datetime=self.T0, end_datetime=self._at(60),
+        )
+        self.client.delete(f"/api/v1/scheduler/events/{planned.pk}/")
+        self.item.refresh_from_db()
+        self.assertEqual(self.item.time_spent, 600)
+
+    def test_deleting_the_block_of_a_running_timer_cancels_it(self):
+        self._call("start", 0)
+        self.client.delete(f"/api/v1/scheduler/events/{self._blocks()[0].pk}/")
+        self.assertEqual(self.client.get("/api/v1/airtable/timers/").data["results"], [])
+        self.item.refresh_from_db()
+        self.assertEqual(self.item.time_spent, 600)
+
+
+
+class AssignmentRuleTests(APITestCase):
+    """Basic users assign to themselves or teammates on the item's account; PM/Admin anyone."""
+
+    FIELDS = "/api/v1/airtable/action-items/{}/fields/"
+
+    def setUp(self):
+        cache.clear()
+        from accounts.models import Account
+        from team.models import TeamMember
+        self.me = User.objects.create_user("asg_me", password="{PASSWORD}")
+        self.me_m = TeamMember.objects.create(user=self.me, full_name="Me", email="asg_me@x.test")
+        self.mate = User.objects.create_user("asg_mate", password="{PASSWORD}")
+        self.mate_m = TeamMember.objects.create(user=self.mate, full_name="Mate", email="asg_mate@x.test")
+        self.stranger = User.objects.create_user("asg_stranger", password="{PASSWORD}")
+        self.stranger_m = TeamMember.objects.create(user=self.stranger, full_name="Stranger", email="asg_s@x.test")
+        self.at = AirtableAccount.objects.create(airtable_id="recASG", name="Assign Co")
+        Account.objects.create(company_name="Assign Co", airtable_id="recASG").team_members.add(self.me_m, self.mate_m)
+        self.item = AirtableActionItem.objects.create(airtable_id="recASG1", account=self.at, task="T")
+        self.client.force_authenticate(user=self.me)
+        patcher = patch("airtable_sync.views.get_table", return_value=MagicMock())
+        patcher.start(); self.addCleanup(patcher.stop)
+
+    def _assign(self, member):
+        return self.client.patch(self.FIELDS.format("recASG1"),
+                                 {"assignee_airtable_id": str(member.pk), "assignee_name": member.full_name},
+                                 format="json")
+
+    def test_basic_can_assign_a_teammate_on_the_account(self):
+        self.assertEqual(self._assign(self.mate_m).status_code, 200)
+
+    def test_basic_can_assign_themselves(self):
+        self.assertEqual(self._assign(self.me_m).status_code, 200)
+
+    def test_basic_cannot_assign_someone_off_the_account(self):
+        self.assertEqual(self._assign(self.stranger_m).status_code, 403)
+        self.item.refresh_from_db()
+        self.assertEqual(self.item.assignee_airtable_id, "")
+
+    def test_pm_can_assign_anyone(self):
+        from team.models import UserProfile
+        UserProfile.objects.update_or_create(user=self.me, defaults={"access_level": "pm"})
+        self.assertEqual(self._assign(self.stranger_m).status_code, 200)
+
+    def test_viewset_patch_applies_the_same_rule(self):
+        resp = self.client.patch(f"/api/v1/airtable/action-items/{self.item.pk}/",
+                                 {"assignee_airtable_id": str(self.stranger_m.pk)}, format="json")
+        self.assertEqual(resp.status_code, 400)
+        resp = self.client.patch(f"/api/v1/airtable/action-items/{self.item.pk}/",
+                                 {"assignee_airtable_id": str(self.mate_m.pk)}, format="json")
+        self.assertEqual(resp.status_code, 200, resp.data)

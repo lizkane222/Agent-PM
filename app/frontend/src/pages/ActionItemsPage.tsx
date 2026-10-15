@@ -5,9 +5,9 @@ import type { SearchResult } from "../lib/api";
 import CommentTrigger from "../components/comments/CommentTrigger";
 import CommentPreviewList from "../components/comments/CommentPreviewList";
 import { useCommentMenuItem } from "../components/comments/commentMenuItem";
-import type { ActionItemAttachment, ActionItemDependency, AirtableActionItem, AirtableAccount, CalendarEvent, TeamMember, UserProfile } from "../types";
+import type { ActionItemAttachment, ActionItemDependency, AirtableActionItem, AirtableAccount, TeamMember, UserProfile } from "../types";
 import { addLog } from "../lib/appLog";
-import { logActionItemUpdate } from "../lib/actionItemLog";
+import { logActionItemUpdate, changedActionItemFields } from "../lib/actionItemLog";
 import { convertActionItemToEvent, restoreConversion } from "../hooks/useConvert";
 import { useLogGlow } from "../hooks/useLogGlow";
 import { useScheduledOccurrences } from "../hooks/useScheduledOccurrences";
@@ -47,6 +47,8 @@ import { ContextMenu, FocusPinBadge, focusPinMenuItem, type ContextMenuItem } fr
 import StepsPanel from "../components/action-items/StepsPanel";
 import ArtifactPicker from "../components/action-items/ArtifactPicker";
 import { useFocusPins } from "../hooks/useFocusPins";
+import { useLiveTimers } from "../hooks/useLiveTimers";
+import { startLiveTimer, stopLiveTimer } from "../lib/liveTimers";
 import {
   useAccountGroupCollapse,
   accountGroupKey,
@@ -3794,7 +3796,9 @@ export default function ActionItemsPage() {
   }
 
   // Account assignment: airtable_id → account key (namespaced "at-N"/"app-N") — persisted to localStorage
-  const [accountAssign, setAccountAssignRaw] = useState<Record<string, string>>(() => {
+  // Still written by the drag paths (and read by hooks/useActionItemZones); the timer no
+  // longer needs it since the server labels sessions from the item itself.
+  const [, setAccountAssignRaw] = useState<Record<string, string>>(() => {
     try { return JSON.parse(localStorage.getItem("actionItemAccountAssign") ?? "{}"); } catch { return {}; }
   });
   function setAccountAssign(updater: ((prev: Record<string, string>) => Record<string, string>) | Record<string, string>) {
@@ -3807,16 +3811,22 @@ export default function ActionItemsPage() {
 
   const [myProfile, setMyProfile] = useState<UserProfile | null>(null);
   const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
-  const [timers, setTimersRaw] = useState<Record<string, TimerState>>(() => {
-    try { return JSON.parse(localStorage.getItem("actionItemTimers") ?? "{}"); } catch { return {}; }
-  });
-  function setTimers(updater: ((prev: Record<string, TimerState>) => Record<string, TimerState>) | Record<string, TimerState>) {
-    setTimersRaw((prev) => {
-      const next = typeof updater === "function" ? updater(prev) : updater;
-      localStorage.setItem("actionItemTimers", JSON.stringify(next));
-      return next;
-    });
-  }
+  // Live Tracking is server-owned (lib/liveTimers.ts): every tab and device sees the same
+  // running timer, and Stop adds time + resizes the calendar block in one request.
+  const { timers: liveTimers, now: timerNow } = useLiveTimers();
+  // Card view of the timer: running seconds while live, else the item's tracked total.
+  const timers: Record<string, TimerState> = useMemo(() => {
+    const out: Record<string, TimerState> = {};
+    for (const item of allItems) {
+      const live = liveTimers[item.airtable_id];
+      out[item.airtable_id] = live
+        ? { running: true, elapsed: item.tracked_time ?? 0, startedAt: new Date(live.started_at).getTime() }
+        : { running: false, elapsed: item.tracked_time ?? 0, startedAt: null };
+    }
+    return out;
+  // timerNow keeps the derived view fresh each second while a timer runs.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allItems, liveTimers, timerNow]);
   const [timeLogs, setTimeLogs] = useState<TimeLogEntry[]>([]);
   const [editItem, setEditItem] = useState<AirtableActionItem | null>(null);
   const [dragId, setDragId] = useState<string | null>(null);
@@ -4014,61 +4024,35 @@ export default function ActionItemsPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [blankCount]);
 
-  // Stores the ISO timestamp when auto-track started for each item (by airtable_id).
-  const trackStartTimes = useRef<Record<string, string>>({});
-  // Maps airtable_id → live calendar event id for the current (in-progress) session.
-  const liveEventIds = useRef<Record<string, number>>({});
-  // Tick counter for throttling live event updates (update every 30 ticks = 30s).
-  const liveTickCount = useRef(0);
-
-  const tickRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  function clearActiveTimer(airtableId: string) {
-    try {
-      const payload = JSON.parse(localStorage.getItem("activeTimers") ?? "{}");
-      delete payload[airtableId];
-      localStorage.setItem("activeTimers", JSON.stringify(payload));
-      window.dispatchEvent(new StorageEvent("storage", { key: "activeTimers", newValue: JSON.stringify(payload) }));
-    } catch { /* best effort */ }
+  /** Start tracking via the server. Failures are surfaced, never silent. */
+  async function startTracking(airtableId: string) {
+    if (airtableId.startsWith("local-")) return;
+    try { await startLiveTimer(airtableId); }
+    catch { reportError("Could not start the timer — nothing is being tracked"); }
   }
 
-  // Tick running timers every second and broadcast to calendar
-  useEffect(() => {
-    tickRef.current = setInterval(() => {
-      liveTickCount.current += 1;
-      const shouldUpdateLiveEvent = liveTickCount.current % 30 === 0;
-
-      setTimers((prev) => {
-        const hasRunning = Object.values(prev).some((t) => t.running);
-        if (!hasRunning) return prev;
-        // Broadcast active timers so CalendarPage can render live events
-        const payload: Record<string, { startedAt: number; elapsed: number; task: string; accountName: string | null }> = {};
-        for (const [id, t] of Object.entries(prev)) {
-          if (!t.running || !t.startedAt) continue;
-          const item = allItems.find((i) => i.airtable_id === id);
-          payload[id] = { startedAt: t.startedAt, elapsed: t.elapsed, task: item?.task ?? id, accountName: item?.account_name ?? null };
-        }
-        localStorage.setItem("activeTimers", JSON.stringify(payload));
-        window.dispatchEvent(new StorageEvent("storage", { key: "activeTimers", newValue: JSON.stringify(payload) }));
-
-        // Every 30s, push updated end_datetime to the live calendar event
-        if (shouldUpdateLiveEvent) {
-          const nowIso = new Date().toISOString();
-          for (const [id, t] of Object.entries(prev)) {
-            if (!t.running) continue;
-            const eventId = liveEventIds.current[id];
-            if (eventId) {
-              schedulerApi.updateEvent(eventId, { end_datetime: nowIso }).catch(() => {});
-            }
-          }
-        }
-
-        return { ...prev }; // shallow clone triggers re-render
-      });
-    }, 1000);
-    return () => { if (tickRef.current) clearInterval(tickRef.current); };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [allItems]);
+  /** Stop + log via the server; merges the item's new totals into the board. */
+  async function stopTracking(airtableId: string) {
+    if (!liveTimers[airtableId]) return;
+    const item = allItems.find((i) => i.airtable_id === airtableId);
+    try {
+      const updated = await stopLiveTimer(airtableId);
+      setAllItems((prev) => prev.map((i) => i.airtable_id === airtableId
+        ? { ...i, time_spent: updated.time_spent, tracked_time: updated.tracked_time } : i));
+      const added = (updated.tracked_time ?? 0) - (item?.tracked_time ?? 0);
+      if (added > 0) {
+        setTimeLogs((prev) => [{
+          airtable_id: airtableId,
+          account_name: updated.account_name ?? item?.account_name ?? "Unknown",
+          task: updated.task,
+          seconds: added,
+          loggedAt: new Date().toISOString(),
+        }, ...prev]);
+      }
+    } catch {
+      reportError("Could not stop the timer — your tracked time may not have been saved");
+    }
+  }
 
   /**
    * Fetch items, accounts and profile.
@@ -4091,16 +4075,6 @@ export default function ActionItemsPage() {
         teamApi.getMyProfile().catch(() => null),
       ]);
       setAllItems(itemsRes.data);
-      // Prune stale activeTimers for items that no longer exist
-      try {
-        const liveIds = new Set((itemsRes.data as AirtableActionItem[]).map((i) => i.airtable_id));
-        const timers: Record<string, unknown> = JSON.parse(localStorage.getItem("activeTimers") ?? "{}");
-        const pruned = Object.fromEntries(Object.entries(timers).filter(([id]) => liveIds.has(id)));
-        if (Object.keys(pruned).length !== Object.keys(timers).length) {
-          localStorage.setItem("activeTimers", JSON.stringify(pruned));
-          window.dispatchEvent(new StorageEvent("storage", { key: "activeTimers", newValue: JSON.stringify(pruned) }));
-        }
-      } catch { /* best effort */ }
       const loadedProfile: UserProfile | null = profileRes?.data ?? null;
       if (loadedProfile) setMyProfile(loadedProfile);
 
@@ -4210,57 +4184,6 @@ export default function ActionItemsPage() {
       // an ordering is a total order, so last-write-wins is the only coherent policy.
       if (e.key === ACTION_ITEM_ORDER_KEY) {
         try { setOrderRaw(JSON.parse(e.newValue ?? "{}")); } catch { /* ignore */ }
-        return;
-      }
-
-      // Calendar removed a work-tracking event — stop timer and subtract that duration
-      if (e.key === "actionItemCancelTimer" && e.newValue) {
-        let parsed: { airtableId: string; seconds?: number } | null = null;
-        try { parsed = JSON.parse(e.newValue); } catch { return; }
-        if (!parsed?.airtableId) return;
-        const { airtableId, seconds: removedSecs } = parsed;
-        setTimers((prev) => {
-          const t = prev[airtableId];
-          if (!t) return prev;
-          // If the timer is still running, stop it first without committing the time
-          if (t.running) {
-            clearActiveTimer(airtableId);
-            delete trackStartTimes.current[airtableId];
-          }
-          // Subtract the removed session duration from elapsed (clamp to 0)
-          const newElapsed = removedSecs != null ? Math.max(0, t.elapsed - removedSecs) : 0;
-          return { ...prev, [airtableId]: { running: false, elapsed: newElapsed, startedAt: null } };
-        });
-        return;
-      }
-
-      // Calendar dropped an item onto today's date — move to In Progress and start timer
-      if (e.key === "actionItemStartTimer" && e.newValue) {
-        const airtableId = e.newValue;
-        setZonesRaw((prev) => {
-          const next = { ...prev, [airtableId]: "active" as Zone };
-          localStorage.setItem("actionItemZones", JSON.stringify(next));
-          return next;
-        });
-        // Update status to In Progress on the backend
-        airtableApi.updateActionItemStatus(airtableId, "In Progress").catch(() => {});
-        setAllItems((prev) => {
-          const item = prev.find((i) => i.airtable_id === airtableId);
-          if (item) {
-            addLog({
-              category: "action_item",
-              message: `"${item.task || "Untitled"}" moved to In Progress from calendar`,
-              links: [{ label: "View action items", path: "/action-items" }],
-              resource: { type: "action_item", id: airtableId },
-            });
-          }
-          return prev.map((i) => i.airtable_id === airtableId ? { ...i, status: "In Progress" } : i);
-        });
-        // Start the timer
-        setTimers((prev) => ({
-          ...prev,
-          [airtableId]: { running: true, elapsed: prev[airtableId]?.elapsed ?? 0, startedAt: Date.now() },
-        }));
         return;
       }
 
@@ -4550,48 +4473,9 @@ export default function ActionItemsPage() {
       });
     }
 
-    // Stop timer if leaving active zone
-    if (prevZone === "active" && targetZone !== "active") {
-      const t = timers[resolvedId];
-      const sessionStartedAt = trackStartTimes.current[resolvedId];
-      const endedAt = new Date().toISOString();
-      if (t?.running) {
-        const elapsed = t.elapsed + Math.floor((Date.now() - (t.startedAt ?? Date.now())) / 1000);
-        setTimers((prev) => ({ ...prev, [resolvedId]: { running: false, elapsed, startedAt: null } }));
-        clearActiveTimer(resolvedId);
-        if (elapsed > 0) {
-          const acc = accounts.find((a) => a.key === accountAssign[resolvedId]);
-          const entry: TimeLogEntry = {
-            airtable_id: resolvedId,
-            account_name: acc?.name ?? item.account_name ?? "Unknown",
-            task: item.task,
-            seconds: elapsed,
-            loggedAt: new Date().toISOString(),
-          };
-          setTimeLogs((prev) => [entry, ...prev]);
-          try { await airtableApi.logTime({ airtable_id: resolvedId, account_name: entry.account_name, task: item.task, seconds: elapsed }); } catch { /* best effort */ }
-        }
-      }
-      // Finalize or create the session calendar event
-      const liveId = liveEventIds.current[resolvedId];
-      if (liveId) {
-        delete liveEventIds.current[resolvedId];
-        schedulerApi.updateEvent(liveId, { end_datetime: endedAt }).catch(() => {});
-      } else if (sessionStartedAt) {
-        schedulerApi.createEvent({
-          title: item.task,
-          description: `Work session — ${item.account_name ?? ""}`,
-          start_datetime: sessionStartedAt,
-          end_datetime: endedAt,
-          all_day: false,
-          status: "confirmed",
-          calendar_id: "work_tracking",
-          is_synced: false,
-          agentpm_airtable_id: resolvedId,
-        } as Partial<CalendarEvent>).catch(() => {});
-      }
-      if (sessionStartedAt) delete trackStartTimes.current[resolvedId];
-    }
+    // Stop (and log) the timer when the card leaves Currently Tracking. The server stop
+    // logs only this session's seconds — the old path re-sent the running total.
+    if (prevZone === "active" && targetZone !== "active") await stopTracking(resolvedId);
 
     // Status changes on drop
     const fromLabel = ZONE_LABELS[prevZone as Zone] ?? prevZone;
@@ -4609,30 +4493,9 @@ export default function ActionItemsPage() {
       // re-PATCH the status, restart the timer, or create a second work_tracking event.
       try { await airtableApi.updateActionItemStatus(resolvedId, "In Progress"); } catch { /* best effort */ }
       setAllItems((prev) => prev.map((i) => i.airtable_id === resolvedId ? { ...i, status: "In Progress" } : i));
-      // Only auto-start the timer if Auto Track is enabled; otherwise wait for the Track button
-      if (autoTrack) {
-        const sessionNow = new Date().toISOString();
-        trackStartTimes.current[resolvedId] = sessionNow;
-        setTimers((prev) => ({
-          ...prev,
-          [resolvedId]: { running: true, elapsed: prev[resolvedId]?.elapsed ?? 0, startedAt: Date.now() },
-        }));
-        // Create live calendar event immediately
-        const resolvedItem = allItems.find((i) => i.airtable_id === resolvedId);
-        schedulerApi.createEvent({
-          title: resolvedItem?.task ?? resolvedId,
-          description: `Work session — ${resolvedItem?.account_name ?? ""}`,
-          start_datetime: sessionNow,
-          end_datetime: sessionNow,
-          all_day: false,
-          status: "confirmed",
-          calendar_id: "work_tracking",
-          is_synced: false,
-          agentpm_airtable_id: resolvedId,
-        } as Partial<CalendarEvent>).then(({ data }) => {
-          liveEventIds.current[resolvedId] = data.id;
-        }).catch(() => {});
-      }
+      // Only auto-start the timer if Auto Track is enabled; otherwise wait for the Track button.
+      // The server creates (or reuses) the calendar block and titles it from the item itself.
+      if (autoTrack) await startTracking(resolvedId);
     } else if (targetZone === "unstaged" && prevZone !== "unstaged") {
       try { await airtableApi.updateActionItemStatus(resolvedId, "Open"); } catch { /* best effort */ }
       setAllItems((prev) => prev.map((i) => i.airtable_id === resolvedId ? { ...i, status: "Open" } : i));
@@ -4694,91 +4557,33 @@ export default function ActionItemsPage() {
   // ── Timer ──────────────────────────────────────────────────────────────────
 
   async function handleTimerToggle(airtableId: string) {
-    const item = allItems.find((i) => i.airtable_id === airtableId);
-    if (!item) return;
-
-    const t = timers[airtableId] ?? { running: false, elapsed: 0, startedAt: null };
-
-    if (t.running) {
-      // ── STOP ──────────────────────────────────────────────────────────────
-      const sessionStart = trackStartTimes.current[airtableId];
-      const endedAt = new Date().toISOString();
-      const elapsed = t.elapsed + Math.floor((Date.now() - (t.startedAt ?? Date.now())) / 1000);
-      const acc = accounts.find((a) => a.key === accountAssign[airtableId]);
-      const sessionSeconds = elapsed - t.elapsed;
-      const entry: TimeLogEntry = {
-        airtable_id: airtableId,
-        account_name: acc?.name ?? item.account_name ?? "Unknown",
-        task: item.task,
-        seconds: sessionSeconds,
-        loggedAt: endedAt,
-      };
-      setTimeLogs((logs) => [entry, ...logs]);
-      airtableApi.logTime({ airtable_id: airtableId, account_name: entry.account_name, task: item.task, seconds: sessionSeconds }).catch(() => {});
-
-      // Finalize the live calendar event with exact stop time
-      const liveId = liveEventIds.current[airtableId];
-      if (liveId) {
-        delete liveEventIds.current[airtableId];
-        schedulerApi.updateEvent(liveId, { end_datetime: endedAt }).catch(() => {});
-      } else if (sessionStart) {
-        // Fallback: no live event was created yet (very short session)
-        schedulerApi.createEvent({
-          title: item.task,
-          description: `Work session — ${entry.account_name}`,
-          start_datetime: sessionStart,
-          end_datetime: endedAt,
-          all_day: false,
-          status: "confirmed",
-          calendar_id: "work_tracking",
-          is_synced: false,
-          agentpm_airtable_id: airtableId,
-        } as Partial<CalendarEvent>).catch(() => {});
-      }
-      if (sessionStart) delete trackStartTimes.current[airtableId];
-      clearActiveTimer(airtableId);
-      setTimers((prev) => ({ ...prev, [airtableId]: { running: false, elapsed, startedAt: null } }));
-    } else {
-      // ── START ─────────────────────────────────────────────────────────────
-      const sessionNow = new Date().toISOString();
-      trackStartTimes.current[airtableId] = sessionNow;
-      setTimers((prev) => ({ ...prev, [airtableId]: { ...t, running: true, startedAt: Date.now() } }));
-
-      // Create a live calendar event immediately so it shows up on the calendar
-      const acc = accounts.find((a) => a.key === accountAssign[airtableId]);
-      schedulerApi.createEvent({
-        title: item.task,
-        description: `Work session — ${acc?.name ?? item.account_name ?? ""}`,
-        start_datetime: sessionNow,
-        end_datetime: sessionNow, // will be updated every 30s by the tick
-        all_day: false,
-        status: "confirmed",
-        calendar_id: "work_tracking",
-        is_synced: false,
-        agentpm_airtable_id: airtableId,
-      } as Partial<CalendarEvent>).then(({ data }) => {
-        liveEventIds.current[airtableId] = data.id;
-      }).catch(() => {});
-    }
+    if (liveTimers[airtableId]) await stopTracking(airtableId);
+    else await startTracking(airtableId);
   }
 
-  function handleTimerEdit(airtableId: string, seconds: number) {
-    // Update the in-memory elapsed value; stop the running clock if it was running
-    setTimers((prev) => {
-      const t = prev[airtableId] ?? { running: false, elapsed: 0, startedAt: null };
-      // If running, stop cleanly before overwriting elapsed
-      if (t.running) {
-        clearActiveTimer(airtableId);
-        delete trackStartTimes.current[airtableId];
-      }
-      return { ...prev, [airtableId]: { running: false, elapsed: seconds, startedAt: null } };
-    });
+  /**
+   * Double-click edit of the timer sets the item's tracked total. It is a deliberate manual
+   * correction: the delta goes into time_spent too, so the overall total stays consistent.
+   */
+  async function handleTimerEdit(airtableId: string, seconds: number) {
+    const item = allItems.find((i) => i.airtable_id === airtableId);
+    if (!item || airtableId.startsWith("local-")) return;
+    if (liveTimers[airtableId]) await stopTracking(airtableId);
+    const latest = allItems.find((i) => i.airtable_id === airtableId) ?? item;
+    const delta = seconds - (latest.tracked_time ?? 0);
+    if (delta === 0) return;
+    const nextSpent = Math.max(0, (latest.time_spent ?? 0) + delta);
+    await handleSaveItem(airtableId, { ...latest, tracked_time: seconds, time_spent: nextSpent });
   }
 
   // ── Edit / save ────────────────────────────────────────────────────────────
 
-  async function handleSaveItem(airtableId: string, updated: Partial<AirtableActionItem>) {
+  async function handleSaveItem(airtableId: string, form: Partial<AirtableActionItem>) {
     const before = allItems.find((i) => i.airtable_id === airtableId);
+    // Card forms hold a full copy of the item; send only what was edited so a stale
+    // time_spent can't overwrite Live Tracking increments (see changedActionItemFields).
+    const updated = before ? changedActionItemFields(before, form) : form;
+    if (before && Object.keys(updated).length === 0) return;
     // Optimistic: update local state immediately so handleDrop sees the latest data
     setAllItems((prev) => prev.map((i) => i.airtable_id === airtableId ? { ...i, ...updated } : i));
     // Skip API for local-only blank items

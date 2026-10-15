@@ -30,7 +30,30 @@ export const mockActionItem: AirtableActionItem = {
   last_synced: "",
 };
 
+/** A running Live Tracking session as the server returns it. */
+export function mockLiveTimer(over: Record<string, unknown> = {}) {
+  return {
+    id: 1, action_item: "recAAA001", task: "Fix billing", account_name: "Acme Corp",
+    started_at: new Date(Date.now() - 60_000).toISOString(), ended_at: null, seconds: 0,
+    calendar_event: 900, ...over,
+  };
+}
+
 export const actionItemHandlers = [
+  // Live Tracking: no timer running by default, so no existing test's DOM changes.
+  http.get("/api/v1/airtable/timers/", () => HttpResponse.json({ results: [] })),
+  http.post("/api/v1/airtable/timers/start/", async ({ request }) => {
+    const { airtable_id } = (await request.json()) as { airtable_id: string };
+    return HttpResponse.json({ session: mockLiveTimer({ action_item: airtable_id }) }, { status: 201 });
+  }),
+  http.post("/api/v1/airtable/timers/stop/", async ({ request }) => {
+    const { airtable_id } = (await request.json()) as { airtable_id: string };
+    return HttpResponse.json({
+      session: mockLiveTimer({ action_item: airtable_id, ended_at: new Date().toISOString(), seconds: 60 }),
+      item: { ...mockActionItem, airtable_id, time_spent: 60, tracked_time: 60 },
+    });
+  }),
+  http.post("/api/v1/airtable/timers/cancel/", () => new HttpResponse(null, { status: 204 })),
   http.get("/api/v1/airtable/action-items/", () =>
     HttpResponse.json([mockActionItem])
   ),

@@ -307,3 +307,42 @@ def pull_gmail_pubsub_messages():
             logger.info("pull_gmail_pubsub_messages: acknowledged %d messages", len(ack_ids))
     except Exception:
         logger.exception("pull_gmail_pubsub_messages: pull failed")
+
+
+@shared_task(name="integrations.tasks.sync_all_google_calendars", ignore_result=True)
+def sync_all_google_calendars():
+    """Every 5 minutes: sync each Google-connected user, renewing push channels on the way.
+
+    The safety net behind Google push notifications (dropped notifications, expired
+    channels, development machines Google can't reach). One user's failure never stops
+    the rest.
+    """
+    from integrations.calendar_sync import ensure_watch, sync_user_calendar
+    from integrations.models import OAuthCredential
+
+    for cred in OAuthCredential.objects.filter(provider="google", is_active=True).select_related("user"):
+        user = cred.user
+        try:
+            sync_user_calendar(user, source="schedule")
+        except Exception:
+            logger.exception("Scheduled Google Calendar sync failed for user %s", user.pk)
+        try:
+            ensure_watch(user)
+        except Exception:
+            logger.exception("Could not register/renew Google Calendar push channel for user %s", user.pk)
+
+
+@shared_task(name="integrations.tasks.sync_google_calendar_for_user", ignore_result=True)
+def sync_google_calendar_for_user(user_id: int, source: str = "webhook"):
+    """Triggered by a Google push notification — sync just that user, off the request."""
+    from django.contrib.auth import get_user_model
+
+    from integrations.calendar_sync import sync_user_calendar
+
+    user = get_user_model().objects.filter(pk=user_id, is_active=True).first()
+    if user is None:
+        return
+    try:
+        sync_user_calendar(user, source=source)
+    except Exception:
+        logger.exception("Google Calendar webhook sync failed for user %s", user_id)

@@ -81,7 +81,10 @@ class AirtableActionItem(models.Model):
     priority = models.CharField(max_length=64, choices=PRIORITY_CHOICES, default="Medium")
     due_date = models.DateTimeField(null=True, blank=True)
     estimated_time = models.IntegerField(default=0)  # seconds
-    time_spent = models.IntegerField(default=0)  # seconds
+    time_spent = models.IntegerField(default=0)  # seconds — overall total (tracked + manual)
+    # Seconds added by Live Tracking only (ActionItemTimeSession stops). Every tracked
+    # second is also added to time_spent; manual edits to time_spent don't touch this.
+    tracked_time = models.IntegerField(default=0)
     prep_time = models.IntegerField(default=0)  # seconds
     slack_thread_url = models.TextField(blank=True, default="")
     salesforce_task_id = models.CharField(max_length=128, blank=True, default="")
@@ -220,3 +223,43 @@ class CalendarEventAccountLink(models.Model):
 
     def __str__(self):
         return f"{self.calendar_event_uid} → {self.account or self.categorization}"
+
+
+class ActionItemTimeSession(models.Model):
+    """One Live Tracking start→stop by one user on one action item.
+
+    Lives on the server (it used to be per-browser localStorage) so a reload, a second tab
+    or a second device sees the same running timer, and so the stop path can add the time
+    and resize the calendar block in one place. `calendar_event` is the work_tracking block
+    the session is drawn on: a block is reused while its tracked total is still ≤ 15 min,
+    so short restarts don't litter the calendar with slivers.
+    """
+
+    user = models.ForeignKey(
+        "auth.User", on_delete=models.CASCADE, related_name="action_item_time_sessions"
+    )
+    action_item = models.ForeignKey(
+        AirtableActionItem, on_delete=models.CASCADE, related_name="time_sessions"
+    )
+    started_at = models.DateTimeField()
+    ended_at = models.DateTimeField(null=True, blank=True)
+    seconds = models.PositiveIntegerField(default=0)
+    calendar_event = models.ForeignKey(
+        "scheduler.CalendarEvent", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="time_sessions",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-started_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "action_item"],
+                condition=models.Q(ended_at__isnull=True),
+                name="one_running_timer_per_user_item",
+            ),
+        ]
+
+    def __str__(self):
+        state = "running" if self.ended_at is None else f"{self.seconds}s"
+        return f"{self.user} · {self.action_item} · {state}"

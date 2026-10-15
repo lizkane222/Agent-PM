@@ -271,6 +271,8 @@ export interface AirtableActionItem {
   due_date: string | null;
   estimated_time: number;
   time_spent: number;
+  /** Seconds added by Live Tracking only; also included in time_spent. */
+  tracked_time?: number;
   prep_time: number;
   slack_thread_url: string;
   salesforce_task_id: string;

@@ -320,6 +320,10 @@ class VoiceSessionViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
+        from core.mixins import admin_wants_all
+        if admin_wants_all(self.request):
+            # Includes sessions with no linked user (inbound PSTN calls never resolve one).
+            return VoiceSession.objects.all().order_by("-started_at")
         return VoiceSession.objects.filter(user=self.request.user)
 
 

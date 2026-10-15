@@ -43,6 +43,9 @@ class SalesforceAccountViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = SalesforceAccountSerializer
 
     def get_queryset(self):
+        from core.mixins import admin_wants_all
+        if admin_wants_all(self.request):
+            return SalesforceAccount.objects.all().order_by("name")
         sf_user_id = _user_sf_id(self.request)
         if not sf_user_id:
             return SalesforceAccount.objects.none()

@@ -29,6 +29,19 @@ import { useFocusPins } from "../hooks/useFocusPins";
 import { useActionItemZoneSets } from "../hooks/useActionItemZoneSets";
 import { groupActionItems, DONE_WINDOW_DAYS, isRecentlyDone, type SidebarGroupKey } from "../lib/actionItemSidebarOrder";
 import SidebarFilterFlags from "../components/calendar/SidebarFilterFlags";
+import CalendarSearch from "../components/calendar/CalendarSearch";
+import { eventMatchesQuery } from "../lib/calendarSearch";
+import { useLiveTimers } from "../hooks/useLiveTimers";
+import { useGoogleCalendarAutoSync } from "../hooks/useGoogleCalendarAutoSync";
+import { AccountRecordLink, ActionItemRecordButton } from "../components/calendar/EventRecordLinks";
+import { useAvailability } from "../hooks/useAvailability";
+import ComparePeoplePicker, { type ComparedPerson } from "../components/calendar/ComparePeoplePicker";
+import { findFreeSlots, isCompareEvent, overlayEvents } from "../lib/availability";
+import { CALENDAR_CHANGED_KEY, cancelLiveTimer, refreshLiveTimers, startLiveTimer } from "../lib/liveTimers";
+import {
+  eventSeconds, isLoggableMeeting, itemBelongsToAccount, localDate, localProjectPillId,
+  projectForActionItem, trackedSecondsByDay,
+} from "../lib/logTimeRows";
 import DayBar from "../components/calendar/DayBar";
 import MeetingDetail from "../components/calendar/MeetingDetail";
 import AccountsSidebar from "../components/calendar/AccountsSidebar";
@@ -69,7 +82,7 @@ import {
   scheduleReminder,
 } from "../lib/calendarScheduling";
 import type { AirtableActionItem, AirtableAccount, CalendarEvent, LogTimeDayAssignment, Reminder, SalesforceProject } from "../types";
-import type { AccountArtifact } from "../types/accounts";
+import type { AccountArtifact, AccountProject } from "../types/accounts";
 import type { TeamMember } from "../types/team";
 import type { ContentView, EventCategory, NewEventDraft } from "../types/calendar";
 import { getRsvp, dateToLocalISO, toLocalISO, addMsToLocalISO } from "twilio-agent-pm-shared";
@@ -210,7 +223,25 @@ function fadeColor(hex: string, amount = 0.45): string {
   return `rgb(${mix(r)},${mix(g)},${mix(b)})`;
 }
 
-function toFullCalendarEvent(e: CalendarEvent, colors: ColorResolver): EventInput {
+function toFullCalendarEvent(e: CalendarEvent, colors: ColorResolver, compareColor?: string): EventInput {
+  if (isCompareEvent(e)) {
+    // Someone else's busy time: their colour as a light wash with a dashed edge, never
+    // editable — it is not a row you own.
+    const c = compareColor ?? "#6b7280";
+    return {
+      id: String(e.id),
+      title: e.title,
+      start: e.start_datetime,
+      end: e.end_datetime,
+      allDay: e.all_day,
+      backgroundColor: tint(c, SURFACE_TINT),
+      borderColor: c,
+      textColor: readableTextColor(tint(c, SURFACE_TINT)),
+      editable: false,
+      classNames: ["compare-overlay"],
+      extendedProps: { ...e },
+    };
+  }
   const isWorkSession = e.calendar_id === "work_tracking";
   const isScheduled = e.google_event_id?.startsWith("scheduled-");
   const isScheduledReminder = isScheduledReminderEvent(e);
@@ -278,13 +309,15 @@ interface EventDetailPanelProps {
   editRequestId?: number;
   /** Resolves the header color from the user's chosen event-type colors. */
   colors: ColorResolver;
+  /** accounts.Account id for an account name — the /accounts/:id page uses that id space. */
+  resolveAccountId?: (accountName: string) => number | null;
 }
 
 /** The fields `PATCH /events/<pk>/details/` accepts from this panel. */
 type EventDetailsPatch = Partial<Pick<CalendarEvent,
   "title" | "description" | "location" | "start_datetime" | "end_datetime" | "event_category" | "artifact_ids">>;
 
-function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAccount, onUnlink, onRemove, onDelete, onUpdateReminder, actionItem, onUpdateActionItem, onUpdateScheduleTime, onOpenActionItemModal, onUpdateEvent, editRequestId, colors }: EventDetailPanelProps) {
+function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAccount, onUnlink, onRemove, onDelete, onUpdateReminder, actionItem, onUpdateActionItem, onUpdateScheduleTime, onOpenActionItemModal, onUpdateEvent, editRequestId, colors, resolveAccountId }: EventDetailPanelProps) {
   const [dropOver, setDropOver] = useState(false);
   const isWorkSession = event.calendar_id === "work_tracking";
   const isScheduledReminder = isScheduledReminderEvent(event);
@@ -696,16 +729,20 @@ function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAcc
                 <div className="flex items-center justify-between gap-2">
                   <div className="flex items-center gap-2 min-w-0">
                     <CorporateIcon className="w-4 h-4 shrink-0 text-indigo-500" />
-                    <span className="font-medium text-[var(--twilio-navy)] truncate">{linkedAccount.accountName}</span>
+                    <AccountRecordLink accountName={linkedAccount.accountName} accountId={resolveAccountId?.(linkedAccount.accountName) ?? null} />
                   </div>
                   {onUnlink && <button onClick={onUnlink} className="text-[var(--twilio-gray-60)] hover:text-red-500 text-xs shrink-0 transition-colors">✕</button>}
                 </div>
               ) : actionItem.account_name ? (
-                <span className="text-[var(--twilio-navy)] text-[13px]">{actionItem.account_name}</span>
+                <div className="flex items-center gap-2 min-w-0 text-[13px]">
+                  <CorporateIcon className="w-4 h-4 shrink-0 text-indigo-500" />
+                  <AccountRecordLink accountName={actionItem.account_name} accountId={resolveAccountId?.(actionItem.account_name) ?? null} />
+                </div>
               ) : (
                 <p className="text-[var(--twilio-gray-60)] text-center text-xs">Drop an account here to link</p>
               )}
             </div>
+            {onOpenActionItemModal && <ActionItemRecordButton item={actionItem} onOpen={onOpenActionItemModal} />}
           </div>
         </div>
       ) : evEditing ? (
@@ -859,7 +896,7 @@ function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAcc
               <div className="flex items-center justify-between gap-2">
                 <div className="flex items-center gap-2 min-w-0">
                   <CorporateIcon className="w-4 h-4 shrink-0 text-indigo-500" />
-                  <span className="font-medium text-[var(--twilio-navy)] truncate">{linkedAccount.accountName}</span>
+                  <AccountRecordLink accountName={linkedAccount.accountName} accountId={resolveAccountId?.(linkedAccount.accountName) ?? null} />
                 </div>
                 {onUnlink && <button onClick={onUnlink} className="text-[var(--twilio-gray-60)] hover:text-red-500 text-xs shrink-0 transition-colors">✕</button>}
               </div>
@@ -1161,9 +1198,12 @@ function stageItemActive(airtableId: string) {
     zones[airtableId] = "active";
     localStorage.setItem(ACTION_ITEM_ZONES_KEY, JSON.stringify(zones));
     window.dispatchEvent(new StorageEvent("storage", { key: ACTION_ITEM_ZONES_KEY, newValue: JSON.stringify(zones) }));
-    // Signal ActionItemsPage to start the timer for this item
-    window.dispatchEvent(new StorageEvent("storage", { key: "actionItemStartTimer", newValue: airtableId }));
   } catch { /* best effort */ }
+  // "Currently Tracking" means In Progress with a running timer. This used to be a
+  // same-window signal to ActionItemsPage — a different route, so never mounted here — and
+  // so the drop staged the card but never started tracking. The server does both now.
+  void import("../lib/api").then(({ airtableApi }) => airtableApi.updateActionItemStatus(airtableId, "In Progress")).catch(() => {});
+  void startLiveTimer(airtableId).catch(() => {});
 }
 
 interface ScheduledItem { airtableId: string; task: string; accountName: string | null; start: string; end: string; googleEventId?: string; uid?: string }
@@ -1438,7 +1478,13 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onO
   );
 }
 
-function ActionItemsSidebar({ expandItemId, colors }: { onDropToast?: (msg: string, type: "success" | "warn") => void; expandItemId?: string | null; colors: ColorResolver }) {
+function ActionItemsSidebar({ expandItemId, colors, accountFilter = null }: {
+  onDropToast?: (msg: string, type: "success" | "warn") => void;
+  expandItemId?: string | null;
+  colors: ColorResolver;
+  /** Account selected in the open Accounts sidebar — narrows the list to its items. */
+  accountFilter?: string | null;
+}) {
   // The sidebar paints itself in the same colors the grid uses, so a card and the
   // block it becomes when dragged onto the calendar always match.
   const accent = colors.colorFor("action_item");
@@ -1644,8 +1690,13 @@ function ActionItemsSidebar({ expandItemId, colors }: { onDropToast?: (msg: stri
   }
 
   const [filterTerm, setFilterTerm] = useState("");
+  // Same case-insensitive match the backend's ?account_name= uses ("Admin" vs "ADMIN").
+  const accountKey = accountFilter?.trim().toLowerCase() || null;
+  const accountScoped = accountKey
+    ? items.filter((i) => (i.account_name ?? "").trim().toLowerCase() === accountKey)
+    : items;
   const textMatched = filterTerm.trim()
-    ? items.filter((i) => {
+    ? accountScoped.filter((i) => {
         const q = filterTerm.toLowerCase();
         return (
           i.task?.toLowerCase().includes(q) ||
@@ -1654,12 +1705,12 @@ function ActionItemsSidebar({ expandItemId, colors }: { onDropToast?: (msg: stri
           i.assignee_name?.toLowerCase().includes(q)
         );
       })
-    : items;
+    : accountScoped;
 
   // Text box and flag chips compose: a card must satisfy both.
   const groups = groupActionItems(textMatched, { trackingIds, stagedIds, pinnedIds, selectedFlags });
   const visibleCount = groups.reduce((n, g) => n + g.items.length, 0);
-  const isNarrowed = !!filterTerm.trim() || selectedFlags.size > 0;
+  const isNarrowed = !!filterTerm.trim() || selectedFlags.size > 0 || !!accountKey;
 
   function toggleFlag(key: SidebarGroupKey) {
     setSelectedFlags((prev) => {
@@ -1702,6 +1753,11 @@ function ActionItemsSidebar({ expandItemId, colors }: { onDropToast?: (msg: stri
             accent={accent}
           />
         </div>
+        {accountKey && (
+          <p data-testid="sidebar-account-filter" className="pt-1.5 text-[11px] text-[var(--twilio-gray-60)] truncate">
+            Showing <span className="font-semibold text-[var(--twilio-navy)]">{accountFilter}</span> only
+          </p>
+        )}
       </div>
 
       <div className="flex-1 overflow-y-auto px-3 py-2 space-y-2">
@@ -2282,7 +2338,7 @@ function RemindersTabContent({ colors }: { onDropToast: (msg: string, type: "suc
 
 // ── Combined Items Sidebar (Action Items + Reminders tabs) ────────────────────
 
-function ItemsSidebar({ onDropToast, forceTab, expandItemId, colors }: { onDropToast: (msg: string, type: "success" | "warn") => void; forceTab?: "action-items" | "reminders"; expandItemId?: string | null; colors: ColorResolver }) {
+function ItemsSidebar({ onDropToast, forceTab, expandItemId, colors, accountFilter = null }: { onDropToast: (msg: string, type: "success" | "warn") => void; forceTab?: "action-items" | "reminders"; expandItemId?: string | null; colors: ColorResolver; accountFilter?: string | null }) {
   const [tab, setTab] = useState<"action-items" | "reminders">(forceTab ?? "action-items");
 
   useEffect(() => {
@@ -2295,7 +2351,7 @@ function ItemsSidebar({ onDropToast, forceTab, expandItemId, colors }: { onDropT
 
       {/* Tab body — each mounts/unmounts so state resets on switch */}
       {tab === "action-items" ? (
-        <ActionItemsSidebar onDropToast={onDropToast} expandItemId={expandItemId} colors={colors} />
+        <ActionItemsSidebar onDropToast={onDropToast} expandItemId={expandItemId} colors={colors} accountFilter={accountFilter} />
       ) : (
         <RemindersTabContent onDropToast={onDropToast} colors={colors} />
       )}
@@ -2318,6 +2374,29 @@ function fmtDecimalHours(secs: number): string {
   return (secs / 3600).toFixed(2);
 }
 
+/** A day assignment as the panel sees it — `auto` rows are derived from account-page projects. */
+type PanelAssignment = LogTimeDayAssignment & { auto?: boolean };
+
+/**
+ * A day whose rows must be placed per project: several projects, or any auto-imported one.
+ * With a single *manual* project everything implicitly files to it (the old behaviour); an
+ * auto project only claims the items that belong to it, so meetings stay unassigned.
+ */
+function isSplitDay(dayAssignments: PanelAssignment[]): boolean {
+  return dayAssignments.length > 1 || dayAssignments.some((a) => a.auto);
+}
+
+/**
+ * Stable negative id for an auto assignment, so a manual placement stored against it
+ * survives a reload. Far below the pseudo-assignment counter (which starts at -2).
+ */
+function autoAssignmentId(date: string, pillId: number): number {
+  const [y, m, d] = date.split("-").map(Number) as [number, number, number];
+  const dayIndex = Math.round(Date.UTC(y, m - 1, d) / 86_400_000) % 100_000;
+  const pill = pillId >= 0 ? pillId * 2 : -pillId * 2 + 1;
+  return -(1_000_000_000 + pill * 100_000 + dayIndex);
+}
+
 /** Round minutes up to the nearest 15-minute increment. */
 // `roundUpToQuarterHour` now comes from lib/logWeek so the hours this panel displays
 // are computed by the same function the server writes with.
@@ -2326,8 +2405,10 @@ interface LogTimeDayColumnProps {
   date: string;
   dayCalEvents: CalendarEvent[];   // pre-filtered to this date, non-work-tracking
   dayItems: AirtableActionItem[];  // pre-filtered: scheduled on calendar for this date + pinned
-  scheduledItems: ScheduledItem[]; // all scheduled items (for slot-duration lookup)
-  syncedItemDurations: Map<string, number>; // "${date}::${airtableId}" → seconds from DB-backed work_tracking events
+  /** Seconds for an item on this day — the panel's single definition (override → slot → tracked). */
+  itemSeconds: (item: AirtableActionItem) => number;
+  /** Remove a row from this day's log. Persisted by the panel so totals and Log Week agree. */
+  onRemoveRow: (rowKey: string) => void;
   projects: SalesforceProject[];
   assignments: LogTimeDayAssignment[];
   timeOverrides: Record<string, number>; // key "${date}::e::{id}" or "${date}::i::{airtableId}" → seconds
@@ -2364,42 +2445,24 @@ function CopyButton({ buildText }: { buildText: () => string }) {
 }
 
 function LogTimeDayColumn({
-  date, dayCalEvents: allDayCalEvents, dayItems: allDayItems, scheduledItems, syncedItemDurations, projects, assignments,
+  date, dayCalEvents, dayItems, itemSeconds, onRemoveRow, projects, assignments,
   timeOverrides, itemAssignments, onOverrideChange, onAddProject, onRemoveProject, onPinItem, onAssignItem, onLogDay, loggedDays,
   manuallyLogged, onMarkManuallyLogged,
 }: LogTimeDayColumnProps) {
   const [isDragOver, setIsDragOver] = useState(false);
   const [isDragOverProject, setIsDragOverProject] = useState<number | null>(null);
   const [loggingKey, setLoggingKey] = useState<string | null>(null);
-  const [removedEventIds, setRemovedEventIds] = useState<Set<number>>(new Set());
-  const [removedItemIds, setRemovedItemIds] = useState<Set<string>>(new Set());
-
-  const dayCalEvents = allDayCalEvents.filter((e) => !removedEventIds.has(e.id));
-  const dayItems = allDayItems.filter((i) => !removedItemIds.has(i.airtable_id));
 
   function secsForEvent(e: CalendarEvent) {
     const key = `${date}::e::${e.id}`;
     if (timeOverrides[key] !== undefined) return timeOverrides[key];
-    return Math.max(0, (new Date(e.end_datetime).getTime() - new Date(e.start_datetime).getTime()) / 1000);
+    return eventSeconds(e);
   }
 
-  function secsForItem(item: AirtableActionItem) {
-    const key = `${date}::i::${item.airtable_id}`;
-    if (timeOverrides[key] !== undefined) return timeOverrides[key];
-    // Prefer the calendar slot duration for locally-scheduled items (localStorage)
-    const slot = scheduledItems.find((s) => s.airtableId === item.airtable_id && s.start.slice(0, 10) === date);
-    if (slot) {
-      const slotSecs = (new Date(slot.end).getTime() - new Date(slot.start).getTime()) / 1000;
-      if (slotSecs > 0) return slotSecs;
-    }
-    // For items already synced to Google (DB-backed work_tracking events), use the actual event duration
-    const syncedSecs = syncedItemDurations.get(`${date}::${item.airtable_id}`);
-    if (syncedSecs !== undefined && syncedSecs > 0) return syncedSecs;
-    const actual = (item.time_spent ?? 0) + (item.prep_time ?? 0);
-    return actual > 0 ? actual : (item.estimated_time ?? 0);
-  }
+  // One definition, owned by the panel — the row label, the day total and Log Week agree.
+  const secsForItem = itemSeconds;
 
-  const multiProject = assignments.length > 1;
+  const multiProject = isSplitDay(assignments);
 
   function eventItemKey(e: CalendarEvent) { return `${date}::e::${e.id}`; }
   function actionItemKey(i: AirtableActionItem) { return `${date}::i::${i.airtable_id}`; }
@@ -2516,7 +2579,7 @@ function LogTimeDayColumn({
 
   function renderEventRow(e: CalendarEvent, compact: boolean, draggable?: boolean) {
     const key = eventItemKey(e);
-    const defaultSecs = Math.max(0, (new Date(e.end_datetime).getTime() - new Date(e.start_datetime).getTime()) / 1000);
+    const defaultSecs = eventSeconds(e);
     return (
       <div
         key={e.id}
@@ -2532,16 +2595,15 @@ function LogTimeDayColumn({
         <div className={["rounded-full bg-blue-400 shrink-0", compact ? "h-1.5 w-1.5" : "h-2 w-2"].join(" ")} />
         <p className={[compact ? "text-[11px]" : "text-xs", "text-[var(--twilio-navy)] truncate flex-1", manuallyLogged ? "line-through text-gray-400" : ""].join(" ")}>{e.title}</p>
         <TimeInput valueKey={key} defaultSecs={defaultSecs} />
-        <button onClick={() => setRemovedEventIds((prev) => new Set([...prev, e.id]))} className="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-red-400 text-xs leading-none shrink-0 transition-opacity ml-1" title="Remove from log">×</button>
+        <button onClick={() => onRemoveRow(key)} className="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-red-400 text-xs leading-none shrink-0 transition-opacity ml-1" title="Remove from log">×</button>
       </div>
     );
   }
 
   function renderItemRow(item: AirtableActionItem, compact: boolean, draggable?: boolean) {
     const key = actionItemKey(item);
-    const defaultSecs = (item.time_spent ?? 0) + (item.prep_time ?? 0) > 0
-      ? (item.time_spent ?? 0) + (item.prep_time ?? 0)
-      : (item.estimated_time ?? 0);
+    // Unoverridden seconds, so the displayed row matches what the total sums.
+    const defaultSecs = timeOverrides[key] !== undefined ? timeOverrides[key] : secsForItem(item);
     return (
       <div
         key={item.airtable_id}
@@ -2560,7 +2622,7 @@ function LogTimeDayColumn({
           {!compact && item.task_details && <p className="text-[10px] text-gray-400 truncate">{htmlToPreviewText(item.task_details)}</p>}
         </div>
         <TimeInput valueKey={key} defaultSecs={defaultSecs} />
-        <button onClick={() => setRemovedItemIds((prev) => new Set([...prev, item.airtable_id]))} className="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-red-400 text-xs leading-none shrink-0 transition-opacity ml-1" title="Remove from log">×</button>
+        <button onClick={() => onRemoveRow(key)} className="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-red-400 text-xs leading-none shrink-0 transition-opacity ml-1" title="Remove from log">×</button>
       </div>
     );
   }
@@ -2696,6 +2758,9 @@ function LogTimeDayColumn({
                 >
                   <div className="h-2 w-2 rounded-full bg-emerald-500 shrink-0" />
                   <p className="text-[11px] font-semibold text-emerald-900 break-words min-w-0">{a.project_name}</p>
+                  {(a as PanelAssignment).auto && (
+                    <span data-testid="auto-project-badge" title="Added because an action item here belongs to this project on the account page" className="shrink-0 text-[9px] font-semibold uppercase tracking-wide text-emerald-600">auto</span>
+                  )}
                 </div>
                 <button onClick={() => onRemoveProject(date, a)} className="shrink-0 text-gray-300 hover:text-red-400 transition-colors text-sm leading-none" title="Remove">×</button>
               </div>
@@ -2707,9 +2772,9 @@ function LogTimeDayColumn({
                   <div key={e.id} className={["flex items-center gap-2 mx-2 mb-1 rounded px-2 py-1 group", manuallyLogged ? "bg-white/60 opacity-60" : "bg-white/80"].join(" ")}>
                     <div className="h-1.5 w-1.5 rounded-full bg-blue-400 shrink-0" />
                     <p className={["text-[11px] text-[var(--twilio-navy)] truncate flex-1", manuallyLogged ? "line-through text-gray-400" : ""].join(" ")}>{e.title}</p>
-                    <TimeInput valueKey={ikey} defaultSecs={Math.max(0, (new Date(e.end_datetime).getTime() - new Date(e.start_datetime).getTime()) / 1000)} />
+                    <TimeInput valueKey={ikey} defaultSecs={eventSeconds(e)} />
                     {multiProject && <button onClick={() => onAssignItem(ikey, null)} className="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-indigo-400 text-xs leading-none shrink-0 transition-opacity" title="Unassign from project">↩</button>}
-                    <button onClick={() => setRemovedEventIds((prev) => new Set([...prev, e.id]))} className="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-red-400 text-xs leading-none shrink-0 transition-opacity" title="Remove from log">×</button>
+                    <button onClick={() => onRemoveRow(ikey)} className="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-red-400 text-xs leading-none shrink-0 transition-opacity" title="Remove from log">×</button>
                   </div>
                 );
               })}
@@ -2723,9 +2788,9 @@ function LogTimeDayColumn({
                     <div className="flex-1 min-w-0">
                       <p className={["text-[11px] font-medium truncate", manuallyLogged ? "line-through text-gray-400" : "text-[var(--twilio-navy)]"].join(" ")}>{item.task}</p>
                     </div>
-                    <TimeInput valueKey={ikey} defaultSecs={(item.time_spent ?? 0) + (item.prep_time ?? 0) > 0 ? (item.time_spent ?? 0) + (item.prep_time ?? 0) : (item.estimated_time ?? 0)} />
+                    <TimeInput valueKey={ikey} defaultSecs={timeOverrides[ikey] !== undefined ? timeOverrides[ikey] : secsForItem(item)} />
                     {multiProject && <button onClick={() => onAssignItem(ikey, null)} className="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-indigo-400 text-xs leading-none shrink-0 transition-opacity" title="Unassign from project">↩</button>}
-                    <button onClick={() => setRemovedItemIds((prev) => new Set([...prev, item.airtable_id]))} className="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-red-400 text-xs leading-none shrink-0 transition-opacity" title="Remove from log">×</button>
+                    <button onClick={() => onRemoveRow(ikey)} className="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-red-400 text-xs leading-none shrink-0 transition-opacity" title="Remove from log">×</button>
                   </div>
                 );
               })}
@@ -2819,19 +2884,16 @@ function LogTimePanel({
   // regardless of what week the main calendar is currently displaying.
   const [weekEvents, setWeekEvents] = useState<CalendarEvent[]>(events);
 
-  // Map "${date}::${airtableId}" → seconds for items already synced to Google (DB-backed work_tracking).
-  // These don't have a localStorage ScheduledItem, so secsForItem/secsForDay can't get their duration
-  // from scheduledItems — they use this map instead, matching what the calendar tile shows.
-  const syncedItemDurations = useMemo(() => {
-    const m = new Map<string, number>();
-    for (const e of weekEvents) {
-      if (e.calendar_id === "work_tracking" && e.agentpm_airtable_id) {
-        const secs = Math.max(0, (new Date(e.end_datetime).getTime() - new Date(e.start_datetime).getTime()) / 1000);
-        if (secs > 0) m.set(`${e.start_datetime.slice(0, 10)}::${e.agentpm_airtable_id}`, secs);
-      }
-    }
-    return m;
-  }, [weekEvents]);
+  // "${localDate}::${airtableId}" → seconds of work_tracking blocks that day, summed.
+  const syncedItemDurations = useMemo(() => trackedSecondsByDay(weekEvents), [weekEvents]);
+  // The account's own projects + goals, kept whole: `action_ids` / `goal_ids` are what
+  // auto-file an action item under the project it belongs to on the account page.
+  const [accountProjects, setAccountProjects] = useState<AccountProject[]>([]);
+  // Rows the user removed ("×"), keyed like timeOverrides. Persisted so a remount, the
+  // week totals and Log Week all honour the removal — it used to live in column state.
+  const [removedRows, setRemovedRows] = useState<Set<string>>(() => new Set(lsGet<string[]>("removedRows", [])));
+  // Auto-imported projects the user dismissed from a day ("${date}::${pillId}").
+  const [suppressedAuto, setSuppressedAuto] = useState<Set<string>>(() => new Set(lsGet<string[]>("suppressedAutoProjects", [])));
   const [loggedDays, setLoggedDays] = useState<Set<string>>(() => new Set(lsGet<string[]>("loggedDays", [])));
   const [dragProjectId, setDragProjectId] = useState<string | null>(null);
   const [weekLogState, setWeekLogState] = useState<"idle" | "logging" | "done">("idle");
@@ -2891,9 +2953,12 @@ function LogTimePanel({
       .then(({ data }) => data.results)
       .catch((): SalesforceProject[] => []);
     const localPromise = accountsApi.listProjectsByAccount(accountName)
-      .then(({ data }) => data.results.map((p) => ({
-        id: -(p.id + 10000),
-        sf_id: `local-${p.id}`,
+      .then(({ data }) => { setAccountProjects(data.results); return data.results; })
+      // Goals are not timesheet targets — they roll up into their parent project.
+      .then((rows) => rows.filter((p) => p.kind !== "goal").map((p) => ({
+        id: localProjectPillId(p.id),
+        // A local project that carries a Cloud Coach id logs straight to it.
+        sf_id: p.sf_project_id || `local-${p.id}`,
         name: p.name,
         description: p.description,
         status: "active",
@@ -2908,7 +2973,10 @@ function LogTimePanel({
       } as SalesforceProject)))
       .catch((): SalesforceProject[] => []);
     Promise.all([sfPromise, localPromise]).then(([sfProjects, localProjects]) => {
-      setProjects([...sfProjects, ...localProjects]);
+      // A local project linked to a Cloud Coach project the user can already see is the
+      // same project — show one pill, not two.
+      const sfIds = new Set(sfProjects.map((p) => p.sf_id));
+      setProjects([...sfProjects, ...localProjects.filter((p) => !sfIds.has(p.sf_id))]);
     });
     airtableApi.listActionItems()
       .then(({ data }) => setAllActionItems(data))
@@ -2939,28 +3007,23 @@ function LogTimePanel({
 
   const days = visibleDays.slice(0, 5);
 
-  const isAdmin = accountName.toLowerCase() === "admin";
-
-  // Build per-day item lists: calendar events + scheduled (dragged) action items + pinned items
+  // Build per-day item lists: calendar events + scheduled (dragged) action items + pinned items.
+  // Eligibility rules live in lib/logTimeRows.ts so the panel and the server agree.
   function dayCalEvents(date: string): CalendarEvent[] {
     return weekEvents.filter((e) => {
-      if (e.start_datetime.slice(0, 10) !== date) return false;
-      if (e.calendar_id === "work_tracking") return false;
+      if (localDate(e.start_datetime) !== date) return false;
+      if (removedRows.has(`${date}::e::${e.id}`)) return false;
       // eventAccountLinks covers in-session links not yet saved to DB
       const link = (e.google_event_id ? eventAccountLinks.get(e.google_event_id) : undefined)
         ?? eventAccountLinks.get(String(e.id));
-      if (link) return link.accountName === accountName;
-      // Fall back to the DB-stored account_name on the event itself
-      return e.account_name === accountName;
+      return isLoggableMeeting(e, accountName, link?.accountName);
     });
   }
 
   function dayActionItems(date: string): AirtableActionItem[] {
     // 1. Items dragged from the sidebar onto the calendar (localStorage), scoped to this account
     const scheduledIds = new Set(
-      scheduledItems
-        .filter((s) => s.start.slice(0, 10) === date && (isAdmin || s.accountName === accountName))
-        .map((s) => s.airtableId)
+      scheduledItems.filter((s) => localDate(s.start) === date).map((s) => s.airtableId)
     );
     // 2. Items manually dragged into the log time day column (already account-scoped via lsKey)
     const pinned = new Set(pinnedItems[date] ?? []);
@@ -2969,54 +3032,120 @@ function LogTimePanel({
     //    Uses weekEvents (own fetch) so last week's items are present even when
     //    the main calendar is displaying a different week.
     const syncedIds = new Set(
-      weekEvents
-        .filter((e) =>
-          e.calendar_id === "work_tracking" &&
-          !!e.agentpm_airtable_id &&
-          e.start_datetime.slice(0, 10) === date
-        )
-        .map((e) => e.agentpm_airtable_id as string)
+      [...syncedItemDurations.keys()].filter((k) => k.startsWith(`${date}::`)).map((k) => k.slice(date.length + 2))
     );
     const allIds = new Set([...scheduledIds, ...pinned, ...syncedIds]);
-    // Filter by ID match AND account — admin sees all, others see only their account's items
+    // The item's own account decides, for every panel (Admin included), and a row with no
+    // time on this day is not a timesheet row — those were the "0m" rows.
     return allActionItems.filter((i) =>
-      allIds.has(i.airtable_id) && (isAdmin || i.account_name === accountName)
+      allIds.has(i.airtable_id)
+      && itemBelongsToAccount(i, accountName)
+      && !removedRows.has(`${date}::i::${i.airtable_id}`)
+      && itemSecs(date, i) > 0
     );
   }
 
+  /**
+   * Seconds worked on `i` on `date`: a manual override, else the day's calendar blocks.
+   * Deliberately NOT time_spent / estimated_time — those are lifetime totals, and counting
+   * them on every day an item appeared logged the same hours several times over.
+   */
   function itemSecs(date: string, i: AirtableActionItem): number {
     const key = `${date}::i::${i.airtable_id}`;
     if (timeOverrides[key] !== undefined) return timeOverrides[key];
-    const slot = scheduledItems.find((s) => s.airtableId === i.airtable_id && s.start.slice(0, 10) === date);
-    if (slot) {
-      const slotSecs = (new Date(slot.end).getTime() - new Date(slot.start).getTime()) / 1000;
-      if (slotSecs > 0) return slotSecs;
-    }
-    const synced = syncedItemDurations.get(`${date}::${i.airtable_id}`);
-    if (synced !== undefined && synced > 0) return synced;
-    const actual = (i.time_spent ?? 0) + (i.prep_time ?? 0);
-    return actual > 0 ? actual : (i.estimated_time ?? 0);
+    const synced = syncedItemDurations.get(`${date}::${i.airtable_id}`) ?? 0;
+    const slots = scheduledItems
+      .filter((s) => s.airtableId === i.airtable_id && localDate(s.start) === date)
+      .reduce((sum, s) => sum + Math.max(0, (new Date(s.end).getTime() - new Date(s.start).getTime()) / 1000), 0);
+    return synced > 0 ? synced : slots;
+  }
+
+  function handleRemoveRow(rowKey: string) {
+    setRemovedRows((prev) => {
+      const next = new Set(prev);
+      next.add(rowKey);
+      lsSet("removedRows", [...next]);
+      return next;
+    });
   }
 
   function secsForProject(date: string, assignmentId: number): number {
     const dayAssignments = assignmentsForDay(date);
-    const multiProject = dayAssignments.length > 1;
+    const multiProject = isSplitDay(dayAssignments);
+    const placed = effectiveItemAssignments(date);
     const evts = multiProject
-      ? dayCalEvents(date).filter((e) => itemAssignments[`${date}::e::${e.id}`] === assignmentId)
+      ? dayCalEvents(date).filter((e) => placed[`${date}::e::${e.id}`] === assignmentId)
       : dayCalEvents(date);
     const items = multiProject
-      ? dayActionItems(date).filter((i) => itemAssignments[`${date}::i::${i.airtable_id}`] === assignmentId)
+      ? dayActionItems(date).filter((i) => placed[`${date}::i::${i.airtable_id}`] === assignmentId)
       : dayActionItems(date);
     const evSecs = evts.reduce((s, e) => {
       const key = `${date}::e::${e.id}`;
-      return s + (timeOverrides[key] !== undefined ? timeOverrides[key] : Math.max(0, (new Date(e.end_datetime).getTime() - new Date(e.start_datetime).getTime()) / 1000));
+      return s + (timeOverrides[key] !== undefined ? timeOverrides[key] : eventSeconds(e));
     }, 0);
     return evSecs + items.reduce((s, i) => s + itemSecs(date, i), 0);
   }
 
-  function assignmentsForDay(date: string) {
+  function persistedAssignmentsForDay(date: string): PanelAssignment[] {
     const projectIds = new Set(projects.map((p) => p.id));
     return assignments.filter((a) => a.date === date && projectIds.has(a.project));
+  }
+
+  /** The panel pill for an account-page project (deduped SF pill wins over the local one). */
+  function pillForAccountProject(ap: AccountProject): SalesforceProject | undefined {
+    const sfId = ap.sf_project_id || `local-${ap.id}`;
+    return projects.find((p) => p.sf_id === sfId);
+  }
+
+  /** item airtable_id → its account-page project's pill, for this day's items. */
+  function autoProjectsForDay(date: string): Map<string, SalesforceProject> {
+    const out = new Map<string, SalesforceProject>();
+    for (const item of dayActionItems(date)) {
+      const ap = projectForActionItem(item.airtable_id, accountProjects);
+      const pill = ap ? pillForAccountProject(ap) : undefined;
+      if (pill) out.set(item.airtable_id, pill);
+    }
+    return out;
+  }
+
+  /**
+   * Persisted day assignments plus one auto-imported assignment per account-page project
+   * that this day's action items are filed under. Auto rows are derived, never written —
+   * dismissing one only suppresses it for that day.
+   */
+  function assignmentsForDay(date: string): PanelAssignment[] {
+    const persisted = persistedAssignmentsForDay(date);
+    const auto: PanelAssignment[] = [];
+    for (const pill of autoProjectsForDay(date).values()) {
+      if (persisted.some((a) => a.project === pill.id) || auto.some((a) => a.project === pill.id)) continue;
+      if (suppressedAuto.has(`${date}::${pill.id}`)) continue;
+      auto.push({
+        id: autoAssignmentId(date, pill.id),
+        date,
+        project: pill.id,
+        project_sf_id: pill.sf_id,
+        project_name: pill.name,
+        position: 1000 + auto.length,
+        auto: true,
+      });
+    }
+    return [...persisted, ...auto];
+  }
+
+  /**
+   * `itemAssignments` with each unplaced action item filed under its account-page project.
+   * A manual placement (including an explicit unassign, stored as 0) always wins.
+   */
+  function effectiveItemAssignments(date: string): Record<string, number> {
+    const out = { ...itemAssignments };
+    const dayAssignments = assignmentsForDay(date);
+    for (const [airtableId, pill] of autoProjectsForDay(date)) {
+      const key = `${date}::i::${airtableId}`;
+      if (key in itemAssignments) continue;
+      const target = dayAssignments.find((a) => a.project === pill.id);
+      if (target) out[key] = target.id;
+    }
+    return out;
   }
 
   function handleOverrideChange(key: string, secs: number) {
@@ -3036,7 +3165,8 @@ function LogTimePanel({
   function handleAssignItem(itemKey: string, assignmentId: number | null) {
     setItemAssignments((prev) => {
       const next = { ...prev };
-      if (assignmentId === null) { delete next[itemKey]; } else { next[itemKey] = assignmentId; }
+      // 0 = explicitly unassigned: kept (not deleted) so auto-filing can't put it back.
+      next[itemKey] = assignmentId ?? 0;
       lsSet("itemAssignments", next);
       return next;
     });
@@ -3076,7 +3206,15 @@ function LogTimePanel({
     } catch { /* best effort */ }
   }
 
-  async function handleRemoveProject(date: string, assignment: LogTimeDayAssignment) {
+  async function handleRemoveProject(date: string, assignment: PanelAssignment) {
+    if (assignment.auto) {
+      setSuppressedAuto((prev) => {
+        const next = new Set(prev).add(`${date}::${assignment.project}`);
+        lsSet("suppressedAutoProjects", [...next]);
+        return next;
+      });
+      return;
+    }
     if (assignment.id < 0) {
       setAssignments((prev) => {
         const next = prev.filter((a) => a.id !== assignment.id);
@@ -3112,7 +3250,8 @@ function LogTimePanel({
     const out: LogWeekEntryInput[] = [];
     for (const date of days) {
       const dayAssignments = assignmentsForDay(date);
-      const multi = dayAssignments.length > 1;
+      const multi = isSplitDay(dayAssignments);
+      const placed = effectiveItemAssignments(date);
       for (const a of dayAssignments) {
         if (!isSalesforceId(a.project_sf_id)) continue;
         if (loggedDays.has(`${date}::${a.project_sf_id}`)) continue;
@@ -3120,10 +3259,10 @@ function LogTimePanel({
         const minutes = roundUpToQuarterHour(Math.round(projSecs / 60));
         if (minutes <= 0) continue;
         const projEvents = multi
-          ? dayCalEvents(date).filter((e) => itemAssignments[`${date}::e::${e.id}`] === a.id)
+          ? dayCalEvents(date).filter((e) => placed[`${date}::e::${e.id}`] === a.id)
           : dayCalEvents(date);
         const projItems = multi
-          ? dayActionItems(date).filter((i) => itemAssignments[`${date}::i::${i.airtable_id}`] === a.id)
+          ? dayActionItems(date).filter((i) => placed[`${date}::i::${i.airtable_id}`] === a.id)
           : dayActionItems(date);
         const titles = [...projEvents.map((e) => e.title), ...projItems.map((i) => i.task)];
         out.push({
@@ -3269,12 +3408,12 @@ function LogTimePanel({
             date={date}
             dayCalEvents={dayCalEvents(date)}
             dayItems={dayActionItems(date)}
-            scheduledItems={scheduledItems}
-            syncedItemDurations={syncedItemDurations}
+            itemSeconds={(i) => itemSecs(date, i)}
+            onRemoveRow={handleRemoveRow}
             projects={projects}
             assignments={assignmentsForDay(date)}
             timeOverrides={timeOverrides}
-            itemAssignments={itemAssignments}
+            itemAssignments={effectiveItemAssignments(date)}
             onOverrideChange={handleOverrideChange}
             onAddProject={handleAddProject}
             onRemoveProject={handleRemoveProject}
@@ -3368,6 +3507,11 @@ export default function CalendarPage() {
     if (expandId) setExpandActionItemId(expandId);
   }
   const [contentView, setContentView] = useState<ContentView>("all");
+  // Calendar search box — narrows the grid; composes with contentView / account filters.
+  const [searchQuery, setSearchQuery] = useState("");
+  // Compare calendars: people overlaid on the grid (session-scoped, like the search box).
+  const [comparedPeople, setComparedPeople] = useState<ComparedPerson[]>([]);
+  const [showFreeSlots, setShowFreeSlots] = useState(false);
   // Right-click context menu for work-tracking events
   const [ctxMenu, setCtxMenu] = useState<{
     x: number; y: number;
@@ -3403,6 +3547,20 @@ export default function CalendarPage() {
     revert: () => void;
   } | null>(null);
   const allAccountsRef = useRef<{ id: number; name: string }[]>([]);
+  // accounts.Account ids by lowercased name, for /accounts/:id links. allAccountsRef mixes
+  // AirtableAccount and Account ids, so it can't build those links.
+  const [appAccountIds, setAppAccountIds] = useState<Map<string, number>>(() => new Map());
+  useEffect(() => {
+    accountsApi.listAccounts({ page_size: "500" })
+      .then(({ data }) => setAppAccountIds(new Map(
+        (data.results as { id: number; company_name: string }[]).map((a) => [a.company_name.trim().toLowerCase(), a.id]),
+      )))
+      .catch(() => { /* links fall back to plain text */ });
+  }, []);
+  const resolveAccountId = useCallback(
+    (name: string) => appAccountIds.get(name.trim().toLowerCase()) ?? null,
+    [appAccountIds],
+  );
   const [selectedAccountName, setSelectedAccountName] = useState<string | null>(null);
   const [logTimeModeAccount, setLogTimeModeAccount] = useState<string | null>(null);
   // Log Time mode force-switches the main grid to the "accounts" content view, scoped to
@@ -3417,6 +3575,8 @@ export default function CalendarPage() {
   // survives navigation and refresh. See didNotAttend() below.
   // Visible date range (ISO strings) tracked for daily totals footer
   const [visibleRange, setVisibleRange] = useState<{ start: string; end: string } | null>(null);
+  const comparedEmails = comparedPeople.map((p) => p.email);
+  const { people: availability } = useAvailability(comparedEmails, visibleRange);
   // Extra events synthesized for the accounts view (Airtable meetings)
   const [accountMeetingEvents, setAccountMeetingEvents] = useState<CalendarEvent[]>([]);
 
@@ -3454,10 +3614,8 @@ export default function CalendarPage() {
   const [scheduledItems, setScheduledItems] = useState<ScheduledItem[]>(() => readScheduledItems());
   // Scheduled reminders dragged onto the calendar
   const [scheduledReminders, setScheduledReminders] = useState<ScheduledReminder[]>(() => readScheduledReminders());
-  // Live running timers broadcast from ActionItemsPage
-  const [activeTimers, setActiveTimers] = useState<Record<string, { startedAt: number; elapsed: number; task: string; accountName: string | null }>>(() => {
-    try { return JSON.parse(localStorage.getItem("activeTimers") ?? "{}"); } catch { return {}; }
-  });
+  // Running Live Tracking timers — server-owned, so they show on every device.
+  const { timers: liveTimers, now: liveNow } = useLiveTimers();
 
   useEffect(() => {
     teamApi.getMyProfile().then(({ data }) => {
@@ -3482,20 +3640,9 @@ export default function CalendarPage() {
       .catch(() => {});
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // On mount: prune stale activeTimers whose backing action item no longer exists in any status
+  // (A mount-time prune of localStorage timers used to live here; timers are server rows now.)
   useEffect(() => {
-    airtableApi.listActionItems({ status: "Open,In Progress,Blocked,Backlogged,Complete" }).then(({ data }) => {
-      const liveIds = new Set((data as AirtableActionItem[]).map((i) => i.airtable_id));
-      // Prune activeTimers
-      try {
-        const timers: Record<string, unknown> = JSON.parse(localStorage.getItem("activeTimers") ?? "{}");
-        const pruned = Object.fromEntries(Object.entries(timers).filter(([id]) => liveIds.has(id)));
-        if (Object.keys(pruned).length !== Object.keys(timers).length) {
-          localStorage.setItem("activeTimers", JSON.stringify(pruned));
-          setActiveTimers(pruned as Record<string, { startedAt: number; elapsed: number; task: string; accountName: string | null }>);
-          window.dispatchEvent(new StorageEvent("storage", { key: "activeTimers", newValue: JSON.stringify(pruned) }));
-        }
-      } catch { /* best effort */ }
+    void Promise.resolve().then(() => {
       // Deliberately NOT pruning scheduled action items / reminders here any more.
       //
       // This block used to drop every `scheduledActionItems` entry whose id was absent from
@@ -3508,7 +3655,7 @@ export default function CalendarPage() {
       // Schedulings are database rows now, so there is no client-side list to prune: a row
       // whose action item is genuinely deleted is cleaned up server-side, and "Done" is a
       // status, not a reason to destroy the record of when the work was scheduled.
-    }).catch(() => {});
+    });
   }, []);
 
 
@@ -3519,9 +3666,6 @@ export default function CalendarPage() {
     function onStorage(e: StorageEvent) {
       if (e.key === SCHEDULED_ITEMS_KEY) setScheduledItems(readScheduledItems());
       if (e.key === SCHEDULED_REMINDERS_KEY) setScheduledReminders(readScheduledReminders());
-      if (e.key === "activeTimers") {
-        try { setActiveTimers(JSON.parse(e.newValue ?? "{}")); } catch { /* ignore */ }
-      }
       if (e.key === LOGGED_DATES_EVENT) setLoggedDates(readLoggedDates());
     }
     window.addEventListener("storage", onStorage);
@@ -3553,13 +3697,6 @@ export default function CalendarPage() {
       .catch(() => {});
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Tick activeTimers every second so live events update their end time
-  useEffect(() => {
-    const hasRunning = Object.keys(activeTimers).length > 0;
-    if (!hasRunning) return;
-    const id = setInterval(() => setActiveTimers((prev) => ({ ...prev })), 1000);
-    return () => clearInterval(id);
-  }, [activeTimers]);
 
   // The important-color swatches belong to one menu opening, never the next
   useEffect(() => { setImportantPickerOpen(false); setConvertPickerOpen(false); }, [ctxMenu]);
@@ -3645,6 +3782,31 @@ export default function CalendarPage() {
     if (!api) return;
     const { activeStart, activeEnd } = api.view;
     await fetchEvents(activeStart.toISOString(), activeEnd.toISOString(), { bustCache: true });
+  }, [fetchEvents]);
+
+  // Pull Google changes on our own: every 5 minutes and on tab focus while the page is open.
+  // Skipped while a manual sync or a drag/resize is in flight; the button is unaffected.
+  const isSyncingRef = useRef(isSyncing);
+  isSyncingRef.current = isSyncing;
+  useGoogleCalendarAutoSync({
+    enabled: true,
+    busy: () => isSyncingRef.current || localMutationRef.current,
+    onChanged: () => { void refetchVisibleRange(); },
+  });
+
+  // A Live Tracking start/stop (here, on the Action Items page, or in another tab) created or
+  // resized a block. Re-read now — the 5-minute event cache used to hide the finished block.
+  const visibleRangeRef = useRef(visibleRange);
+  visibleRangeRef.current = visibleRange;
+  useEffect(() => {
+    function onStorage(e: StorageEvent) {
+      if (e.key !== CALENDAR_CHANGED_KEY) return;
+      bustEventCache();
+      const r = visibleRangeRef.current;
+      if (r) void fetchEvents(r.start, r.end, { bustCache: true });
+    }
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
   }, [fetchEvents]);
 
   /**
@@ -3834,6 +3996,8 @@ export default function CalendarPage() {
 
   const handleEventClick = useCallback(
     (info: EventClickArg) => {
+      // Someone else's busy block (or a free-slot band) has nothing to open.
+      if (isCompareEvent(info.event.extendedProps as CalendarEvent) || info.event.extendedProps?.freeSlot) return;
       // Resolve to the DB row up front: extendedProps has no `id`, so a panel opened
       // from a raw snapshot could not save anything.
       const extProps = resolveEventRow(info.event.extendedProps as CalendarEvent);
@@ -3859,7 +4023,10 @@ export default function CalendarPage() {
           const sep = body.lastIndexOf("__");
           airtableId = sep === -1 ? body : body.slice(0, sep);
         }
-        airtableApi.listActionItems({ status: "Open,In Progress,Blocked,Backlogged,Complete" })
+        // Direct lookup by id. The old status filter listed "Complete" — not a real status —
+        // and omitted Done, so a Done item's block never found its action item and the panel
+        // fell back to the plain meeting view.
+        airtableApi.listActionItems({ airtable_id: airtableId })
           .then(({ data }) => {
             const found = (data as AirtableActionItem[]).find((i) => i.airtable_id === airtableId) ?? null;
             setSelectedActionItem(found);
@@ -4149,7 +4316,11 @@ export default function CalendarPage() {
   }
 
   const handleCreateEventSave = useCallback(async (payload: SavePayload) => {
-    const { draft, assembledDescription, attendees, meetLink } = payload;
+    const { draft, assembledDescription, attendees, meetLink, sendInvites } = payload;
+    // Worst Google outcome across the occurrences, so a failed push is never toasted as a
+    // plain "Created" — that silence is how missing invites went unnoticed.
+    let googleOutcome: "ok" | "not_connected" | "failed" | null = null;
+    let invitesSent = false;
     setNewEventSaving(true);
     try {
       if (draft.type === "action-item") {
@@ -4197,7 +4368,14 @@ export default function CalendarPage() {
             meet_link: meetLink,
             event_category: draft.category,
             artifact_ids: draft.linkedArtifactIds,
+            send_invites: sendInvites,
           });
+          const sync = created.data.google_sync;
+          if (sync) {
+            const rank = { ok: 0, not_connected: 1, failed: 2 } as const;
+            if (googleOutcome === null || rank[sync.status] > rank[googleOutcome]) googleOutcome = sync.status;
+            invitesSent = invitesSent || sync.invites_sent;
+          }
           setEvents((prev) => [...prev, created.data]);
           if (draft.selectedAccount) {
             // Link by google_event_id if available; also by numeric id as fallback
@@ -4219,8 +4397,17 @@ export default function CalendarPage() {
         }
       }
       setNewEventDraft(null);
-      setDropToast({ msg: `Created "${draft.title.trim()}"`, type: "success" });
-      setTimeout(() => setDropToast(null), 3000);
+      const title = draft.title.trim();
+      if (googleOutcome === "failed") {
+        setDropToast({ msg: `Created "${title}" here, but Google Calendar rejected it — guests were not invited`, type: "warn" });
+      } else if (googleOutcome === "not_connected") {
+        setDropToast({ msg: `Created "${title}" here only — connect Google Calendar in Settings to send invites`, type: "warn" });
+      } else if (invitesSent) {
+        setDropToast({ msg: `Created "${title}" and emailed ${attendees.length} guest${attendees.length === 1 ? "" : "s"}`, type: "success" });
+      } else {
+        setDropToast({ msg: `Created "${title}"`, type: "success" });
+      }
+      setTimeout(() => setDropToast(null), googleOutcome && googleOutcome !== "ok" ? 6000 : 3000);
     } catch {
       setDropToast({ msg: "Failed to create", type: "warn" });
       setTimeout(() => setDropToast(null), 3000);
@@ -4329,7 +4516,7 @@ export default function CalendarPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const handleEventResize = useCallback((info: { event: { extendedProps: Record<string, unknown>; startStr: string; endStr: string; start: Date | null; end: Date | null }; revert: () => void }) => {
+  const handleEventResize = useCallback((info: { event: { id?: string; extendedProps: Record<string, unknown>; startStr: string; endStr: string; start: Date | null; end: Date | null }; revert: () => void }) => {
     const ev = info.event.extendedProps as unknown as CalendarEvent;
     const uid = ev.google_event_id ?? "";
     // Normalise to proper RFC3339 with local offset
@@ -4342,9 +4529,13 @@ export default function CalendarPage() {
     // DB-backed synced action item — persist updated times to the DB + Airtable due_date
     if (isDbBackedActionItemEvent(ev)) {
       localMutationRef.current = true;
-      setEvents((prev) => prev.map((e) => e.google_event_id === uid ? { ...e, start_datetime: newStart, end_datetime: newEnd } : e));
-      setSelectedEvent((prev) => prev?.google_event_id === uid ? { ...prev, start_datetime: newStart, end_datetime: newEnd } : prev);
-      schedulerApi.updateEvent(ev.id, { start_datetime: newStart, end_datetime: newEnd })
+      // Match the exact row. Unsynced blocks all have a blank google_event_id, so matching
+      // on it would move every one of them together.
+      const rowId = info.event.id ?? String(ev.id);
+      const isThis = (e: CalendarEvent) => String(e.id) === rowId;
+      setEvents((prev) => prev.map((e) => isThis(e) ? { ...e, start_datetime: newStart, end_datetime: newEnd } : e));
+      setSelectedEvent((prev) => prev && isThis(prev) ? { ...prev, start_datetime: newStart, end_datetime: newEnd } : prev);
+      schedulerApi.updateEvent(Number(rowId), { start_datetime: newStart, end_datetime: newEnd })
         .catch(() => { info.revert(); })
         .finally(() => { localMutationRef.current = false; });
       airtableApi.updateActionItemFields(ev.agentpm_airtable_id, { due_date: newStart.slice(0, 10) })
@@ -4389,7 +4580,7 @@ export default function CalendarPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [applyMeetingReschedule, userEmail]);
 
-  const handleEventDrop = useCallback((info: { event: { extendedProps: Record<string, unknown>; startStr: string; endStr: string; start: Date | null; end: Date | null }; revert: () => void }) => {
+  const handleEventDrop = useCallback((info: { event: { id?: string; extendedProps: Record<string, unknown>; startStr: string; endStr: string; start: Date | null; end: Date | null }; revert: () => void }) => {
     const ev = info.event.extendedProps as unknown as CalendarEvent;
     const uid = ev.google_event_id ?? "";
     const newStart = info.event.start ? dateToLocalISO(info.event.start) : info.event.startStr;
@@ -4401,9 +4592,13 @@ export default function CalendarPage() {
     // DB-backed synced action item — persist updated times to the DB + Airtable due_date
     if (isDbBackedActionItemEvent(ev)) {
       localMutationRef.current = true;
-      setEvents((prev) => prev.map((e) => e.google_event_id === uid ? { ...e, start_datetime: newStart, end_datetime: newEnd } : e));
-      setSelectedEvent((prev) => prev?.google_event_id === uid ? { ...prev, start_datetime: newStart, end_datetime: newEnd } : prev);
-      schedulerApi.updateEvent(ev.id, { start_datetime: newStart, end_datetime: newEnd })
+      // Match the exact row. Unsynced blocks all have a blank google_event_id, so matching
+      // on it would move every one of them together.
+      const rowId = info.event.id ?? String(ev.id);
+      const isThis = (e: CalendarEvent) => String(e.id) === rowId;
+      setEvents((prev) => prev.map((e) => isThis(e) ? { ...e, start_datetime: newStart, end_datetime: newEnd } : e));
+      setSelectedEvent((prev) => prev && isThis(prev) ? { ...prev, start_datetime: newStart, end_datetime: newEnd } : prev);
+      schedulerApi.updateEvent(Number(rowId), { start_datetime: newStart, end_datetime: newEnd })
         .catch(() => { info.revert(); })
         .finally(() => { localMutationRef.current = false; });
       airtableApi.updateActionItemFields(ev.agentpm_airtable_id, { due_date: newStart.slice(0, 10) })
@@ -4496,40 +4691,11 @@ export default function CalendarPage() {
           }
         }
       }
-    } else if (uid.startsWith("active-timer-") || uid.includes("active-timer")) {
+    } else if (uid.startsWith("active-timer-")) {
+      // Removing a running timer from the calendar discards that session (nothing logged);
+      // the server drops its block too if the block held no earlier tracked time.
       const airtableId = uid.replace(/^active-timer-/, "");
-      try {
-        const raw: Record<string, { startedAt: number; elapsed: number; task: string; accountName: string | null }> =
-          JSON.parse(localStorage.getItem("activeTimers") ?? "{}");
-        // Calculate how many seconds were accumulated in this active session
-        const timerEntry = Object.entries(raw).find(([key]) =>
-          key === airtableId || key.includes(airtableId) || airtableId.includes(key)
-        )?.[1];
-        const accumulatedSecs = timerEntry
-          ? timerEntry.elapsed + (timerEntry.startedAt ? Math.floor((Date.now() - timerEntry.startedAt) / 1000) : 0)
-          : 0;
-        // Delete the exact key and any key that is a substring match (handles legacy/malformed entries)
-        const pruned = Object.fromEntries(
-          Object.entries(raw).filter(([key]) =>
-            key !== airtableId && !key.includes(airtableId) && !airtableId.includes(key)
-          )
-        );
-        localStorage.setItem("activeTimers", JSON.stringify(pruned));
-        setActiveTimers({ ...pruned } as Record<string, { startedAt: number; elapsed: number; task: string; accountName: string | null }>);
-        window.dispatchEvent(new StorageEvent("storage", { key: "activeTimers", newValue: JSON.stringify(pruned) }));
-        // Tell ActionItemsPage to stop + zero the timer without committing the time
-        const cancelPayload = JSON.stringify({ airtableId, seconds: accumulatedSecs });
-        localStorage.setItem("actionItemCancelTimer", cancelPayload);
-        window.dispatchEvent(new StorageEvent("storage", { key: "actionItemCancelTimer", newValue: cancelPayload }));
-        // Also delete the live DB CalendarEvent if one was created
-        const liveDbEv = eventsRef.current.find(
-          (e) => e.calendar_id === "work_tracking" && e.agentpm_airtable_id === airtableId && !e.is_synced
-        );
-        if (liveDbEv) {
-          setEvents((prev) => prev.filter((e) => e.id !== liveDbEv.id));
-          schedulerApi.deleteEvent(liveDbEv.id).catch(() => {});
-        }
-      } catch { /* best effort */ }
+      void cancelLiveTimer(airtableId).catch(() => {});
     } else {
       // DB-backed work-tracking event or scheduled reminder — delete the row.
       //
@@ -4541,17 +4707,17 @@ export default function CalendarPage() {
         (e) => (e.google_event_id && e.google_event_id === uid) || String(e.id) === uid
       );
       if (ev) {
-        const durationSecs = ev.agentpm_airtable_id
-          ? Math.round((new Date(ev.end_datetime).getTime() - new Date(ev.start_datetime).getTime()) / 1000)
-          : 0;
         setEvents((prev) => prev.filter((e) => e.id !== ev.id));
-        schedulerApi.deleteEvent(ev.id).catch(() => {});
-        // Tell ActionItemsPage to subtract this session's duration from the timer display
-        if (ev.agentpm_airtable_id && durationSecs > 0) {
-          const cancelPayload = JSON.stringify({ airtableId: ev.agentpm_airtable_id, seconds: durationSecs });
-          localStorage.setItem("actionItemCancelTimer", cancelPayload);
-          window.dispatchEvent(new StorageEvent("storage", { key: "actionItemCancelTimer", newValue: cancelPayload }));
-        }
+        // The server subtracts only the block's *tracked* seconds (none for a planned block)
+        // and cancels a timer still running on it; refresh both views once it has.
+        schedulerApi.deleteEvent(ev.id)
+          .then(() => {
+            if (ev.agentpm_airtable_id) {
+              void refreshLiveTimers();
+              window.dispatchEvent(new StorageEvent("storage", { key: "actionItemsUpdated", newValue: String(Date.now()) }));
+            }
+          })
+          .catch(() => {});
       }
     }
     setSelectedEvent(null);
@@ -5009,29 +5175,32 @@ export default function CalendarPage() {
   }));
 
   // Synthesize live running timers as calendar events
-  const now = Date.now();
-  const activeTimerCalEvents: CalendarEvent[] = Object.entries(activeTimers).map(([id, t]) => ({
-    id: -(Math.abs(id.split("").reduce((a, c) => a + c.charCodeAt(0), 0)) + 1),
+  const now = liveNow;
+  const activeTimerCalEvents: CalendarEvent[] = Object.values(liveTimers).map((t) => ({
+    id: -(Math.abs(t.action_item.split("").reduce((a, c) => a + c.charCodeAt(0), 0)) + 1),
     owner: 0,
-    owner_username: t.accountName ?? "",
+    owner_username: t.account_name ?? "",
     account: null,
-    account_name: t.accountName ?? null,
-    google_event_id: `active-timer-${id}`,
-    title: `⏱ ${t.task}`,
+    account_name: t.account_name ?? null,
+    google_event_id: `active-timer-${t.action_item}`,
+    title: t.task, // toFullCalendarEvent adds the ⏱ for work_tracking
     description: "",
     location: "",
-    start_datetime: new Date(t.startedAt).toISOString(),
-    end_datetime: new Date(now).toISOString(),
+    start_datetime: t.started_at,
+    end_datetime: new Date(Math.max(now, new Date(t.started_at).getTime() + 60_000)).toISOString(),
     all_day: false,
     status: "confirmed" as const,
     attendees: [],
     meet_link: "",
     calendar_id: "work_tracking",
     is_synced: false,
-    agentpm_airtable_id: id,
+    agentpm_airtable_id: t.action_item,
     created_at: "",
     updated_at: "",
   }));
+  // A running session's own block is drawn by the live overlay above; showing both stacked
+  // the same work twice and double-counted it in the daily footer.
+  const liveBlockIds = new Set(Object.values(liveTimers).map((t) => t.calendar_event).filter((v): v is number => v != null));
 
   // Synthesize scheduled reminders as calendar events (amber)
   const scheduledReminderCalEvents: CalendarEvent[] = scheduledReminders.map((r) => ({
@@ -5070,6 +5239,7 @@ export default function CalendarPage() {
   const filteredEvents = (() => {
     const base = events.filter((e) => {
       if (e.calendar_id === "reminders") return false; // never show reminders as standalone events
+      if (liveBlockIds.has(e.id)) return false; // drawn by its running timer instead
       if (contentView === "all") return true;
       if (contentView === "meetings") return e.calendar_id !== "work_tracking";
       if (contentView === "action-items") return e.calendar_id === "work_tracking";
@@ -5089,11 +5259,44 @@ export default function CalendarPage() {
       : contentView === "reminders"
         ? [...scheduledReminderCalEvents]
         : [];
-    if (contentView !== "accounts") return [...base, ...workEvents];
-    const extraFiltered = accountMeetingEvents.filter((e) =>
-      selectedAccountName === null || e.owner_username === selectedAccountName
-    );
-    return [...base, ...extraFiltered, ...workEvents];
+    const extraFiltered = contentView === "accounts"
+      ? accountMeetingEvents.filter((e) =>
+          selectedAccountName === null || e.owner_username === selectedAccountName
+        )
+      : [];
+    // Compared people's busy time is meeting-like: shown in All / Meetings / Accounts, hidden
+    // in the action-item and reminder views; in Accounts it narrows to that account's titles.
+    const compareEvents = (contentView === "all" || contentView === "meetings" || contentView === "accounts" || contentView === "unlinked")
+      ? availability.flatMap(overlayEvents).filter((e) =>
+          contentView !== "accounts" || selectedAccountName === null
+          || e.title.toLowerCase().includes(selectedAccountName.toLowerCase()))
+      : [];
+    const all = [...base, ...extraFiltered, ...workEvents, ...compareEvents];
+    if (!searchQuery.trim()) return all;
+    return all.filter((e) => {
+      const link = (e.google_event_id ? eventAccountLinks.get(e.google_event_id) : undefined)
+        ?? eventAccountLinks.get(String(e.id));
+      return eventMatchesQuery(e, searchQuery, link?.accountName);
+    });
+  })();
+
+  // "Find free time": weekday working-hour gaps where nobody shown is busy. Built from what
+  // the grid shows, so the filters above apply. Rendered as background events.
+  const freeSlotEvents: EventInput[] = (() => {
+    if (!showFreeSlots || comparedPeople.length === 0 || !visibleRange) return [];
+    const busy = filteredEvents
+      .filter((e) => e.status !== "cancelled" && !didNotAttend(e))
+      .map((e) => ({ start: e.start_datetime, end: e.end_datetime, all_day: e.all_day }));
+    return findFreeSlots(busy, new Date(visibleRange.start), new Date(visibleRange.end), { includeWeekends: showWeekends })
+      .map((slot, i) => ({
+        id: `free-${i}`,
+        start: slot.start,
+        end: slot.end,
+        display: "background",
+        backgroundColor: "#bbf7d0",
+        classNames: ["free-slot"],
+        extendedProps: { freeSlot: true },
+      }));
   })();
 
   // Compute daily time totals (seconds) across all filtered events for the footer
@@ -5126,7 +5329,8 @@ export default function CalendarPage() {
   // crediting a whole event's duration to whichever day its start falls on — see
   // lib/calendarDailyTotals.ts for why (a forgotten running timer's synthetic event can
   // span many days).
-  const dailyTotals: Record<string, number> = computeDailyTotals(filteredEvents, visibleDays);
+  // Other people's busy time is not your time — keep it out of your daily footer.
+  const dailyTotals: Record<string, number> = computeDailyTotals(filteredEvents.filter((e) => !isCompareEvent(e)), visibleDays);
   const weekTotal = Object.values(dailyTotals).reduce((a, b) => a + b, 0);
 
   // Right panels: always-visible action items sidebar + conditional meeting detail
@@ -5182,6 +5386,24 @@ export default function CalendarPage() {
 
       {/* ── Right button row — mirrors Accounts button on the left ─────────── */}
       <div className="absolute top-4 right-4 z-30 flex items-center gap-2">
+        <ComparePeoplePicker
+          people={comparedPeople}
+          onChange={(next) => { setComparedPeople(next); if (next.length === 0) setShowFreeSlots(false); }}
+          availability={availability}
+          showFreeSlots={showFreeSlots}
+          onToggleFreeSlots={() => setShowFreeSlots((v) => !v)}
+        />
+        <CalendarSearch
+          query={searchQuery}
+          onQueryChange={setSearchQuery}
+          onPick={(ev) => {
+            const api = calendarRef.current?.getApi();
+            api?.gotoDate(ev.start_datetime);
+            // A pinned result must be visible even if the current content view hides it.
+            if (contentView !== "all" && contentView !== "meetings" && ev.calendar_id !== "work_tracking") setContentView("all");
+            setSearchQuery(ev.title || "");
+          }}
+        />
         <button
           onClick={() => void handleSync()}
           disabled={isSyncing}
@@ -5232,6 +5454,9 @@ export default function CalendarPage() {
             : itemsTab
           }
           expandItemId={expandActionItemId}
+          // Only while the Accounts sidebar is actually open — a closed panel must not
+          // keep silently filtering the list by a selection the user can no longer see.
+          accountFilter={accountPanelOpen ? selectedAccountName : null}
         />
       </div>
 
@@ -5258,6 +5483,7 @@ export default function CalendarPage() {
           <EventDetailPanel
             event={selectedEvent}
             colors={calendarColors}
+            resolveAccountId={resolveAccountId}
             onClose={() => { setSelectedEvent(null); setSelectedActionItem(null); }}
             onCollapse={() => setMeetingPanelCollapsed(true)}
             linkedAccount={
@@ -5351,7 +5577,7 @@ export default function CalendarPage() {
               // Update the selected event and events list so the calendar redraws immediately
               setSelectedEvent((prev) => prev ? { ...prev, start_datetime: newStart, end_datetime: newEnd } : prev);
               setEvents((prev) => prev.map((e) =>
-                e.google_event_id === uid ? { ...e, start_datetime: newStart, end_datetime: newEnd } : e
+                (uid ? e.google_event_id === uid : e.id === selectedEvent.id) ? { ...e, start_datetime: newStart, end_datetime: newEnd } : e
               ));
             }}
           />
@@ -5901,7 +6127,11 @@ export default function CalendarPage() {
               center: "title",
               right: "viewAll,viewMeetings,viewActionItems,viewReminders,viewAccounts toggleWeekends dayGridMonth,timeGridWeek,timeGridDay colorsButton",
             }}
-            events={filteredEvents.map((e) => {
+            events={[...freeSlotEvents, ...filteredEvents.map((e) => {
+              if (isCompareEvent(e)) {
+                const person = comparedPeople.find((p) => p.name === e.owner_username);
+                return toFullCalendarEvent(e, calendarColors, person?.color);
+              }
               const base = toFullCalendarEvent(e, calendarColors);
               if (didNotAttend(e)) {
                 return {
@@ -5922,7 +6152,7 @@ export default function CalendarPage() {
                 return { ...base, backgroundColor: faded, borderColor: faded };
               }
               return base;
-            })}
+            })]}
             eventContent={(arg) => {
               const e = arg.event.extendedProps as CalendarEvent;
               const isWorkSession = e.calendar_id === "work_tracking";

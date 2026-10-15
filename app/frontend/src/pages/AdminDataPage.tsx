@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import { useCurrentUser } from "../context/CurrentUserContext";
+import { accessLevel } from "../lib/permissions";
 import { salesforceApi, skillsApi, realtimeApi, teamApi } from "../lib/api";
 import type { SalesforceAccount, Tag, VoiceSession } from "../types";
 
 type Section = "tags" | "teams" | "memberships" | "invocations" | "voice" | "sf-accounts";
 
-interface TeamRow { id: number; name: string; slug: string; description: string; created_at: string }
-interface MembershipRow { id: number; user: number; user_display: string; team: number; team_name: string; role: string; created_at: string }
+interface TeamRow { id: number; name: string; description: string; member_count: number; created_at: string }
+interface MembershipRow { id: number; user: number; user_display_name: string; user_email: string; team: number; team_name: string; role: string; created_at: string }
 interface InvocationRow {
   id: number;
   skill: number;
@@ -16,8 +18,13 @@ interface InvocationRow {
   arguments: unknown;
   result: unknown;
   error: string;
-  created_at: string;
+  status: string;
+  duration_ms: number | null;
+  invoked_at: string;
 }
+
+/** Admins get every row; without this the endpoints scope to the caller's own data. */
+const ALL = { scope: "all", page_size: "500" };
 
 const SECTIONS: { key: Section; label: string; description: string }[] = [
   { key: "tags", label: "Tags", description: "Colour-coded labels on team members and tasks." },
@@ -35,12 +42,12 @@ export default function AdminDataPage() {
   if (profile === null) {
     return <div className="p-6 text-sm text-[var(--twilio-navy)]">Loading…</div>;
   }
-  if (!profile.is_staff) {
+  if (accessLevel(profile) !== "admin") {
     return (
       <div className="p-6 max-w-lg">
         <h1 className="text-lg font-semibold text-[var(--twilio-navy)] mb-2">Admin Data</h1>
         <p className="text-sm text-gray-600">
-          This page is only visible to staff users. Ask an admin if you need access.
+          This page is only visible to Admins. Ask an Admin if you need access.
         </p>
       </div>
     );
@@ -49,7 +56,8 @@ export default function AdminDataPage() {
   return (
     <div className="flex h-full min-h-[500px]">
       <aside className="w-56 border-r border-gray-200 bg-gray-50 p-4 shrink-0">
-        <h1 className="text-sm font-semibold text-[var(--twilio-navy)] mb-3">Admin Data</h1>
+        <Link to="/settings" className="text-xs text-indigo-600 hover:underline">← Settings</Link>
+        <h1 className="text-sm font-semibold text-[var(--twilio-navy)] mb-3 mt-1">Admin Data</h1>
         <nav className="flex flex-col gap-1">
           {SECTIONS.map((s) => (
             <button
@@ -108,7 +116,7 @@ function useList<T>(fetcher: () => Promise<{ data: { results: T[] } }>): {
       setRows(res.data.results);
     } catch (err: unknown) {
       const status = (err as { response?: { status?: number } })?.response?.status;
-      setError(status === 403 ? "Forbidden (staff-only endpoint)." : "Failed to load.");
+      setError(status === 403 ? "You don't have access to this data." : "Failed to load.");
     } finally {
       setLoading(false);
     }
@@ -126,12 +134,12 @@ function TableWrapper({ loading, error, empty, children }: {
 }) {
   if (loading) return <p className="text-sm text-gray-500">Loading…</p>;
   if (error) return <p className="text-sm text-red-600">{error}</p>;
-  if (empty) return <p className="text-sm text-gray-500 italic">No rows.</p>;
+  if (empty) return <p className="text-sm text-gray-500 italic">No rows yet — nothing has been recorded in this table.</p>;
   return <div className="overflow-x-auto">{children}</div>;
 }
 
 function TagsTable() {
-  const { rows, loading, error } = useList<Tag>(() => teamApi.listTags());
+  const { rows, loading, error } = useList<Tag>(() => teamApi.listTags({ page_size: "500" }));
   return (
     <TableWrapper loading={loading} error={error} empty={rows.length === 0}>
       <table className="min-w-full text-sm border border-gray-200 rounded-lg overflow-hidden">
@@ -161,13 +169,13 @@ function TagsTable() {
 }
 
 function TeamsTable() {
-  const { rows, loading, error } = useList<TeamRow>(() => teamApi.listTeams());
+  const { rows, loading, error } = useList<TeamRow>(() => teamApi.listTeams(ALL));
   return (
     <TableWrapper loading={loading} error={error} empty={rows.length === 0}>
       <table className="min-w-full text-sm border border-gray-200 rounded-lg overflow-hidden">
         <thead className="bg-gray-50">
           <tr>
-            <Th>ID</Th><Th>Name</Th><Th>Slug</Th><Th>Description</Th><Th>Created</Th>
+            <Th>ID</Th><Th>Name</Th><Th>Members</Th><Th>Description</Th><Th>Created</Th>
           </tr>
         </thead>
         <tbody>
@@ -175,7 +183,7 @@ function TeamsTable() {
             <tr key={r.id} className="border-t border-gray-100">
               <Td>{r.id}</Td>
               <Td>{r.name}</Td>
-              <Td><code className="text-xs text-gray-500">{r.slug}</code></Td>
+              <Td>{r.member_count ?? 0}</Td>
               <Td>{r.description || "—"}</Td>
               <Td>{fmtDate(r.created_at)}</Td>
             </tr>
@@ -187,7 +195,7 @@ function TeamsTable() {
 }
 
 function MembershipsTable() {
-  const { rows, loading, error } = useList<MembershipRow>(() => teamApi.listMemberships());
+  const { rows, loading, error } = useList<MembershipRow>(() => teamApi.listMemberships(ALL));
   return (
     <TableWrapper loading={loading} error={error} empty={rows.length === 0}>
       <table className="min-w-full text-sm border border-gray-200 rounded-lg overflow-hidden">
@@ -200,7 +208,7 @@ function MembershipsTable() {
           {rows.map((r) => (
             <tr key={r.id} className="border-t border-gray-100">
               <Td>{r.id}</Td>
-              <Td>{r.user_display} <span className="text-xs text-gray-400">#{r.user}</span></Td>
+              <Td>{r.user_display_name || r.user_email} <span className="text-xs text-gray-400">#{r.user}</span></Td>
               <Td>{r.team_name} <span className="text-xs text-gray-400">#{r.team}</span></Td>
               <Td><code className="text-xs">{r.role}</code></Td>
               <Td>{fmtDate(r.created_at)}</Td>
@@ -213,13 +221,13 @@ function MembershipsTable() {
 }
 
 function InvocationsTable() {
-  const { rows, loading, error } = useList<InvocationRow>(() => skillsApi.listInvocations());
+  const { rows, loading, error } = useList<InvocationRow>(() => skillsApi.listInvocations({ page_size: "500" }));
   return (
     <TableWrapper loading={loading} error={error} empty={rows.length === 0}>
       <table className="min-w-full text-sm border border-gray-200 rounded-lg overflow-hidden">
         <thead className="bg-gray-50">
           <tr>
-            <Th>ID</Th><Th>Skill</Th><Th>Invoked by</Th><Th>Error</Th><Th>Created</Th>
+            <Th>ID</Th><Th>Skill</Th><Th>Invoked by</Th><Th>Status</Th><Th>Duration</Th><Th>Error</Th><Th>Invoked</Th>
           </tr>
         </thead>
         <tbody>
@@ -228,8 +236,10 @@ function InvocationsTable() {
               <Td>{r.id}</Td>
               <Td>{r.skill_name || `#${r.skill}`}</Td>
               <Td>{r.invoked_by_username || (r.invoked_by ? `#${r.invoked_by}` : "—")}</Td>
+              <Td>{r.status || "—"}</Td>
+              <Td>{r.duration_ms != null ? `${r.duration_ms} ms` : "—"}</Td>
               <Td>{r.error ? <span className="text-red-600 text-xs">{r.error}</span> : <span className="text-gray-400">—</span>}</Td>
-              <Td>{fmtDate(r.created_at)}</Td>
+              <Td>{fmtDate(r.invoked_at)}</Td>
             </tr>
           ))}
         </tbody>
@@ -239,7 +249,7 @@ function InvocationsTable() {
 }
 
 function VoiceSessionsTable() {
-  const { rows, loading, error } = useList<VoiceSession>(() => realtimeApi.listVoiceSessions());
+  const { rows, loading, error } = useList<VoiceSession>(() => realtimeApi.listVoiceSessions(ALL));
   return (
     <TableWrapper loading={loading} error={error} empty={rows.length === 0}>
       <table className="min-w-full text-sm border border-gray-200 rounded-lg overflow-hidden">
@@ -267,7 +277,7 @@ function VoiceSessionsTable() {
 }
 
 function SFAccountsTable() {
-  const { rows, loading, error } = useList<SalesforceAccount>(() => salesforceApi.listAccounts());
+  const { rows, loading, error } = useList<SalesforceAccount>(() => salesforceApi.listAccounts(ALL));
   return (
     <TableWrapper loading={loading} error={error} empty={rows.length === 0}>
       <table className="min-w-full text-sm border border-gray-200 rounded-lg overflow-hidden">

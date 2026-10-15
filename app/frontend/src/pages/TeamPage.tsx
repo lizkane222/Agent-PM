@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import axios from "axios";
+import { permissionMessage } from "../lib/permissions";
+import { useAppError } from "../context/AppErrorContext";
 import CorporateIcon from "../assets/icons/Corporate.svg?react";
 import TeamIcon from "../assets/icons/Team.svg?react";
 import { accountsApi } from "../lib/api";
@@ -747,6 +749,7 @@ function MemberDetailSidebar({
 }
 
 export default function TeamPage() {
+  const { reportError } = useAppError();
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [search, setSearch] = useState("");
   const [modal, setModal] = useState<Partial<TeamMember> | null | "new">(null);
@@ -893,10 +896,14 @@ export default function TeamPage() {
     if (!accountId) return;
     const existingIds: number[] = JSON.parse(e.dataTransfer.getData("accountTeamMemberIds") || "[]");
     if (existingIds.includes(member.id)) return;
-    const { data } = await accountsApi.updateAccount(accountId, {
-      team_member_ids: [...existingIds, member.id],
-    } as Partial<Account>);
-    setAccounts((prev) => prev.map((a) => (a.id === data.id ? data : a)));
+    try {
+      const { data } = await accountsApi.updateAccount(accountId, {
+        team_member_ids: [...existingIds, member.id],
+      } as Partial<Account>);
+      setAccounts((prev) => prev.map((a) => (a.id === data.id ? data : a)));
+    } catch (err) {
+      reportError(permissionMessage(err, "Could not add that team member to the account."), "TeamPage");
+    }
   }
 
   async function handleMemberDropOnAccount(e: React.DragEvent, account: Account) {
@@ -906,10 +913,14 @@ export default function TeamPage() {
     if (!memberId) return;
     const existing = (account.team_members ?? []).map((m) => m.id);
     if (existing.includes(memberId)) return;
-    const { data } = await accountsApi.updateAccount(account.id, {
-      team_member_ids: [...existing, memberId],
-    } as Partial<Account>);
-    setAccounts((prev) => prev.map((a) => (a.id === data.id ? data : a)));
+    try {
+      const { data } = await accountsApi.updateAccount(account.id, {
+        team_member_ids: [...existing, memberId],
+      } as Partial<Account>);
+      setAccounts((prev) => prev.map((a) => (a.id === data.id ? data : a)));
+    } catch (err) {
+      reportError(permissionMessage(err, "Could not add that team member to the account."), "TeamPage");
+    }
   }
 
   return (
@@ -1259,8 +1270,12 @@ export default function TeamPage() {
           onClose={() => setSelectedMember(null)}
           onEdit={() => { setModal(selectedMember); setSelectedMember(null); }}
           onRemoveFromAccount={async (accountId) => {
-            const { data } = await accountsApi.removeTeamMember(accountId, selectedMember.id);
-            setAccounts((prev) => prev.map((a) => (a.id === data.id ? data : a)));
+            try {
+              const { data } = await accountsApi.removeTeamMember(accountId, selectedMember.id);
+              setAccounts((prev) => prev.map((a) => (a.id === data.id ? data : a)));
+            } catch (err) {
+              reportError(permissionMessage(err, "Could not remove them from the account."), "TeamPage");
+            }
           }}
         />
       )}

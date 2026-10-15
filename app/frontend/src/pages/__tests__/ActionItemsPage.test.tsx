@@ -453,9 +453,53 @@ describe("ActionItemsPage", () => {
 
     const realInput = screen.getByDisplayValue("Fix billing issue");
     const card = realInput.closest("[draggable='true']") as HTMLElement;
+    // An unedited Save sends nothing (only changed fields are PATCHed), so edit first.
+    fireEvent.change(realInput, { target: { value: "Fix billing issue v2" } });
     fireEvent.click(within(card).getByRole("button", { name: "Save" }));
 
     await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+  });
+
+  it("card Save sends only edited fields, so a stale time_spent can't overwrite tracked time", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    server.use(
+      http.get("/api/v1/airtable/action-items/", () =>
+        HttpResponse.json([{ ...mockItem, account: null, account_name: null, time_spent: 600 }])
+      ),
+      http.patch("/api/v1/airtable/action-items/:airtableId/fields/", async ({ request }) => {
+        bodies.push((await request.json()) as Record<string, unknown>);
+        return HttpResponse.json({ ...mockItem, task: "Renamed" });
+      })
+    );
+    await renderPageStableWithErrors();
+    await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
+
+    const realInput = screen.getByDisplayValue("Fix billing issue");
+    const card = realInput.closest("[draggable='true']") as HTMLElement;
+    fireEvent.change(realInput, { target: { value: "Renamed" } });
+    fireEvent.click(within(card).getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(bodies).toHaveLength(1));
+    expect(bodies[0]).toEqual({ task: "Renamed" });
+  });
+
+  it("card Save with no edits sends no request", async () => {
+    let patches = 0;
+    server.use(
+      http.get("/api/v1/airtable/action-items/", () =>
+        HttpResponse.json([{ ...mockItem, account: null, account_name: null }])
+      ),
+      http.patch("/api/v1/airtable/action-items/:airtableId/fields/", () => {
+        patches += 1;
+        return HttpResponse.json(mockItem);
+      })
+    );
+    await renderPageStableWithErrors();
+    await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
+    const card = screen.getByDisplayValue("Fix billing issue").closest("[draggable='true']") as HTMLElement;
+    fireEvent.click(within(card).getByRole("button", { name: "Save" }));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(patches).toBe(0);
   });
 
   // ── Focus mode ────────────────────────────────────────────────────────────────
@@ -1076,6 +1120,91 @@ describe("ActionItemsPage", () => {
     } finally {
       rects.mockRestore();
     }
+  });
+
+  // ── Live Tracking (server-owned timers) ───────────────────────────────────────
+
+  describe("Live Tracking", () => {
+    function serveTimers(initiallyRunning: string[] = []) {
+      const calls: string[] = [];
+      // Stateful like the server, so a refetch after start/stop sees the change.
+      const running = new Set(initiallyRunning);
+      server.use(
+        http.get("/api/v1/airtable/timers/", () =>
+          HttpResponse.json({
+            results: [...running].map((id) => ({
+              id: 1, action_item: id, task: "Alpha task", account_name: null,
+              started_at: new Date(Date.now() - 90_000).toISOString(), ended_at: null, seconds: 0, calendar_event: 900,
+            })),
+          })
+        ),
+        http.post("/api/v1/airtable/timers/:action/", async ({ params, request }) => {
+          const body = (await request.json()) as { airtable_id: string };
+          calls.push(`${params.action}:${body.airtable_id}`);
+          if (params.action === "start") running.add(body.airtable_id); else running.delete(body.airtable_id);
+          if (params.action === "start") {
+            return HttpResponse.json({ session: { id: 1, action_item: body.airtable_id, task: "Alpha task", account_name: null, started_at: new Date().toISOString(), ended_at: null, seconds: 0, calendar_event: 900 } }, { status: 201 });
+          }
+          return HttpResponse.json({
+            session: { id: 1, action_item: body.airtable_id, task: "Alpha task", account_name: null, started_at: new Date().toISOString(), ended_at: new Date().toISOString(), seconds: 90, calendar_event: 900 },
+            item: { ...ITEM_A, time_spent: 90, tracked_time: 90 },
+          });
+        }),
+        // The old client-side protocol must not come back.
+        http.post("/api/v1/airtable/time-logs/", () => { calls.push("time-logs"); return HttpResponse.json({}); }),
+        http.post("/api/v1/scheduler/events/", () => { calls.push("create-event"); return HttpResponse.json({ id: 99 }); }),
+        http.get("/api/v1/airtable/action-items/", () => HttpResponse.json([ITEM_A])),
+      );
+      return calls;
+    }
+
+    it("Track starts a server timer and makes no client-side calendar or time-log writes", async () => {
+      localStorage.setItem("actionItemZones", JSON.stringify({ recAAA: "active" }));
+      const calls = serveTimers();
+      await renderPageStable();
+      await waitFor(() => expect(screen.getByDisplayValue("Alpha task")).toBeInTheDocument());
+
+      fireEvent.click(within(zonePanel("Currently Tracking")).getByRole("button", { name: "Track" }));
+
+      await waitFor(() => expect(calls).toContain("start:recAAA"));
+      expect(await within(zonePanel("Currently Tracking")).findByRole("button", { name: "Stop" })).toBeInTheDocument();
+      expect(calls).not.toContain("create-event");
+      expect(calls).not.toContain("time-logs");
+    });
+
+    it("a timer running on the server shows as running after a reload", async () => {
+      localStorage.setItem("actionItemZones", JSON.stringify({ recAAA: "active" }));
+      serveTimers(["recAAA"]);
+      await renderPageStable();
+      await waitFor(() => expect(screen.getByText("Currently Tracking")).toBeInTheDocument());
+      expect(await within(zonePanel("Currently Tracking")).findByRole("button", { name: "Stop" })).toBeInTheDocument();
+      // 90s running — the clock reflects server start time, not when this tab mounted.
+      expect(within(zonePanel("Currently Tracking")).getByText(/^0?1:3\d$/)).toBeInTheDocument();
+    });
+
+    it("Stop logs via the server and shows the new tracked total", async () => {
+      localStorage.setItem("actionItemZones", JSON.stringify({ recAAA: "active" }));
+      const calls = serveTimers(["recAAA"]);
+      await renderPageStable();
+      await waitFor(() => expect(screen.getByText("Currently Tracking")).toBeInTheDocument());
+      fireEvent.click(await within(zonePanel("Currently Tracking")).findByRole("button", { name: "Stop" }));
+      await waitFor(() => expect(calls).toContain("stop:recAAA"));
+      expect(await within(zonePanel("Currently Tracking")).findByRole("button", { name: "Track" })).toBeInTheDocument();
+      expect(calls).not.toContain("time-logs");
+    });
+
+    it("dragging a running card out of Currently Tracking stops it exactly once", async () => {
+      localStorage.setItem("actionItemZones", JSON.stringify({ recAAA: "active" }));
+      const calls = serveTimers(["recAAA"]);
+      await renderPageStable();
+      await waitFor(() => expect(screen.getByText("Currently Tracking")).toBeInTheDocument());
+      await within(zonePanel("Currently Tracking")).findByRole("button", { name: "Stop" });
+
+      fireEvent.dragStart(cardFor("Alpha task"), { dataTransfer: DT() });
+      fireEvent.drop(zonePanel("Stage Today"), { dataTransfer: DT() });
+
+      await waitFor(() => expect(calls.filter((c) => c.startsWith("stop:"))).toEqual(["stop:recAAA"]));
+    });
   });
 
   // ── Display completeness ──────────────────────────────────────────────────────

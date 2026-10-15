@@ -537,3 +537,50 @@ class ReportShapeTest(LogWeekTestBase):
 
     def test_week_range_label_is_inclusive(self):
         self.assertEqual(week_range_label(MONDAY), "Mon 31 Aug – Sun 06 Sep")
+
+
+class ScopedManualAssignmentTest(LogWeekTestBase):
+    """Day assignments are per user, not per account — a per-account run must not let a
+    project dragged in from another account's panel capture this account's events."""
+
+    def test_another_accounts_dragged_project_does_not_capture_this_accounts_events(self):
+        AccountProject.objects.create(account=self.account, name="Acme Phase 1", sf_project_id="a0BACMEPHASE0001")
+        beta = self.sf_project(name="Beta Rollout", sf_id="a0BBETAROLL00001", account_name="Beta")
+        LogTimeDayAssignment.objects.create(user=self.user, date=MONDAY, project=beta)
+        self.event(account=self.account)
+
+        plan = plan_week(self.user, MONDAY, account_name="Acme")
+
+        self.assertEqual([e.project_sf_id for e in plan.entries], ["a0BACMEPHASE0001"])
+        self.assertEqual(plan.entries[0].source, "auto")
+
+    def test_this_accounts_dragged_project_still_wins(self):
+        AccountProject.objects.create(account=self.account, name="Auto", sf_project_id="a0BAUTO000000001")
+        mine = self.sf_project(name="Manual", sf_id="a0BMANUAL0000001", account_name="Acme")
+        LogTimeDayAssignment.objects.create(user=self.user, date=MONDAY, project=mine)
+        self.event(account=self.account)
+
+        plan = plan_week(self.user, MONDAY, account_name="acme")
+
+        self.assertEqual([e.project_sf_id for e in plan.entries], ["a0BMANUAL0000001"])
+
+    def test_scoped_run_reports_a_no_account_event_instead_of_filing_it(self):
+        mine = self.sf_project(name="Manual", sf_id="a0BMANUAL0000001", account_name="Acme")
+        LogTimeDayAssignment.objects.create(user=self.user, date=MONDAY, project=mine)
+        self.event(account=None, title="Mystery")
+
+        plan = plan_week(self.user, MONDAY, account_name="Acme")
+
+        self.assertEqual(plan.entries, [])
+        self.assertEqual([s.title for s in plan.unlinked_events], ["Mystery"])
+
+    def test_goal_rows_are_never_the_auto_project(self):
+        AccountProject.objects.create(account=self.account, name="A goal", sf_project_id="a0BGOAL000000001",
+                                      kind="goal", position=0)
+        AccountProject.objects.create(account=self.account, name="The project", sf_project_id="a0BPROJ000000001",
+                                      position=1)
+        self.event(account=self.account)
+
+        plan = plan_week(self.user, MONDAY)
+
+        self.assertEqual([e.project_sf_id for e in plan.entries], ["a0BPROJ000000001"])

@@ -119,3 +119,26 @@ class SyncState(models.Model):
 
     def __str__(self) -> str:
         return f"{self.user.username} — {self.provider}/{self.resource}"
+
+
+class IntegrationVote(models.Model):
+    """A user's YES / "Not now" vote on an integration that isn't configured yet.
+
+    One row per (user, provider); re-voting overwrites. Feeds the future-integrations
+    backlog — the Settings page shows it instead of a dead OAuth link.
+    """
+
+    VOTE_CHOICES = [("yes", "Yes"), ("not_now", "Not now")]
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="integration_votes")
+    provider = models.CharField(max_length=40)
+    vote = models.CharField(max_length=10, choices=VOTE_CHOICES)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = [("user", "provider")]
+        ordering = ["provider"]
+
+    def __str__(self):
+        return f"{self.user} · {self.provider} · {self.vote}"
