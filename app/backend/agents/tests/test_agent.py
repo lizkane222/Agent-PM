@@ -505,3 +505,97 @@ class VoiceTierTest(SimpleTestCase):
         from django.conf import settings as real_settings
         backend = real_settings.AGENT_BACKEND
         self.assertTrue(real_settings.AGENT_MODEL_TIERS[backend]["voice"])
+
+
+class SavedWorkflowScopeAcrossTurnTests(SimpleTestCase):
+    """
+    After load_skill succeeds, the rest of the turn may only use that workflow's
+    allowed_tools. The scope has to live on the orchestrator: each tool runs in its own
+    asyncio task with a copied context, so a ContextVar set inside load_skill would not
+    survive to the next round.
+    """
+
+    def _orchestrator(self, responses):
+        orch = AgentOrchestrator(client=FakeClient(responses))
+        return orch
+
+    async def _run(self, orch, dispatch):
+        with patch("agents.agent.mcp_server.dispatch", new=dispatch), \
+             patch("agents.agent.mcp_server.tool_schemas", return_value=DUMMY_TOOLS):
+            return [item async for item in orch.run("go", [], user=object())]
+
+    async def test_scope_set_by_load_skill_applies_to_later_rounds(self):
+        from agents.tool_policy import active_skill
+
+        seen_scopes = []
+
+        async def dispatch(name, arguments, user=None, **kw):
+            seen_scopes.append((name, active_skill.get()))
+            if name == "load_skill":
+                return {"name": "digest", "instructions": "do it", "allowed_tools": ["search_records"]}
+            return {"status": "ok"}
+
+        orch = self._orchestrator([
+            _Response([_Block("tool_use", name="load_skill", id="t1", input={"name": "digest"})]),
+            _Response([_tool_use("send_sms", id="t2", to="+1", body="x")]),
+            _Response([_Block("text", text="done")]),
+        ])
+        await self._run(orch, dispatch)
+
+        self.assertIsNone(seen_scopes[0][1])  # load_skill itself runs unscoped
+        name, scope = seen_scopes[1]
+        self.assertEqual(name, "send_sms")
+        self.assertEqual(scope.name, "digest")
+        self.assertEqual(scope.allowed_tools, frozenset({"search_records"}))
+
+    async def test_a_failed_load_skill_sets_no_scope(self):
+        from agents.tool_policy import active_skill
+
+        seen = []
+
+        async def dispatch(name, arguments, user=None, **kw):
+            seen.append(active_skill.get())
+            if name == "load_skill":
+                return {"error": "No approved workflow named 'x' is available to you."}
+            return {"status": "ok"}
+
+        orch = self._orchestrator([
+            _Response([_Block("tool_use", name="load_skill", id="t1", input={"name": "x"})]),
+            _Response([_tool_use("search_records", id="t2")]),
+            _Response([_Block("text", text="done")]),
+        ])
+        await self._run(orch, dispatch)
+        self.assertEqual(seen, [None, None])
+
+    async def test_scope_blocks_the_real_dispatcher_end_to_end(self):
+        """No patching of dispatch: the real policy refuses the out-of-scope tool."""
+        from types import SimpleNamespace
+        from agents.tool_policy import SkillScope
+
+        orch = AgentOrchestrator(client=FakeClient([]))
+        orch.skill_scope = SkillScope("digest", frozenset({"search_records"}))
+        user = SimpleNamespace(pk=99, is_authenticated=True, is_active=True, is_staff=False)
+        result = await orch._dispatch_in_scope("create_reminder", {"title": "x", "due_at": "2026-10-20T09:00:00Z"}, user)
+        self.assertEqual(result["error_code"], "not_allowed_in_skill")
+
+
+class ToolErrorsNeverLeakTests(SimpleTestCase):
+    """The chat loop must never put exception text in a tool_result or on the activity feed."""
+
+    async def test_error_results_are_flagged_and_feed_gets_only_the_code(self):
+        published = []
+
+        async def dispatch(name, arguments, user=None, **kw):
+            return {"status": "error", "error_code": "upstream_rate_limited",
+                    "message": "A connected service is rate limiting requests.", "retryable": True, "retry_after": 30}
+
+        orch = AgentOrchestrator(client=FakeClient([]))
+        with patch("agents.agent.mcp_server.dispatch", new=dispatch), \
+             patch("agents.agent._publish", side_effect=lambda *a, **k: published.append(a)):
+            results = await orch._execute_tools([_tool_use("search_records", id="t1")], user=object())
+
+        self.assertTrue(results[0]["is_error"])
+        feed_details = [a[3] for a in published]
+        self.assertIn("error: upstream_rate_limited", feed_details)
+        # The tool_call entry no longer echoes the raw arguments onto the feed.
+        self.assertEqual(published[0][1:], ("tool_call", "search_records", ""))

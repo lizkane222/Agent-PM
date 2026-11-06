@@ -360,3 +360,151 @@ describe("ArtifactsPanel", () => {
     );
   });
 });
+
+// ── Artifact images + file icon choice ───────────────────────────────────────
+
+import { apiClient } from "../../../lib/api";
+import { beforeAll, afterEach } from "vitest";
+
+describe("ArtifactsPanel — images and file icons", () => {
+  beforeAll(() => {
+    URL.createObjectURL = vi.fn(() => "blob:preview");
+    URL.revokeObjectURL = vi.fn();
+  });
+
+  // jsdom stringifies FormData before MSW sees it, so capture the real object at the axios layer.
+  let sent: Array<{ method?: string; url: string; data: unknown }> = [];
+  let interceptorId = 0;
+  beforeEach(() => {
+    sent = [];
+    interceptorId = apiClient.interceptors.request.use((config) => {
+      if (config.method !== "get") sent.push({ method: config.method, url: String(config.url), data: config.data });
+      return config;
+    });
+  });
+  afterEach(() => apiClient.interceptors.request.eject(interceptorId));
+
+  const png = () => new File(["png"], "cover.png", { type: "image/png" });
+  const formOf = (urlPart: string) => sent.find((r) => r.url.includes(urlPart) && r.data instanceof FormData)?.data as FormData | undefined;
+
+  it("picking a file opens the icon dialog instead of uploading straight away", async () => {
+    renderPanel();
+    await waitFor(() => screen.getByText("Product Spec"));
+    const input = document.querySelector('input[type="file"][multiple]') as HTMLInputElement;
+    fireEvent.change(input, { target: { files: [new File(["x"], "plan.pdf", { type: "application/pdf" })] } });
+
+    expect(await screen.findByTestId("upload-file-dialog")).toBeInTheDocument();
+    expect(screen.getByTestId("upload-icon-0-file_pdf")).toHaveAttribute("aria-pressed", "true");
+    expect(sent.filter((r) => r.method === "post")).toHaveLength(0);
+  });
+
+  it("uploads with the chosen icon and the optional image", async () => {
+    renderPanel();
+    await waitFor(() => screen.getByText("Product Spec"));
+    const input = document.querySelector('input[type="file"][multiple]') as HTMLInputElement;
+    fireEvent.change(input, { target: { files: [new File(["x"], "plan.pdf", { type: "application/pdf" })] } });
+    await screen.findByTestId("upload-file-dialog");
+
+    fireEvent.click(screen.getByTestId("upload-icon-0-file_slides"));
+    const cover = png();
+    fireEvent.change(screen.getByTestId("artifact-image-input"), { target: { files: [cover] } });
+    fireEvent.click(screen.getByRole("button", { name: "Upload" }));
+
+    await waitFor(() => expect(formOf("/artifacts/")).toBeDefined());
+    const fd = formOf("/artifacts/")!;
+    expect(fd.get("icon_key")).toBe("file_slides");
+    expect(fd.get("artifact_type")).toBe("file");
+    expect((fd.get("custom_image") as File).name).toBe("cover.png");
+    expect(screen.queryByTestId("upload-file-dialog")).not.toBeInTheDocument();
+  });
+
+  it("cancelling the dialog uploads nothing", async () => {
+    renderPanel();
+    await waitFor(() => screen.getByText("Product Spec"));
+    const input = document.querySelector('input[type="file"][multiple]') as HTMLInputElement;
+    fireEvent.change(input, { target: { files: [new File(["x"], "plan.pdf", { type: "application/pdf" })] } });
+    await screen.findByTestId("upload-file-dialog");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByTestId("upload-file-dialog")).not.toBeInTheDocument();
+    expect(sent.filter((r) => r.method === "post")).toHaveLength(0);
+  });
+
+  it("an artifact with an uploaded image shows it on its card", async () => {
+    server.use(
+      http.get("/api/v1/accounts/accounts/:id/artifacts/", () =>
+        HttpResponse.json([{ ...mockArtifact, image_url: "http://x/brand.png" }]),
+      ),
+    );
+    renderPanel();
+    await waitFor(() => screen.getByText("Product Spec"));
+    const card = screen.getByText("Product Spec").closest("[draggable]")!;
+    expect(card.querySelector('img[src="http://x/brand.png"]')).not.toBeNull();
+  });
+
+  it("an unrecognised link falls back to the site's favicon on its card", async () => {
+    server.use(
+      http.get("/api/v1/accounts/accounts/:id/artifacts/", () =>
+        HttpResponse.json([{ ...mockArtifact, url: "https://wiki.acme-corp.io/page", icon_key: "link", artifact_type: "link", mime_type: "" }]),
+      ),
+    );
+    renderPanel();
+    await waitFor(() => screen.getByText("Product Spec"));
+    const card = screen.getByText("Product Spec").closest("[draggable]")!;
+    expect(card.querySelector("img")!.getAttribute("src")).toContain("domain=wiki.acme-corp.io");
+  });
+
+  it("the edit modal sends a replacement image as multipart", async () => {
+    renderPanel();
+    await waitFor(() => screen.getByText("Product Spec"));
+    fireEvent.contextMenu(screen.getByText("Product Spec").closest("[draggable]")!);
+    fireEvent.click(screen.getByText("Edit artifact"));
+    fireEvent.change(screen.getByTestId("artifact-image-input"), { target: { files: [png()] } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() => expect(formOf("/accounts/artifacts/")).toBeDefined());
+    expect((formOf("/accounts/artifacts/")!.get("custom_image") as File).name).toBe("cover.png");
+  });
+
+  it("removing a saved image sends remove_image", async () => {
+    server.use(
+      http.get("/api/v1/accounts/accounts/:id/artifacts/", () =>
+        HttpResponse.json([{ ...mockArtifact, image_url: "http://x/brand.png" }]),
+      ),
+    );
+    renderPanel();
+    await waitFor(() => screen.getByText("Product Spec"));
+    fireEvent.contextMenu(screen.getByText("Product Spec").closest("[draggable]")!);
+    fireEvent.click(screen.getByText("Edit artifact"));
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() => expect(sent.some((r) => r.method === "patch")).toBe(true));
+    const patch = sent.find((r) => r.method === "patch")!;
+    expect((patch.data as { remove_image?: boolean }).remove_image).toBe(true);
+  });
+
+  it("the Add link modal sends the image along with the link", async () => {
+    renderPanel();
+    await waitFor(() => screen.getByText("Product Spec"));
+    fireEvent.click(screen.getByRole("button", { name: "+ Link" }));
+    fireEvent.change(screen.getByPlaceholderText("https://…"), { target: { value: "https://example.com" } });
+    fireEvent.change(screen.getByTestId("artifact-image-input"), { target: { files: [png()] } });
+    fireEvent.click(screen.getByRole("button", { name: "Add link" }));
+
+    await waitFor(() => expect(formOf("/artifacts/")).toBeDefined());
+    const fd = formOf("/artifacts/")!;
+    expect(fd.get("url")).toBe("https://example.com");
+    expect((fd.get("custom_image") as File).name).toBe("cover.png");
+  });
+
+  it("the Add link modal stays plain JSON when no image is chosen", async () => {
+    renderPanel();
+    await waitFor(() => screen.getByText("Product Spec"));
+    fireEvent.click(screen.getByRole("button", { name: "+ Link" }));
+    fireEvent.change(screen.getByPlaceholderText("https://…"), { target: { value: "https://example.com" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add link" }));
+
+    await waitFor(() => expect(sent.some((r) => r.method === "post")).toBe(true));
+    expect(sent.find((r) => r.method === "post")!.data instanceof FormData).toBe(false);
+  });
+});

@@ -86,3 +86,55 @@ export interface GmailWatchConfig {
   keywords?: string[];
   block_keywords?: string[];
 }
+
+// ── Notifications, public profile, left notes ──────────────────────────────────
+
+export type NotificationChannel = "in_app" | "push" | "sms" | "slack" | "email";
+
+export interface AppNotification {
+  id: number;
+  channel: NotificationChannel;
+  kind: string;
+  title: string;
+  body: string;
+  link: string;
+  status: "sent" | "failed" | "skipped";
+  read_at: string | null;
+  created_at: string;
+}
+
+export type PublicItemType = "artifact_link" | "artifact_file" | "note" | "record_ref";
+
+export interface PublicItemRef {
+  resource_type: string;
+  resource_id: string | number;
+  label: string;
+  url: string;
+}
+
+export interface PublicItem {
+  id: number;
+  owner: number;
+  item_type: PublicItemType;
+  title: string;
+  url: string;
+  file_url: string;
+  body: string;
+  ref: Partial<PublicItemRef>;
+  position: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Safe public header for a team member, as served by /team/members/<id>/profile/. */
+export interface MemberPublicProfile extends TeamMember {
+  is_self: boolean;
+}
+
+export interface LeftNote {
+  id: number;
+  author: number;
+  author_name: string;
+  body: string;
+  created_at: string;
+}

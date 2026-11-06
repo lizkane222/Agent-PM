@@ -346,3 +346,33 @@ def sync_google_calendar_for_user(user_id: int, source: str = "webhook"):
         sync_user_calendar(user, source=source)
     except Exception:
         logger.exception("Google Calendar webhook sync failed for user %s", user_id)
+
+
+@shared_task(name="integrations.tasks.check_meeting_notes_all_users", ignore_result=True)
+def check_meeting_notes_all_users():
+    """Every 10 minutes: pull fresh Gong / Zoom recaps into meetings for each Gmail user.
+
+    Same scan as the "GET Meeting Notes" button over a short recent window, followed by
+    an in-app notification per meeting that gained notes. One user's failure (Gmail not
+    connected, an LLM outage) never stops the rest.
+    """
+    from integrations.meeting_notes import (
+        AUTO_LOOKBACK_DAYS,
+        AUTO_MAX_SUMMARIES,
+        GmailNotConnected,
+        notify_notes_added,
+        sync_meeting_notes_from_email,
+    )
+    from integrations.models import OAuthCredential
+
+    for cred in OAuthCredential.objects.filter(provider="google", is_active=True).select_related("user"):
+        user = cred.user
+        try:
+            report = sync_meeting_notes_from_email(
+                user, days=AUTO_LOOKBACK_DAYS, max_summaries=AUTO_MAX_SUMMARIES
+            )
+            notify_notes_added(user, report)
+        except GmailNotConnected:
+            continue
+        except Exception:
+            logger.exception("Scheduled meeting-notes check failed for user %s", user.pk)

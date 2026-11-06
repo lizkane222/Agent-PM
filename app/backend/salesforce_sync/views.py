@@ -1,10 +1,13 @@
 import logging
 
 from django.db.models import Q
+from django.utils.dateparse import parse_date
 from rest_framework import viewsets, status
 from rest_framework.decorators import api_view, permission_classes, action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+
+from core.pagination import ClientPageSizePagination
 
 from .models import (
     SalesforceAccount,
@@ -116,9 +119,21 @@ class SalesforceTaskViewSet(viewsets.ReadOnlyModelViewSet):
 class SalesforceTimeEntryViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated]
     serializer_class = SalesforceTimeEntrySerializer
+    # ?page_size= so a two-month range arrives in one request instead of 50 rows a page.
+    pagination_class = ClientPageSizePagination
 
     def get_queryset(self):
-        return SalesforceTimeEntry.objects.filter(user=self.request.user)
+        qs = SalesforceTimeEntry.objects.filter(user=self.request.user).select_related("project__account", "account")
+        # Optional inclusive date window (YYYY-MM-DD). A malformed value narrows to nothing
+        # rather than falling through to "everything".
+        for param, lookup in (("date_after", "date__gte"), ("date_before", "date__lte")):
+            raw = self.request.query_params.get(param)
+            if raw:
+                parsed = parse_date(raw)
+                if parsed is None:
+                    return qs.none()
+                qs = qs.filter(**{lookup: parsed})
+        return qs
 
 
 @api_view(["POST"])
@@ -137,6 +152,15 @@ def log_time(request):
         duration_minutes=d["duration_minutes"],
         description=d.get("description", ""),
     )
+    if entry.synced_to_sf:
+        from scheduler.event_log import record_event_change
+
+        label = entry.description or "Time entry"
+        record_event_change(
+            request.user, "time_logged", None, title=label,
+            message=f'Time logged: "{label}" on {entry.date.isoformat()}',
+            extra={"log_date": entry.date.isoformat(), "minutes": entry.duration_minutes},
+        )
     return Response(SalesforceTimeEntrySerializer(entry).data, status=status.HTTP_201_CREATED)
 
 
@@ -340,3 +364,25 @@ def log_time_day_assignments(request):
             user=request.user, date=entry_date, project_id=project_id
         ).delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def time_allocation(request):
+    """
+    Where the caller's time went, by day and account, for ``?start=YYYY-MM-DD&end=YYYY-MM-DD``.
+
+    Logged time where it exists, calendar events where it does not; meetings marked did-not-attend
+    are never counted. Always the caller's own data — there is no way to ask for anyone else's.
+    """
+    from .time_allocation import MAX_RANGE_DAYS, build_allocation
+
+    start = parse_date(request.query_params.get("start", ""))
+    end = parse_date(request.query_params.get("end", ""))
+    if start is None or end is None:
+        return Response({"error": "start and end are required, as YYYY-MM-DD."}, status=status.HTTP_400_BAD_REQUEST)
+    if end < start:
+        return Response({"error": "end must not be before start."}, status=status.HTTP_400_BAD_REQUEST)
+    if (end - start).days > MAX_RANGE_DAYS:
+        return Response({"error": f"Ask for at most {MAX_RANGE_DAYS} days at a time."}, status=status.HTTP_400_BAD_REQUEST)
+    return Response(build_allocation(request.user, start, end))

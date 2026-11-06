@@ -17,6 +17,8 @@ from . import conversations as conv_api
 from .voice_agent import VoiceAgent, dispatch_confirmed
 from .voice_identity import (
     IDENTITY_PARAM,
+    LAUNCH_PARAM,
+    read_launch_token,
     REASON_USER_INACTIVE,
     IdentityError,
     load_user,
@@ -27,6 +29,7 @@ from .voice_persistence import (
     attach_user_to_voice_session,
     close_agent_session,
     load_skill_inventory,
+    load_user_timezone,
     open_agent_session,
     record_message,
     record_tool_calls,
@@ -321,6 +324,8 @@ class ConversationRelayConsumer(AsyncWebsocketConsumer):
         self._identity_error: str = ""
         self._agent_session_id: int | None = None
         self._skill_inventory: str = ""
+        self._active_workflow: dict | None = None
+        self._timezone: str = "UTC"
         self._state = VoiceTurnState()
         logger.info("ConversationRelay connected")
 
@@ -419,6 +424,13 @@ class ConversationRelayConsumer(AsyncWebsocketConsumer):
         await attach_user_to_voice_session(self._call_sid, user)
         self._agent_session_id = await open_agent_session(user, self._call_sid)
         self._skill_inventory = await load_skill_inventory(user)
+        launch_key = read_launch_token(
+            (msg.get("customParameters") or {}).get(LAUNCH_PARAM, ""), self._call_sid)
+        if launch_key:
+            from skills.voice_launch import consume_launch_context
+
+            self._active_workflow = await database_sync_to_async(consume_launch_context)(user, launch_key)
+        self._timezone = await load_user_timezone(user)
 
         # Create a Conversations thread to persist the full voice transcript.
         try:
@@ -467,6 +479,12 @@ class ConversationRelayConsumer(AsyncWebsocketConsumer):
         """Route one caller utterance: confirmation reply first, otherwise a full turn."""
         if self._identity_error:
             return
+        if self._user is None:
+            # A prompt before a verified setup frame. `_user` starts as None and only the
+            # signed identity token sets it; running a turn now would dispatch tools with
+            # no user. The dispatcher refuses that too, but nothing should get that far.
+            logger.warning("ConversationRelay: prompt before verified setup on %s; ignored", self._call_sid)
+            return
 
         await self._push_turn("user", utterance)
         if self._conversation_sid:
@@ -502,7 +520,21 @@ class ConversationRelayConsumer(AsyncWebsocketConsumer):
             )
             self._state.clear()
 
+        # Daily token budget: checked before a model turn starts, so a turn already speaking
+        # is never cut off. A confirmed action above ran without the model, so it is not gated.
+        from agents import token_budget
+
+        gate = await sync_to_async(token_budget.gate_status, thread_sensitive=True)(self._user)
+        if gate.state == "blocked":
+            await sync_to_async(token_budget.note_state, thread_sensitive=True)(self._user, gate)
+            await self._speak_once(token_budget.blocked_message(gate))
+            return
+
         await self._run_agent_turn(utterance)
+
+        after = await sync_to_async(token_budget.gate_status, thread_sensitive=True)(self._user)
+        if after.state != "ok":
+            await sync_to_async(token_budget.note_state, thread_sensitive=True)(self._user, after)
 
     async def _handle_dtmf(self, digit: str) -> None:
         """
@@ -512,7 +544,7 @@ class ConversationRelayConsumer(AsyncWebsocketConsumer):
         beats ASR for an irreversible action, which is why the spoken prompt offers it.
         """
         logger.info("ConversationRelay dtmf [%s]: %s", self._call_sid, digit)
-        if self._identity_error:
+        if self._identity_error or self._user is None:
             return
 
         if self._state.expire(asyncio.get_running_loop().time()):
@@ -583,6 +615,8 @@ class ConversationRelayConsumer(AsyncWebsocketConsumer):
             user=self._user,
             state=self._state,
             skill_inventory=self._skill_inventory,
+            tz_name=self._timezone,
+            active_workflow=self._active_workflow,
         )
         spoken_parts: list[str] = []
         usage: dict = {}

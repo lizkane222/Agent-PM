@@ -2,7 +2,7 @@
 
 from rest_framework import serializers
 
-from .models import AgentSkill, ClaudeSkill, SkillInvocation
+from .models import AgentSkill, AgentSkillAttachment, ClaudeSkill, SkillInvocation
 
 
 class SkillInvocationSerializer(serializers.ModelSerializer):
@@ -39,8 +39,27 @@ class ClaudeSkillSerializer(serializers.ModelSerializer):
         return obj.submitted_by.username if obj.submitted_by else None
 
 
+class AgentSkillAttachmentSerializer(serializers.ModelSerializer):
+    uploaded_by_username = serializers.CharField(source="uploaded_by.username", read_only=True, default=None)
+    has_text = serializers.SerializerMethodField()
+    file_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = AgentSkillAttachment
+        fields = ["id", "name", "url", "file_url", "mime_type", "file_size", "has_text",
+                  "artifact", "uploaded_by_username", "created_at"]
+        read_only_fields = fields
+
+    def get_has_text(self, obj):
+        return bool(obj.text)
+
+    def get_file_url(self, obj):
+        return obj.file.url if obj.file else ""
+
+
 class AgentSkillSerializer(serializers.ModelSerializer):
     created_by_username = serializers.SerializerMethodField(read_only=True)
+    attachments = AgentSkillAttachmentSerializer(many=True, read_only=True)
     pinned_by_me        = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
@@ -48,12 +67,13 @@ class AgentSkillSerializer(serializers.ModelSerializer):
         fields = [
             "id", "name", "description", "instructions", "allowed_tools",
             "scripts", "references", "status", "visibility",
+            "twilio_skills", "chained_skills", "context_defaults", "templates", "attachments",
             "review_verdict", "review_findings", "reviewed_at",
             "pinned_to_roles", "pinned_by_me",
             "version", "created_by_username", "created_at", "updated_at",
         ]
         read_only_fields = [
-            "id", "status", "review_verdict", "review_findings", "reviewed_at",
+            "id", "status", "review_verdict", "review_findings", "reviewed_at", "attachments",
             "pinned_by_me", "version", "created_by_username", "created_at", "updated_at",
         ]
 

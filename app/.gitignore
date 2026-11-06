@@ -49,6 +49,9 @@ cover/
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
+# Dated database backups (db.sqlite3.pre-<reason>.<timestamp>). They hold real event guests and
+# encrypted OAuth tokens and must never be committed.
+db.sqlite3.*
 instance/
 .webassets-cache
 .scrapy

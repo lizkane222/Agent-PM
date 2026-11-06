@@ -29,18 +29,29 @@ describe("useGoogleCalendarAutoSync", () => {
     setVisibility("visible");
     const onChanged = vi.fn();
     renderHook(() => useGoogleCalendarAutoSync({ enabled: true, busy: () => false, onChanged }));
-    expect(bodies).toHaveLength(0);
-    await vi.advanceTimersByTimeAsync(AUTO_SYNC_INTERVAL_MS);
+    // The on-open sync.
     await waitFor(() => expect(bodies).toEqual([{ auto: true }]));
-    await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(AUTO_SYNC_INTERVAL_MS);
+    await waitFor(() => expect(bodies).toEqual([{ auto: true }, { auto: true }]));
+    await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(2));
   });
 
-  it("does not refresh when nothing changed", async () => {
+  it("still re-reads when this call found nothing new (the background job may have applied it first)", async () => {
     setVisibility("visible");
     changed = 0;
     const onChanged = vi.fn();
     renderHook(() => useGoogleCalendarAutoSync({ enabled: true, busy: () => false, onChanged }));
+    await waitFor(() => expect(bodies).toHaveLength(1));
     await vi.advanceTimersByTimeAsync(AUTO_SYNC_INTERVAL_MS);
+    await waitFor(() => expect(bodies).toHaveLength(2));
+    await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
+  });
+
+  it("does not re-read on open when that sync changed nothing (the page just read the DB)", async () => {
+    setVisibility("visible");
+    changed = 0;
+    const onChanged = vi.fn();
+    renderHook(() => useGoogleCalendarAutoSync({ enabled: true, busy: () => false, onChanged }));
     await waitFor(() => expect(bodies).toHaveLength(1));
     expect(onChanged).not.toHaveBeenCalled();
   });
@@ -48,9 +59,10 @@ describe("useGoogleCalendarAutoSync", () => {
   it("syncs when the tab becomes visible again", async () => {
     setVisibility("visible");
     renderHook(() => useGoogleCalendarAutoSync({ enabled: true, busy: () => false, onChanged: vi.fn() }));
+    await waitFor(() => expect(bodies).toHaveLength(1)); // on open
     await vi.advanceTimersByTimeAsync(61_000);
     document.dispatchEvent(new Event("visibilitychange"));
-    await waitFor(() => expect(bodies).toHaveLength(1));
+    await waitFor(() => expect(bodies).toHaveLength(2));
   });
 
   it("skips while the tab is hidden", async () => {

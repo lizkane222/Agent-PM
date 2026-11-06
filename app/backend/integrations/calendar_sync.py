@@ -33,32 +33,52 @@ WATCH_RENEW_MARGIN = timedelta(hours=24)
 
 
 def google_credentials_for(user):
-    """google.oauth2 Credentials for the user's active Google connection, or None."""
-    from google.oauth2.credentials import Credentials
+    """google.oauth2 Credentials for the user's active Google connection, or None.
 
-    from .models import OAuthCredential
+    Delegates to `integrations.google_api.credentials_for`, which passes the stored expiry
+    (so a stale token is refreshed before a request, not after a 401) and supports saving
+    the refreshed token back.
+    """
+    from .google_api import credentials_for
 
-    cred = OAuthCredential.objects.filter(user=user, provider="google", is_active=True).first()
-    if cred is None:
-        return None
-    return Credentials(
-        token=cred.access_token,
-        refresh_token=cred.refresh_token,
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=settings.GOOGLE_CLIENT_ID,
-        client_secret=settings.GOOGLE_CLIENT_SECRET,
-        scopes=cred.scopes.split(),
-    )
+    return credentials_for(user)
+
+
+# One sync per user at a time. The 5-minute beat job, a Google push notification and the
+# open calendar page's own poll can all fire together; without this they run the same
+# pull concurrently and race each other's writes to the same rows.
+SYNC_LOCK_SECONDS = 240
+
+
+def _sync_lock_key(user) -> str:
+    return f"google-calendar-sync-lock:{user.pk}"
 
 
 def sync_user_calendar(user, *, source: str) -> dict | None:
     """Run the full Google sync for `user`. Returns change counts, or None if not connected."""
+    from django.core.cache import cache
+
+    from .google_api import GoogleConnectionRevoked, ensure_fresh, persist_refreshed
     from .views import _sync_google_calendar
 
     creds = google_credentials_for(user)
     if creds is None:
         return None
-    counts = _sync_google_calendar(user, creds) or {}
+    # cache.add is atomic: only one caller acquires the lock, the rest skip cleanly. The TTL
+    # bounds a crashed run so the next beat tick is never blocked for long.
+    if not cache.add(_sync_lock_key(user), source, timeout=SYNC_LOCK_SECONDS):
+        logger.info("Google Calendar sync for %s already running; skipping (%s)", user.pk, source)
+        return {"skipped": "already_running", "changed": 0}
+    try:
+        try:
+            ensure_fresh(user, creds)
+        except GoogleConnectionRevoked:
+            # The credential is now marked inactive, so the beat job stops retrying it.
+            return {"skipped": "google_disconnected", "changed": 0}
+        counts = _sync_google_calendar(user, creds) or {}
+        persist_refreshed(user, creds)
+    finally:
+        cache.delete(_sync_lock_key(user))
     changed = sum(counts.get(k, 0) for k in ("created", "updated", "deleted", "unlinked"))
     if changed:
         _announce(user, changed, source)

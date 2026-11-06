@@ -114,12 +114,16 @@ class TrimTests(SimpleTestCase):
 class ConfirmToolsTests(SimpleTestCase):
     EXPECTED = {
         "delete_action_item",
-        "delete_meeting",
         "delete_calendar_event",
         "send_sms",
         "make_phone_call",
         # Writes timesheet rows into Salesforce Cloud Coach on the user's behalf.
         "log_time_week",
+        # Emails a Google Calendar invitation to a named colleague.
+        "invite_to_meeting",
+        # Notifies a colleague with a private note. In-app only, but it is a message to another
+        # person, so a misheard name must be audible before it is delivered.
+        "leave_note_for",
     }
 
     def test_gate_covers_exactly_the_expected_tools(self):
@@ -153,6 +157,28 @@ class ConfirmToolsTests(SimpleTestCase):
         from agents.mcp_server import mcp_server
         params = inspect.signature(mcp_server._registry["log_time_week"]).parameters
         self.assertNotIn("confirm", params)
+
+    def test_invite_to_meeting_is_gated_as_outbound(self):
+        # It emails a real person, the same trust level as send_sms.
+        self.assertEqual(VOICE_CONFIRM_TOOLS["invite_to_meeting"].category, "outbound")
+
+    def test_invite_summary_names_everyone_who_will_be_emailed(self):
+        spoken = spoken_summary("invite_to_meeting", {"event_id": 7, "attendee_names": ["Melissa Ramirez", "Ana Diaz"]})
+        self.assertIn("Melissa Ramirez", spoken)
+        self.assertIn("Ana Diaz", spoken)
+        self.assertIn("invitation", spoken)
+
+    def test_invite_summary_reads_naturally_for_one_and_for_several(self):
+        one = spoken_summary("invite_to_meeting", {"attendee_names": ["Melissa Ramirez"]})
+        self.assertIn("Melissa Ramirez", one)
+        self.assertNotIn(" and ", one.split("invitation")[0].split("to ")[-1])
+        three = spoken_summary("invite_to_meeting", {"attendee_names": ["A One", "B Two", "C Three"]})
+        self.assertIn("A One, B Two, and C Three", three)
+
+    def test_invite_summary_survives_missing_or_malformed_arguments(self):
+        for args in ({}, {"attendee_names": None}, {"attendee_names": []}, {"attendee_names": "Melissa"}):
+            with self.subTest(args=args):
+                self.assertIn("invitation", spoken_summary("invite_to_meeting", args))
 
     def test_every_gated_name_is_a_real_registered_tool(self):
         """A rename in mcp_server.py must not silently disarm a gate."""

@@ -29,6 +29,7 @@ AUDITED_FIELDS = {
     "arr": "ARR",
     "owner": "Owner",
     "primary_contact": "Primary contact",
+    "slack_channels": "Slack channels",
 }
 
 
@@ -71,6 +72,10 @@ def _display(field: str, value) -> str:
         return getattr(value, "username", "") or str(value)
     if field == "primary_contact":
         return getattr(value, "full_name", "") or str(value)
+    if field == "slack_channels":
+        return "; ".join(
+            f"{c.get('workspace', '')} #{c.get('channel', '')} ({c.get('type', '')})" for c in (value or [])
+        )
     if isinstance(value, Decimal):
         return format(value.normalize(), "f")
     return str(value)

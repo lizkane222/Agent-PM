@@ -621,6 +621,12 @@ export default function EventDetailPanel({ event, onClose, onCollapse, linkedAcc
               </p>
             </div>
           )}
+          {event.project_name && (
+            <div data-testid="event-project">
+              <p className="text-sm text-[var(--twilio-gray-60)] uppercase tracking-wide mb-1">Project</p>
+              <p className="text-[var(--twilio-navy)] break-words">{event.project_name}</p>
+            </div>
+          )}
           {descriptionWithLinks && (
             <div>
               <p className="text-sm text-[var(--twilio-gray-60)] uppercase tracking-wide mb-1">Description</p>

@@ -49,6 +49,8 @@ export const mockContact: CustomerContact = {
   role: "Engineer",
   description: "",
   email: "bob@acme.com",
+  team: "",
+  is_main_poc: false,
   airtable_id: "",
   notes_count: 0,
   notes: [],
@@ -94,6 +96,7 @@ export const mockArtifact: AccountArtifact = {
   secondary_url: "",
   icon_key: "google_docs",
   file_url: null,
+  image_url: null,
   mime_type: "",
   file_size: null,
   description: "",
@@ -114,6 +117,7 @@ export const mockCodeArtifact: AccountArtifact = {
   secondary_url: "",
   icon_key: "file_code",
   file_url: "https://storage.example.com/utils.js",
+  image_url: null,
   mime_type: "text/javascript",
   file_size: 2048,
   description: "",
@@ -169,7 +173,15 @@ export const mockQuickLink: AccountQuickLink = {
   updated_at: "2026-01-01T00:00:00Z",
 };
 
+/** Empty per-account Activity Log response, with every category count present. */
+export function activityLogResponse(rows: Array<Record<string, unknown>> = []) {
+  const cats = ["activity", "events", "comments", "notifications", "reminders", "feedback", "tokens"];
+  const counts = Object.fromEntries(cats.map((c) => [c, rows.filter((r) => r.category === c).length]));
+  return { counts, results: rows };
+}
+
 export const accountHandlers = [
+  http.get("/api/v1/accounts/accounts/:id/activity-log/", () => HttpResponse.json(activityLogResponse())),
   http.get("/api/v1/accounts/accounts/", () =>
     HttpResponse.json({ count: 1, next: null, previous: null, results: [mockAccount] })
   ),
@@ -240,14 +252,18 @@ export const accountHandlers = [
     HttpResponse.json([mockArtifact, mockCodeArtifact])
   ),
   http.post("/api/v1/accounts/accounts/:id/artifacts/", async ({ request, params }) => {
-    const body = await request.json() as Partial<AccountArtifact>;
+    // Uploads (files, or links with an image) arrive as multipart, which jsdom hands over
+    // stringified — tests assert on those at the axios layer, so just acknowledge them.
+    const isMultipart = (request.headers.get("content-type") ?? "").includes("multipart");
+    const body = (isMultipart ? {} : await request.json()) as Partial<AccountArtifact>;
     return HttpResponse.json(
       { ...mockArtifact, id: 42, account: Number(params.id), ...body },
       { status: 201 }
     );
   }),
   http.patch("/api/v1/accounts/artifacts/:id/", async ({ request }) => {
-    const body = await request.json() as Partial<AccountArtifact>;
+    const isMultipart = (request.headers.get("content-type") ?? "").includes("multipart");
+    const body = (isMultipart ? {} : await request.json()) as Partial<AccountArtifact>;
     return HttpResponse.json({ ...mockArtifact, ...body });
   }),
   http.delete("/api/v1/accounts/artifacts/:id/", () =>

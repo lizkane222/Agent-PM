@@ -23,9 +23,9 @@ function mockOidcStatus(enabled: boolean) {
   } as Response);
 }
 
-function renderPage() {
+function renderPage(path = "/login") {
   return render(
-    <MemoryRouter>
+    <MemoryRouter initialEntries={[path]}>
       <LoginPage />
     </MemoryRouter>
   );
@@ -116,5 +116,22 @@ describe("LoginPage", () => {
     );
 
     resolve!({ access: "tok", refresh: "ref" });
+  });
+
+  it("offers only Okta SSO, with no password form, when SSO is configured", async () => {
+    mockOidcStatus(true);
+    renderPage();
+    const link = await screen.findByRole("link", { name: /sign in with okta sso/i });
+    expect(link).toHaveAttribute("href", "/oidc/authenticate/");
+    expect(screen.queryByLabelText(/^password$/i)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/username or email/i)).not.toBeInTheDocument();
+  });
+
+  it("keeps the password form reachable with ?local=1 as a break-glass path", async () => {
+    mockOidcStatus(true);
+    renderPage("/login?local=1");
+    await waitFor(() => expect(global.fetch).toHaveBeenCalled());
+    expect(await screen.findByLabelText(/^password$/i)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /sign in with okta sso/i })).toBeInTheDocument();
   });
 });

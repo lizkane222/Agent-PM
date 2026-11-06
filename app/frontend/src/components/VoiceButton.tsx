@@ -12,6 +12,22 @@ import { getAccessToken } from "../lib/auth";
 
 type VoiceState = "idle" | "connecting" | "active" | "error";
 
+// The SDK defaults to the "roaming" edge, i.e. wss://voice-js.roaming.twilio.com. Some corporate
+// DNS resolves every other edge host but returns nothing for that one, so register() never
+// settles and the button spins on "Connecting…" with no error. Pinning a concrete edge avoids
+// it. Set VITE_TWILIO_VOICE_EDGE to another edge id (e.g. "umatilla"), or to "roaming" to get
+// the SDK's automatic selection back.
+const DEFAULT_VOICE_EDGE = "ashburn";
+
+// How long to wait for the device to register before giving up. The SDK retries a failed
+// signaling connection internally and never rejects, so without a deadline a blocked network
+// is indistinguishable from "still connecting".
+const REGISTER_TIMEOUT_MS = 15_000;
+
+function voiceEdge(): string {
+  return (import.meta.env.VITE_TWILIO_VOICE_EDGE as string | undefined)?.trim() || DEFAULT_VOICE_EDGE;
+}
+
 export interface VoiceTurn {
   role: "user" | "assistant";
   content: string;
@@ -24,8 +40,20 @@ interface VoiceButtonProps {
   onTranscript?: (transcript: string) => void;
 }
 
+/** Dispatched by "Use in Voice": start a call that already knows what the user wants. */
+export const VOICE_LAUNCH_EVENT = "voice-launch";
+export interface VoiceLaunchDetail {
+  /** Server-side launch context (see POST /skills/.../voice-start/); rides the call as `ctx`. */
+  key?: string;
+  /** Plain-language brief. Shown on screen so the user can read it if the context didn't take. */
+  script: string;
+  title?: string;
+}
+
 export default function VoiceButton({ onTurn, onTranscript }: VoiceButtonProps) {
   const [state, setState] = useState<VoiceState>("idle");
+  const [brief, setBrief] = useState<VoiceLaunchDetail | null>(null);
+  const pendingKeyRef = useRef<string | undefined>(undefined);
   const [errorMessage, setErrorMessage] = useState<string>("");
   const [duration, setDuration] = useState(0);
   const deviceRef = useRef<Device | null>(null);
@@ -47,7 +75,7 @@ export default function VoiceButton({ onTurn, onTranscript }: VoiceButtonProps) 
     if (deviceRef.current) return deviceRef.current;
 
     const { data } = await realtimeApi.getSyncToken();
-    const device = new Device(data.token, { logLevel: "warn" });
+    const device = new Device(data.token, { logLevel: "warn", edge: voiceEdge() });
 
     device.on("error", (err: Error) => {
       setErrorMessage(err.message);
@@ -59,7 +87,28 @@ export default function VoiceButton({ onTurn, onTranscript }: VoiceButtonProps) 
       device.updateToken(refreshed.token);
     });
 
-    await device.register();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        device.register(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("register timed out")), REGISTER_TIMEOUT_MS);
+        }),
+      ]);
+    } catch (err) {
+      // Stop the SDK retrying in the background, and never leave a half-registered device
+      // behind for the next click to reuse.
+      device.destroy();
+      if (err instanceof Error && err.message === "register timed out") {
+        throw new Error(
+          "Voice could not reach Twilio. Check your network or DNS " +
+            "(the call signaling host may be blocked), then try again.",
+        );
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
     deviceRef.current = device;
     return device;
   }, []);
@@ -93,7 +142,10 @@ export default function VoiceButton({ onTurn, onTranscript }: VoiceButtonProps) 
       setDuration(0);
 
       const device = await initDevice();
-      const call = await device.connect({ params: {} });
+      // Only a short key travels with the call; the server looks up what it points at.
+      const key = pendingKeyRef.current;
+      pendingKeyRef.current = undefined;
+      const call = await device.connect({ params: key ? { ctx: key } : {} });
 
       call.on("accept", (acceptedCall: Call) => {
         setState("active");
@@ -128,6 +180,21 @@ export default function VoiceButton({ onTurn, onTranscript }: VoiceButtonProps) 
     }
   }, [initDevice, openTranscriptSocket, onTranscript]);
 
+  // "Use in Voice" from a skill: remember the launch key, show the script, and start.
+  const startCallRef = useRef(startCall);
+  startCallRef.current = startCall;
+  useEffect(() => {
+    function onLaunch(e: Event) {
+      const detail = (e as CustomEvent<VoiceLaunchDetail>).detail;
+      if (!detail?.script) return;
+      pendingKeyRef.current = detail.key;
+      setBrief(detail);
+      void startCallRef.current();
+    }
+    window.addEventListener(VOICE_LAUNCH_EVENT, onLaunch);
+    return () => window.removeEventListener(VOICE_LAUNCH_EVENT, onLaunch);
+  }, []);
+
   const endCall = useCallback(() => {
     deviceRef.current?.disconnectAll();
   }, []);
@@ -138,6 +205,33 @@ export default function VoiceButton({ onTurn, onTranscript }: VoiceButtonProps) 
     return `${m}:${s}`;
   };
 
+  const briefPanel = brief ? (
+    <div
+      data-testid="voice-script"
+      className="fixed bottom-20 right-4 z-[300] w-[360px] max-w-[92vw] rounded-lg border border-indigo-200 bg-white p-3 shadow-xl"
+    >
+      <div className="flex items-start justify-between gap-2">
+        <div className="text-xs font-semibold text-indigo-700">
+          {brief.key ? "Voice session started from a skill" : "Script to follow"}
+          {brief.title ? ` — ${brief.title}` : ""}
+        </div>
+        <button onClick={() => setBrief(null)} aria-label="Close script" className="text-gray-400 hover:text-gray-600">×</button>
+      </div>
+      <p className="mt-1 text-xs text-gray-500">
+        {brief.key
+          ? "The agent already has this. If it doesn't act on it, read it aloud:"
+          : "Read this to the agent once connected:"}
+      </p>
+      <p className="mt-1.5 max-h-40 overflow-y-auto whitespace-pre-wrap text-sm text-gray-800">{brief.script}</p>
+      <button
+        onClick={() => void navigator.clipboard?.writeText(brief.script)}
+        className="mt-2 text-xs font-medium text-indigo-600 hover:underline"
+      >
+        Copy script
+      </button>
+    </div>
+  ) : null;
+
   if (state === "error") {
     return (
       <div className="flex items-center gap-2">
@@ -145,6 +239,7 @@ export default function VoiceButton({ onTurn, onTranscript }: VoiceButtonProps) 
         <button onClick={() => setState("idle")} className="text-sm text-indigo-600 hover:underline">
           Dismiss
         </button>
+        {briefPanel}
       </div>
     );
   }
@@ -165,23 +260,29 @@ export default function VoiceButton({ onTurn, onTranscript }: VoiceButtonProps) 
         >
           End Call
         </button>
+        {briefPanel}
       </div>
     );
   }
 
   if (state === "connecting") {
     return (
-      <button
-        disabled
-        className="inline-flex items-center gap-2 rounded-md bg-indigo-400 px-4 py-2 text-sm font-medium text-white cursor-not-allowed"
-      >
-        <span className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
-        Connecting…
-      </button>
+      <>
+        <button
+          disabled
+          className="inline-flex items-center gap-2 rounded-md bg-indigo-400 px-4 py-2 text-sm font-medium text-white cursor-not-allowed"
+        >
+          <span className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full" />
+          Connecting…
+        </button>
+        {briefPanel}
+      </>
     );
   }
 
   return (
+    <>
+    {briefPanel}
     <button
       onClick={startCall}
       className="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500"
@@ -192,5 +293,6 @@ export default function VoiceButton({ onTurn, onTranscript }: VoiceButtonProps) 
       </svg>
       Start Voice Session
     </button>
+    </>
   );
 }

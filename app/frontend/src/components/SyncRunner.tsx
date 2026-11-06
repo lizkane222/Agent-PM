@@ -6,144 +6,144 @@ const SCHEDULED_ITEMS_KEY = "scheduledActionItems";
 
 type Phase = "idle" | "crouch" | "running" | "celebrate" | "walking";
 
-// ── Side-profile stick figure ─────────────────────────────────────────────────
+// ── Side-profile stick figure (temporarily disabled) ──────────────────────────
 // ViewBox: 40 wide × 52 tall. Ground line is y=48.
 // All poses are drawn from the side (facing right by default).
 
-function Figure({ phase, frame, color = "white" }: { phase: Phase; frame: number; color?: string }) {
-  const f = frame % 2;
-  const s = { stroke: color, strokeWidth: "2", strokeLinecap: "round" as const, fill: "none" };
-
-  if (phase === "idle") {
-    // Side profile standing, right arm waves up/down
-    const armY = f === 0 ? 22 : 18;
-    return (
-      <svg viewBox="0 0 40 52" width="32" height="52" overflow="visible">
-        {/* head */}
-        <circle cx="20" cy="7" r="5" {...s} />
-        {/* torso */}
-        <line x1="20" y1="12" x2="20" y2="30" {...s} />
-        {/* rear arm (left, behind body) — slightly transparent */}
-        <line x1="20" y1="17" x2="13" y2="24" stroke={color} strokeWidth="2" strokeLinecap="round" opacity="0.5" />
-        {/* front arm waves */}
-        <line x1="20" y1="17" x2="28" y2={armY} {...s} />
-        {/* rear leg */}
-        <line x1="20" y1="30" x2="15" y2="42" stroke={color} strokeWidth="2" strokeLinecap="round" opacity="0.5" />
-        <line x1="15" y1="42" x2="13" y2="48" stroke={color} strokeWidth="2" strokeLinecap="round" opacity="0.5" />
-        {/* front leg */}
-        <line x1="20" y1="30" x2="23" y2="42" {...s} />
-        <line x1="23" y1="42" x2="26" y2="48" {...s} />
-      </svg>
-    );
-  }
-
-  if (phase === "crouch") {
-    // Crouched at start: body leaning forward, one knee up
-    return (
-      <svg viewBox="0 0 40 52" width="32" height="52" overflow="visible">
-        <circle cx="23" cy="18" r="5" {...s} />
-        {/* leaning torso */}
-        <line x1="22" y1="23" x2="18" y2="34" {...s} />
-        {/* front arm reaching forward */}
-        <line x1="21" y1="26" x2="30" y2="24" {...s} />
-        {/* rear arm back */}
-        <line x1="21" y1="26" x2="12" y2="28" stroke={color} strokeWidth="2" strokeLinecap="round" opacity="0.5" />
-        {/* front leg — knee up */}
-        <line x1="18" y1="34" x2="24" y2="40" {...s} />
-        <line x1="24" y1="40" x2="28" y2="48" {...s} />
-        {/* rear leg — extended back */}
-        <line x1="18" y1="34" x2="12" y2="42" stroke={color} strokeWidth="2" strokeLinecap="round" opacity="0.5" />
-        <line x1="12" y1="42" x2="10" y2="48" stroke={color} strokeWidth="2" strokeLinecap="round" opacity="0.5" />
-      </svg>
-    );
-  }
-
-  if (phase === "running") {
-    // Two alternating frames — classic side-on sprint
-    return (
-      <svg viewBox="0 0 40 52" width="32" height="52" overflow="visible">
-        {/* head tilted slightly forward */}
-        <circle cx="22" cy="8" r="5" {...s} />
-        {/* torso leaning forward */}
-        <line x1="21" y1="13" x2="19" y2="28" {...s} />
-        {f === 0 ? (
-          <>
-            {/* front arm swings back (up-back) */}
-            <line x1="20" y1="18" x2="13" y2="13" {...s} />
-            {/* rear arm swings forward (down-front) */}
-            <line x1="20" y1="18" x2="28" y2="22" stroke={color} strokeWidth="2" strokeLinecap="round" opacity="0.55" />
-            {/* front leg: thigh forward, shin down */}
-            <line x1="19" y1="28" x2="26" y2="36" {...s} />
-            <line x1="26" y1="36" x2="28" y2="48" {...s} />
-            {/* rear leg: thigh back, shin kicks up */}
-            <line x1="19" y1="28" x2="12" y2="36" stroke={color} strokeWidth="2" strokeLinecap="round" opacity="0.55" />
-            <line x1="12" y1="36" x2="16" y2="42" stroke={color} strokeWidth="2" strokeLinecap="round" opacity="0.55" />
-          </>
-        ) : (
-          <>
-            {/* front arm swings forward (down-front) */}
-            <line x1="20" y1="18" x2="28" y2="14" {...s} />
-            {/* rear arm swings back */}
-            <line x1="20" y1="18" x2="12" y2="22" stroke={color} strokeWidth="2" strokeLinecap="round" opacity="0.55" />
-            {/* front leg: knee lifted high */}
-            <line x1="19" y1="28" x2="25" y2="34" {...s} />
-            <line x1="25" y1="34" x2="22" y2="44" {...s} />
-            {/* rear leg: fully extended back, toe off */}
-            <line x1="19" y1="28" x2="11" y2="38" stroke={color} strokeWidth="2" strokeLinecap="round" opacity="0.55" />
-            <line x1="11" y1="38" x2="14" y2="48" stroke={color} strokeWidth="2" strokeLinecap="round" opacity="0.55" />
-          </>
-        )}
-      </svg>
-    );
-  }
-
-  if (phase === "celebrate") {
-    // Facing forward (both arms & legs visible symmetrically), jumping
-    const bounce = f === 0;
-    const by = bounce ? 0 : 3; // vertical offset for jump
-    return (
-      <svg viewBox="0 0 40 52" width="32" height="52" overflow="visible">
-        <circle cx="20" cy={7 - by} r="5" stroke="#fbbf24" strokeWidth="2" fill="none" />
-        <line x1="20" y1={12 - by} x2="20" y2={28 - by} stroke="#fbbf24" strokeWidth="2" strokeLinecap="round" />
-        {/* both arms raised in V */}
-        <line x1="20" y1={16 - by} x2="10" y2={9 - by} stroke="#fbbf24" strokeWidth="2" strokeLinecap="round" />
-        <line x1="20" y1={16 - by} x2="30" y2={9 - by} stroke="#fbbf24" strokeWidth="2" strokeLinecap="round" />
-        {/* legs apart */}
-        <line x1="20" y1={28 - by} x2="13" y2={42 - by} stroke="#fbbf24" strokeWidth="2" strokeLinecap="round" />
-        <line x1="13" y1={42 - by} x2="11" y2={48} stroke="#fbbf24" strokeWidth="2" strokeLinecap="round" />
-        <line x1="20" y1={28 - by} x2="27" y2={42 - by} stroke="#fbbf24" strokeWidth="2" strokeLinecap="round" />
-        <line x1="27" y1={42 - by} x2="29" y2={48} stroke="#fbbf24" strokeWidth="2" strokeLinecap="round" />
-      </svg>
-    );
-  }
-
-  // walking back — side profile, facing left (scaleX flip), calmer gait
-  return (
-    <svg viewBox="0 0 40 52" width="32" height="52" overflow="visible" style={{ transform: "scaleX(-1)" }}>
-      <circle cx="20" cy="8" r="5" stroke="rgba(255,255,255,0.65)" strokeWidth="2" fill="none" />
-      <line x1="20" y1="13" x2="20" y2="29" stroke="rgba(255,255,255,0.65)" strokeWidth="2" strokeLinecap="round" />
-      {f === 0 ? (
-        <>
-          <line x1="20" y1="18" x2="13" y2="23" stroke="rgba(255,255,255,0.65)" strokeWidth="2" strokeLinecap="round" />
-          <line x1="20" y1="18" x2="26" y2="21" stroke="rgba(255,255,255,0.35)" strokeWidth="2" strokeLinecap="round" />
-          <line x1="20" y1="29" x2="25" y2="40" stroke="rgba(255,255,255,0.65)" strokeWidth="2" strokeLinecap="round" />
-          <line x1="25" y1="40" x2="27" y2="48" stroke="rgba(255,255,255,0.65)" strokeWidth="2" strokeLinecap="round" />
-          <line x1="20" y1="29" x2="15" y2="38" stroke="rgba(255,255,255,0.35)" strokeWidth="2" strokeLinecap="round" />
-          <line x1="15" y1="38" x2="14" y2="48" stroke="rgba(255,255,255,0.35)" strokeWidth="2" strokeLinecap="round" />
-        </>
-      ) : (
-        <>
-          <line x1="20" y1="18" x2="27" y2="23" stroke="rgba(255,255,255,0.65)" strokeWidth="2" strokeLinecap="round" />
-          <line x1="20" y1="18" x2="14" y2="21" stroke="rgba(255,255,255,0.35)" strokeWidth="2" strokeLinecap="round" />
-          <line x1="20" y1="29" x2="14" y2="40" stroke="rgba(255,255,255,0.65)" strokeWidth="2" strokeLinecap="round" />
-          <line x1="14" y1="40" x2="13" y2="48" stroke="rgba(255,255,255,0.65)" strokeWidth="2" strokeLinecap="round" />
-          <line x1="20" y1="29" x2="25" y2="38" stroke="rgba(255,255,255,0.35)" strokeWidth="2" strokeLinecap="round" />
-          <line x1="25" y1="38" x2="26" y2="48" stroke="rgba(255,255,255,0.35)" strokeWidth="2" strokeLinecap="round" />
-        </>
-      )}
-    </svg>
-  );
-}
+// function Figure({ phase, frame, color = "white" }: { phase: Phase; frame: number; color?: string }) {
+//   const f = frame % 2;
+//   const s = { stroke: color, strokeWidth: "2", strokeLinecap: "round" as const, fill: "none" };
+//
+//   if (phase === "idle") {
+//     // Side profile standing, right arm waves up/down
+//     const armY = f === 0 ? 22 : 18;
+//     return (
+//       <svg viewBox="0 0 40 52" width="32" height="52" overflow="visible">
+//         {/* head */}
+//         <circle cx="20" cy="7" r="5" {...s} />
+//         {/* torso */}
+//         <line x1="20" y1="12" x2="20" y2="30" {...s} />
+//         {/* rear arm (left, behind body) — slightly transparent */}
+//         <line x1="20" y1="17" x2="13" y2="24" stroke={color} strokeWidth="2" strokeLinecap="round" opacity="0.5" />
+//         {/* front arm waves */}
+//         <line x1="20" y1="17" x2="28" y2={armY} {...s} />
+//         {/* rear leg */}
+//         <line x1="20" y1="30" x2="15" y2="42" stroke={color} strokeWidth="2" strokeLinecap="round" opacity="0.5" />
+//         <line x1="15" y1="42" x2="13" y2="48" stroke={color} strokeWidth="2" strokeLinecap="round" opacity="0.5" />
+//         {/* front leg */}
+//         <line x1="20" y1="30" x2="23" y2="42" {...s} />
+//         <line x1="23" y1="42" x2="26" y2="48" {...s} />
+//       </svg>
+//     );
+//   }
+//
+//   if (phase === "crouch") {
+//     // Crouched at start: body leaning forward, one knee up
+//     return (
+//       <svg viewBox="0 0 40 52" width="32" height="52" overflow="visible">
+//         <circle cx="23" cy="18" r="5" {...s} />
+//         {/* leaning torso */}
+//         <line x1="22" y1="23" x2="18" y2="34" {...s} />
+//         {/* front arm reaching forward */}
+//         <line x1="21" y1="26" x2="30" y2="24" {...s} />
+//         {/* rear arm back */}
+//         <line x1="21" y1="26" x2="12" y2="28" stroke={color} strokeWidth="2" strokeLinecap="round" opacity="0.5" />
+//         {/* front leg — knee up */}
+//         <line x1="18" y1="34" x2="24" y2="40" {...s} />
+//         <line x1="24" y1="40" x2="28" y2="48" {...s} />
+//         {/* rear leg — extended back */}
+//         <line x1="18" y1="34" x2="12" y2="42" stroke={color} strokeWidth="2" strokeLinecap="round" opacity="0.5" />
+//         <line x1="12" y1="42" x2="10" y2="48" stroke={color} strokeWidth="2" strokeLinecap="round" opacity="0.5" />
+//       </svg>
+//     );
+//   }
+//
+//   if (phase === "running") {
+//     // Two alternating frames — classic side-on sprint
+//     return (
+//       <svg viewBox="0 0 40 52" width="32" height="52" overflow="visible">
+//         {/* head tilted slightly forward */}
+//         <circle cx="22" cy="8" r="5" {...s} />
+//         {/* torso leaning forward */}
+//         <line x1="21" y1="13" x2="19" y2="28" {...s} />
+//         {f === 0 ? (
+//           <>
+//             {/* front arm swings back (up-back) */}
+//             <line x1="20" y1="18" x2="13" y2="13" {...s} />
+//             {/* rear arm swings forward (down-front) */}
+//             <line x1="20" y1="18" x2="28" y2="22" stroke={color} strokeWidth="2" strokeLinecap="round" opacity="0.55" />
+//             {/* front leg: thigh forward, shin down */}
+//             <line x1="19" y1="28" x2="26" y2="36" {...s} />
+//             <line x1="26" y1="36" x2="28" y2="48" {...s} />
+//             {/* rear leg: thigh back, shin kicks up */}
+//             <line x1="19" y1="28" x2="12" y2="36" stroke={color} strokeWidth="2" strokeLinecap="round" opacity="0.55" />
+//             <line x1="12" y1="36" x2="16" y2="42" stroke={color} strokeWidth="2" strokeLinecap="round" opacity="0.55" />
+//           </>
+//         ) : (
+//           <>
+//             {/* front arm swings forward (down-front) */}
+//             <line x1="20" y1="18" x2="28" y2="14" {...s} />
+//             {/* rear arm swings back */}
+//             <line x1="20" y1="18" x2="12" y2="22" stroke={color} strokeWidth="2" strokeLinecap="round" opacity="0.55" />
+//             {/* front leg: knee lifted high */}
+//             <line x1="19" y1="28" x2="25" y2="34" {...s} />
+//             <line x1="25" y1="34" x2="22" y2="44" {...s} />
+//             {/* rear leg: fully extended back, toe off */}
+//             <line x1="19" y1="28" x2="11" y2="38" stroke={color} strokeWidth="2" strokeLinecap="round" opacity="0.55" />
+//             <line x1="11" y1="38" x2="14" y2="48" stroke={color} strokeWidth="2" strokeLinecap="round" opacity="0.55" />
+//           </>
+//         )}
+//       </svg>
+//     );
+//   }
+//
+//   if (phase === "celebrate") {
+//     // Facing forward (both arms & legs visible symmetrically), jumping
+//     const bounce = f === 0;
+//     const by = bounce ? 0 : 3; // vertical offset for jump
+//     return (
+//       <svg viewBox="0 0 40 52" width="32" height="52" overflow="visible">
+//         <circle cx="20" cy={7 - by} r="5" stroke="#fbbf24" strokeWidth="2" fill="none" />
+//         <line x1="20" y1={12 - by} x2="20" y2={28 - by} stroke="#fbbf24" strokeWidth="2" strokeLinecap="round" />
+//         {/* both arms raised in V */}
+//         <line x1="20" y1={16 - by} x2="10" y2={9 - by} stroke="#fbbf24" strokeWidth="2" strokeLinecap="round" />
+//         <line x1="20" y1={16 - by} x2="30" y2={9 - by} stroke="#fbbf24" strokeWidth="2" strokeLinecap="round" />
+//         {/* legs apart */}
+//         <line x1="20" y1={28 - by} x2="13" y2={42 - by} stroke="#fbbf24" strokeWidth="2" strokeLinecap="round" />
+//         <line x1="13" y1={42 - by} x2="11" y2={48} stroke="#fbbf24" strokeWidth="2" strokeLinecap="round" />
+//         <line x1="20" y1={28 - by} x2="27" y2={42 - by} stroke="#fbbf24" strokeWidth="2" strokeLinecap="round" />
+//         <line x1="27" y1={42 - by} x2="29" y2={48} stroke="#fbbf24" strokeWidth="2" strokeLinecap="round" />
+//       </svg>
+//     );
+//   }
+//
+//   // walking back — side profile, facing left (scaleX flip), calmer gait
+//   return (
+//     <svg viewBox="0 0 40 52" width="32" height="52" overflow="visible" style={{ transform: "scaleX(-1)" }}>
+//       <circle cx="20" cy="8" r="5" stroke="rgba(255,255,255,0.65)" strokeWidth="2" fill="none" />
+//       <line x1="20" y1="13" x2="20" y2="29" stroke="rgba(255,255,255,0.65)" strokeWidth="2" strokeLinecap="round" />
+//       {f === 0 ? (
+//         <>
+//           <line x1="20" y1="18" x2="13" y2="23" stroke="rgba(255,255,255,0.65)" strokeWidth="2" strokeLinecap="round" />
+//           <line x1="20" y1="18" x2="26" y2="21" stroke="rgba(255,255,255,0.35)" strokeWidth="2" strokeLinecap="round" />
+//           <line x1="20" y1="29" x2="25" y2="40" stroke="rgba(255,255,255,0.65)" strokeWidth="2" strokeLinecap="round" />
+//           <line x1="25" y1="40" x2="27" y2="48" stroke="rgba(255,255,255,0.65)" strokeWidth="2" strokeLinecap="round" />
+//           <line x1="20" y1="29" x2="15" y2="38" stroke="rgba(255,255,255,0.35)" strokeWidth="2" strokeLinecap="round" />
+//           <line x1="15" y1="38" x2="14" y2="48" stroke="rgba(255,255,255,0.35)" strokeWidth="2" strokeLinecap="round" />
+//         </>
+//       ) : (
+//         <>
+//           <line x1="20" y1="18" x2="27" y2="23" stroke="rgba(255,255,255,0.65)" strokeWidth="2" strokeLinecap="round" />
+//           <line x1="20" y1="18" x2="14" y2="21" stroke="rgba(255,255,255,0.35)" strokeWidth="2" strokeLinecap="round" />
+//           <line x1="20" y1="29" x2="14" y2="40" stroke="rgba(255,255,255,0.65)" strokeWidth="2" strokeLinecap="round" />
+//           <line x1="14" y1="40" x2="13" y2="48" stroke="rgba(255,255,255,0.65)" strokeWidth="2" strokeLinecap="round" />
+//           <line x1="20" y1="29" x2="25" y2="38" stroke="rgba(255,255,255,0.35)" strokeWidth="2" strokeLinecap="round" />
+//           <line x1="25" y1="38" x2="26" y2="48" stroke="rgba(255,255,255,0.35)" strokeWidth="2" strokeLinecap="round" />
+//         </>
+//       )}
+//     </svg>
+//   );
+// }
 
 // ── Finish line SVG ───────────────────────────────────────────────────────────
 
@@ -200,7 +200,7 @@ async function runFullSync(): Promise<void> {
 
 export default function SyncRunner() {
   const [phase, setPhase] = useState<Phase>("idle");
-  const [frame, setFrame] = useState(0);
+  const [, setFrame] = useState(0);
   const [hovering, setHovering] = useState(false);
   const [x, setX] = useState(0); // 0–100 % across track
   const [trackH, setTrackH] = useState(64);
@@ -466,7 +466,7 @@ export default function SyncRunner() {
           }}>all synced!</div>
         )}
 
-        {/* The figure — scaled to 0.7× anchored at its bottom-left foot */}
+        {/* The figure — temporarily hidden
         <div style={{
           position: "absolute",
           bottom: "5px",
@@ -479,6 +479,7 @@ export default function SyncRunner() {
         }}>
           <Figure phase={phase} frame={frame} color={isCelebrating ? "#fbbf24" : "white"} />
         </div>
+        */}
       </div>
 
       <style>{`

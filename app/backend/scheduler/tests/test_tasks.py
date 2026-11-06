@@ -141,3 +141,50 @@ class DeliverDueRemindersTests(TestCase):
         reminder = _make_reminder(self.user, status="sent")
         deliver_due_reminders()
         MockClient.return_value.messages.create.assert_not_called()
+
+
+class ReminderClaimTests(TestCase):
+    """A due reminder is delivered exactly once, even when two runs overlap."""
+
+    def setUp(self):
+        self.user = _make_user()
+
+    @override_settings(**TWILIO_SETTINGS)
+    @patch("twilio.rest.Client")
+    @patch("scheduler.tasks._send_in_app")
+    def test_a_reminder_claimed_by_another_run_is_not_delivered_again(self, mock_in_app, MockClient):
+        from scheduler.models import Reminder
+        from scheduler import tasks
+
+        reminder = _make_reminder(self.user)
+        original = tasks._dispatch_reminder
+        dispatched = []
+
+        def overlapping_run(r):
+            # While this run is delivering, a second run starts and sees the same row.
+            dispatched.append(r.pk)
+            if len(dispatched) == 1:
+                tasks.deliver_due_reminders()
+            return original(r)
+
+        with patch("scheduler.tasks._dispatch_reminder", side_effect=overlapping_run):
+            tasks.deliver_due_reminders()
+
+        self.assertEqual(dispatched, [reminder.pk])
+        MockClient.return_value.messages.create.assert_called_once()
+        self.assertEqual(Reminder.objects.get(pk=reminder.pk).status, "sent")
+
+    @override_settings(**TWILIO_SETTINGS)
+    @patch("twilio.rest.Client")
+    @patch("scheduler.tasks._send_in_app")
+    def test_a_channel_failure_is_logged_and_does_not_re_arm(self, mock_in_app, MockClient):
+        from scheduler.models import Reminder
+
+        MockClient.return_value.messages.create.side_effect = RuntimeError("twilio down")
+        reminder = _make_reminder(self.user)
+        with self.assertLogs("scheduler.tasks", level="WARNING") as logs:
+            deliver_due_reminders()
+        self.assertEqual(Reminder.objects.get(pk=reminder.pk).status, "sent")
+        self.assertTrue(any("channel failures" in line for line in logs.output))
+        deliver_due_reminders()  # a second run must not retry it
+        self.assertEqual(MockClient.return_value.messages.create.call_count, 1)

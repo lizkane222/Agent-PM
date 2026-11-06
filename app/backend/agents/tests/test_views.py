@@ -337,14 +337,24 @@ class ClassifyAgentErrorTest(SimpleTestCase):
         self.assertIn("misconfigured", message)
         self.assertNotIn("Re-authenticate", message)
 
-    def test_auth_errors_mention_key_or_role(self):
+    @override_settings(AGENT_BACKEND="gateway",
+                       AGENT_GATEWAY_TOKEN_COMMAND="/bin/token-helper")
+    def test_gateway_auth_errors_name_the_gateway_not_bedrock(self):
         for cls, code in (
             (anthropic.AuthenticationError, 401),
             (anthropic.PermissionDeniedError, 403),
         ):
             with self.subTest(cls=cls.__name__):
                 msg = classify_agent_error(self._anthropic(cls, code), "ref2")
-                self.assertIn("access denied", msg.lower())
+                self.assertIn("LiteLLM gateway", msg)
+                self.assertIn("/bin/token-helper", msg)
+                self.assertNotIn("Bedrock", msg)
+
+    @override_settings(AGENT_BACKEND="bedrock")
+    def test_bedrock_auth_errors_mention_the_role(self):
+        msg = classify_agent_error(self._anthropic(anthropic.PermissionDeniedError, 403), "r")
+        self.assertIn("access denied", msg.lower())
+        self.assertIn("Bedrock", msg)
 
     def test_rate_limit(self):
         msg = classify_agent_error(self._anthropic(anthropic.RateLimitError, 429), "r")
@@ -369,6 +379,42 @@ class ClassifyAgentErrorTest(SimpleTestCase):
         msg = classify_agent_error(ImproperlyConfigured("no model"), "ref4")
         self.assertIn("misconfigured", msg.lower())
 
+    def test_rate_limit_reports_the_servers_retry_after(self):
+        exc = anthropic.RateLimitError(
+            "slow down",
+            response=httpx.Response(429, headers={"retry-after": "17"},
+                                    request=httpx.Request("POST", "https://example.com")),
+            body=None,
+        )
+        self.assertIn("about 17 seconds", classify_agent_error(exc, "r"))
+
+    def test_rate_limit_retry_after_ms_is_converted(self):
+        exc = anthropic.RateLimitError(
+            "slow down",
+            response=httpx.Response(429, headers={"retry-after-ms": "4500"},
+                                    request=httpx.Request("POST", "https://example.com")),
+            body=None,
+        )
+        self.assertIn("about 4 seconds", classify_agent_error(exc, "r"))
+
+    def test_overloaded_529_is_reported_as_overloaded(self):
+        msg = classify_agent_error(self._anthropic(anthropic.APIStatusError, 529), "r")
+        self.assertIn("overloaded", msg.lower())
+
+    def test_timeout_is_not_blamed_on_the_vpn(self):
+        exc = anthropic.APITimeoutError(request=httpx.Request("POST", "https://example.com"))
+        msg = classify_agent_error(exc, "r")
+        self.assertIn("too long", msg.lower())
+        self.assertNotIn("vpn", msg.lower())
+
+    def test_context_too_long_suggests_a_new_session(self):
+        exc = anthropic.BadRequestError(
+            "prompt is too long: 250000 tokens > 200000 maximum",
+            response=httpx.Response(400, request=httpx.Request("POST", "https://example.com")),
+            body=None,
+        )
+        self.assertIn("new session", classify_agent_error(exc, "r").lower())
+
     def test_unknown_error_falls_back_but_still_carries_the_ref(self):
         msg = classify_agent_error(RuntimeError("kaboom"), "deadbeef")
         self.assertIn("unexpected", msg.lower())
@@ -386,3 +432,59 @@ class ClassifyAgentErrorTest(SimpleTestCase):
         for exc in cases:
             with self.subTest(exc=type(exc).__name__):
                 self.assertIn("ref9", classify_agent_error(exc, "ref9"))
+
+
+class AgentStreamThrottleTests(APITestCase):
+    """The agent_stream scope (30/min) applies to the streaming send endpoint."""
+
+    def setUp(self):
+        from django.core.cache import cache
+        cache.clear()
+        self.addCleanup(cache.clear)
+        self.user = User.objects.create_user("throttled", password="x")
+        self.client.force_authenticate(user=self.user)
+
+    def test_send_is_capped_by_the_agent_stream_rate(self):
+        from unittest.mock import patch as _patch
+        from django.test import override_settings as _ov
+        from rest_framework.settings import api_settings
+
+        rates = {**api_settings.DEFAULT_THROTTLE_RATES, "agent_stream": "2/min"}
+
+        class _Quiet:
+            def __init__(self, *a, **k):
+                pass
+
+            async def run(self, *a, **k):
+                yield "ok"
+                yield {"__token_usage__": True, "input_tokens": 0, "output_tokens": 0, "model": "m"}
+
+        with _patch("agents.views.AgentOrchestrator", _Quiet), \
+             _patch("rest_framework.throttling.ScopedRateThrottle.THROTTLE_RATES", rates):
+            codes = [self.client.post("/api/v1/agents/sessions/send/", {"message": "hi"}, format="json").status_code
+                     for _ in range(3)]
+        self.assertEqual(codes[:2], [200, 200])
+        self.assertEqual(codes[2], 429)
+
+    def test_other_session_routes_are_not_scoped(self):
+        for _ in range(5):
+            self.assertEqual(self.client.get("/api/v1/agents/sessions/").status_code, 200)
+
+
+class AgentToolCatalogViewTests(APITestCase):
+    URL = "/api/v1/agents/tools/"
+
+    def test_unauthenticated_returns_401(self):
+        self.assertEqual(self.client.get(self.URL).status_code, 401)
+
+    def test_lists_every_registered_tool_with_its_policy(self):
+        from agents.mcp_server import mcp_server
+        from agents.tool_policy import CONFIRM_REQUIRED
+
+        self.client.force_authenticate(user=User.objects.create_user("catalog", password="x"))
+        tools = {t["name"]: t for t in self.client.get(self.URL).json()["tools"]}
+        self.assertEqual(set(tools), set(mcp_server.list_tools()))
+        self.assertEqual({n for n, t in tools.items() if t["skill_safe"]}, set(mcp_server.skill_safe_tools()))
+        self.assertEqual({n for n, t in tools.items() if t["requires_confirmation"]}, set(CONFIRM_REQUIRED))
+        self.assertFalse(tools["delete_action_item"]["skill_safe"])
+        self.assertNotIn("delete_meeting", tools)

@@ -74,6 +74,8 @@ export interface SalesforceTimeEntry {
   sf_id: string;
   project: number | null;
   project_name: string;
+  /** Cloud Coach account of the project; blank when the project has none. */
+  account_name: string;
   task: number | null;
   task_subject: string;
   date: string;
@@ -82,4 +84,25 @@ export interface SalesforceTimeEntry {
   synced_to_sf: boolean;
   sync_error: string;
   created_at: string;
+}
+
+/** One day/account of the profile page's Time Allocation. `source` says where the minutes came from. */
+export interface TimeAllocationRow {
+  date: string; // YYYY-MM-DD, the user's local day
+  /** "" when logged time has no account. */
+  account: string;
+  minutes: number;
+  source: "logged" | "calendar";
+}
+
+export interface TimeAllocation {
+  start: string;
+  end: string;
+  rows: TimeAllocationRow[];
+  logged_minutes: number;
+  calendar_minutes: number;
+  /** Of the calendar minutes, those matched to an account by name rather than by a link. */
+  inferred_minutes: number;
+  /** Calendar time with no account at all; not in `rows`. */
+  unlinked_calendar_minutes: number;
 }

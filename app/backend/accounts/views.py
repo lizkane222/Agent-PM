@@ -19,6 +19,7 @@ from realtime.sync import publish_activity_event
 from scheduler.models import Reminder
 from scheduler.serializers import ActionItemSerializer, CalendarEventSerializer, ReminderSerializer
 
+from .artifact_images import image_upload_error
 from .artifact_links import used_in_map
 from .models import Account, AccountArtifact, AccountNote, AccountProject, AccountQuickLink, AccountRole, CustomerContact, CustomerContactNote, ProjectMember
 from .serializers import AccountArtifactSerializer, AccountNoteSerializer, AccountProjectSerializer, AccountQuickLinkSerializer, AccountRoleSerializer, AccountSerializer, CustomerContactNoteSerializer, CustomerContactSerializer, ProjectMemberSerializer
@@ -398,6 +399,12 @@ class AccountViewSet(viewsets.ModelViewSet):
                             {"error": "That HTML file could not be read as text."}, status=400
                         )
 
+            image_obj = request.FILES.get("custom_image")
+            if image_obj:
+                image_error = image_upload_error(image_obj)
+                if image_error:
+                    return Response({"error": image_error}, status=400)
+
             kwargs = {
                 "account": account,
                 "uploaded_by": request.user,
@@ -408,6 +415,8 @@ class AccountViewSet(viewsets.ModelViewSet):
                 "description": request.data.get("description", ""),
                 "references": request.data.get("references", []),
             }
+            if image_obj:
+                kwargs["custom_image"] = image_obj
             if file_obj:
                 kwargs["file"] = file_obj
                 kwargs["mime_type"] = file_obj.content_type or ""
@@ -437,6 +446,19 @@ class AccountViewSet(viewsets.ModelViewSet):
             "used_in_map": used_in_map([a.id for a in artifacts], [account.id]),
         }
         return Response(AccountArtifactSerializer(artifacts, many=True, context=context).data)
+
+    @action(detail=True, methods=["get"], url_path="activity-log")
+    def activity_log(self, request, pk=None):
+        """GET /accounts/accounts/<id>/activity-log/?category=<name> — the account's Activity Log.
+
+        Seven categories (activity, events, comments, notifications, reminders, feedback,
+        tokens). `get_object()` applies the account visibility rules, so an account the caller
+        cannot see is a 404; personal categories are filtered to the caller regardless.
+        """
+        from .activity_log import build_account_activity
+
+        account = self.get_object()
+        return Response(build_account_activity(account, request.user, request.query_params.get("category")))
 
     @action(detail=False, methods=["get"], url_path="artifacts-batch")
     def artifacts_batch(self, request):

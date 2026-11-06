@@ -2472,3 +2472,40 @@ class AssignmentRuleTests(APITestCase):
         resp = self.client.patch(f"/api/v1/airtable/action-items/{self.item.pk}/",
                                  {"assignee_airtable_id": str(self.mate_m.pk)}, format="json")
         self.assertEqual(resp.status_code, 200, resp.data)
+
+
+# Airtable's Action Items "Status" / "Priority" are single-select fields and the sync
+# token cannot create new options, so any value we send that is not already an option
+# is rejected with INVALID_MULTIPLE_CHOICE_OPTIONS and the whole write fails. These are
+# the options the base actually has (read from the metadata API, 2026-10-16).
+AIRTABLE_STATUS_OPTIONS = {"Not Started", "In Progress", "Blocked", "Ready", "Completed"}
+AIRTABLE_PRIORITY_OPTIONS = {"Low", "Medium", "High", "Urgent"}
+
+
+class ActionItemSelectOptionMappingTests(TestCase):
+    """Every status/priority the app can hold must map to an option Airtable has."""
+
+    def _fields(self, **kw):
+        from .write_back import _action_item_fields
+        return _action_item_fields(AirtableActionItem(airtable_id="x", task="t", **kw))
+
+    def test_every_app_status_maps_to_an_existing_airtable_option(self):
+        for status in ("Open", "In Progress", "Done", "Blocked", "Backlogged"):
+            with self.subTest(status=status):
+                self.assertIn(self._fields(status=status)["Status"], AIRTABLE_STATUS_OPTIONS)
+
+    def test_done_is_written_as_completed(self):
+        self.assertEqual(self._fields(status="Done")["Status"], "Completed")
+
+    def test_every_app_priority_maps_to_an_existing_airtable_option(self):
+        for priority in ("Critical", "High", "Medium", "Low"):
+            with self.subTest(priority=priority):
+                self.assertIn(self._fields(priority=priority)["Priority"], AIRTABLE_PRIORITY_OPTIONS)
+
+    def test_status_round_trips_through_the_pull_sync_map(self):
+        # What we push must come back as the status we started with (Backlogged is
+        # many-to-one on the way out, so it is excluded from the round trip).
+        from .sync import _AT_TO_STATUS
+        for status in ("Open", "In Progress", "Done", "Blocked"):
+            with self.subTest(status=status):
+                self.assertEqual(_AT_TO_STATUS[self._fields(status=status)["Status"]], status)

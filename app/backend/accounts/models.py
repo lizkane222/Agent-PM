@@ -20,6 +20,10 @@ class Account(models.Model):
     industry = models.CharField(max_length=150, blank=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="prospect")
     arr = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    # Slack channels the team uses for this account: a list of
+    # {workspace, channel, url, type: customer_facing|account_team}. Validated in
+    # accounts.slack_channels.clean_slack_channels.
+    slack_channels = models.JSONField(default=list, blank=True)
     owner = models.ForeignKey(
         User,
         on_delete=models.SET_NULL,
@@ -132,6 +136,10 @@ class CustomerContact(models.Model):
     role = models.CharField(max_length=200, blank=True, default="")
     description = models.TextField(blank=True, default="")
     email = models.EmailField(blank=True, default="")
+    # Free-text name of the customer's INTERNAL team (not the app's Team feature).
+    team = models.CharField(max_length=200, blank=True, default="")
+    # Main point of contact. Several per account are allowed (one flag per contact).
+    is_main_poc = models.BooleanField(default=False)
     airtable_id = models.CharField(max_length=64, blank=True, default="", db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -200,6 +208,8 @@ class AccountArtifact(models.Model):
     file = models.FileField(upload_to="account_artifacts/%Y/%m/", null=True, blank=True)
     mime_type = models.CharField(max_length=100, blank=True)
     file_size = models.PositiveIntegerField(null=True, blank=True)  # bytes
+    # Optional user-supplied image shown in place of the icon. See accounts/artifact_images.py.
+    custom_image = models.FileField(upload_to="artifact_images/%Y/%m/", null=True, blank=True)
     description = models.TextField(blank=True, default="")  # rich text (HTML)
     # Records referenced via @# picker inside the description: [{resource_type, resource_id, label, url}]
     references = models.JSONField(default=list, blank=True)

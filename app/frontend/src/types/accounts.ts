@@ -25,6 +25,10 @@ export interface CustomerContact {
   role: string;
   description: string;
   email: string;
+  /** Free-text name of the customer's internal team (not the app's Team feature). */
+  team: string;
+  /** Main point of contact (star). Several per account are allowed. */
+  is_main_poc: boolean;
   airtable_id: string;
   notes_count: number;
   notes: CustomerContactNote[];
@@ -41,6 +45,16 @@ export interface AccountTeamMember {
   slack_handle: string;
 }
 
+export type SlackChannelType = "customer_facing" | "account_team";
+
+/** One Slack channel the team uses for an account. `workspace` says which Slack to have open. */
+export interface SlackChannel {
+  workspace: string;
+  channel: string;
+  url: string;
+  type: SlackChannelType;
+}
+
 export interface Account {
   id: number;
   company_name: string;
@@ -49,6 +63,7 @@ export interface Account {
   industry: string;
   status: "prospect" | "active" | "inactive" | "churned";
   arr: string | null;
+  slack_channels?: SlackChannel[];
   owner: number | null;
   owner_username: string | null;
   primary_contact: number | null;
@@ -92,6 +107,8 @@ export interface AccountArtifact {
   secondary_url: string;
   icon_key: string;
   file_url: string | null;
+  /** User-uploaded image shown in place of the icon, or null. */
+  image_url: string | null;
   mime_type: string;
   file_size: number | null;
   description: string;

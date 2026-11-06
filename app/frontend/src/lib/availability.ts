@@ -65,6 +65,15 @@ export function isCompareEvent(e: Pick<CalendarEvent, "calendar_id">): boolean {
   return e.calendar_id === COMPARE_CALENDAR_ID;
 }
 
+/**
+ * True for the green bands "Find free time" paints on the grid. They are bare FullCalendar
+ * events carrying only `{ freeSlot: true }` — no attendees, title or ids — so anything that
+ * reads CalendarEvent fields off `extendedProps` must skip them first.
+ */
+export function isFreeSlotBand(extendedProps: unknown): boolean {
+  return (extendedProps as { freeSlot?: unknown } | null | undefined)?.freeSlot === true;
+}
+
 export interface FreeSlot { start: Date; end: Date }
 
 /**

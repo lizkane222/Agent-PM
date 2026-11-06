@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import type { AirtableActionItem, AirtableMeeting, CalendarEvent } from "../../types";
 import { useRightClickComment } from "../comments/CommentContext";
 import CommentCountBadge from "../comments/CommentCountBadge";
+import { meetingHasNotes } from "../../lib/meetingNotes";
 
 export function fmtDuration(secs: number): string {
   if (!secs) return "—";
@@ -67,6 +68,17 @@ function MeetingTimelineBtn({
         maxWidth: "100%",
       }}
     >
+      {/* Notes status: a check once a Gong or Zoom recap is stored, a hollow clock while
+          none has arrived yet. */}
+      <span
+        data-testid="meeting-notes-status"
+        data-has-notes={meetingHasNotes(m) ? "true" : "false"}
+        title={meetingHasNotes(m) ? "Meeting notes added" : "No meeting notes yet"}
+        aria-hidden="true"
+        style={{ marginRight: 3, fontWeight: 700, color: meetingHasNotes(m) ? "#16a34a" : "#9ca3af" }}
+      >
+        {meetingHasNotes(m) ? "✓" : "◷"}
+      </span>
       {m.name || "Meeting"}
       {/* A badge, not a button — the chip itself is the button, and right-click on it
           opens the thread. */}

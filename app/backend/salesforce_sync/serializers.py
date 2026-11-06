@@ -49,12 +49,21 @@ class SalesforceProjectSerializer(serializers.ModelSerializer):
 
 class SalesforceTimeEntrySerializer(serializers.ModelSerializer):
     project_name = serializers.CharField(source="project.name", read_only=True, default="")
+    # The Cloud Coach account the project belongs to; blank when the project has none. The
+    # profile page's Time Allocation panel groups logged time by this.
+    account_name = serializers.SerializerMethodField()
     task_subject = serializers.CharField(source="task.subject", read_only=True, default="")
+
+    def get_account_name(self, obj) -> str:
+        """The app account recorded at log time, else the synced Cloud Coach project's account."""
+        from .time_entry_accounts import entry_account_name
+
+        return entry_account_name(obj)
 
     class Meta:
         model = SalesforceTimeEntry
         fields = "__all__"
-        read_only_fields = ["user", "sf_id", "synced_to_sf", "sync_error"]
+        read_only_fields = ["user", "account", "sf_id", "synced_to_sf", "sync_error"]
 
 
 class LogTimeSerializer(serializers.Serializer):

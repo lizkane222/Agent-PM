@@ -15,13 +15,15 @@ from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from agents.mcp_server import mcp_server
 from core.llm import TIER_DEFAULT, build_sync_client, model_for_tier
 from .models import AgentSkill, ClaudeSkill, SkillInvocation
-from .serializers import AgentSkillSerializer, ClaudeSkillSerializer, SkillInvocationSerializer
+from .serializers import AgentSkillAttachmentSerializer, AgentSkillSerializer, ClaudeSkillSerializer, SkillInvocationSerializer
 
 logger = logging.getLogger(__name__)
 
@@ -646,7 +648,31 @@ def _claude_review_agent_skill(skill: AgentSkill) -> dict:
     return json.loads(raw)
 
 
-def _claude_generate_agent_skill(description: str) -> dict:
+def _generation_context_text(ctx: dict) -> str:
+    """The author's selections, phrased so the generated instructions build on them."""
+    if not isinstance(ctx, dict):
+        return ""
+    lines = []
+    caps = [c for c in (ctx.get("capabilities") or []) if c in _PLATFORM_TOOL_CATALOG]
+    if caps:
+        lines.append("Capabilities the author selected (prefer these tools): " + ", ".join(caps))
+    for key, label in (("twilio_skills", "Twilio skills to apply"), ("chained_skills", "Existing skills to build on first"),
+                       ("attachments", "Attached reference documents"), ("records", "Pinned context records")):
+        vals = [str(v)[:120] for v in (ctx.get(key) or [])][:20]
+        if vals:
+            lines.append(f"{label}: " + ", ".join(vals))
+    if ctx.get("needs_accounts"):
+        lines.append("The runner will choose one or more accounts at run time; scope every lookup to them.")
+    if ctx.get("slack"):
+        lines.append("Slack channels/DMs may be supplied as extra context.")
+    lines.append("The runner may give vague input (e.g. 'recent action items from account A'); "
+                 "write steps that turn it into concrete lookups, and use @#--all-action-items-${account_name}, "
+                 "@#--all-meeting-notes-${account_name}-${date-range}, @#--all-artifacts-${account_name} style "
+                 "keywords where a whole list is needed.")
+    return "\n\nAuthor selections:\n" + "\n".join(f"- {l}" for l in lines) if lines else ""
+
+
+def _claude_generate_agent_skill(description: str, context: dict | None = None) -> dict:
     client = _llm_client()
     system = _AGENT_SKILL_GENERATE_SYSTEM.replace(
         "{allowed_tools_catalog}", ", ".join(_PLATFORM_TOOL_CATALOG)
@@ -655,7 +681,7 @@ def _claude_generate_agent_skill(description: str) -> dict:
         model=_review_model(),
         max_tokens=4096,
         system=system,
-        messages=[{"role": "user", "content": description}],
+        messages=[{"role": "user", "content": description + _generation_context_text(context or {})}],
     )
     raw = response.content[0].text.strip()
     # Strip markdown code fence if present
@@ -723,6 +749,26 @@ def _validate_no_angle_brackets(text: str, field: str) -> str | None:
     return None
 
 
+ESTIMATE_BATCH = 10   # skills estimated per request; each is one Claude call
+
+
+def _budget_block_response(user):
+    """A 403 with the standard message when the user's daily token block limit is reached.
+
+    Launching a skill would only hand the user a prompt the agent then refuses, so say so up front.
+    """
+    from agents import token_budget
+
+    st = token_budget.gate_status(user)
+    if st.state != "blocked":
+        return None
+    token_budget.note_state(user, st)
+    return Response(
+        {"detail": token_budget.blocked_message(st), "code": "token_budget_blocked", "budget": st.as_dict()},
+        status=status.HTTP_403_FORBIDDEN,
+    )
+
+
 class AgentSkillViewSet(viewsets.ModelViewSet):
     """CRUD + generate / review for structured Claude Agent Skills."""
 
@@ -746,7 +792,7 @@ class AgentSkillViewSet(viewsets.ModelViewSet):
     # mutate only the caller's own pin state; run/retrieve don't mutate the skill at
     # all. Everything else (update, destroy, review) stays with the creator, so a
     # shipped capability can't be rewritten by whoever happens to use it.
-    _SHARED_ACTIONS = ("pin", "unpin", "run", "retrieve")
+    _SHARED_ACTIONS = ("pin", "unpin", "run", "retrieve", "resolve_keywords", "voice_start", "attachments", "attachment", "parse_template")
 
     def check_object_permissions(self, request, obj):
         super().check_object_permissions(request, obj)
@@ -787,6 +833,48 @@ class AgentSkillViewSet(viewsets.ModelViewSet):
             )
         return super().create(request, *args, **kwargs)
 
+    # Fields whose change alters what the skill *does*. Editing any of them on a reviewed
+    # skill sends it back to draft: the review verdict was about the old content, and an
+    # approved skill that keeps its status after gaining `send_sms` in `allowed_tools`, or
+    # going public, is exactly the bypass this closes.
+    _BEHAVIOUR_FIELDS = ("instructions", "allowed_tools", "scripts", "visibility", "description", "name",
+                         "twilio_skills", "chained_skills", "context_defaults", "templates")
+
+    def update(self, request, *args, **kwargs):
+        if "allowed_tools" in request.data:
+            allowed = request.data.get("allowed_tools") or []
+            if not isinstance(allowed, list):
+                return Response({"detail": "allowed_tools must be a list."}, status=status.HTTP_400_BAD_REQUEST)
+            unknown = [t for t in allowed if t not in _PLATFORM_TOOL_CATALOG]
+            if unknown:
+                return Response(
+                    {"detail": f"Unknown tool(s): {', '.join(unknown)}. Must be from the platform catalog."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        for field in ("name", "description"):
+            if field in request.data:
+                err = _validate_no_angle_brackets((request.data.get(field) or "").strip(), field)
+                if err:
+                    return Response({"detail": err}, status=status.HTTP_400_BAD_REQUEST)
+        if "name" in request.data:
+            err = _validate_agent_skill_name((request.data.get("name") or "").strip())
+            if err:
+                return Response({"detail": err}, status=status.HTTP_400_BAD_REQUEST)
+        return super().update(request, *args, **kwargs)
+
+    def perform_update(self, serializer):
+        instance = serializer.instance
+        changed = any(
+            field in serializer.validated_data
+            and serializer.validated_data[field] != getattr(instance, field)
+            for field in self._BEHAVIOUR_FIELDS
+        )
+        if changed and instance.status != "draft":
+            serializer.save(status="draft", review_verdict="", review_findings={}, reviewed_at=None,
+                            version=instance.version + 1)
+        else:
+            serializer.save()
+
     @action(detail=False, methods=["post"], url_path="generate")
     def generate(self, request):
         """Generate a structured skill definition from a freeform description."""
@@ -794,7 +882,7 @@ class AgentSkillViewSet(viewsets.ModelViewSet):
         if not description:
             return Response({"detail": "description is required."}, status=status.HTTP_400_BAD_REQUEST)
         try:
-            result = _claude_generate_agent_skill(description)
+            result = _claude_generate_agent_skill(description, request.data.get("context"))
             return Response(result)
         except Exception as exc:
             logger.exception("Agent skill generation failed: %s", exc)
@@ -833,6 +921,90 @@ class AgentSkillViewSet(viewsets.ModelViewSet):
             return Response({"detail": f"Review failed: {exc}"}, status=status.HTTP_502_BAD_GATEWAY)
         return Response(AgentSkillSerializer(skill, context={"request": request}).data)
 
+    @action(detail=False, methods=["post"], url_path="recommend-tools")
+    def recommend_tools(self, request):
+        """
+        "Claude recommended tools": suggest the capabilities a skill needs from its description.
+
+        Suggestions only — each name is validated against the skill-safe registry, and nothing
+        is saved. The author decides what to keep.
+        """
+        from .recommend import recommend_tools as recommend
+
+        description = (request.data.get("description") or "").strip()
+        instructions = (request.data.get("instructions") or "")
+        if not description:
+            return Response({"detail": "Write a description first so Claude has something to read."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if len(description) > 4000:
+            return Response({"detail": "description is limited to 4000 characters."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        try:
+            result = recommend(description, instructions if isinstance(instructions, str) else "",
+                               client=_llm_client(), model=_review_model())
+        except Exception as exc:
+            logger.exception("Tool recommendation failed: %s", exc)
+            return Response({"detail": "Couldn't get recommendations right now. Pick tools manually or try again."},
+                            status=status.HTTP_502_BAD_GATEWAY)
+        return Response(result)
+
+    @action(detail=False, methods=["get", "post"], url_path="token-estimates")
+    def token_estimates(self, request):
+        """
+        Admin Data: Claude's per-run token estimate for each skill.
+
+        GET lists every skill with its stored estimate. POST re-estimates one skill
+        ({skill_id}) or up to ESTIMATE_BATCH of the missing/stale ones (no body).
+        """
+        from agents import token_budget as tb
+        from core.mixins import is_admin
+
+        from . import token_estimate as te
+
+        if not is_admin(request.user):
+            raise PermissionDenied("Only admins can view skill token estimates.")
+
+        def row(skill):
+            est = skill.token_estimate or None
+            pricing = tb.get_pricing()
+            out = {
+                "id": skill.pk, "name": skill.name, "status": skill.status,
+                "created_by_username": skill.created_by.username if skill.created_by else None,
+                "estimate": est or None,
+                "estimated_at": skill.token_estimated_at,
+                "stale": te.is_stale(skill),
+            }
+            if est:
+                for k in ("low", "expected", "high"):
+                    out[f"{k}_usd"] = f"{tb.usage_usd(est[k]['input'], est[k]['output'], pricing):.4f}"
+            return out
+
+        if request.method == "GET":
+            qs = AgentSkill.objects.select_related("created_by").prefetch_related("attachments").order_by("name")
+            return Response({"results": [row(sk) for sk in qs]})
+
+        client, model = _llm_client(), _review_model()
+        skill_id = request.data.get("skill_id")
+        if skill_id is not None:
+            targets = list(AgentSkill.objects.filter(pk=skill_id))
+            if not targets:
+                return Response({"detail": "No such skill."}, status=status.HTTP_404_NOT_FOUND)
+        else:
+            pending = [sk for sk in AgentSkill.objects.prefetch_related("attachments").order_by("name")
+                       if te.is_stale(sk)]
+            targets = pending[:ESTIMATE_BATCH]
+        failed = []
+        for sk in targets:
+            try:
+                te.estimate_skill(sk, client=client, model=model)
+            except Exception as exc:
+                logger.exception("Token estimate failed for skill %s: %s", sk.pk, exc)
+                failed.append(sk.name)
+        fresh = AgentSkill.objects.select_related("created_by").prefetch_related("attachments").filter(
+            pk__in=[t.pk for t in targets])
+        return Response({"results": [row(sk) for sk in fresh], "failed": failed,
+                         "remaining": max(0, len(pending) - len(targets)) if skill_id is None else 0})
+
     @action(detail=True, methods=["post"], url_path="pin")
     def pin(self, request, pk=None):
         """Pin this skill to the requesting user's profile."""
@@ -850,10 +1022,12 @@ class AgentSkillViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"], url_path="run")
     def run(self, request, pk=None):
         """
-        Run an approved AgentSkill by injecting its instructions into the agent
-        as a chat message. Returns the injected prompt text for the frontend to
-        send to the chat bar.
-        POST body: { "args": { ...optional context } }
+        Assemble the run prompt for an approved AgentSkill: its instructions, chained
+        skills, attached documents, selected records and expanded `@#--` keywords.
+
+        POST body (all optional): { args, free_text, account_ids, accounts, records,
+        slack, template_key }. Returns { prompt, script, warnings }. `prompt` is what
+        the chat bar receives; `script` is plain spoken-style text for a voice session.
         """
         skill = self.get_object()
         if skill.status != "approved":
@@ -861,12 +1035,136 @@ class AgentSkillViewSet(viewsets.ModelViewSet):
                 {"detail": f"Skill is not approved (status: {skill.status})."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        args = request.data.get("args", {})
-        args_text = ""
-        if args:
-            args_text = "\n\nContext provided:\n" + "\n".join(f"- {k}: {v}" for k, v in args.items())
-        prompt = f"/{skill.name}{args_text}\n\n{skill.instructions}"
-        return Response({"prompt": prompt})
+        from .run_assembly import assemble_run
+
+        blocked = _budget_block_response(request.user)
+        if blocked is not None:
+            return blocked
+        try:
+            result = assemble_run(skill, request.user, request.data)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(result)
+
+    @action(detail=False, methods=["get", "post"], url_path="resolve-keywords")
+    def resolve_keywords(self, request):
+        """
+        GET: the keyword catalog for the editor's `@#--` picker.
+        POST { text }: expand every `@#--` keyword in `text` as the caller.
+        """
+        from . import keywords
+
+        if request.method == "GET":
+            return Response({"keywords": keywords.KEYWORD_CATALOG})
+        text = request.data.get("text") or ""
+        found = keywords.find_keywords(text)[:10]
+        results = [keywords.expand_keyword(request.user, kw) for kw in found]
+        return Response({"results": results})
+
+    @action(detail=True, methods=["get", "post"], url_path="attachments",
+            parser_classes=[MultiPartParser, FormParser, JSONParser])
+    def attachments(self, request, pk=None):
+        """GET: list attachments. POST (creator/staff): multipart `file` or JSON `url`+`name`."""
+        skill = self.get_object()
+        if request.method == "GET":
+            return Response(AgentSkillAttachmentSerializer(skill.attachments.all(), many=True).data)
+        if not (request.user.is_staff or skill.created_by_id == request.user.pk):
+            raise PermissionDenied("Only the skill's creator can attach documents.")
+        from .attachments import create_attachment
+
+        try:
+            att = create_attachment(
+                skill, request.user,
+                upload=request.FILES.get("file"),
+                url=(request.data.get("url") or "").strip(),
+                name=(request.data.get("name") or "").strip(),
+                account_id=request.data.get("account_id") or None,
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(AgentSkillAttachmentSerializer(att).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["get", "delete"], url_path=r"attachments/(?P<att_id>\d+)")
+    def attachment(self, request, pk=None, att_id=None):
+        """GET: the attachment with its extracted text (for the in-app viewer). DELETE: remove it."""
+        skill = self.get_object()
+        att = skill.attachments.filter(pk=att_id).first()
+        if att is None:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        if request.method == "GET":
+            return Response({**AgentSkillAttachmentSerializer(att).data, "text": att.text})
+        if not (request.user.is_staff or skill.created_by_id == request.user.pk):
+            raise PermissionDenied("Only the skill's creator can remove documents.")
+        att.delete()
+        self._reset_if_reviewed(skill)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=False, methods=["post"], url_path="parse-template",
+            parser_classes=[MultiPartParser, FormParser])
+    def parse_template(self, request):
+        """Read an uploaded document into selectable templates. Stores nothing."""
+        from .attachments import MAX_UPLOAD_BYTES
+        from .extract import extract_text, split_sections
+
+        upload = request.FILES.get("file")
+        if upload is None:
+            return Response({"detail": "Attach a file."}, status=status.HTTP_400_BAD_REQUEST)
+        if upload.size > MAX_UPLOAD_BYTES:
+            return Response({"detail": "That file is larger than 15 MB."}, status=status.HTTP_400_BAD_REQUEST)
+        text = extract_text(upload.name, upload.read())
+        if not text:
+            return Response({"detail": "Couldn't read any text from that file. Try .md, .txt, .docx or .pdf."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        return Response({"text": text, **split_sections(text)})
+
+    @staticmethod
+    def _reset_if_reviewed(skill):
+        """Attachments feed the prompt, so changing them invalidates a past review."""
+        if skill.status != "draft":
+            skill.status, skill.review_verdict, skill.review_findings, skill.reviewed_at = "draft", "", {}, None
+            skill.version += 1
+            skill.save(update_fields=["status", "review_verdict", "review_findings", "reviewed_at", "version"])
+
+    @action(detail=True, methods=["post"], url_path="voice-start")
+    def voice_start(self, request, pk=None):
+        """Stash the run context for a voice call; returns the short key the call carries."""
+        skill = self.get_object()
+        if skill.status != "approved":
+            return Response({"detail": f"Skill is not approved (status: {skill.status})."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        from .run_assembly import assemble_run
+        from .voice_launch import create_launch_context
+
+        blocked = _budget_block_response(request.user)
+        if blocked is not None:
+            return blocked
+        try:
+            result = assemble_run(skill, request.user, request.data)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        key = create_launch_context(request.user, skill, result)
+        return Response({"key": key, "script": result["script"], "warnings": result["warnings"]})
+
+
+class VoiceLaunchView(APIView):
+    """
+    POST { title, text } -> { key }: a voice launch for sources that are not an AgentSkill
+    (a Twilio skill, a Python tool, an example prompt). The text is the caller's own, goes
+    only into their own call, and is length-capped.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from .voice_launch import MAX_VOICE_CONTEXT_CHARS, create_launch_context
+
+        title = (request.data.get("title") or "").strip()[:120]
+        text = (request.data.get("text") or "").strip()
+        if not text:
+            return Response({"detail": "text is required."}, status=status.HTTP_400_BAD_REQUEST)
+        script = f"Task: {title}. {text}" if title else text
+        key = create_launch_context(request.user, None, {"script": script[:MAX_VOICE_CONTEXT_CHARS]})
+        return Response({"key": key, "script": script[:MAX_VOICE_CONTEXT_CHARS]})
 
 
 class SkillInvocationViewSet(viewsets.ReadOnlyModelViewSet):
@@ -876,7 +1174,11 @@ class SkillInvocationViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
+        # Invocation rows carry the arguments and results of every run, so they are the
+        # caller's own unless they are staff. This used to return every user's history.
         qs = SkillInvocation.objects.select_related("skill", "invoked_by")
+        if not self.request.user.is_staff:
+            qs = qs.filter(invoked_by=self.request.user)
         skill_id = self.request.query_params.get("skill")
         if skill_id:
             qs = qs.filter(skill_id=skill_id)

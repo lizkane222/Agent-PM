@@ -107,6 +107,24 @@ class AgentSkill(models.Model):
         help_text="Supporting docs loaded on demand.",
     )
 
+    # What the skill builds on besides its own instructions. All are names/ids only:
+    # the content is resolved at run time, under the *runner's* permissions.
+    twilio_skills = models.JSONField(
+        default=list, blank=True, help_text="Slugs of Twilio skills this skill builds on.",
+    )
+    chained_skills = models.JSONField(
+        default=list, blank=True, help_text="Names of other AgentSkills whose instructions run first.",
+    )
+    context_defaults = models.JSONField(
+        default=dict, blank=True,
+        help_text="{records:[{resource_type,resource_id,label}], account_ids:[], "
+                  "slack:[{id,kind,label}], needs_accounts:bool}",
+    )
+    templates = models.JSONField(
+        default=list, blank=True,
+        help_text="Selectable variants: [{key, title, body_html}]. The runner picks one.",
+    )
+
     status     = models.CharField(max_length=20, choices=STATUS_CHOICES, default="draft")
     visibility = models.CharField(max_length=20, choices=VISIBILITY_CHOICES, default="private")
 
@@ -122,6 +140,11 @@ class AgentSkill(models.Model):
         User, blank=True, related_name="pinned_agent_skills",
         help_text="Users who have pinned this skill to their profile.",
     )
+
+    # Claude's estimate of what one run costs in tokens (see skills/token_estimate.py). Kept
+    # off the public serializer: it is an admin planning figure, not part of the skill's contract.
+    token_estimate = models.JSONField(default=dict, blank=True)
+    token_estimated_at = models.DateTimeField(null=True, blank=True)
 
     version    = models.PositiveIntegerField(default=1)
     created_by = models.ForeignKey(
@@ -179,3 +202,51 @@ class SkillInvocation(models.Model):
 
     def __str__(self) -> str:
         return f"{self.skill.name} @ {self.invoked_at:%Y-%m-%d %H:%M} ({self.status})"
+
+
+class AgentSkillAttachment(models.Model):
+    """
+    A document attached to an AgentSkill as standing context.
+
+    `text` is extracted once at upload so run-time prompt assembly never re-parses a
+    file. When the uploader chose an account, the file is also filed as an
+    `accounts.AccountArtifact` (`artifact`), so it shows up on that account too.
+    """
+
+    skill = models.ForeignKey(AgentSkill, on_delete=models.CASCADE, related_name="attachments")
+    name = models.CharField(max_length=300)
+    file = models.FileField(upload_to="skill_attachments/%Y/%m/", null=True, blank=True)
+    url = models.TextField(blank=True, default="")
+    mime_type = models.CharField(max_length=100, blank=True, default="")
+    file_size = models.PositiveIntegerField(null=True, blank=True)
+    text = models.TextField(blank=True, default="")
+    artifact = models.ForeignKey(
+        "accounts.AccountArtifact", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="skill_attachments",
+    )
+    uploaded_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True, related_name="skill_attachments",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.name} → {self.skill_id}"
+
+
+class VoiceLaunchContext(models.Model):
+    """
+    Short-lived hand-off from "Use in Voice" to the call that follows.
+
+    Twilio's connect params are tiny and browser-controlled, so only this row's key
+    travels; the prompt, records and skill are looked up server-side when the call
+    sets up. Consumed (deleted) on first use and expired after a couple of minutes.
+    """
+
+    key = models.CharField(max_length=64, unique=True)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="voice_launch_contexts")
+    skill = models.ForeignKey(AgentSkill, on_delete=models.CASCADE, null=True, blank=True)
+    payload = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)

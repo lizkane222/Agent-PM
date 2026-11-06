@@ -67,7 +67,7 @@ vi.mock("@fullcalendar/react", async () => {
         gotoDate: (d: string) => { (window as unknown as Record<string, unknown>).__TEST_GOTO_DATE__ = d; },
         changeView: () => {},
         getDate: () => new Date("2026-07-28T00:00:00Z"),
-        view: { type: "timeGridWeek" },
+        view: { type: "timeGridWeek", activeStart: new Date("2026-07-28T00:00:00Z"), activeEnd: new Date("2026-08-04T00:00:00Z") },
         refetchEvents: () => {},
         unselect: () => {},
       }),
@@ -370,10 +370,38 @@ describe("CalendarPage", () => {
     );
   });
 
-  it("renders FullCalendar stub and Sync button without crashing", async () => {
+  it("renders FullCalendar stub without a manual sync button", async () => {
     renderPage();
     expect(screen.getByTestId("fullcalendar")).toBeInTheDocument();
-    expect(screen.getByText("Sync Google Calendar")).toBeInTheDocument();
+    expect(screen.queryByText("Sync Google Calendar")).not.toBeInTheDocument();
+  });
+
+  it("the Calendar heading is pushed below the top-right button row so it is never covered", async () => {
+    renderPage();
+    const heading = await screen.findByRole("heading", { name: "Calendar" });
+    const scroller = heading.closest(".overflow-auto") as HTMLElement;
+    // The button row is `absolute top-4`; the content must start below it (pt-16 = 64px).
+    expect(scroller.className).toMatch(/\bpt-16\b/);
+    expect(scroller.className).not.toMatch(/\bpy-8\b/);
+  });
+
+  it("syncs with Google when the page opens, and a meeting deleted in Google disappears", async () => {
+    let syncBodies: unknown[] = [];
+    let deletedInGoogle = false;
+    server.use(
+      http.get("/api/v1/scheduler/events/", () =>
+        HttpResponse.json(deletedInGoogle ? mockCalendarEvents.slice(1) : mockCalendarEvents),
+      ),
+      http.post("/api/v1/integrations/google/sync/", async ({ request }) => {
+        syncBodies.push(await request.json());
+        deletedInGoogle = true; // the server removed the cancelled event during this sync
+        return HttpResponse.json({ detail: "Sync complete.", event_count: 1, changed: 1 });
+      }),
+    );
+    renderPage();
+    await waitFor(() => expect(syncBodies).toEqual([{ auto: true }]));
+    await waitFor(() => expect(screen.queryByText(mockCalendarEvents[0].title)).not.toBeInTheDocument());
+    expect(screen.getByText(mockCalendarEvents[1].title)).toBeInTheDocument();
   });
 
   it("renders event titles after fetchEvents completes", async () => {
@@ -1183,50 +1211,6 @@ describe("CalendarPage", () => {
     });
   });
 
-  it("Sync button shows Syncing… then re-enables after successful sync", async () => {
-    server.use(
-      http.post("/api/v1/integrations/google/sync/", () =>
-        HttpResponse.json({ detail: "Synced", event_count: 2 }),
-      ),
-    );
-
-    renderPage();
-    await screen.findByTestId("fullcalendar");
-
-    const syncBtn = screen.getByRole("button", { name: "Sync Google Calendar" });
-    fireEvent.click(syncBtn);
-
-    await waitFor(() =>
-      expect(screen.getByText("Syncing…")).toBeInTheDocument(),
-    );
-    await waitFor(
-      () =>
-        expect(
-          screen.getByRole("button", { name: "Sync Google Calendar" }),
-        ).toBeInTheDocument(),
-      { timeout: 4000 },
-    );
-  });
-
-  it("handleSync API error surfaces via toast message", async () => {
-    server.use(
-      http.post("/api/v1/integrations/google/sync/", () =>
-        new HttpResponse(null, { status: 500 }),
-      ),
-    );
-
-    renderPage();
-    await screen.findByTestId("fullcalendar");
-
-    const syncBtn = screen.getByRole("button", { name: "Sync Google Calendar" });
-    fireEvent.click(syncBtn);
-
-    // handleSync shows a toast (not AppErrorBanner) on sync failure.
-    await waitFor(() =>
-      expect(screen.getByText(/Google Calendar sync failed/)).toBeInTheDocument(),
-    );
-  });
-
   describe("sidebar colors follow the user's preferences", () => {
     const ACTION_COLOR = "#842D78"; // 90s purple
     const REMINDER_COLOR = "#174DB1"; // 90s blue
@@ -1519,22 +1503,35 @@ describe("CalendarPage — editing an event", () => {
     expect(screen.getByTestId("event-edit-form")).toBeInTheDocument();
   });
 
-  it("warns that saving notifies guests on a synced event with attendees", async () => {
+  // HISTORY: this notice used to say saving "will update it in Google and notify them", and the
+  // server really did email every guest on every save. A customer received 2,000+ invitations
+  // from one meeting move. Saving now NEVER emails guests, so the notice says so — a UI that
+  // promised a notification that never comes would leave guests uninformed of a time change.
+  it("tells the user that saving updates Google but does NOT email the guests", async () => {
     serveEvent({ attendees: [{ email: "a@example.com", responseStatus: "accepted" }] });
     await openEditViaMenu();
-    expect(within(form()).getByText(/notify them/i)).toBeInTheDocument();
+    const notice = within(form()).getByText(/guest/i, { selector: "p" });
+    expect(notice).toHaveTextContent(/update it in Google/i);
+    expect(notice).toHaveTextContent(/not email/i);
   });
 
-  it("does not warn about guests on a solo event", async () => {
+  it("never claims that saving will notify guests", async () => {
+    serveEvent({ attendees: [{ email: "a@example.com", responseStatus: "accepted" }] });
+    await openEditViaMenu();
+    expect(within(form()).queryByText(/and notify them/i)).not.toBeInTheDocument();
+    expect(within(form()).queryByText(/will notify/i)).not.toBeInTheDocument();
+  });
+
+  it("does not show the guest notice on a solo event", async () => {
     serveEvent({ attendees: [] });
     await openEditViaMenu();
-    expect(within(form()).queryByText(/notify them/i)).not.toBeInTheDocument();
+    expect(within(form()).queryByText(/not email/i)).not.toBeInTheDocument();
   });
 
-  it("does not warn about guests on an unsynced event", async () => {
+  it("does not show the guest notice on an unsynced event", async () => {
     serveEvent({ is_synced: false, attendees: [{ email: "a@example.com", responseStatus: "accepted" }] });
     await openEditViaMenu();
-    expect(within(form()).queryByText(/notify them/i)).not.toBeInTheDocument();
+    expect(within(form()).queryByText(/not email/i)).not.toBeInTheDocument();
   });
 
   describe("Convert to…", () => {
@@ -2214,7 +2211,7 @@ describe("scheduled action items are database rows and survive a sync", () => {
     );
   });
 
-  it("a scheduled action item is STILL on the grid after Sync Google Calendar", async () => {
+  it("a scheduled action item is STILL on the grid after the page's Google sync", async () => {
     // The headline regression guard.
     let syncCalls = 0;
     server.use(
@@ -2233,13 +2230,9 @@ describe("scheduled action items are database rows and survive a sync", () => {
       expect(screen.getByText(/Provision SQL Traits/)).toBeInTheDocument(),
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Sync Google Calendar" }));
+    // The page syncs on open; wait for that sync (and its refetch) to settle.
     await waitFor(() => expect(syncCalls).toBe(1));
-    // Wait for the sync to finish so the post-sync refetch has settled.
-    await waitFor(
-      () => expect(screen.getByRole("button", { name: "Sync Google Calendar" })).toBeInTheDocument(),
-      { timeout: 4000 },
-    );
+    await new Promise((r) => setTimeout(r, 50));
 
     expect(screen.getByText(/Provision SQL Traits/)).toBeInTheDocument();
   });
@@ -2267,11 +2260,7 @@ describe("scheduled action items are database rows and survive a sync", () => {
     renderPage();
     await waitFor(() => expect(screen.getByText(/Provision SQL Traits/)).toBeInTheDocument());
 
-    fireEvent.click(screen.getByRole("button", { name: "Sync Google Calendar" }));
-    await waitFor(
-      () => expect(screen.getByRole("button", { name: "Sync Google Calendar" })).toBeInTheDocument(),
-      { timeout: 4000 },
-    );
+    await new Promise((r) => setTimeout(r, 100)); // let the on-open sync finish
 
     // The push-then-prune dance is gone: the server owns mirroring to Google now.
     expect(methods).toEqual([]);
@@ -2281,12 +2270,14 @@ describe("scheduled action items are database rows and survive a sync", () => {
     // Guards against the class of fake test the 2026-08-19 log entry records: MSW answers in a
     // microtask, so a blank-then-restore would be invisible unless the response is held open.
     let release: (() => void) | null = null;
+    let syncStarted = false;
     const held = new Promise<void>((resolve) => { release = resolve; });
     server.use(
       http.get("/api/v1/scheduler/events/", () =>
         HttpResponse.json([...mockCalendarEvents, scheduledRow()]),
       ),
       http.post("/api/v1/integrations/google/sync/", async () => {
+        syncStarted = true;
         await held;
         return HttpResponse.json({ detail: "Sync complete.", event_count: 3 });
       }),
@@ -2295,17 +2286,14 @@ describe("scheduled action items are database rows and survive a sync", () => {
     renderPage();
     await waitFor(() => expect(screen.getByText(/Provision SQL Traits/)).toBeInTheDocument());
 
-    fireEvent.click(screen.getByRole("button", { name: "Sync Google Calendar" }));
-    await waitFor(() => expect(screen.getByText("Syncing…")).toBeInTheDocument());
+    // The on-open sync is now in flight and held open.
+    await waitFor(() => expect(syncStarted).toBe(true));
 
     // Mid-sync, the item must not have been removed from the grid.
     expect(screen.getByText(/Provision SQL Traits/)).toBeInTheDocument();
 
     release!();
-    await waitFor(
-      () => expect(screen.getByRole("button", { name: "Sync Google Calendar" })).toBeInTheDocument(),
-      { timeout: 4000 },
-    );
+    await new Promise((r) => setTimeout(r, 100));
     expect(screen.getByText(/Provision SQL Traits/)).toBeInTheDocument();
   });
 
@@ -2566,6 +2554,34 @@ describe("CalendarPage — navigating to earlier weeks", () => {
     aimAt("2026-06-16T00:00:00.000Z", "2026-06-23T00:00:00.000Z");
     fireEvent.click(screen.getByTestId("trigger-dates-set"));
 
+    await screen.findByText(/Event for 2026-06-16/);
+  });
+
+  it("shows a week fetched while an attendance save was still in flight", async () => {
+    // The race behind the previous test, forced deterministically: the week is requested
+    // and answered while the save still holds the in-flight-mutation latch, so its result
+    // is set aside. When the save settles the set-aside week must be applied — otherwise
+    // the old week stays on screen until the next navigation.
+    servePerWeek();
+    let releasePatch: () => void = () => {};
+    const patchGate = new Promise<void>((resolve) => { releasePatch = resolve; });
+    server.use(
+      http.patch("/api/v1/scheduler/events/:id/attendance/", async () => {
+        await patchGate;
+        return HttpResponse.json({ ...mockCalendarEvents[0], id: 900, attended: false });
+      }),
+    );
+    renderPage();
+    fireEvent.click(await screen.findByText(/Event for 2026-07-28/));
+    fireEvent.click(await screen.findByTestId("attendance-toggle"));
+
+    aimAt("2026-06-16T00:00:00.000Z", "2026-06-23T00:00:00.000Z");
+    fireEvent.click(screen.getByTestId("trigger-dates-set"));
+    // The save is still pending, so the new week is held back.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.queryByText(/Event for 2026-06-16/)).not.toBeInTheDocument();
+
+    releasePatch();
     await screen.findByText(/Event for 2026-06-16/);
   });
 

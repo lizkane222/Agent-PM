@@ -139,6 +139,46 @@ def _google_freebusy(viewer, emails: list[str], start: datetime, end: datetime) 
     return out
 
 
+def compute_availability(viewer, emails: list[str], start: datetime, end: datetime) -> list[dict]:
+    """
+    Privacy-masked busy time for each address, as the compare-calendars view returns it.
+
+    One implementation for the REST view and the voice agent's tool, so the masking rules
+    (titles only on shared accounts, nothing else ever returned) cannot drift between them.
+    The viewer's own address is skipped; their calendar is already on screen.
+    """
+    from team.models import TeamMember
+
+    User = get_user_model()
+    members = {
+        m.email.lower(): m
+        for m in TeamMember.objects.filter(email__in=emails).select_related("user")
+    }
+    users_by_email = {u.email.lower(): u for u in User.objects.filter(email__in=emails, is_active=True)}
+
+    people, google_emails = [], []
+    for email in emails:
+        member = members.get(email)
+        user = (member.user if member and member.user_id else None) or users_by_email.get(email)
+        name = (member.full_name if member else "") or (user.get_full_name() if user else "") or email
+        if user is not None and user.pk == viewer.pk:
+            continue  # the viewer's own calendar is already on screen
+        if user is not None and user.is_active:
+            people.append({
+                "email": email, "name": name, "source": "app",
+                "busy": _app_user_busy(viewer, user, start, end), "error": None,
+            })
+        else:
+            people.append({"email": email, "name": name, "source": "google", "busy": [], "error": None})
+            google_emails.append(email)
+
+    google = _google_freebusy(viewer, google_emails, start, end)
+    for person in people:
+        if person["source"] == "google" and person["email"] in google:
+            person.update(google[person["email"]])
+    return people
+
+
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def availability(request):
@@ -156,34 +196,5 @@ def availability(request):
     if len(emails) > MAX_PEOPLE:
         return Response({"detail": f"At most {MAX_PEOPLE} people at a time."}, status=400)
 
-    from team.models import TeamMember
-
-    User = get_user_model()
-    members = {
-        m.email.lower(): m
-        for m in TeamMember.objects.filter(email__in=emails).select_related("user")
-    }
-    users_by_email = {u.email.lower(): u for u in User.objects.filter(email__in=emails, is_active=True)}
-
-    people, google_emails = [], []
-    for email in emails:
-        member = members.get(email)
-        user = (member.user if member and member.user_id else None) or users_by_email.get(email)
-        name = (member.full_name if member else "") or (user.get_full_name() if user else "") or email
-        if user is not None and user.pk == request.user.pk:
-            continue  # the viewer's own calendar is already on screen
-        if user is not None and user.is_active:
-            people.append({
-                "email": email, "name": name, "source": "app",
-                "busy": _app_user_busy(request.user, user, start, end), "error": None,
-            })
-        else:
-            people.append({"email": email, "name": name, "source": "google", "busy": [], "error": None})
-            google_emails.append(email)
-
-    google = _google_freebusy(request.user, google_emails, start, end)
-    for person in people:
-        if person["source"] == "google" and person["email"] in google:
-            person.update(google[person["email"]])
-
+    people = compute_availability(request.user, emails, start, end)
     return Response({"start": start.isoformat(), "end": end.isoformat(), "people": people})

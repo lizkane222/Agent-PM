@@ -1,0 +1,7 @@
+{
+  "name": "agent-pm-relay",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": { "twilio": "^5.0.0" },
+  "engines": { "node": "22" }
+}

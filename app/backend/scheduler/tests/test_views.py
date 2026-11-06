@@ -4,6 +4,7 @@ from unittest import mock
 
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
+from django.test import override_settings
 from django.urls import reverse
 from rest_framework.test import APITestCase
 
@@ -1105,11 +1106,17 @@ class CalendarEventSourceLinkCreateTest(APITestCase):
         pushed.assert_not_called()
 
 
+@override_settings(GOOGLE_GUEST_NOTIFICATIONS=True)
 class MeetingInviteGooglePushTest(APITestCase):
-    """Creating/editing a meeting with guests must ask Google to email them.
+    """Guests are emailed only on an explicit, approved send — never as a default or a side effect.
 
-    Google's `sendUpdates` defaults to "none": attendees were added to the event but
-    nobody was notified, which is why invitees never received anything.
+    HISTORY: these tests once asserted the opposite — that an omitted ``send_invites`` emailed
+    guests, and that moving a meeting did. A customer then received 2,000+ invitation emails
+    from a single meeting move. The rule is now: one invitation per event, only when the user
+    creates it in AgentPM and approves the send (``send_invites: true``); moving, renaming or
+    syncing an event never emails anyone. See ``integrations/invite_gate.py``. Do not restore
+    the old expectations. The switch is on here so the approved path can be exercised; it
+    defaults off in production.
     """
 
     def setUp(self):
@@ -1129,11 +1136,22 @@ class MeetingInviteGooglePushTest(APITestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    @staticmethod
+    def _in_days(days, hour=16, length_hours=1):
+        """(start, end) ISO strings `days` from now. Never a fixed date: the invite gate refuses
+        past and far-future events, so a hard-coded date turns an 'approved send' test into a
+        'refused' test the day it passes (this class did exactly that on 2026-10-20 at 16:00Z)."""
+        from datetime import timedelta
+        from django.utils import timezone as _tz
+        start = (_tz.now() + timedelta(days=days)).replace(hour=hour, minute=0, second=0, microsecond=0)
+        return start.isoformat(), (start + timedelta(hours=length_hours)).isoformat()
+
     def _create(self, **extra):
+        start, end = self._in_days(3)
         body = {
             "title": "Kickoff",
-            "start_datetime": "2026-10-20T16:00:00Z",
-            "end_datetime": "2026-10-20T17:00:00Z",
+            "start_datetime": start,
+            "end_datetime": end,
             "calendar_id": "primary",
             "attendees": [
                 {"email": "ana@example.com", "displayName": "Ana", "responseStatus": "needsAction"},
@@ -1161,9 +1179,11 @@ class MeetingInviteGooglePushTest(APITestCase):
         self.assertEqual(self._insert_kwargs()["sendUpdates"], "none")
         self.assertEqual(resp.data["google_sync"]["invites_sent"], False)
 
-    def test_omitted_flag_defaults_to_sending_when_there_are_guests(self):
-        self._create()
-        self.assertEqual(self._insert_kwargs()["sendUpdates"], "all")
+    def test_omitted_flag_does_NOT_email_guests(self):
+        # Was "defaults to sending". Approval is never assumed: absent means no.
+        resp = self._create()
+        self.assertEqual(self._insert_kwargs()["sendUpdates"], "none")
+        self.assertEqual(resp.data["google_sync"]["invites_sent"], False)
 
     def test_organiser_is_not_invited_to_their_own_meeting(self):
         self._create(send_invites=True, attendees=[
@@ -1190,6 +1210,17 @@ class MeetingInviteGooglePushTest(APITestCase):
         self.assertEqual(resp.data["google_sync"], {"status": "not_connected", "invites_sent": False})
         self.service.events.return_value.insert.assert_not_called()
 
+    def test_an_approved_send_the_gate_refuses_is_reported_as_not_sent(self):
+        # The user approved, but the master switch is off, so the gate tells Google not to email.
+        # The response must say what happened, not what was asked for: a caller (the profile
+        # "Schedule call" modal, the calendar page) shows it to the user as fact.
+        with override_settings(GOOGLE_GUEST_NOTIFICATIONS=False):
+            resp = self._create(send_invites=True)
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertEqual(self._insert_kwargs()["sendUpdates"], "none")
+        self.assertEqual(resp.data["google_sync"], {"status": "ok", "invites_sent": False})
+        self.assertFalse(CalendarEvent.objects.get(pk=resp.data["id"]).invite_sent)
+
     def test_google_failure_is_reported_and_the_event_is_kept(self):
         self.service.events.return_value.insert.return_value.execute.side_effect = RuntimeError("boom")
         resp = self._create(send_invites=True)
@@ -1199,30 +1230,33 @@ class MeetingInviteGooglePushTest(APITestCase):
 
     def test_non_primary_create_has_no_google_sync_key(self):
         resp = self.client.post("/api/v1/scheduler/events/", {
-            "title": "Block", "start_datetime": "2026-10-20T16:00:00Z",
-            "end_datetime": "2026-10-20T16:15:00Z", "calendar_id": "work_tracking",
+            "title": "Block", "start_datetime": self._in_days(3)[0],
+            "end_datetime": self._in_days(3, length_hours=0)[0], "calendar_id": "work_tracking",
         }, format="json")
         self.assertEqual(resp.status_code, 201)
         self.assertNotIn("google_sync", resp.data)
 
-    def test_reschedule_notifies_guests(self):
+    def test_reschedule_does_NOT_notify_guests(self):
+        # This was test_reschedule_notifies_guests, asserting sendUpdates == "all" on a plain
+        # move. That is the incident: moving one meeting emailed its guests, every time.
         event = CalendarEvent.objects.create(
-            owner=self.user, title="Sync", start_datetime="2026-10-20T16:00:00Z",
-            end_datetime="2026-10-20T17:00:00Z", google_event_id="g-1", is_synced=True,
-            attendees=[{"email": "ana@example.com"}],
+            owner=self.user, title="Sync", start_datetime=self._in_days(3)[0],
+            end_datetime=self._in_days(3)[1], google_event_id="g-1", is_synced=True,
+            attendees=[{"email": "ana@example.com"}], origin="agentpm",
         )
         resp = self.client.patch(f"/api/v1/scheduler/events/{event.pk}/", {
-            "start_datetime": "2026-10-20T18:00:00Z", "end_datetime": "2026-10-20T19:00:00Z",
+            "start_datetime": self._in_days(3, hour=18)[0], "end_datetime": self._in_days(3, hour=18)[1],
         }, format="json")
         self.assertEqual(resp.status_code, 200, resp.data)
         kwargs = self.service.events.return_value.patch.call_args.kwargs
-        self.assertEqual(kwargs["sendUpdates"], "all")
+        self.assertEqual(kwargs["sendUpdates"], "none")
+        # The guest list is still sent to Google; only the email is withheld.
         self.assertEqual(kwargs["body"]["attendees"], [{"email": "ana@example.com"}])
 
     def test_adding_a_guest_is_pushed(self):
         event = CalendarEvent.objects.create(
-            owner=self.user, title="Sync", start_datetime="2026-10-20T16:00:00Z",
-            end_datetime="2026-10-20T17:00:00Z", google_event_id="g-2", is_synced=True,
+            owner=self.user, title="Sync", start_datetime=self._in_days(3)[0],
+            end_datetime=self._in_days(3)[1], google_event_id="g-2", is_synced=True,
             attendees=[{"email": "ana@example.com"}],
         )
         self.client.patch(f"/api/v1/scheduler/events/{event.pk}/", {

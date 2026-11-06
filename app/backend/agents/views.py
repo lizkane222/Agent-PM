@@ -19,8 +19,10 @@ from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle, UserRateThrottle
 from rest_framework.views import APIView
 
+from . import token_budget
 from .agent import AgentOrchestrator
 from .models import AgentMessage, AgentSession
 from .serializers import (
@@ -43,6 +45,24 @@ _BEDROCK_CREDENTIAL_ERRORS = (
     botocore_exceptions.CredentialRetrievalError,
     botocore_exceptions.ProfileNotFound,
 )
+
+
+def _retry_after_seconds(exc: BaseException) -> int | None:
+    """The server's Retry-After, if it sent one — used to tell the user how long to wait."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None) or {}
+    for key in ("retry-after-ms", "retry-after"):
+        raw = headers.get(key)
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        seconds = value / 1000 if key.endswith("-ms") else value
+        if 0 < seconds <= 3600:
+            return max(1, int(round(seconds)))
+    return None
 
 
 def classify_agent_error(exc: BaseException, ref: str) -> str:
@@ -76,14 +96,37 @@ def classify_agent_error(exc: BaseException, ref: str) -> str:
     if isinstance(exc, ImproperlyConfigured):
         return f"[Agent is misconfigured — see server logs. (ref {ref})]"
     if isinstance(exc, (anthropic.AuthenticationError, anthropic.PermissionDeniedError)):
+        if settings.AGENT_BACKEND == "bedrock":
+            return (
+                f"[Model access denied. Check the Bedrock role permissions. (ref {ref})]"
+            )
+        # Already retried once with a fresh token by core.llm's gateway transport.
         return (
-            f"[Model access denied. Check the gateway key or Bedrock role "
-            f"permissions. (ref {ref})]"
+            f"[The LiteLLM gateway refused the request. Re-run "
+            f"`{settings.AGENT_GATEWAY_TOKEN_COMMAND or 'the gateway token helper'}` "
+            f"in a terminal and try again. (ref {ref})]"
         )
     if isinstance(exc, anthropic.NotFoundError):
         return f"[Configured model is unavailable on this backend. (ref {ref})]"
     if isinstance(exc, anthropic.RateLimitError):
-        return f"[Rate limited by the model endpoint. Try again shortly. (ref {ref})]"
+        wait = _retry_after_seconds(exc)
+        hint = f" in about {wait} seconds" if wait else " shortly"
+        return f"[Rate limited by the model endpoint. Try again{hint}. (ref {ref})]"
+    # 529 Overloaded and other 5xx: the SDK has already retried with backoff by now.
+    if isinstance(exc, anthropic.APIStatusError) and getattr(exc, "status_code", 0) in (500, 502, 503, 504, 529):
+        return f"[The model service is overloaded or unavailable. Try again in a minute. (ref {ref})]"
+    # Before APIConnectionError, which it subclasses — a timeout is not a VPN problem.
+    if isinstance(exc, anthropic.APITimeoutError):
+        return (
+            f"[The model took too long to respond. Try a shorter or simpler request. (ref {ref})]"
+        )
+    if isinstance(exc, anthropic.BadRequestError):
+        text = str(getattr(exc, "message", "") or "").lower()
+        if "too long" in text or "context" in text or "max_tokens" in text:
+            return (
+                f"[This conversation is too long for the model. Start a new session. (ref {ref})]"
+            )
+        return f"[The model rejected the request. (ref {ref})]"
     if isinstance(
         exc,
         (
@@ -104,6 +147,11 @@ class AgentSessionViewSet(viewsets.ModelViewSet):
 
     serializer_class = AgentSessionSerializer
     permission_classes = [IsAuthenticated]
+
+    def get_throttles(self):
+        # ScopedRateThrottle reads the scope off the view; only the streaming send uses it.
+        self.throttle_scope = "agent_stream" if getattr(self, "action", None) == "send_message" else None
+        return super().get_throttles()
 
     def get_queryset(self):
         user = self.request.user
@@ -298,7 +346,14 @@ class AgentSessionViewSet(viewsets.ModelViewSet):
             "by_session": by_session,
         })
 
-    @action(detail=False, methods=["post"], url_path="send")
+    # `agent_stream` (30/min) was defined in DEFAULT_THROTTLE_RATES but never attached to
+    # anything, so one POST here — which can run up to 11 model calls and dozens of tool
+    # calls — counted only against the generic 200/min budget. Scoped on top of the
+    # default user throttle, not instead of it.
+    @action(
+        detail=False, methods=["post"], url_path="send",
+        throttle_classes=[UserRateThrottle, ScopedRateThrottle],
+    )
     def send_message(self, request):
         """Send a message to the agent and stream the response."""
         serializer = AgentMessageInputSerializer(data=request.data)
@@ -306,6 +361,17 @@ class AgentSessionViewSet(viewsets.ModelViewSet):
 
         user_message: str = serializer.validated_data["message"]
         session_id: int | None = serializer.validated_data.get("session_id")
+
+        # Daily token budget: refuse *before* any work or any new session row. A turn already
+        # streaming is never cut off — see agents/token_budget.py for the rules.
+        budget = token_budget.gate_status(request.user)
+        if budget.state == "blocked":
+            token_budget.note_state(request.user, budget)
+            return Response(
+                {"detail": token_budget.blocked_message(budget), "code": "token_budget_blocked",
+                 "budget": budget.as_dict()},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
         if session_id:
             try:
@@ -356,10 +422,17 @@ class AgentSessionViewSet(viewsets.ModelViewSet):
                         # Send a usage frame the frontend can parse. The framing is a
                         # wire contract shared by several frontend call sites — extra
                         # keys are safe, changing the delimiters is not.
+                        # Budget state *including this turn*, so the warning appears on the
+                        # turn that crosses the line rather than one message later.
+                        turn_state = await sync_to_async(token_budget.gate_status)(
+                            request.user, item["input_tokens"] + item["output_tokens"])
+                        if turn_state.state != "ok":
+                            await sync_to_async(token_budget.note_state)(request.user, turn_state)
                         payload = json.dumps({
                             "input_tokens": item["input_tokens"],
                             "output_tokens": item["output_tokens"],
                             "model": item.get("model", ""),
+                            "budget": turn_state.as_dict(),
                         })
                         yield f"\x00TOKEN_USAGE:{payload}\x00".encode()
                     else:
@@ -394,6 +467,37 @@ class AgentSessionViewSet(viewsets.ModelViewSet):
             content_type="text/event-stream",
             headers={"X-Session-Id": str(session.pk), "Cache-Control": "no-cache"},
         )
+
+
+class AgentToolCatalogView(APIView):
+    """
+    GET /api/v1/agents/tools/ — the agent's tool registry, as the server enforces it.
+
+    The Skills page used to hard-code its own tool list, which drifted from the registry
+    (it still offered delete tools to skill authors after the server stopped allowing
+    them). The page now renders from this. Read-only, and contains no secrets: it is the
+    same names and one-line descriptions already sent to the model.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from .mcp_server import mcp_server
+        from .tool_policy import CONFIRM_REQUIRED
+
+        safe = set(mcp_server.skill_safe_tools())
+        tools = [
+            {
+                "name": name,
+                "group": mcp_server.group_of(name),
+                "description": description,
+                "skill_safe": name in safe,
+                "requires_confirmation": name in CONFIRM_REQUIRED,
+            }
+            for entries in mcp_server.grouped_catalog().values()
+            for name, description in entries
+        ]
+        return Response({"tools": tools})
 
 
 class UserListView(APIView):

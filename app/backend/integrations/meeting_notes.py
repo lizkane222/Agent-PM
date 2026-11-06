@@ -245,6 +245,22 @@ def _event_has_matching_recap(probe, messages: list[dict]) -> bool:
     )
 
 
+def _unlinked_title_q(names) -> Q:
+    """Match events with no account whose title names one of `names`.
+
+    Google-synced meetings are often never linked to an account, so an account-scoped
+    scan that required the FK would never see them. Naming the account in the title
+    ("Siemens / Twilio Segment - Implementation Call") is the signal available. Names
+    under 3 chars are ignored: a substring match on them is noise.
+    """
+    q = Q(pk__in=[])
+    for name in names:
+        name = (name or "").strip()
+        if len(name) >= 3:
+            q |= Q(account__isnull=True, title__icontains=name)
+    return q
+
+
 def candidate_events(user, days: int, account_name: str = "", account: str = ""):
     """Calendar events the user owns that have no AirtableMeeting behind them yet.
 
@@ -276,20 +292,28 @@ def candidate_events(user, days: int, account_name: str = "", account: str = "")
     if token:
         # `account` is an AirtableAccount PK or rec* id; CalendarEvent points at a Django
         # Account, so bridge the two on airtable_id.
-        if token.isdigit():
-            at_ids = list(
-                AirtableAccount.objects.filter(pk=int(token)).values_list(
-                    "airtable_id", flat=True
-                )
-            )
-        else:
-            at_ids = [token]
-        at_ids = [i for i in at_ids if i]
+        at_rows = (
+            AirtableAccount.objects.filter(pk=int(token))
+            if token.isdigit()
+            else AirtableAccount.objects.filter(airtable_id=token)
+        )
+        at_ids = [i for i in at_rows.values_list("airtable_id", flat=True) if i]
+        if not token.isdigit():
+            at_ids = at_ids or [token]
         accounts = DjangoAccount.objects.filter(airtable_id__in=at_ids) if at_ids \
             else DjangoAccount.objects.none()
-        qs = qs.filter(account_id__in=accounts.values_list("pk", flat=True))
+        names = set(at_rows.values_list("name", flat=True)) | set(
+            accounts.values_list("company_name", flat=True)
+        )
+        qs = qs.filter(
+            Q(account_id__in=accounts.values_list("pk", flat=True))
+            | _unlinked_title_q(names)
+        )
     elif account_name:
-        qs = qs.filter(account__company_name__iexact=account_name)
+        qs = qs.filter(
+            Q(account__company_name__iexact=account_name)
+            | _unlinked_title_q({account_name})
+        )
 
     return qs.order_by("-start_datetime")
 
@@ -422,7 +446,10 @@ Recap
 - one or two bullets summarising what the meeting was about
 
 Key Points
-- one bullet per substantive point discussed
+- one bullet per substantive point discussed. When the email gives a point a short \
+topic title followed by a colon (for example "Debugger Navigation: The team showed..."), \
+keep that title verbatim at the start of the bullet: "- Debugger Navigation: The team \
+showed..."
 
 Next Steps
 - one bullet per commitment or follow-up, naming the person responsible where the \
@@ -434,8 +461,10 @@ remarks, no markdown fences, no bold or italic markers.
 - Every bullet starts with "- ".
 - Use only information present in the email. Do not infer or invent commitments.
 - Omit a section entirely if the email contains nothing for it.
-- Strip email chrome: unsubscribe links, "view in browser", legal footers, \
-recording links, and calendar boilerplate.
+- Keep any title that precedes a colon in the email's own bullets; never drop it.
+- If the email links to a document or page that a point refers to, keep it inline as \
+[label](https://...). Strip email chrome: unsubscribe links, "view in browser", legal \
+footers, "go to call"/"view in Zoom" buttons, and calendar boilerplate.
 
 Email body:
 {body}
@@ -484,6 +513,111 @@ def fallback_bullets(body: str, max_chars: int = 4000) -> str:
     return text[:max_chars]
 
 
+# A point in a vendor recap often opens with a topic title: "3.  Destination Strategy: The
+# customer team decided...". The model sometimes folds the title away while rewriting, so
+# the output is checked against the email and the title put back.
+_TITLED_POINT_RE = re.compile(
+    r"^\s*(?:\d+[.)]\s+|[-•*▪◦–—]\s+)?"
+    r"(?P<title>[A-Z][^:\n]{2,60}?):\s+(?P<text>\S.{19,})$"
+)
+
+
+def topic_titled_points(body: str) -> list[tuple[str, str]]:
+    """(title, text) for every email line shaped like "Title: sentence"."""
+    out = []
+    for raw in (body or "").splitlines():
+        m = _TITLED_POINT_RE.match(raw.strip())
+        if not m:
+            continue
+        title, text = m.group("title").strip(), m.group("text").strip()
+        # URLs and clock times ("Duration: 00:31:24") contain colons but are not titles.
+        if "http" in title.lower() or re.search(r"\d:\d", title) or title.count(" ") > 7:
+            continue
+        if re.match(r"^(\d{1,2}:\d{2}|https?://)", text):
+            continue
+        out.append((title, text))
+    return out
+
+
+def restore_topic_titles(summary: str, body: str) -> str:
+    """Put back "Title:" on summary bullets whose source point had one.
+
+    A bullet is matched to its source point by similarity of the opening words, so a
+    lightly reworded bullet still finds its title; a bullet that already carries the
+    title, or matches nothing, is left alone.
+    """
+    points = topic_titled_points(body)
+    if not points:
+        return summary
+    out = []
+    for line in summary.splitlines():
+        m = re.match(r"^(\s*[-•*]\s+)(.*)$", line)
+        if not m:
+            out.append(line)
+            continue
+        prefix, bullet = m.groups()
+        lowered = bullet.lower()
+        best = None
+        for title, text in points:
+            if lowered.startswith(title.lower() + ":"):
+                best = None
+                break
+            ratio = SequenceMatcher(None, lowered[:90], text.lower()[:90]).ratio()
+            if ratio >= 0.6 and (best is None or ratio > best[0]):
+                best = (ratio, title)
+        out.append(f"{prefix}{best[1]}: {bullet}" if best else line)
+    return "\n".join(out)
+
+
+# ── Recording-only notes (a vendor notification with no recap) ────────────────────────
+
+RECORDING_HEADING = "Recording"
+_DURATION_RE = re.compile(r"duration:?\s*\n?\s*(\d{1,2}:\d{2}(?::\d{2})?)", re.IGNORECASE)
+_LINK_LABEL_RE = re.compile(r"link|recording|share|transcript|audio|download", re.IGNORECASE)
+_RECAP_HEADING_RE = re.compile(r"^(recap|key points|next steps)\s*:?$", re.IGNORECASE | re.MULTILINE)
+
+
+def build_recording_notes(body: str, domains: tuple[str, ...]) -> str:
+    """Notes for a notification email that links to a recording but carries no recap.
+
+    Zoom's "Meeting assets" email is exactly this: a duration and a shareable link, the
+    summary itself living in the Zoom web app. The Zoom tab shows those two facts rather
+    than staying blank; the link is a real URL the UI turns into a hyperlink. Empty when
+    the email has no link on the provider's own domains.
+    """
+    lines = [l.strip() for l in (body or "").splitlines()]
+    items: list[str] = []
+    duration = _DURATION_RE.search(body or "")
+    if duration:
+        items.append(f"- Duration: {duration.group(1)}")
+    seen: set[str] = set()
+    for i, line in enumerate(lines):
+        for url in _URL_RE.findall(line):
+            if not any(d in url.lower() for d in domains) or url in seen:
+                continue
+            seen.add(url)
+            # The label is the nearest preceding "Something:" line ("Shareable link:").
+            label = "Recording link"
+            for prev in reversed(lines[max(0, i - 3):i]):
+                if prev.endswith(":") and len(prev) < 40 and _LINK_LABEL_RE.search(prev):
+                    label = prev.rstrip(":").strip().capitalize()
+                    break
+            items.append(f"- {label}: {url}")
+    if not seen:
+        return ""
+    return "\n".join([RECORDING_HEADING, *items])
+
+
+def is_recording_only(notes: str) -> bool:
+    """True for notes made only of the recording block above — not a real recap.
+
+    Such notes may be replaced when a real summary arrives, and do not count as the
+    meeting "having notes" in the UI.
+    """
+    text = (notes or "").strip()
+    return text.splitlines()[:1] == [RECORDING_HEADING] and not _RECAP_HEADING_RE.search(text)
+
+
 def summarize_email(body: str, meeting_name: str, source: str) -> str:
     """Normalise a recap email into headed bullets, falling back to the raw text."""
     body = (body or "").strip()
@@ -515,7 +649,7 @@ def summarize_email(body: str, meeting_name: str, source: str) -> str:
         text = "".join(
             block.text for block in message.content if getattr(block, "type", "") == "text"
         ).strip()
-        return text or fallback_bullets(body)
+        return restore_topic_titles(text, body) if text else fallback_bullets(body)
     except Exception:
         logger.exception("meeting_notes: Claude summarisation failed — falling back to raw text")
         return fallback_bullets(body)
@@ -560,6 +694,76 @@ def extract_provider_url(body: str, domains: tuple[str, ...]) -> str:
         if any(domain in url.lower() for domain in domains):
             return url[:200]
     return ""
+
+
+# ── Notifications ─────────────────────────────────────────────────────────────
+
+# The background check only needs to see mail that arrived since its last run; a week of
+# slack absorbs a stopped worker or a recap that lands the next working day.
+AUTO_LOOKBACK_DAYS = 7
+AUTO_MAX_SUMMARIES = 10
+
+
+def _meeting_link(meeting_id) -> str:
+    """App path that opens the meeting on its account page, or '' when it has no account.
+
+    The account route takes the app's own Account id, while a meeting points at the
+    Airtable mirror, so the two are joined on the shared Airtable id.
+    """
+    from accounts.models import Account
+
+    meeting = AirtableMeeting.objects.select_related("account").filter(pk=meeting_id).first()
+    airtable_id = getattr(getattr(meeting, "account", None), "airtable_id", "")
+    account = Account.objects.filter(airtable_id=airtable_id).first() if airtable_id else None
+    return f"/accounts/{account.pk}?meeting={meeting_id}" if account else ""
+
+
+def notify_notes_added(user, report: dict) -> int:
+    """Record one in-app notification per (meeting, provider) the scan just filled in.
+
+    Idempotent on `client_id`, so a manual click and the scheduled check racing over the
+    same recap cannot announce it twice. Returns how many were created.
+    """
+    from realtime.models import AgentActivityEvent
+
+    created = 0
+    for note in report.get("updated", []):
+        for source in note.get("sources", []):
+            recording = source in note.get("recording_only", [])
+            what = "recording link" if recording else "notes"
+            title = f"{source.capitalize()} {what} added to {note.get('meeting_name') or 'a meeting'}"
+            # Recording-only and recap notes are separate announcements: the recap that
+            # replaces a recording block later is news of its own.
+            client_id = (
+                f"meeting-notes-{note.get('airtable_id') or note['meeting_id']}-{source}"
+                + ("-recording" if recording else "")
+            )
+            _, was_created = AgentActivityEvent.objects.get_or_create(
+                user=user,
+                client_id=client_id,
+                defaults={
+                    "event_type": "meeting_notes",
+                    "title": title,
+                    "metadata": {
+                        "meeting_id": note["meeting_id"],
+                        "airtable_id": note.get("airtable_id", ""),
+                        "meeting_name": note.get("meeting_name", ""),
+                        "account_name": note.get("account_name"),
+                        "source": source,
+                        "kind": "recording" if recording else "notes",
+                    },
+                },
+            )
+            created += int(was_created)
+            if was_created:
+                from team.notifications import account_for_user_by_name, record_notification
+
+                record_notification(
+                    user, "in_app", "meeting_notes", title,
+                    link=_meeting_link(note["meeting_id"]),
+                    account=account_for_user_by_name(user, note.get("account_name")),
+                )
+    return created
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -614,6 +818,22 @@ def sync_meeting_notes_from_email(
 
     state = {"summaries_done": 0}
 
+    def _mirror_notes(meeting, source):
+        # Mirror to Airtable per provider so a missing Zoom column can't take the
+        # Gong write down with it (see write_back.push_meeting_zoom_notes).
+        pusher = (
+            write_back.push_meeting_gong_notes
+            if source == "gong"
+            else write_back.push_meeting_zoom_notes
+        )
+        try:
+            pusher(meeting)
+        except Exception:
+            logger.exception(
+                "meeting_notes: Airtable mirror failed for meeting %s (%s)",
+                meeting.pk, source,
+            )
+
     def import_for_meeting(meeting) -> dict:
         """Try every provider against `meeting`. Returns a per-meeting outcome dict.
 
@@ -626,6 +846,7 @@ def sync_meeting_notes_from_email(
         # reported without saying why.
         matched_without_summary: set[str] = set()
         linked_sources: list[str] = []
+        recording_only_sources: list[str] = []
         hit_summary_cap = False
         email_subjects: dict[str, str] = {}
 
@@ -634,8 +855,10 @@ def sync_meeting_notes_from_email(
             # `.strip()`, not truthiness: an Airtable richText column that was written
             # once and later cleared reports "\n" forever, and a bare truthiness check
             # would read that as an existing summary and skip the meeting permanently.
-            if (getattr(meeting, provider["notes_field"], "") or "").strip():
-                # Already summarised for this provider — never overwrite.
+            existing = (getattr(meeting, provider["notes_field"], "") or "").strip()
+            if existing and not is_recording_only(existing):
+                # Already summarised for this provider — never overwrite. Notes that are
+                # only a recording block are the exception: a real recap replaces them.
                 continue
 
             candidates = [
@@ -659,6 +882,16 @@ def sync_meeting_notes_from_email(
                     setattr(meeting, provider["url_field"], url)
                     meeting.save(update_fields=[provider["url_field"]])
                     linked_sources.append(source)
+                # The provider's tab shows what the email does say — duration and the
+                # recording link — instead of staying blank. Not counted as a recap.
+                recording = build_recording_notes(best["body"], provider["url_domains"])
+                if recording and recording != existing:
+                    setattr(meeting, provider["notes_field"], recording)
+                    meeting.save(update_fields=[provider["notes_field"]])
+                    _mirror_notes(meeting, source)
+                    matched_sources.append(source)
+                    recording_only_sources.append(source)
+                    email_subjects[source] = best["subject"]
                 continue
 
             if state["summaries_done"] >= max_summaries:
@@ -694,26 +927,14 @@ def sync_meeting_notes_from_email(
                     update_fields.append(provider["url_field"])
             meeting.save(update_fields=update_fields)
 
-            # Mirror to Airtable per provider so a missing Zoom column can't take the
-            # Gong write down with it (see write_back.push_meeting_zoom_notes).
-            pusher = (
-                write_back.push_meeting_gong_notes
-                if source == "gong"
-                else write_back.push_meeting_zoom_notes
-            )
-            try:
-                pusher(meeting)
-            except Exception:
-                logger.exception(
-                    "meeting_notes: Airtable mirror failed for meeting %s (%s)",
-                    meeting.pk, source,
-                )
+            _mirror_notes(meeting, source)
 
             matched_sources.append(source)
             email_subjects[source] = best["subject"]
 
         return {
             "sources": matched_sources,
+            "recording_only": recording_only_sources,
             "linked_sources": linked_sources,
             "without_summary": matched_without_summary,
             "hit_summary_cap": hit_summary_cap,
@@ -734,6 +955,8 @@ def sync_meeting_notes_from_email(
                 note["email_subjects"] = outcome["email_subjects"]
             if outcome["linked_sources"]:
                 note["linked_sources"] = outcome["linked_sources"]
+            if outcome["recording_only"]:
+                note["recording_only"] = outcome["recording_only"]
             if created_stub:
                 # The meeting row didn't exist until this import created it.
                 note["created_meeting"] = True

@@ -49,10 +49,43 @@ export const ARTIFACT_ICON_CATALOG: ArtifactIconEntry[] = [
   { key: "file_sheet",  label: "Spreadsheet", assetUrl: statisticsIconUrl },
   { key: "file_image",  label: "Image",       assetUrl: imageIconUrl },
   { key: "file_code",   label: "Code",        emoji: "</>" },
+  { key: "file_pdf",    label: "PDF",         emoji: "📕" },
+  { key: "file_slides", label: "Presentation", emoji: "📊" },
+  { key: "file_video",  label: "Video",       emoji: "🎬" },
+  { key: "file_audio",  label: "Audio",       emoji: "🎧" },
+  { key: "file_archive", label: "Archive",    emoji: "🗜️" },
+  { key: "file_text",   label: "Text",        emoji: "📝" },
   { key: "file_upload", label: "File",        assetUrl: cloudUploadIconUrl },
   // Generic
   { key: "link",        label: "Link",        emoji: "🔗" },
 ];
+
+const CODE_EXTS = new Set(["js", "ts", "tsx", "jsx", "mjs", "cjs", "css", "scss", "sass", "less", "html", "htm", "xml", "py", "rb", "go", "java", "c", "cpp", "h", "cs", "php", "rs", "swift", "kt", "json", "yaml", "yml", "toml", "sh", "bash", "zsh", "sql", "graphql", "gql", "vue", "svelte"]);
+
+/** Best-guess file-type icon key for an uploaded file, from its mime type and extension. */
+export function fileIconKeyFor(mime: string, name: string): string {
+  const m = (mime ?? "").toLowerCase();
+  const ext = name.split(".").pop()?.toLowerCase() ?? "";
+  if (m.startsWith("image/")) return "file_image";
+  if (m === "application/pdf" || ext === "pdf") return "file_pdf";
+  if (m.startsWith("video/")) return "file_video";
+  if (m.startsWith("audio/")) return "file_audio";
+  if (m.includes("spreadsheet") || ["xlsx", "xls", "csv", "numbers"].includes(ext)) return "file_sheet";
+  if (m.includes("presentation") || ["ppt", "pptx", "key"].includes(ext)) return "file_slides";
+  if (["zip", "gz", "tar", "tgz", "7z", "rar"].includes(ext)) return "file_archive";
+  if (CODE_EXTS.has(ext)) return "file_code";
+  if (m.startsWith("text/") || ["txt", "md", "rtf", "log"].includes(ext)) return "file_text";
+  if (m.includes("word") || ["doc", "docx", "pages"].includes(ext)) return "file_doc";
+  return "file_upload";
+}
+
+/** Hostname of an http(s) URL, or null. */
+function hostOf(url: string | null | undefined): string | null {
+  try {
+    const u = new URL(url ?? "");
+    return u.protocol === "http:" || u.protocol === "https:" ? u.hostname : null;
+  } catch { return null; }
+}
 
 export const CATALOG_BY_KEY = Object.fromEntries(ARTIFACT_ICON_CATALOG.map((e) => [e.key, e]));
 
@@ -128,36 +161,55 @@ export function ArtifactIconImg({
   return <span style={{ fontSize: size, lineHeight: 1 }}>{entry.emoji ?? "🔗"}</span>;
 }
 
+/**
+ * Icon for an artifact. Precedence:
+ *   1. the user's uploaded image
+ *   2. the icon they picked (or, for links, the one recognised from the URL)
+ *   3. links: the site's own favicon;  files: an icon guessed from the file type
+ *   4. 🔗
+ */
 export function ArtifactIcon({
-  artifactType, mime, name, url, iconKey, size = 18,
+  artifactType, mime, name, url, iconKey, imageUrl, size = 18,
 }: {
   artifactType: string;
   mime: string;
   name: string;
   url?: string | null;
   iconKey?: string;
+  imageUrl?: string | null;
   size?: number;
 }) {
   const [imgFailed, setImgFailed] = useState(false);
+  const [customFailed, setCustomFailed] = useState(false);
+
+  if (imageUrl && !customFailed) {
+    return (
+      <img
+        src={imageUrl}
+        alt={name}
+        width={size}
+        height={size}
+        onError={() => setCustomFailed(true)}
+        style={{ objectFit: "cover", borderRadius: 4, display: "block", flexShrink: 0 }}
+      />
+    );
+  }
 
   if (artifactType === "link") {
     const resolvedKey = (iconKey && iconKey !== "") ? iconKey : getAutoIconKey(url ?? "");
-    const entry = CATALOG_BY_KEY[resolvedKey] ?? CATALOG_BY_KEY["link"];
+    // "link" means nothing was recognised or chosen: fall back to the site's own favicon.
+    const host = resolvedKey === "link" ? hostOf(url) : null;
+    const entry: ArtifactIconEntry = host
+      ? { key: "favicon", label: host, faviconDomain: host }
+      : (CATALOG_BY_KEY[resolvedKey] ?? CATALOG_BY_KEY["link"]);
     if (!imgFailed) {
       return <ArtifactIconImg entry={entry} size={size} onError={() => setImgFailed(true)} />;
     }
     return <span style={{ fontSize: size, lineHeight: 1 }}>🔗</span>;
   }
 
-  // File type — use asset icons
-  const m = mime.toLowerCase();
-  const ext = name.split(".").pop()?.toLowerCase() ?? "";
-  const CODE_EXTS = new Set(["js", "ts", "tsx", "jsx", "mjs", "cjs", "css", "scss", "sass", "less", "html", "htm", "xml", "py", "rb", "go", "java", "c", "cpp", "h", "cs", "php", "rs", "swift", "kt", "json", "yaml", "yml", "toml", "sh", "bash", "zsh", "sql", "graphql", "gql", "vue", "svelte"]);
-  let fileEntry: ArtifactIconEntry;
-  if (m.startsWith("image/")) fileEntry = CATALOG_BY_KEY["file_image"];
-  else if (m.includes("spreadsheet") || ext === "xlsx" || ext === "csv") fileEntry = CATALOG_BY_KEY["file_sheet"];
-  else if (CODE_EXTS.has(ext)) fileEntry = CATALOG_BY_KEY["file_code"];
-  else fileEntry = CATALOG_BY_KEY["file_upload"];
-
+  // Files: an explicitly chosen file-type icon wins, otherwise guess from the file.
+  const chosen = iconKey && iconKey.startsWith("file_") ? CATALOG_BY_KEY[iconKey] : undefined;
+  const fileEntry = chosen ?? CATALOG_BY_KEY[fileIconKeyFor(mime, name)];
   return <ArtifactIconImg entry={fileEntry} size={size} />;
 }

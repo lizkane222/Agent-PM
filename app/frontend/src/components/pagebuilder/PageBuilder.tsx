@@ -498,6 +498,9 @@ export default function PageBuilder() {
     resizeCommit,
     getSelectedNode,
     clearCanvas,
+    setAside,
+    swapSetAside,
+    discardSetAside,
   } = useCanvasState();
 
   const { zoom, panX, panY, zoomByAt, zoomToAt, panBy, resetView } = useCanvasViewport();
@@ -1123,6 +1126,42 @@ export default function PageBuilder() {
             Save Layout
           </button>
         </div>
+
+        {/* A canvas has been set aside — either the user's earlier draft (when the profile page's
+            mini-canvas opened as a new canvas) or the mini-canvas (after switching back). */}
+        {setAside && (
+          <div
+            role="status"
+            data-testid="set-aside-banner"
+            className="shrink-0 border-b border-amber-200 bg-amber-50 flex items-center gap-3 px-4 py-1.5 text-xs text-amber-900"
+          >
+            <span className="flex-1">
+              {setAside.shown === "mini"
+                ? "Opened a new canvas from your profile mini-canvas. Your earlier canvas is saved."
+                : "Showing your earlier canvas. Your profile mini-canvas is saved."}
+            </span>
+            <button
+              onClick={swapSetAside}
+              className="px-2.5 py-1 rounded-md font-semibold border border-amber-300 bg-white hover:bg-amber-100 transition-colors"
+            >
+              {setAside.shown === "mini" ? "Switch to my earlier canvas" : "Switch to the mini-canvas"}
+            </button>
+            <button
+              onClick={() => {
+                // Permanent, and the only way a set-aside canvas is ever lost: ask first.
+                if (window.confirm(
+                  setAside.shown === "mini"
+                    ? "Permanently delete your earlier canvas? This cannot be undone."
+                    : "Permanently delete the copy of your profile mini-canvas? This cannot be undone.",
+                )) discardSetAside();
+              }}
+              title="Permanently delete the other canvas"
+              className="px-2 py-1 rounded-md text-amber-800 hover:bg-amber-100 transition-colors"
+            >
+              {setAside.shown === "mini" ? "Delete earlier canvas" : "Delete mini-canvas copy"}
+            </button>
+          </div>
+        )}
 
         {/* Export tray is shown in the global red ExportBar at the top of the page.
             Dragging a pill from that bar fires kind="export-item" which is handled

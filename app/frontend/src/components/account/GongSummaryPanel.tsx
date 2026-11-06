@@ -1,3 +1,4 @@
+import { renderMeetingNoteText } from "../../lib/noteHelpers";
 import React, { useState, useRef, useEffect } from "react";
 import { airtableApi, integrationsApi } from "../../lib/api";
 import type { MeetingNotesSource } from "../../lib/api";
@@ -293,10 +294,7 @@ export function GongSummaryPanel({ eventId, meetingId: meetingIdProp, existingNo
 }
 
 function renderWithMentions(text: string): React.ReactNode {
-  const parts = text.split(/(@\S+)/g);
-  return parts.map((p, i) =>
-    p.startsWith("@") ? <span key={i} style={{ color: "#2563eb", fontWeight: 600 }}>{p}</span> : p
-  );
+  return renderMeetingNoteText(text);
 }
 
 export function _strHash(s: string): number {

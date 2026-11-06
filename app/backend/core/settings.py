@@ -139,10 +139,21 @@ if _database_url:
         }
     }
 else:
+    # SQLite is fine for one developer, but Daphne, the Celery worker and Celery beat all
+    # write at once. With SQLite's defaults the second writer fails immediately with
+    # "database is locked". WAL lets readers proceed during a write; the busy timeout makes
+    # a writer wait its turn instead of failing; IMMEDIATE takes the write lock at BEGIN so
+    # two transactions cannot deadlock upgrading read locks. Production uses Postgres
+    # (DATABASE_URL above), where none of this applies.
     DATABASES = {
         "default": {
             "ENGINE": "django.db.backends.sqlite3",
             "NAME": BASE_DIR / "db.sqlite3",
+            "OPTIONS": {
+                "init_command": "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=10000;",
+                "transaction_mode": "IMMEDIATE",
+                "timeout": 20,
+            },
         }
     }
 
@@ -261,11 +272,29 @@ CELERY_BEAT_SCHEDULE = {
         "task": "integrations.tasks.sync_all_google_calendars",
         "schedule": 300,  # backup for Google push notifications; also renews push channels
     },
+    "meeting-notes-every-10-minutes": {
+        "task": "integrations.tasks.check_meeting_notes_all_users",
+        "schedule": 600,
+    },
     "deliver-due-reminders-every-minute": {
         "task": "scheduler.deliver_due_reminders",
         "schedule": 60,  # every 60 seconds — reminder precision is ~1 minute
     },
+    # Documented as "run every 6 days" but never scheduled, so Gmail push watches simply
+    # expired after 7 days. Daily, because the task only re-arms watches expiring within
+    # 24 hours — a 6-day period would miss any that expire in between. Idempotent.
+    "renew-gmail-watches-daily": {
+        "task": "integrations.tasks.renew_gmail_watches",
+        "schedule": 86400,
+    },
 }
+# A crashed worker must not silently drop a task: acknowledge only after it finishes, take
+# one task at a time so a long Airtable pull doesn't hold others hostage, and hard-stop a
+# task that hangs (a stalled third-party connection) instead of pinning a worker forever.
+CELERY_TASK_ACKS_LATE = True
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1
+CELERY_TASK_SOFT_TIME_LIMIT = int(os.getenv("CELERY_TASK_SOFT_TIME_LIMIT", "540"))
+CELERY_TASK_TIME_LIMIT = int(os.getenv("CELERY_TASK_TIME_LIMIT", "600"))
 
 # ── Gmail Watch Keywords (default sync filters) ────────────────────────────────
 GMAIL_DEFAULT_KEYWORDS = [
@@ -292,7 +321,21 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 # Which transport the agent uses to reach Claude.
 #   "bedrock" — AWS Bedrock via the twilio-devex-bedrock SSO profile (needs `aws sso login`)
 #   "gateway" — the corporate LiteLLM proxy, authenticated with ANTHROPIC_API_KEY as a bearer token
-AGENT_BACKEND = os.getenv("AGENT_BACKEND", "gateway").strip().lower()
+#
+# Forced to "gateway" (2026-10-16): every AI feature must go through LiteLLM. An
+# AGENT_BACKEND=bedrock left in a shell or .env is ignored and warned about. The
+# Bedrock code path stays in core.llm (reachable via override_settings in tests) but
+# reviving it at runtime now needs AGENT_ALLOW_BEDROCK=1 as well, deliberately.
+_requested_backend = os.getenv("AGENT_BACKEND", "gateway").strip().lower()
+if _requested_backend != "gateway" and os.getenv("AGENT_ALLOW_BEDROCK") != "1":
+    import warnings
+    warnings.warn(
+        f"AGENT_BACKEND={_requested_backend!r} ignored; LLM traffic is forced to the "
+        f"LiteLLM gateway. Set AGENT_ALLOW_BEDROCK=1 to override.",
+        stacklevel=1,
+    )
+    _requested_backend = "gateway"
+AGENT_BACKEND = _requested_backend
 
 # The gateway is authenticated with a short-lived Okta token. Prefer a static
 # ANTHROPIC_API_KEY (a LiteLLM virtual key) where one exists — CI and prod should use
@@ -330,6 +373,26 @@ _RUNNING_TESTS = "test" in sys.argv or os.getenv("DJANGO_RUNNING_TESTS") == "1"
 if _RUNNING_TESTS:
     AGENT_GATEWAY_TOKEN_COMMAND = ""
     ANTHROPIC_API_KEY = ""
+
+# ── Agent tool policy (agents/tool_policy.py) ─────────────────────────────────
+# Per-user budgets for agent tool calls, by category: (max calls, window seconds).
+# Outbound (texts, calls, invites, Cloud Coach writes) is deliberately tight.
+AGENT_TOOL_RATE_LIMITS = {
+    "read": (120, 60),
+    "write": (40, 60),
+    "delete": (10, 3600),
+    "outbound": (5, 3600),
+    "outbound_per_recipient": (3, 3600),
+}
+# Off under the test runner: the buckets live in the process-wide cache, so a suite that
+# runs an outbound tool more than five times would otherwise fail on the sixth for
+# reasons unrelated to the test. Tests of the limiter re-enable it with override_settings.
+AGENT_TOOL_RATE_LIMITS_ENABLED = not _RUNNING_TESTS
+AGENT_TOOL_TIMEOUT_SECONDS = float(os.getenv("AGENT_TOOL_TIMEOUT_SECONDS", "30"))
+AGENT_TOOL_MAX_CONCURRENCY = int(os.getenv("AGENT_TOOL_MAX_CONCURRENCY", "8"))
+# Hard-won tool timeouts: the meeting-notes scan reads Gmail and may summarise several
+# recaps, so it needs far more than a single record lookup.
+AGENT_TOOL_TIMEOUTS = {"get_meeting_notes_from_email": 120, "log_time_week": 60}
 
 # base_url is passed explicitly rather than left to the SDK's ANTHROPIC_BASE_URL fallback:
 # Claude Code's managed settings export that variable, so a bare client would silently
@@ -452,6 +515,26 @@ VOICE_HINTS_MAX_CHARS = int(os.getenv("VOICE_HINTS_MAX_CHARS", "1000"))
 GOOGLE_WEBHOOK_BASE_URL = os.getenv("GOOGLE_WEBHOOK_BASE_URL", "")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+
+# ── Google Calendar guest notifications (integrations/invite_gate.py) ─────────────────────
+# A customer once received 2,000+ invitation emails from a single meeting move. Whether
+# Google may email an event's guests is decided in ONE place; these are its dials.
+#
+# The master switch. DEFAULT OFF: with it off, every Google Calendar write is sent with
+# sendUpdates="none" and nobody is ever emailed by the app. Turn it on deliberately, in the
+# environment, never in code.
+GOOGLE_GUEST_NOTIFICATIONS = os.getenv("GOOGLE_GUEST_NOTIFICATIONS", "off").strip().lower() in ("on", "true", "1", "yes")
+# How recent a creation/edit, and the user's approval of the send, must be to count as "now".
+GOOGLE_INVITE_FRESHNESS_SECONDS = int(os.getenv("GOOGLE_INVITE_FRESHNESS_SECONDS", "60"))
+# Hard ceiling on guest emails caused by one user's events in any rolling hour.
+GOOGLE_MAX_GUEST_EMAILS_PER_HOUR = int(os.getenv("GOOGLE_MAX_GUEST_EMAILS_PER_HOUR", "20"))
+# Nothing starting further ahead than this (or already in the past) is announced automatically,
+# so no invitation goes out for events months, weeks or years in advance.
+GOOGLE_INVITE_HORIZON_DAYS = int(os.getenv("GOOGLE_INVITE_HORIZON_DAYS", "14"))
+# A one-off, non-recurring event may be announced up to this far ahead (recurring: never).
+GOOGLE_INVITE_SINGLE_EVENT_HORIZON_DAYS = int(os.getenv("GOOGLE_INVITE_SINGLE_EVENT_HORIZON_DAYS", "60"))
+# Per-write limit: a single event with more guests than this is never notified automatically.
+GOOGLE_MAX_GUESTS_PER_NOTIFIED_EVENT = int(os.getenv("GOOGLE_MAX_GUESTS_PER_NOTIFIED_EVENT", "25"))
 GOOGLE_REDIRECT_URI = os.getenv(
     "GOOGLE_REDIRECT_URI", "http://localhost:8000/api/v1/integrations/google/callback/"
 )

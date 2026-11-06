@@ -234,3 +234,91 @@ class TeamMemberDocument(models.Model):
 
     def __str__(self) -> str:
         return f"{self.name} — {self.team_member.full_name}"
+
+
+class Notification(models.Model):
+    """
+    One notification delivered (or attempted) to a user on one channel.
+
+    Senders call `team.notifications.record_notification`, so a user's history
+    covers in-app, push, SMS and Slack alike. Nothing is backfilled.
+    """
+
+    CHANNEL_CHOICES = [
+        ("in_app", "In app"),
+        ("push", "Push"),
+        ("sms", "SMS"),
+        ("slack", "Slack"),
+        ("email", "Email"),
+    ]
+    STATUS_CHOICES = [
+        ("sent", "Sent"),
+        ("failed", "Failed"),
+        ("skipped", "Skipped"),
+    ]
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="notifications")
+    channel = models.CharField(max_length=20, choices=CHANNEL_CHOICES, default="in_app")
+    kind = models.CharField(max_length=40, db_index=True)
+    title = models.CharField(max_length=300)
+    body = models.TextField(blank=True)
+    link = models.CharField(max_length=500, blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="sent")
+    read_at = models.DateTimeField(null=True, blank=True)
+    # The account this notification is about, when it is about one. Drives the per-account
+    # Activity Log; it never widens who can read the notification (still owner-only).
+    account = models.ForeignKey(
+        "accounts.Account", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="notifications",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        indexes = [models.Index(fields=["user", "-created_at"])]
+
+    def __str__(self) -> str:
+        return f"{self.kind}/{self.channel} → {self.user_id}"
+
+
+class PublicItem(models.Model):
+    """
+    Something a user chooses to show on their public profile. Readable by any
+    authenticated user; only the owner may create, edit or delete one.
+    """
+
+    TYPE_CHOICES = [
+        ("artifact_link", "Artifact link"),
+        ("artifact_file", "Artifact file"),
+        ("note", "Note"),
+        ("record_ref", "Record reference"),
+    ]
+
+    owner = models.ForeignKey(User, on_delete=models.CASCADE, related_name="public_items")
+    item_type = models.CharField(max_length=20, choices=TYPE_CHOICES)
+    title = models.CharField(max_length=300)
+    url = models.TextField(blank=True)
+    file = models.FileField(upload_to="public_items/", null=True, blank=True)
+    body = models.TextField(blank=True)  # sanitized HTML for notes
+    ref = models.JSONField(default=dict, blank=True)  # {resource_type, resource_id, label, url}
+    position = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["position", "created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.item_type}: {self.title}"
+
+
+class LeftNote(models.Model):
+    """A private note one user leaves for another. Never shown on the public page."""
+
+    author = models.ForeignKey(User, on_delete=models.CASCADE, related_name="notes_left")
+    recipient = models.ForeignKey(User, on_delete=models.CASCADE, related_name="notes_received")
+    body = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]

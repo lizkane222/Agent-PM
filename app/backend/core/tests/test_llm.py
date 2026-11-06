@@ -442,3 +442,128 @@ class GatewayCredentialErrorTypeTests(SimpleTestCase):
         with self.assertRaises(ImproperlyConfigured) as ctx:
             model_for_tier(TIER_DEFAULT)
         self.assertNotIsInstance(ctx.exception, GatewayCredentialError)
+
+
+@override_settings(**{**BASE, "ANTHROPIC_API_KEY": "", "AGENT_GATEWAY_TOKEN_COMMAND": "/bin/tok"})
+class GatewayAuthRetryTests(SimpleTestCase):
+    """A gateway 401/403 is retried once with a re-minted token (2026-10-16 edge 403)."""
+
+    def setUp(self):
+        reset_gateway_token_cache()
+        self.tokens = iter(["tok-1", "tok-2", "tok-3"])
+        patcher = patch("core.llm._mint_gateway_token",
+                        side_effect=lambda: (next(self.tokens), time.time() + 3600))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _client(self, statuses, *, use_async=False):
+        import httpx
+        from core.llm import _AsyncGatewayRetryTransport, _GatewayRetryTransport
+        seen = []
+        codes = iter(statuses)
+
+        def handler(request):
+            seen.append(request.headers["Authorization"])
+            code = next(codes)
+            if code == 200:
+                return httpx.Response(200, json={
+                    "id": "m", "type": "message", "role": "assistant", "model": "claude-x",
+                    "content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}})
+            return httpx.Response(code, text="<html>403 Forbidden</html>")
+
+        kw = dict(base_url="https://gw.example.com", auth_token=gateway_token(), max_retries=0)
+        if use_async:
+            transport = _AsyncGatewayRetryTransport(httpx.MockTransport(handler))
+            client = anthropic.AsyncAnthropic(**kw, http_client=httpx.AsyncClient(transport=transport))
+        else:
+            transport = _GatewayRetryTransport(httpx.MockTransport(handler))
+            client = anthropic.Anthropic(**kw, http_client=httpx.Client(transport=transport))
+        return client, seen
+
+    def _call(self, client):
+        return client.messages.create(model="claude-x", max_tokens=5,
+                                      messages=[{"role": "user", "content": "hi"}])
+
+    def test_403_then_200_succeeds_with_a_fresh_token(self):
+        client, seen = self._client([403, 200])
+        self.assertEqual(self._call(client).content[0].text, "ok")
+        self.assertEqual(seen, ["Bearer tok-1", "Bearer tok-2"])
+
+    def test_401_is_also_retried(self):
+        client, seen = self._client([401, 200])
+        self._call(client)
+        self.assertEqual(len(seen), 2)
+
+    def test_retries_only_once(self):
+        client, seen = self._client([403, 403, 200])
+        with self.assertRaises(anthropic.PermissionDeniedError):
+            self._call(client)
+        self.assertEqual(len(seen), 2)
+
+    def test_async_client_retries_too(self):
+        import asyncio
+        client, seen = self._client([403, 200], use_async=True)
+        resp = asyncio.run(self._call(client))
+        self.assertEqual(resp.content[0].text, "ok")
+        self.assertEqual(seen, ["Bearer tok-1", "Bearer tok-2"])
+
+    @override_settings(ANTHROPIC_API_KEY="static")
+    def test_static_key_is_not_retried(self):
+        client, seen = self._client([403, 200])
+        with self.assertRaises(anthropic.PermissionDeniedError):
+            self._call(client)
+        self.assertEqual(len(seen), 1)
+
+    def test_production_clients_carry_the_retry_transport(self):
+        from core.llm import _AsyncGatewayRetryTransport, _GatewayRetryTransport
+        self.assertIsInstance(build_sync_client()._client._transport, _GatewayRetryTransport)
+        self.assertIsInstance(build_async_client()._client._transport, _AsyncGatewayRetryTransport)
+
+
+class ForcedGatewayBackendTests(SimpleTestCase):
+    """settings.AGENT_BACKEND ignores a stray AGENT_BACKEND=bedrock."""
+
+    def _resolve(self, env):
+        import os
+        import subprocess
+        import sys
+        code = ("import os,django;os.environ['DJANGO_SETTINGS_MODULE']='core.settings';"
+                "from django.conf import settings;print(settings.AGENT_BACKEND)")
+        full = {**os.environ, **env}
+        full.pop("AGENT_ALLOW_BEDROCK", None) if "AGENT_ALLOW_BEDROCK" not in env else None
+        out = subprocess.run([sys.executable, "-W", "ignore", "-c", code], env=full,
+                             capture_output=True, text=True, check=True,
+                             cwd=os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+        return out.stdout.strip().splitlines()[-1]
+
+    def test_bedrock_env_is_overridden_to_gateway(self):
+        self.assertEqual(self._resolve({"AGENT_BACKEND": "bedrock"}), "gateway")
+
+    def test_explicit_opt_in_still_allows_bedrock(self):
+        self.assertEqual(
+            self._resolve({"AGENT_BACKEND": "bedrock", "AGENT_ALLOW_BEDROCK": "1"}), "bedrock")
+
+
+class ClientResilienceTests(SimpleTestCase):
+    """Explicit timeouts and retries — the SDK defaults (600s, 2 retries) were wrong for us."""
+
+    @override_settings(AGENT_BACKEND="gateway", ANTHROPIC_API_KEY="sk-test")
+    def test_chat_client_has_a_bounded_timeout_and_retries(self):
+        from core import llm
+        client = llm.build_async_client()
+        self.assertEqual(client.max_retries, 3)
+        self.assertEqual(client.timeout.read, 120.0)
+
+    @override_settings(AGENT_BACKEND="gateway", ANTHROPIC_API_KEY="sk-test")
+    def test_voice_client_fails_fast(self):
+        from core import llm
+        client = llm.build_async_client(voice=True)
+        self.assertEqual(client.max_retries, 1)
+        self.assertLessEqual(client.timeout.read, 10.0)
+
+    @override_settings(AGENT_BACKEND="gateway", ANTHROPIC_API_KEY="sk-test")
+    def test_sync_client_matches_chat_policy(self):
+        from core import llm
+        client = llm.build_sync_client()
+        self.assertEqual((client.max_retries, client.timeout.read), (3, 120.0))

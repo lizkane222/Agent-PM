@@ -30,6 +30,13 @@ import type {
   AirtableMeeting,
   CalendarEvent,
   AgentSkill,
+  AgentSkillAttachment,
+  SkillRunInput,
+  SkillRunResult,
+  KeywordTemplate,
+  KeywordExpansion,
+  SlackConversations,
+  AgentTool,
   ClaudeSkill,
   Comment,
   CommentMention,
@@ -561,10 +568,26 @@ export const discoverApi = {
   deleteApplet: (id: number) => apiClient.delete(`/discover/applets/${id}/`),
 };
 
+export type AccountLogCategory =
+  "activity" | "events" | "comments" | "notifications" | "reminders" | "feedback" | "tokens";
+export interface AccountLogRow {
+  id: string; category: AccountLogCategory; ts: string | null; title: string;
+  body: string; link: string; actor: string; status: string;
+}
+export interface AccountActivityLogResponse {
+  counts: Record<AccountLogCategory, number>;
+  results: AccountLogRow[];
+}
+
 export const accountsApi = {
   listAccounts: (params?: Record<string, string>, opts?: { fresh?: boolean }) =>
     apiClient.get<PaginatedResponse<Account>>("/accounts/accounts/", { params, ...freshConfig(opts) }),
   getAccount: (id: number) => apiClient.get<Account>(`/accounts/accounts/${id}/`),
+  /** Per-account Activity Log: counts for all seven categories plus rows (optionally one category). */
+  getActivityLog: (id: number, category?: string) =>
+    apiClient.get<AccountActivityLogResponse>(`/accounts/accounts/${id}/activity-log/`, {
+      params: category ? { category } : undefined,
+    }),
   createAccount: (data: Partial<Account>) =>
     apiClient.post<Account>("/accounts/accounts/", data),
   updateAccount: (id: number, data: Partial<Account>) =>
@@ -614,9 +637,10 @@ export const accountsApi = {
     iconKey?: string,
     secondaryUrl?: string,
     description?: string,
-    references?: CommentReference[]
-  ) =>
-    apiClient.post<AccountArtifact>(`/accounts/accounts/${accountId}/artifacts/`, {
+    references?: CommentReference[],
+    image?: File | null,
+  ) => {
+    const body = {
       artifact_type: "link",
       name,
       url,
@@ -624,12 +648,23 @@ export const accountsApi = {
       secondary_url: secondaryUrl ?? "",
       description: description ?? "",
       references: references ?? [],
-    }),
-  uploadArtifactFile: (accountId: number, file: File) => {
+    };
+    // Only go multipart when there is an image to send — plain JSON otherwise, as before.
+    if (!image) return apiClient.post<AccountArtifact>(`/accounts/accounts/${accountId}/artifacts/`, body);
+    const fd = new FormData();
+    Object.entries(body).forEach(([k, v]) => fd.append(k, typeof v === "string" ? v : JSON.stringify(v)));
+    fd.append("custom_image", image);
+    return apiClient.post<AccountArtifact>(`/accounts/accounts/${accountId}/artifacts/`, fd, {
+      headers: { "Content-Type": "multipart/form-data" },
+    });
+  },
+  uploadArtifactFile: (accountId: number, file: File, opts?: { iconKey?: string; image?: File | null }) => {
     const fd = new FormData();
     fd.append("artifact_type", "file");
     fd.append("name", file.name);
     fd.append("file", file);
+    if (opts?.iconKey) fd.append("icon_key", opts.iconKey);
+    if (opts?.image) fd.append("custom_image", opts.image);
     return apiClient.post<AccountArtifact>(`/accounts/accounts/${accountId}/artifacts/`, fd, {
       headers: { "Content-Type": "multipart/form-data" },
     });
@@ -639,8 +674,24 @@ export const accountsApi = {
   createUserArtifact: (data: { name: string; url: string; icon_key?: string; secondary_url?: string; account?: number | null; description?: string; references?: CommentReference[] }) =>
     apiClient.post<AccountArtifact>("/accounts/artifacts/", { artifact_type: "link", ...data }),
   // `url` accepts null: the edit modal clears a link by sending null explicitly.
-  updateArtifact: (artifactId: number, data: { name?: string; url?: string | null; icon_key?: string; secondary_url?: string; account?: number | null; description?: string; references?: CommentReference[] }) =>
-    apiClient.patch<AccountArtifact>(`/accounts/artifacts/${artifactId}/`, data),
+  updateArtifact: (
+    artifactId: number,
+    data: { name?: string; url?: string | null; icon_key?: string; secondary_url?: string; account?: number | null; description?: string; references?: CommentReference[] },
+    image?: { file?: File | null; remove?: boolean },
+  ) => {
+    if (!image?.file) {
+      return apiClient.patch<AccountArtifact>(`/accounts/artifacts/${artifactId}/`, image?.remove ? { ...data, remove_image: true } : data);
+    }
+    const fd = new FormData();
+    Object.entries(data).forEach(([k, v]) => {
+      if (v === undefined) return;
+      fd.append(k, v === null ? "" : typeof v === "string" || typeof v === "number" ? String(v) : JSON.stringify(v));
+    });
+    fd.append("custom_image", image.file);
+    return apiClient.patch<AccountArtifact>(`/accounts/artifacts/${artifactId}/`, fd, {
+      headers: { "Content-Type": "multipart/form-data" },
+    });
+  },
   listQuickLinks: (accountId: number) =>
     apiClient.get<AccountQuickLink[]>(`/accounts/accounts/${accountId}/quick-links/`),
   createQuickLink: (accountId: number, name: string, url: string) =>
@@ -858,6 +909,10 @@ export const realtimeApi = {
   getSyncToken: () => apiClient.get<SyncToken>("/realtime/sync-token/"),
   listActivity: (params?: { event_type?: string; since?: string; page_size?: number }) =>
     apiClient.get<PaginatedResponse<AgentActivityEvent>>("/realtime/activity/", { params }),
+  /** What happened to the caller's calendar events: created, edited, deleted, attended,
+   *  time logged, notes added. A history of changes — never a list of events themselves. */
+  listEventUpdates: () =>
+    apiClient.get<{ results: AgentActivityEvent[] }>("/realtime/activity/event-updates/", { noCache: true }),
   /** Every user's activity on one record (not just the caller's), newest first. */
   listActivityForResource: (type: string, id: string | number) =>
     apiClient.get<{ results: (AgentActivityEvent & { actor_id: number; actor_display: string })[] }>(
@@ -914,6 +969,27 @@ export const skillsApi = {
     apiClient.get<SkillTokenStats>("/skills/skills/token-stats/", freshConfig(opts)),
 };
 
+/** The agent's tool registry, exactly as the server enforces it. */
+export const agentToolsApi = {
+  list: () => apiClient.get<{ tools: AgentTool[] }>("/agents/tools/"),
+};
+
+/** Daily token budgets (admin) and the signed-in user's own state. */
+export const tokenBudgetApi = {
+  overview: () =>
+    apiClient.get<TokenBudgetOverview>("/agents/token-budgets/", { noCache: true }),
+  mine: () =>
+    apiClient.get<MyBudget>("/agents/token-budgets/me/", { noCache: true }),
+  setPricing: (data: { input_usd_per_million?: string | number; output_usd_per_million?: string | number; output_share?: string | number }) =>
+    apiClient.put<TokenPricingView>("/agents/token-budgets/pricing/", data),
+  setRole: (role: string, data: LimitInput) =>
+    apiClient.put<RoleBudgetRow>(`/agents/token-budgets/roles/${role}/`, data),
+  setUser: (userId: number, data: LimitInput & { block_at_warn?: boolean }) =>
+    apiClient.put(`/agents/token-budgets/users/${userId}/`, data),
+  clearUser: (userId: number) =>
+    apiClient.delete(`/agents/token-budgets/users/${userId}/`),
+};
+
 export const agentSkillsApi = {
   list: () =>
     apiClient.get<PaginatedResponse<AgentSkill>>("/skills/agent-skills/"),
@@ -925,18 +1001,63 @@ export const agentSkillsApi = {
     apiClient.patch<AgentSkill>(`/skills/agent-skills/${id}/`, data),
   delete: (id: number) =>
     apiClient.delete(`/skills/agent-skills/${id}/`),
-  generate: (description: string) =>
-    apiClient.post<{ name: string; description: string; instructions: string; allowed_tools: string[]; needs_script: boolean; script: string }>("/skills/agent-skills/generate/", { description }),
+  generate: (description: string, context?: Record<string, unknown>) =>
+    apiClient.post<{ name: string; description: string; instructions: string; allowed_tools: string[]; needs_script: boolean; script: string }>("/skills/agent-skills/generate/", { description, context }),
   review: (id: number) =>
     apiClient.post<AgentSkill>(`/skills/agent-skills/${id}/review/`),
   pin: (id: number) =>
     apiClient.post<AgentSkill>(`/skills/agent-skills/${id}/pin/`),
   unpin: (id: number) =>
     apiClient.post<AgentSkill>(`/skills/agent-skills/${id}/unpin/`),
-  run: (id: number, args?: Record<string, string>) =>
-    apiClient.post<{ prompt: string }>(`/skills/agent-skills/${id}/run/`, { args: args ?? {} }),
-  updateSkill: (id: number, data: Partial<Pick<AgentSkill, "name" | "description" | "instructions" | "allowed_tools" | "scripts" | "pinned_to_roles">>) =>
+  run: (id: number, input?: SkillRunInput) =>
+    apiClient.post<SkillRunResult>(`/skills/agent-skills/${id}/run/`, { args: {}, ...input }),
+  updateSkill: (id: number, data: Partial<Pick<AgentSkill, "name" | "description" | "instructions" | "allowed_tools" | "scripts" | "pinned_to_roles" | "twilio_skills" | "chained_skills" | "context_defaults" | "templates">>) =>
     apiClient.patch<AgentSkill>(`/skills/agent-skills/${id}/`, data),
+  listAttachments: (id: number) =>
+    apiClient.get<AgentSkillAttachment[]>(`/skills/agent-skills/${id}/attachments/`),
+  /** A file (multipart) or a link. `account_id` also files it as that account's artifact. */
+  addAttachment: (id: number, body: { file?: File; url?: string; name?: string; account_id?: number }) => {
+    if (body.file) {
+      const form = new FormData();
+      form.append("file", body.file);
+      if (body.name) form.append("name", body.name);
+      if (body.account_id) form.append("account_id", String(body.account_id));
+      return apiClient.post<AgentSkillAttachment>(`/skills/agent-skills/${id}/attachments/`, form);
+    }
+    return apiClient.post<AgentSkillAttachment>(`/skills/agent-skills/${id}/attachments/`, body);
+  },
+  getAttachment: (id: number, attachmentId: number) =>
+    apiClient.get<AgentSkillAttachment & { text: string }>(`/skills/agent-skills/${id}/attachments/${attachmentId}/`),
+  /** Read a document into selectable templates; nothing is stored. */
+  parseTemplate: (file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    return apiClient.post<{ text: string; intro: string; sections: { key: string; title: string; markdown: string }[] }>(
+      "/skills/agent-skills/parse-template/", form);
+  },
+  /** Voice launch for sources that are not an AgentSkill (Twilio skills, example prompts). */
+  voiceLaunch: (title: string, text: string) =>
+    apiClient.post<{ key: string; script: string }>("/skills/voice-launch/", { title, text }),
+  removeAttachment: (id: number, attachmentId: number) =>
+    apiClient.delete(`/skills/agent-skills/${id}/attachments/${attachmentId}/`),
+  /** Stash the run context for a voice call; the returned key rides the call as `ctx`. */
+  /** "Claude recommended tools": suggestions only, validated against the skill-safe registry. */
+  recommendTools: (description: string, instructions?: string) =>
+    apiClient.post<{ tools: RecommendedTool[]; limitations: string[] }>(
+      "/skills/agent-skills/recommend-tools/", { description, instructions }),
+  /** Admin: Claude's per-run token estimate for every skill. */
+  listTokenEstimates: () =>
+    apiClient.get<{ results: SkillEstimateRow[] }>("/skills/agent-skills/token-estimates/", { noCache: true }),
+  /** Admin: (re)estimate one skill, or the missing/stale ones (up to 10 per request) when skillId is omitted. */
+  estimateTokens: (skillId?: number) =>
+    apiClient.post<{ results: SkillEstimateRow[]; failed: string[]; remaining: number }>(
+      "/skills/agent-skills/token-estimates/", skillId === undefined ? {} : { skill_id: skillId }),
+  voiceStart: (id: number, input?: SkillRunInput) =>
+    apiClient.post<{ key: string; script: string; warnings: string[] }>(`/skills/agent-skills/${id}/voice-start/`, input ?? {}),
+  keywordCatalog: () =>
+    apiClient.get<{ keywords: KeywordTemplate[] }>("/skills/agent-skills/resolve-keywords/"),
+  resolveKeywords: (text: string) =>
+    apiClient.post<{ results: KeywordExpansion[] }>("/skills/agent-skills/resolve-keywords/", { text }),
 };
 
 export interface SearchResult {
@@ -1091,6 +1212,8 @@ export interface MeetingNotesUpdate {
   linked_sources?: MeetingNotesSource[];
   /** True when this meeting existed only as a calendar event until the import ran. */
   created_meeting?: boolean;
+  /** Providers whose email only linked a recording; their tab got a Recording block, not a recap. */
+  recording_only?: string[];
 }
 
 export interface MeetingNotesSkip {
@@ -1160,6 +1283,9 @@ export interface DirectoryUser {
 }
 
 export const integrationsApi = {
+  /** Slack channels/DMs for context pickers. `enabled: false` until Slack is connected. */
+  listSlackConversations: (q?: string) =>
+    apiClient.get<SlackConversations>("/integrations/slack/conversations/", { params: q ? { q } : undefined, noCache: true }),
   getStatus: () =>
     apiClient.get<{ connected: OAuthCredential[]; sync_states: unknown[] }>(
       "/integrations/status/"
@@ -1197,7 +1323,8 @@ export const integrationsApi = {
   // what the account detail page does; `account_name` is the fallback for accounts with
   // no Airtable link. Omit both to cover every account the user is on — what the profile
   // and role pages do.
-  getMeetingNotesFromEmail: (body?: { days?: number; account?: string; account_name?: string }) =>
+  // `auto: true` is the background poll: recent window only, quiet.
+  getMeetingNotesFromEmail: (body?: { days?: number; account?: string; account_name?: string; auto?: boolean }) =>
     apiClient.post<MeetingNotesEmailReport>("/integrations/gmail/meeting-notes/", body ?? {}),
   // NOTE: no backend route exists yet for this — the caller (ThreadCard, orphaned/unwired)
   // is not reachable from any current page, so this is a type-level stub only.
@@ -1251,6 +1378,7 @@ export const integrationsApi = {
 };
 
 import type { ActionItemStep, StepStatus } from "../types/action_items";
+import type { LimitInput, MyBudget, RecommendedTool, RoleBudgetRow, SkillEstimateRow, TokenBudgetOverview, TokenPricingView } from "../types/tokenBudget";
 export type { ActionItemStep, StepStatus };
 
 export const stepsApi = {
@@ -1280,4 +1408,44 @@ export const syncReviewApi = {
     apiClient.get<{ count: number; results: SyncDeleteRequest[] }>("/sync-review/delete-requests/", { params }),
   resolveDeleteRequest: (id: number, decision: "approved" | "rejected") =>
     apiClient.patch<SyncDeleteRequest>(`/sync-review/delete-requests/${id}/resolve/`, { decision }),
+};
+
+// ── Profile page: notifications, public section, notes left for a member ───────
+
+export const notificationsApi = {
+  list: (params?: Record<string, string>) =>
+    apiClient.get<PaginatedResponse<import("../types/team").AppNotification>>("/team/notifications/", { params: { page_size: "200", ...params } }),
+  markRead: (ids?: number[]) =>
+    apiClient.post<{ updated: number }>("/team/notifications/mark-read/", ids ? { ids } : {}),
+};
+
+export const publicItemsApi = {
+  listForMember: (memberId: number | "me") =>
+    apiClient.get<import("../types/team").PublicItem[]>("/team/public-items/", { params: { member: String(memberId) } }),
+  create: (data: Partial<import("../types/team").PublicItem> | FormData) =>
+    apiClient.post<import("../types/team").PublicItem>("/team/public-items/", data),
+  update: (id: number, data: Partial<import("../types/team").PublicItem>) =>
+    apiClient.patch<import("../types/team").PublicItem>(`/team/public-items/${id}/`, data),
+  remove: (id: number) => apiClient.delete(`/team/public-items/${id}/`),
+};
+
+export const memberProfileApi = {
+  get: (memberId: number) =>
+    apiClient.get<import("../types/team").MemberPublicProfile>(`/team/members/${memberId}/profile/`),
+  leaveNote: (memberId: number, body: string) =>
+    apiClient.post<import("../types/team").LeftNote>(`/team/members/${memberId}/leave-note/`, { body }),
+  listNotesLeftForMe: (myMemberId: number) =>
+    apiClient.get<import("../types/team").LeftNote[]>(`/team/members/${myMemberId}/leave-note/`),
+};
+
+/** Logged time (Log Time panel entries). Feeds the profile page's Time Allocation panel. */
+export const timeEntriesApi = {
+  list: (params?: Record<string, string>) =>
+    apiClient.get<PaginatedResponse<import("../types/salesforce").SalesforceTimeEntry>>("/salesforce/time-entries/", { params }),
+};
+
+/** Where time went, by day and account: logged time, with calendar events filling unlogged days. */
+export const timeAllocationApi = {
+  get: (params: { start: string; end: string }) =>
+    apiClient.get<import("../types/salesforce").TimeAllocation>("/salesforce/time-allocation/", { params }),
 };

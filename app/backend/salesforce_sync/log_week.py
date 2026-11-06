@@ -463,10 +463,16 @@ def write_week(user, plan: WeekPlan) -> dict:
         )
     }
 
+    from .time_entry_accounts import account_for_project_sf_id, infer_account
+
     audit_rows = [
         SalesforceTimeEntry.objects.create(
             user=user,
             project=projects_by_sf_id.get(entry.project_sf_id),
+            account=(
+                account_for_project_sf_id(entry.project_sf_id)
+                or infer_account(user, entry.entry_date, entry.description)
+            ),
             date=entry.entry_date,
             duration_minutes=entry.minutes,
             description=entry.description,
@@ -504,6 +510,7 @@ def write_week(user, plan: WeekPlan) -> dict:
         "Logged %d Cloud Coach time entries for %s, week of %s",
         len(audit_rows), user, plan.week_start,
     )
+    _record_time_logged(user, plan.entries)
     return {
         **plan.as_dict(),
         "logged": len(audit_rows),
@@ -512,6 +519,34 @@ def write_week(user, plan: WeekPlan) -> dict:
             for entry, row in zip(plan.entries, audit_rows)
         ],
     }
+
+
+MAX_LOGGED_TITLES_RECORDED = 25
+
+
+def _record_time_logged(user, entries) -> None:
+    """One Events-tab entry per event that was just logged to Cloud Coach.
+
+    Entries are a day's work on a project and carry event titles rather than ids, so each
+    title is recorded against its project and day. Never raises (see scheduler.event_log).
+    """
+    from scheduler.event_log import record_event_change
+
+    recorded = 0
+    for entry in entries:
+        for title in (entry.titles or [entry.description]):
+            if not title or recorded >= MAX_LOGGED_TITLES_RECORDED:
+                continue
+            recorded += 1
+            record_event_change(
+                user, "time_logged", None, title=title,
+                message=(
+                    f'Time logged: "{title}" — {entry.hours}h to {entry.project_name} '
+                    f"on {entry.entry_date.isoformat()}"
+                ),
+                extra={"project": entry.project_name, "hours": entry.hours,
+                       "log_date": entry.entry_date.isoformat()},
+            )
 
 
 def week_range_label(week_start: date) -> str:

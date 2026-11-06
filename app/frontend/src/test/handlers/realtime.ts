@@ -46,7 +46,28 @@ export function resourceActivityResponse(
   };
 }
 
+/** One entry from the Events tab feed — a change made to a calendar event. */
+export const mockEventUpdate = (overrides: Partial<AgentActivityEvent> = {}): AgentActivityEvent => ({
+  id: 301,
+  event_type: "calendar_event.created",
+  title: 'Event created: "Kickoff"',
+  detail: "",
+  metadata: {
+    action: "created",
+    event_title: "Kickoff",
+    event_start: "2026-11-10T17:00:00Z",
+    resource: { type: "calendar_event", id: 7 },
+    links: [{ label: "View calendar", path: "/calendar" }],
+  },
+  sync_document_id: "",
+  client_id: "",
+  client_ts: null,
+  created_at: "2026-11-04T12:00:00Z",
+  ...overrides,
+});
+
 export const realtimeHandlers = [
+  http.get("/api/v1/realtime/activity/event-updates/", () => HttpResponse.json({ results: [] })),
   http.get("/api/v1/realtime/activity/for-resource/", () => HttpResponse.json({ results: [] })),
   http.get("/api/v1/realtime/activity/", () =>
     HttpResponse.json({ results: [], count: 0 })

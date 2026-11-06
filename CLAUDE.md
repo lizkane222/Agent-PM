@@ -32,6 +32,7 @@ These are non-negotiable and apply to every change in every session:
 3. **Tests are not optional.** Every new or modified hook, page, and backend view endpoint must have automated tests written in the same change. Do not defer tests to a follow-up.
 4. **All tests must pass before a change is considered done.** Run `npm run test` (frontend) and `python manage.py test` (backend) and confirm both exit 0.
 5. **The build must stay clean.** `npm run build` in `app/frontend/` must produce no TypeScript errors after every change.
+6. **Nothing may email anyone without the user's explicit approval, and the Google guest-notification governance may never be weakened.** Read "Outbound communication governance" below before touching anything that writes to Google Calendar, sends a message, or defines a tool. Three tests in `scheduler/tests/test_views.py::MeetingInviteGooglePushTest` were rewritten on purpose after a customer received 2,000+ invitation emails — never restore, skip or weaken them.
 
 ---
 
@@ -75,6 +76,12 @@ All data-fetching hooks are built on `useResource<T>` in `src/hooks/useResource.
 | `useAgentSessions` | `hooks/useAgentSessions.ts` | `AgentSession[]` |
 | `useFeedbackItems` | `hooks/useFeedbackItems.ts` | `FeedbackItem[]` |
 | `useCalendarEvents` | `hooks/useCalendarEvents.ts` | `CalendarEvent[]` |
+| `useLiveTimers` | `hooks/useLiveTimers.ts` | Running Live Tracking timers — a shared store (`lib/liveTimers.ts`), **not** `useResource` |
+| `useAvailability` | `hooks/useAvailability.ts` | Compared people's busy time — keyed object, **not** `useResource` |
+| `useGoogleCalendarAutoSync` | `hooks/useGoogleCalendarAutoSync.ts` | Side-effect hook (5-min Google pull), no data |
+| `useNotifications` | `hooks/useNotifications.ts` | `AppNotification[]` (the caller's own history, any channel) |
+| `usePublicItems` | `hooks/usePublicItems.ts` | `PublicItem[]` for one member (`"me"` or a TeamMember id) |
+| `useMyTokenBudget` | `hooks/useMyTokenBudget.ts` | The caller's own daily token state — one object, **not** `useResource` |
 
 ---
 
@@ -85,7 +92,7 @@ Types live in per-domain files under `src/types/`. `src/types/index.ts` re-expor
 | Domain file | Types it owns |
 |---|---|
 | `types/scheduler.ts` | `Reminder`, `ReminderStatus`, `ReminderResourceType`, `CalendarEvent`, `MeetingNote`, `Attendee` |
-| `types/team.ts` | `Tag`, `TeamMember`, `UserProfile` |
+| `types/team.ts` | `Tag`, `TeamMember`, `UserProfile`, `AppNotification`, `PublicItem`, `MemberPublicProfile`, `LeftNote` |
 | `types/discover.ts` | `DiscoverApplet`, `AppletCategory`, `ItemType`, `UrlStatus` |
 | `types/agents.ts` | `SessionParticipant`, `AgentSession`, `AgentMessage`, `ToolCall`, `AgentSkill`, `AgentSkillStatus`, `AgentSkillVisibility`, `AgentSkillScript` |
 | `types/feedback.ts` | `FeedbackStatus`, `FeedbackComment`, `FeedbackItem` |
@@ -162,6 +169,16 @@ backend/<app>/
 
 Create the `tests/` package (with `__init__.py`) if it doesn't exist. Do not put tests in the top-level `tests.py` stub.
 
+### Access levels (Basic / PM / Admin)
+
+`team.UserProfile.access_level` is the authorisation tier. Read it through `core/mixins.py`
+(`access_level`, `is_admin`, `is_pm_or_above`) — never branch on raw `is_staff` for a new
+permission. `_staff_sees_all` is now "Admin **and** `staff_view_override`". The level is
+read-only on `/me/`; only the Admin-only `PATCH /team/profiles/<id>/access-level/` changes it.
+New staff profiles are created as Admin (`UserProfile.save`); everyone else defaults to Basic.
+Many older call sites still check raw `is_staff` (list in the 2026-10-16 entry) — migrate them
+when touched.
+
 ### `_staff_sees_all`
 
 The canonical implementation is in `core/mixins.py`. Import from there — never redefine it locally in a view file:
@@ -171,6 +188,209 @@ from core.mixins import _staff_sees_all
 ```
 
 ---
+
+## MCP server and agent tools
+
+The agent's tools live in an **in-process MCP server** (`agents/mcp_server.py`, instance
+`mcp_server`). Chat, voice and saved workflows all reach a tool through the single function
+`MCPServer.dispatch`, and that is the only place the agent's actions are protected. These rules
+are binding for every session; the 2026-10-19 session-log entry explains why each exists.
+
+### Where things live
+
+| File | Owns |
+|---|---|
+| `agents/mcp_server.py` | The registry, `dispatch()`, and the original tools |
+| `agents/tool_policy.py` | Every rule `dispatch` enforces (auth, schema, skill scope, confirmation, rate limits, timeout, error shape) |
+| `agents/rest_bridge.py` | Calls the app's real REST view in-process as the user |
+| `agents/record_tools.py` | Create/read/update tools for user-facing records. **No deletes.** |
+| `agents/people_tools.py` | Colleague lookup, availability, invites |
+| `salesforce_sync/agent_tools.py` | Cloud Coach tools |
+| `realtime/voice_policy.py` | `VOICE_CONFIRM_TOOLS`: the spoken confirmation gate for voice |
+| `pages/ClaudeSkillsPage.tsx` | The "Agent Capabilities" cards (`AGENT_SKILL_DEFS`) |
+
+Tools in a module other than `mcp_server.py` register from an `AppConfig.ready()` (see
+`agents/apps.py`, `salesforce_sync/apps.py`). Do the same for a new module.
+
+### Rules for adding or changing a tool
+
+1. **Never skip `dispatch()`.** Do not call a tool function directly, add a second entry point,
+   or branch on the caller inside a tool. Anything a tool needs to enforce about *who may call
+   it or how often* belongs in `tool_policy.py`, once, not in the tool body.
+2. **Use the REST bridge for anything the app can already do.** Call the real endpoint with
+   `rest_bridge.call(user, method, path, ...)` + `rest_bridge.check(...)`. The agent then gets
+   the app's exact permissions and side effects (Airtable write-back, Google push, activity log,
+   Cloud Coach push). **Do not** reimplement a permission rule, touch the ORM to write a
+   user-facing record, or widen what a view allows. If the app's UI cannot do it, the agent
+   cannot either; changing that is a product decision, not a tool change.
+3. **Read tools must scope by user unconditionally.** Never write `if user:` before an owner
+   filter. `dispatch` already refuses a call with no signed-in user; the filter must not be the
+   thing deciding whether it applies.
+4. **No delete tools.** Deletes stay in the app. The only two that exist
+   (`delete_action_item`, `delete_calendar_event`) are in `CONFIRM_REQUIRED`. Adding a delete,
+   or any tool that leaves the platform (SMS, call, email, invite, third-party write), requires
+   asking the user first, then adding it to `CONFIRM_REQUIRED` / `OUTBOUND_TOOLS` in
+   `tool_policy.py` **and** `VOICE_CONFIRM_TOOLS` in `realtime/voice_policy.py`.
+5. **Declare the tool properly:** `@mcp_server.tool(group=..., skill_safe=..., schema=...)` with a
+   one-line docstring (it is the description Claude sees) and a complete `input_schema`.
+   `dispatch` validates against that schema and **rejects unknown keys**, so every argument the
+   function accepts must be in `properties`, with `enum`, `minimum`/`maximum`, `maxLength` and
+   `items.type` wherever they apply. Bound every list/limit argument.
+6. **`skill_safe=True` only for create/read/update that runs through the REST bridge.** Never for
+   a delete, an outbound tool, or a third-party write. Adding one means editing
+   `EXPECTED_SKILL_SAFE` in `agents/tests/test_mcp_catalog.py` on purpose, which is the point:
+   the test fails first so the decision is deliberate.
+7. **Never put exception text, record contents or credentials in a tool result.** Raise
+   `ToolPolicyError(code, safe_message)` for expected refusals, and let anything else propagate:
+   `dispatch` logs it with a ref and returns a fixed message. Never `return {"error": str(exc)}`
+   (Twilio's exception text contains the account SID).
+8. **Use `sync_to_async(thread_sensitive=True)` for ORM work**, never
+   `loop.run_in_executor(None, ...)`. Bare executor threads leak DB connections and cannot see
+   `TestCase` data.
+9. **Names are fuzzy-matched, ids are exact.** Resolve a spoken account or person name with
+   `agents.fuzzy.resolve_name` (via `_resolve_account` in `record_tools.py`), and only among
+   records the caller can already see. Never fall back to "no account" silently when a name does
+   not resolve; return the candidates.
+10. **Rate limits:** a tool's category comes from its `group` (`read`, `write`, `delete`);
+    outbound tools are in `OUTBOUND_TOOLS`. Change budgets in `AGENT_TOOL_RATE_LIMITS`
+    (`core/settings.py`), not in a tool. A tool that can be slow needs an entry in
+    `AGENT_TOOL_TIMEOUTS`.
+
+### Required tests for every tool change
+
+| What you change | Tests required |
+|---|---|
+| New or changed tool | A test through `mcp_server.dispatch(...)` (not the function directly) in `agents/tests/`: happy path, **a user acting on another user's record is refused**, and the arguments the schema forbids are refused |
+| New tool that reaches a third party | The third party is patched; assert nothing is sent when unconfirmed, and that an upstream error does not appear in the result |
+| New `skill_safe` / `CONFIRM_REQUIRED` / `OUTBOUND_TOOLS` membership | Update `EXPECTED_SKILL_SAFE` (`test_mcp_catalog.py`) or the `EXPECTED` set (`realtime/tests/test_voice_policy.py`) in the same change |
+| New rule in `tool_policy.py` | A test in `agents/tests/test_tool_policy.py`, and **sabotage-check it**: disable the rule, confirm the test fails, restore |
+
+Rate limiting is off under the test runner (`AGENT_TOOL_RATE_LIMITS_ENABLED`); a test of the
+limiter must re-enable it with `override_settings`.
+
+### Keeping the user-facing list in step
+
+The "Agent Capabilities" page documents tools by hand in `AGENT_SKILL_DEFS`.
+`agents/tests/test_skills_page_parity.py` fails if a documented tool is not registered or if a
+voice-gated tool is not documented. When you add a tool, add it to the right card (or a new one)
+in the same change, with an example prompt. The skill-picker tool list is **not** hand-written:
+it comes from `GET /agents/tools/`, so do not add a tool list to the frontend.
+
+### Changing the dispatcher itself
+
+Editing `MCPServer.dispatch`, `tool_policy.py` or `rest_bridge.py` changes the protection for
+every tool and every surface. Before you do: read the 2026-10-19 session-log entry, run
+`agents`, `realtime`, `skills` and `salesforce_sync` tests together, and confirm voice still
+passes `confirmed=True` only after a spoken yes (`realtime/voice_agent.py::dispatch_confirmed`).
+Other sessions edit these files concurrently; check `git status` and `ls -lT` first, and keep
+their uncommitted changes.
+
+---
+
+## Outbound communication governance — BINDING, never relax
+
+**Why this section exists.** A customer received **over 2,000** Google Calendar invitation emails
+from the user's own Gmail address after one meeting was moved, including invitations for events
+months, weeks and *years* in the future. It put the product under severe scrutiny. Every rule
+below is a response to a specific way that happened. A future change that weakens any of them is
+not a refactor; it reopens the incident.
+
+**The product rule (the owner's words, verbatim intent).** An invitation email is sent **at most
+once per event**, only at the moment the user **creates or updates the event in AgentPM** and
+**explicitly approves the send**. Google's own "accept this event or all events" prompt handles
+the rest — the app never sends reminders, re-sends, or per-occurrence emails. Anything that
+communicates with another person by email, from **any** surface (calendar UI, chat, voice, a
+saved skill, a background sync), requires the user's explicit approval. If you are unsure whether
+a change could email someone, assume it can and ask the user first.
+
+### The single gateway — the only way to write to Google Calendar
+
+1. **Every** `events().insert / patch / update / delete` goes through
+   `integrations/google_calendar_gateway.py` (`write_event`, `write_guestless`, `delete_by_id`).
+   Never call the Google client directly. `integrations/tests/test_no_direct_google_writes.py`
+   scans the source and **fails the build** if anyone does — including in a new file. Do not add
+   a path to its allow-list.
+2. `sendUpdates` is **never chosen at a call site and never left unset**. Google's default has
+   differed by method, and `"all"` emails every guest. Only `integrations/invite_gate.py::decide`
+   can return `"all"`; the gateway sets the value, so a call site cannot forget it.
+3. `invite_gate.decide` returns "send" only if **all** of these hold, checked in this order, and
+   every uncertain input (missing timestamp, future timestamp, no approval time) means *don't send*:
+   - not already sent — `invite_sent` is false **and** `invited_emails` is empty;
+   - the event's `origin` is `agentpm` (events pulled from Google are Google's to announce);
+   - **not a recurring instance** (id shaped `<series>_<date>`) — a series is one invitation;
+   - the master switch `GOOGLE_GUEST_NOTIFICATIONS` is on (**default off**);
+   - created or updated within the freshness window (`GOOGLE_INVITE_FRESHNESS_SECONDS`, 60);
+   - starts no more than `GOOGLE_INVITE_HORIZON_DAYS` (**14**, owner's decision 2026-11-04; was 90) ahead and no more than 5 minutes ago — **or**, for a one-off
+     event that is not recurring and has no series, up to `GOOGLE_INVITE_SINGLE_EVENT_HORIZON_DAYS` (**60**) ahead;
+   - the user approved, and the approval itself is within the freshness window;
+   - there is someone to email, within the hourly budget (`GOOGLE_MAX_GUEST_EMAILS_PER_HOUR`, 20)
+     and the per-event ceiling (`GOOGLE_MAX_GUESTS_PER_NOTIFIED_EVENT`, 25).
+4. **Never notify for a newly added guest on an already-announced event.** The owner asked for
+   "email only the new address". Google cannot do that: `attendees` **replaces** the whole list
+   and `sendUpdates="all"` notifies **every** guest (its docs offer no "new guests only"). Sending
+   only the newcomer would delete everyone else; asking Google to notify would re-email everyone
+   already invited — the incident. So later additions are added **silently**. Do not "improve"
+   this by sending a partial attendee list or by calling `all` again.
+5. **Deleting never emails cancellations** (`delete_by_id` is always `none`).
+6. **Every write is audited** in `integrations.GoogleWriteLog` (who, event, guests, what Google
+   was told, the gate's reason, the outcome), written *before* the Google call so a crash still
+   leaves evidence. When asked "what did the app email, and why?", answer from this table.
+
+### Approval on every surface
+
+7. **Every tool in `OUTBOUND_TOOLS` must also be in `CONFIRM_REQUIRED` and in
+   `VOICE_CONFIRM_TOOLS`.** Two of four were missing, so chat could email guests with no yes.
+   `agents/tests/test_outbound_approval.py` iterates the **live registry**, so a new outbound tool
+   fails the build until it is gated. A saved skill can never reach an outbound tool, even if it
+   lists the tool, claims `confirmed=True`, or carries a forged token — that is tested, keep it.
+8. A tool that emails must read `agents.mcp_server._current_approved` (set by `dispatch` for a
+   spoken yes **or** a redeemed single-use chat token) and **fail closed** without it. Read it in
+   the async wrapper and pass it as an argument — a `ContextVar` does not reliably cross into a
+   `sync_to_async` thread. A tool must report **truthfully** whether *this call* sent an email;
+   never infer success from "no exception".
+9. `send_invites` in a request body means **no** when absent. It used to mean yes, so any API or
+   voice caller that added guests emailed them with no approval. Do not restore that default.
+
+### Google OAuth scopes are a security boundary
+
+10. `integrations/views.py::GOOGLE_SCOPES / GMAIL_SCOPES` ask for the narrowest scopes that work:
+    `calendar.events` + `calendar.freebusy` (not the full `calendar`, not `calendar.readonly`),
+    and **never `gmail.send`** or full Gmail. `integrations/tests/test_google_scopes.py` pins them.
+    `gmail.modify` remains on the calendar flow only because `integrations/gmail_utils.py`
+    documents a combined-credential fallback for some users; it cannot send mail. Removing it
+    needs a migration plan for those users — ask first. Changing the requested scopes does not
+    change tokens already issued: the user must disconnect and reconnect to drop old grants.
+
+### Tests that pin the incident — NEVER restore the old behaviour
+
+11. **Three tests in `scheduler/tests/test_views.py::MeetingInviteGooglePushTest` were rewritten
+    on purpose**, because they asserted the exact behaviour that caused the incident:
+    - `test_reschedule_notifies_guests` (asserted `sendUpdates == "all"` on a plain move) is now
+      **`test_reschedule_does_NOT_notify_guests`**.
+    - `test_omitted_flag_defaults_to_sending_when_there_are_guests` is now
+      **`test_omitted_flag_does_NOT_email_guests`**.
+    - `test_guests_are_emailed_when_send_invites_is_true` now runs with the master switch on.
+    **No agent may revert, rename back, delete, skip, or weaken these three tests, or loosen the
+    gate, the gateway, `_send_invites_flag`, or `CONFIRM_REQUIRED`, to make a test or feature
+    pass.** If a test of yours fails against these rules, your test is wrong. The same applies to
+    `CalendarPage.test.tsx`'s "never claims that saving will notify guests": the edit form used
+    to promise "saving will … notify them", and saving now never emails guests, so the UI says so.
+    If a requirement seems to need weaker governance, stop and ask the user — do not decide it.
+12. Tests for anything date-based use dates **relative to now**. The gate refuses past and
+    far-future events, so a hard-coded date silently turns an "approved send" test into a
+    "refused" test the day it passes.
+
+### Running the stack safely after this incident
+
+13. `app/backend` must have `scheduler 0011` and `integrations 0006` applied **before** the new
+    code runs (it reads columns that otherwise do not exist). Start with
+    `GOOGLE_GUEST_NOTIFICATIONS` **off** and watch `GoogleWriteLog`; turn it on only deliberately,
+    in the environment, never in code. `npm run agent-pm` starts a Celery **beat** that runs the
+    Google sync every 5 minutes — the gateway makes it safe, but it *is* a recurring writer.
+    `scripts/stop-voice-stack.sh` (run by `npm run agent-pm`) stops the voice relay and the
+    Cloudflare tunnels; it identifies them by port + working directory and exact tunnel target,
+    never by a broad `pkill`. It does not restart them: a quick tunnel gets a new URL each start,
+    which must then be re-entered in the Twilio TwiML App and `DJANGO_ALLOWED_HOSTS`.
 
 ## Key commands
 
@@ -226,6 +446,8 @@ npm run build
 - [ ] No API routes, request shapes, or response shapes were changed
 - [ ] No visible UI or styling changes were introduced
 - [ ] The original app at `/Users/lizkane/Desktop/TWILIO - Agent PM` was not touched
+- [ ] If you touched an agent tool: it goes through `dispatch`, uses the REST bridge, has a cross-user refusal test, and the Agent Capabilities page documents it (see "MCP server and agent tools")
+- [ ] If you touched anything that writes to Google Calendar or can communicate with a person: it goes through `integrations/google_calendar_gateway.py`, needs the user's approval on chat, voice and skills, and `integrations/tests/test_no_direct_google_writes.py`, `agents/tests/test_outbound_approval.py` and `integrations/tests/test_google_scopes.py` still pass unmodified (see "Outbound communication governance")
 
 ---
 
@@ -3496,3 +3718,921 @@ post-mutation refetch otherwise reverts the change.
 
 **Verified:** 7 new tests in `AccountDetailPage.test.tsx`; frontend 1389/1403, with the failing
 set byte-identical to the 14 pre-existing failures. `npm run build` clean. No backend change.
+
+---
+
+### 2026-10-16 — Chat "Model access denied": gateway edge 403, retry + forced gateway
+
+**Finding:** the app was already on LiteLLM. Daphne had `AGENT_BACKEND=gateway`, and the failing
+request (ref `cff244aa`) went to `litellm.ai-services.corp.twilio.com` with a valid, freshly
+minted Okta token. The 403 body was a bare nginx HTML page, not a LiteLLM JSON auth error. The
+same process and token answered every later request with 200, so the cause was a one-off edge
+rejection and not config. The chat message also wrongly mentioned "Bedrock role permissions".
+
+**What changed**
+- `core/llm.py`: `_GatewayRetryTransport` / `_AsyncGatewayRetryTransport` are wired into both
+  gateway clients. A 401/403 is retried **once** with `gateway_token(force=True)`. A static
+  `ANTHROPIC_API_KEY` is not retried, since re-minting can't change it. All AI features get this
+  because they all build their client here.
+- `core/settings.py`: `AGENT_BACKEND` is forced to `gateway`. A stray `AGENT_BACKEND=bedrock`
+  is ignored with a warning unless `AGENT_ALLOW_BEDROCK=1` is also set.
+- `agents/views.py`: on the gateway, auth errors now tell the user to re-run the token helper.
+  The Bedrock wording only appears on the Bedrock backend.
+
+**Verified:** 1491/1491 backend (8 new: 6 `GatewayAuthRetryTests`, 2
+`ForcedGatewayBackendTests`, plus the classifier test split by backend). Sabotage-checked the
+retry. Daphne restarted standalone, and a live chat through `/agents/sessions/send/` returned
+200 from the gateway. Frontend untouched.
+
+
+---
+
+### 2026-10-14 → 16 — Calendar for multiple users, Settings, access levels, Admin Data
+
+A long multi-part session. Everything below passed the full suites at the end
+(**1512 frontend, 1482 backend, `npm run build` clean**); none of it was exercised in a real
+browser, against a real Google calendar, or on a live call.
+
+**Calendar page**
+- `ActionItemModal` is now **portalled to `document.body`**. It used to render inside the
+  sidebar's `translate-x` panel; a `transform` on any ancestor makes `position: fixed`
+  resolve against that ancestor, so the modal was squeezed into the sidebar's width.
+- Items sidebar filters by the selected account **only while the Accounts sidebar is open**
+  (case-insensitive name match, with a "Showing X only" label).
+- **Calendar search** (`components/calendar/CalendarSearch.tsx`, `lib/calendarSearch.ts`): narrows
+  the grid as you type and lists ±1 year of server matches (`?search=`, which now also matches
+  account name). Composes with the view buttons.
+- **Compare calendars**: `GET /scheduler/availability/?emails=…&start=…&end=…`. App users show
+  their busy blocks, with the **title only for meetings on an account both people are on**
+  (otherwise "Busy"); anyone else goes through Google free/busy with the *viewer's* connection.
+  Overlay events use `calendar_id: "compare"` and negative ids so no edit/attendance/Log Time
+  path can touch them. "Find free time" paints weekday 9–5 gaps (`lib/availability.ts`).
+- **Invites**: `_push_to_google` now passes `sendUpdates="all"` (Google's default is `"none"`,
+  which is why nobody received invites), honours the modal's `send_invites`, creates a real Meet
+  link, and pushes attendee changes on update. The create response carries `google_sync`
+  (`ok` / `not_connected` / `failed`) so the page never toasts a plain "Created" over a failed push.
+- **Google → AgentPM auto-sync**: the open page syncs every 5 minutes and on tab focus
+  (`useGoogleCalendarAutoSync`, `auto: true` skips the activity-log entry); `sync_all_google_calendars`
+  runs on Celery beat every 5 minutes; `POST /integrations/google/calendar-webhook/` handles Google push
+  notifications (identified by channel id **and** secret token, both stored in
+  `SyncState(resource="calendar_watch")`). Push only activates when `GOOGLE_WEBHOOK_BASE_URL` is a public
+  HTTPS URL — **not on this laptop (Zscaler blocks ngrok)**. A Celery worker + beat are also not running
+  locally, so in development the open page's own refresh is the only thing keeping it current.
+- Event panel: the account name links to `/accounts/:id` (resolved to an `accounts.Account` id — the
+  calendar's `allAccountsRef` mixes Airtable and app ids, so it can't build that link), and an
+  action-item block shows an **"Action item" row that opens the shared modal**. The block's
+  action-item lookup used `status=…Complete` (not a real status) and omitted Done, so a Done item's
+  block never found its item; it now uses `?airtable_id=`.
+- **"Calendar notes"** in the action item modal: `GET /scheduler/meeting-notes/?action_item=<id>`
+  returns notes from every calendar block of that item (visible to anyone who can see the item).
+  **Derived on read, deliberately not copied into `task_details`** — Airtable overwrites that field
+  on every pull and edits/deletes would leave stale duplicates.
+
+**Log Time** (`lib/logTimeRows.ts` + `salesforce_sync/log_week.py`)
+- An item's account comes from the item itself; Admin takes account-less items, not every account's.
+- Zero-length, all-day, cancelled and did-not-attend events are dropped; days use **local** time.
+- An item's time on a day is that day's calendar blocks — **never** lifetime `time_spent` (it was
+  counted again on every day the item appeared).
+- Removed rows persist (`logtime::<account>::removedRows`) and are honoured by Log Week.
+- Items are auto-filed under the account-page project they belong to (goal → parent project),
+  shown with an "auto" badge; dismissing one only hides it for that day.
+- Server: a project dragged onto a day only captures **that account's** events in a scoped run, a
+  no-account event is reported as unlinked rather than filed, and goals are never the auto project.
+
+**Time units (important)**: Airtable `Time Spent` / `Estimated Time` / `Prep Time` are `duration`
+fields — **seconds**. The pull multiplied by 60 and the push divided by 60, so values drifted on every
+sync (one item reached 1,754 hours). Both conversions are gone. Existing values were repaired with
+`manage.py repair_action_item_durations` (dry run by default; `--set recXXX=<seconds>`, `--commit`),
+backup at `/tmp/db.sqlite3.pre-duration-repair`. Edit forms now send **only changed fields**
+(`changedActionItemFields`) so a stale `time_spent` can't overwrite tracked time.
+
+**Live Tracking is server-owned** (`airtable_sync/live_tracking.py`, `lib/liveTimers.ts`)
+- Two fields: `time_spent` (overall total, tracked + manual) and new `tracked_time` (Live Tracking only).
+  Stop adds the session to **both** atomically (`F()`).
+- `ActionItemTimeSession` + `POST /airtable/timers/{start,stop,cancel}/`, `GET /airtable/timers/`.
+  One running session per (user, item) is a DB constraint.
+- Start puts a `work_tracking` block on the calendar immediately. The block is **reused while its tracked
+  total is ≤ 15 min**, drawn as tracked seconds rounded up to 15 min from its first start; once it exceeds
+  15 min the next start opens a new block at the new start time.
+- Deleting a calendar block subtracts only its **tracked** seconds (a planned block subtracts nothing) and
+  pushes the result to Airtable. A running session's own block is hidden in favour of the live overlay
+  (no double render).
+- The old localStorage protocol (`actionItemTimers`, `activeTimers`, `actionItemStartTimer`,
+  `actionItemCancelTimer`) is gone. `hooks/useActiveTimers.ts` is now dead code.
+
+**Settings**
+- Integrations with no working connect flow (Gong, Zoom, Lucidchart; GitHub, Notion, Microsoft Teams
+  have no credentials) open a **vote modal** ("YES" / "Not now") instead of Django's debug 404 page.
+  `IntegrationVote` model, `GET /integrations/availability/`, `POST /integrations/votes/`. The
+  configured/not-configured list is `_configured_providers()` in `integrations/views.py`.
+- Org data-source tokens show only a mask (`••••••••3f9a`, last 4 chars, none for short tokens) —
+  `mask_secret()`; the full value never reaches the browser.
+- Phone numbers are E.164 with a country-code dropdown; the serializer rejects numbers without a
+  country code. Migration `team/0008` normalised the one bare 10-digit number to `+1…`.
+- **Test notifications on Save Profile**: `POST /scheduler/notifications/test/` runs the real reminder
+  senders for each option that was **changed to on** in that edit. `slack` reports *skipped* (no
+  `SLACK_BOT_TOKEN`) and `email` reports *skipped* (**the app has no email sender; the "Email
+  notifications" toggle does nothing**). The two general toggles (`notification_email`,
+  `notification_slack`) are read by no backend code.
+
+**Access levels (Basic / PM / Admin)** — see the new section under "Backend testing rules".
+- Basic: edits fields on accounts they belong to; assigns action items to themselves or teammates **on the
+  item's account**; may only add/remove **themselves** on an account/project. PM: assigns anyone. Admin: full,
+  plus the user search in Settings. Rules live in `accounts/access.py` and `airtable_sync/assignment.py`
+  (one rule for both assignment paths, which used to disagree).
+- **Every account field that is set, changed or cleared writes an Activity Log event** (`account.field_changed`,
+  with old and new value, `resource: {type: "account"}`) — a hard requirement from the user.
+- Existing staff were migrated to Admin (`team/0009`); both current users (`lizkane`, `lkane`) are Admin.
+- Closed along the way: any member could add/remove anyone via `team-members/add|remove/`; `/fields/` had no
+  assignee check; staff could PATCH other users' profiles through the generic route.
+- **Still on raw `is_staff`** (migrate when touched): `accounts/views.py` ex-`_require_account_owner`,
+  `team/views.py` (tags, team members, gmail-keywords), `airtable_sync/serializers.py`,
+  `scheduler/views.py` (meeting notes), `comments`, `feedback`, `layouts`, `discover`, `skills`, `search`,
+  `integrations` (`~L2575`), `agents/mcp_server.py::_is_staff`, `airtable_sync/views.py::trigger_sync`.
+  The MCP `update_account` tool is looser than REST (any team member).
+
+**Admin Data** (`pages/AdminDataPage.tsx`) is a read-only inspector for six shared tables (tags, teams,
+memberships, skill invocations, voice sessions, Salesforce accounts). The tabs were empty because four
+tables have **no rows** and two were filtered out for the caller, and several columns read field names the
+backend never sends (`slug`, `user_display`, `created_at`…). Fixed: `?scope=all` (`admin_wants_all` in
+`core/mixins.py`, Admin-only, opt-in per request so pickers keep their scoping); the page is now at
+`/settings/admin-data` (old path redirects), Admin-only in nav (`lib/navItems.ts`), page and server.
+Dev DB: all 12 `VoiceSession` rows have `user_id` NULL (inbound PSTN never resolves a user).
+
+**Test-harness notes**
+- A page that renders a `<Link>` needs a router: wrapping `CalendarPage` tests in `MemoryRouter` was required.
+- Two helpers named `_make_event` exist in `scheduler/tests/test_views.py`; the **later** one wins, so the
+  first's `airtable_id=` kwarg raises `TypeError`. Use `agentpm_airtable_id=`.
+- `fireEvent`-based tests of `useSyncExternalStore` stores need the store reset in `test/setup.ts`
+  (`resetLiveTimers`), same trap as the other module-level stores.
+- Several sabotage checks caught tests that passed for the wrong reason (a double-render guard asserted
+  before the week's events had loaded; a "refetch on broadcast" test whose GET was served from the request
+  cache). Verify a new test goes red with its fix removed.
+
+**Left open**
+- **Deploying**: set `GOOGLE_WEBHOOK_BASE_URL`, run a Celery worker **and** beat, and have users reconnect Google
+  (or wait one scheduled run) so push channels register. `sync_review` has a pre-existing un-generated migration
+  (`makemigrations --check` reports it); not touched.
+- `.env` names `GONG_ACCESS_KEY_SECRET` but settings reads `GONG_ACCESS_SECRET`. Not changed.
+- Two `Estimated Time` values that read 1 second were pushed to Airtable unchanged; the intended 1 minute is still to set.
+- Log Time still computes an item's time from calendar blocks only — an item pinned to a day with no block shows
+  no row (intentional, but a change from before).
+- `components/calendar/LogTimePanel.tsx`, `ActionItemsSidebar.tsx` and `hooks/useCalendarOverlay.ts` /
+  `CalendarOverlayPicker.tsx` remain dead copies.
+- The `calendar.synced` activity event is published after a changed sync, but no frontend listens for it yet; other
+  tabs/devices pick changes up on their own 5-minute refresh or tab focus.
+
+
+---
+
+### 2026-10-19 — Agent tool policy layer, full record coverage, incremental Google sync
+
+**Why:** an audit found the in-process MCP server (`agents/mcp_server.py`) did not protect what
+the agent could do. Four tools dropped their owner filter when no user was attached and returned
+every user's data; several allowed more than the UI (editing others' action items, renaming
+accounts as a non-owner, re-filing meetings onto any account); SMS/calls had no recipient limit;
+a skill's `allowed_tools` was prompt text only; raw exception text (Twilio URIs with the account
+SID) reached the model and the activity feed. Most user-facing models had no tool at all.
+
+**The policy layer** — `agents/tool_policy.py`, enforced inside `MCPServer.dispatch` (the one path
+chat, voice and saved workflows all use). In order: refuse no/inactive user → validate args against
+the tool schema (unknown keys, enums, types, bounds; bool never satisfies integer) → saved-workflow
+scope → confirmation → per-user rate limit by category (Django cache) → timeout + concurrency cap.
+Every failure returns `{status:"error", error_code, message, retryable, retry_after?}` with no
+exception text. `dispatch` never raises.
+
+- **Confirmation** for `CONFIRM_REQUIRED` (`delete_action_item`, `delete_calendar_event`,
+  `send_sms`, `make_phone_call`): the first call returns `confirmation_required` + a single-use
+  token bound to user + tool + SHA-256 of the exact args (5 min TTL). Voice passes
+  `confirmed=True` from its existing spoken gate instead.
+- **Skill scope** lives on the orchestrator (`AgentOrchestrator.skill_scope`, `VoiceAgent.skill_scope`),
+  set when `load_skill` succeeds. Not a ContextVar set by the tool: each tool runs in its own
+  `gather` task with a copied context, so it would vanish. Deletes/outbound are never skill-usable.
+- **Rate limits** (`AGENT_TOOL_RATE_LIMITS`): read 120/min, write 40/min, delete 10/h, outbound 5/h,
+  plus 3/h **per recipient**. Off under the test runner (`AGENT_TOOL_RATE_LIMITS_ENABLED`) because
+  the buckets live in the process-wide cache; limiter tests re-enable it.
+
+**REST bridge** — `agents/rest_bridge.py` runs the app's real view in-process as the user
+(`resolve()` + `APIRequestFactory` + `force_authenticate`), so tools inherit exact REST permissions
+and side effects. It keeps the normal DRF user throttle on purpose: an agent turn spends the same
+200/min budget as the browser. Sabotage-checked: running the bridge as a superuser reds 11 tests.
+
+**Tools** (27 → 70). New `agents/record_tools.py` (create/read/update, **no deletes**): reminders,
+artifacts (links only), account notes, quick links, customer contacts + notes, projects/goals,
+project members, action-item steps / dependencies / link attachments, meeting notes, comments,
+tasks, feedback, working sessions, notepad, team members (read). Existing calendar, account and
+action-item tools now go through their REST views (`details/`, `/fields/`, `perform_update`).
+`update_action_item`'s reassign now sets the real `assignee_airtable_id` (was name-only).
+
+**Removed / narrowed (user decisions):**
+- `delete_meeting` **removed** — the next Airtable pull recreated whatever it deleted, and the app
+  has no meeting delete.
+- `update_meeting` is **notes only** (Gong/Zoom summary via the app's notes endpoints); rename,
+  redate and account re-link removed. The peer session's two re-link tests were rewritten.
+- Deletes kept but server-gated as above; SMS/calls only to profile numbers of the user, users
+  sharing an account, or users sharing a team (`_allowed_phone_numbers`).
+
+**Skills:** editing `instructions` / `allowed_tools` / `scripts` / `visibility` / `name` /
+`description` on a reviewed skill resets it to `draft` (+version); `allowed_tools` re-validated
+on update; `SkillInvocationViewSet` now user-scoped (was every user's). New read-only
+`GET /agents/tools/` serves the registry; the Skills page pickers read it (`hooks/useAgentTools.ts`)
+instead of a hard-coded list that still offered delete tools. Capability cards added for the new
+records; sidebar badges de-duplicated so a card with several Create tools still reads one badge.
+
+**429 / errors:** `core.llm` clients now set explicit `timeout` / `max_retries` (chat 120s / 3;
+voice 10s / 1 — a mid-call 429 must fail fast to speech). `classify_agent_error` gained 529/5xx,
+timeout (was mislabelled VPN), context-too-long, and Retry-After-aware rate-limit messages.
+`agent_stream` (30/min) is finally attached to `/agents/sessions/send/` via `get_throttles`.
+Prompt caching on `SYSTEM_BLOCKS` (tools + system ≈ 10K tokens, resent every round).
+
+**Google Calendar sync** (the 5-minute beat job already existed, commit 8d8981c):
+- **Incremental** via `syncToken` stored on `SyncState(resource="calendar").sync_token` (the watch
+  channel uses its own `calendar_watch` row). Incremental runs never reconcile by absence;
+  `status:"cancelled"` items delete plain meetings and only *unlink* AgentPM-owned blocks. 410 →
+  token cleared, full sync. No `orderBy` on either request (incompatible with syncToken).
+- `integrations/google_api.py`: `execute_with_retry` = googleapiclient's own `num_retries` (429,
+  5xx, rate-limit 403s, jitter) replacing three hand-rolled loops; `credentials_for` passes stored
+  expiry; `persist_refreshed` saves refreshed tokens (verified `.update()` still encrypts);
+  `invalid_grant` marks the credential inactive so the beat job stops retrying it.
+- Per-user sync lock (`cache.add`, 240s TTL) so beat + webhook + page poll can't overlap.
+
+**Also:** reminders are claimed with a conditional UPDATE before delivery (exactly once across
+overlapping runs). `renew_gmail_watches` scheduled daily (was documented but never scheduled).
+`CELERY_TASK_ACKS_LATE`, prefetch 1, soft/hard time limits 540/600s. Dev SQLite: WAL +
+`busy_timeout` + `IMMEDIATE` (Daphne + worker + beat now write concurrently); backup at
+`/tmp/db.sqlite3.pre-mcp-wal`. `npm run agent-pm` now also starts the Celery worker + beat, checks
+Redis, and kills only *this checkout's* celery (the old app runs the same `core.celery` module);
+`start-agent-pm` added as the alias CLAUDE.md always documented.
+
+**CalendarPage (two additive fixes found by the suite):** `refetchVisibleRange` guarded against an
+unrendered view (5 pre-existing unhandled rejections made `vitest run` exit 1 even with every test
+passing — confirmed on a reconstructed pre-change tree). And a fetch that lands while the
+in-flight-mutation latch is held is now recorded and replayed by `releaseLocalMutation()` at all
+five release sites — paging during an attendance save left the old week on screen. New
+deterministic test holds the PATCH open; sabotage-checked.
+
+**Verified:** backend 1773/1773 (baseline 1635), frontend 1607/1607 twice with exit 0 and no
+unhandled errors, `npm run build` clean. Live stack (started 14:38, after the last Python edit)
+answers 401 on all new routes, one Celery worker online with the sync tasks registered, and the
+live sync stored a change token at 21:43 UTC. Counts include a concurrent session's artifact-image
+work (`accounts/*`, migration 0022), which this change does not touch.
+
+**Left open**
+- Google push notifications still need a public HTTPS `GOOGLE_WEBHOOK_BASE_URL`; ngrok is
+  Zscaler-blocked, so near-real-time updates fall back to the 5-minute poll.
+- Voice was not exercised against a real call (same Zscaler limit as 2026-08-31).
+- Customer contacts have no phone field, so the SMS allowlist covers teammates only.
+- A failed reminder channel is logged at WARNING but still marked `sent` (adding a status would
+  change the Reminders API); delivery failures need an operator to watch the log.
+- Production should set `DATABASE_URL` (Postgres) and run worker + beat (Procfile already has both).
+
+---
+
+### 2026-10-20 — Claude Skills: attachments, context, dynamic lookups, voice launch, Slack scaffold
+
+**Why**
+A skill was instructions + `allowed_tools` and nothing else, and could only be sent to chat. It is
+now a template that combines capabilities, Twilio skills, other skills, attached documents, any
+record type and Slack sources, and can take vague run-time input from chat or a voice session.
+
+**Backend (`skills`, `realtime`, `integrations`, `agents`, `search`)**
+- `AgentSkill` gains `twilio_skills`, `chained_skills`, `context_defaults`, `templates` (JSON);
+  new `AgentSkillAttachment` (extracted `text`, optional `artifact` FK) and `VoiceLaunchContext`
+  (migration `skills/0009`). All four new fields are in `_BEHAVIOUR_FIELDS`, and changing attachments
+  returns an approved skill to draft — the review was about the old content.
+- `skills/extract.py` — md/txt/html/docx/pdf → text (`python-docx`, `pypdf` added to
+  requirements) and `split_sections()`, which splits a document at the shallowest heading level
+  giving ≥2 sections with real body text. Everything else becomes `intro`, not a template.
+- `skills/keywords.py` — `@#--all-action-items|all-meeting-notes|all-artifacts|all-account-notes-${account}[-${range}]`.
+  Expanded by calling the app's own REST endpoints **as the runner** through `agents.rest_bridge`, so
+  a keyword can never reach a record the runner couldn't open in the UI. Date ranges: `last-30-days`,
+  `this-week`, `last-month`, `october`, `2026-10`, `2026-10-01..2026-10-31`. Also an agent tool,
+  `resolve_skill_keywords` (always allowed inside a skill, like `load_skill`).
+- `skills/run_assembly.py` — `run` now accepts `{free_text, account_ids, records, slack, template_key}`
+  and returns `{prompt, script, warnings}`. Accounts are checked against the runner's own list; chained
+  skills come from `_skill_scope` (so a private skill of someone else is skipped, with a warning);
+  attachment and looked-up text sit in `<data>` blocks the agent is told not to take orders from.
+  The old `{prompt}` shape is a subset.
+- Voice launch: `POST …/voice-start/` stores a short-lived row and returns a key. The browser sends
+  only that key as the connect param `ctx`; `VoiceTwiMLView` forwards it as a signed, **call-bound**
+  `<Parameter name="launch_token">` only if the row belongs to the caller; the consumer consumes it
+  (single-use, 2 min TTL) and passes it to `VoiceAgent` as an "ACTIVE WORKFLOW" prompt block with the
+  skill's `allowed_tools` enforced from turn 1. `POST /skills/voice-launch/` does the same for
+  non-AgentSkill sources (Twilio skills, example prompts). Twilio connect params are tiny and
+  browser-controlled, which is why nothing but a key travels.
+- Slack: `integrations/slack_channels.py` + `GET /integrations/slack/conversations/`; the stubbed
+  `get_slack_messages` tool is now real. It prefers the user's own OAuth credential (the only token that
+  can read their DMs) and falls back to `SLACK_BOT_TOKEN` for channels only. With neither it reports
+  `enabled: false`, which the UI renders as a disabled "not connected yet" picker. **Nothing here has
+  run against a real Slack workspace** — it is covered only by mocks.
+- `search/views.py` — `AgentSkill` is now an `@#`-referenceable type (`agent_skill`).
+
+**Frontend**
+- `components/skills/` — `SkillMultiPicker` (search + flag chips), `CapabilityPicker` (grouped,
+  searchable, expandable full list with descriptions), `AccountMultiSelect` (Select all),
+  `AttachmentDropzone`, `ContextRecordsField`, `SlackSourcesField`, `TemplateTabs` (import a document → one
+  tab per section, editable with `@`, `@#`, `@#--`), `AttachmentViewer`, `SkillRunDialog`,
+  `SkillLaunchButtons` (Use in Chat + Use in Voice Session, identical on every tab).
+- `RichTextMentionEditor` — `enableKeywords` opts into `@#--`. Off by default, so no other editor changes.
+- `VoiceButton` listens for a `voice-launch` window event, connects with `{ctx}` and shows the brief
+  on screen as the "script to read" fallback.
+- `lib/markdownToHtml.ts` — a small converter instead of a markdown dependency; output is sanitized.
+- `lib/twilioSkills.ts` — the Twilio skill list moved out of `ClaudeSkillsPage.tsx` so the picker can use it.
+- New-skill form: helper text beside the Generate button says Claude designs the **instructions** from
+  the description and the choices; the pickers sit between the description and that button.
+
+**Key decisions**
+- The `get-meeting-notes`-style seeded skills pattern was *not* used for the Impact 360 template: the
+  user will build it by hand in the UI to test the new configuration.
+- Voice and chat share no live state (only history rows afterwards), so "Use in Voice" carries a
+  prepared brief rather than the chat transcript.
+- Attachments with an account chosen are also filed as `AccountArtifact`s; the account is checked
+  against the uploader's membership.
+
+**Incident — `ClaudeSkillsPage.tsx` lost ~1,900 lines mid-session, then reconstructed**
+A scripted edit searched for the first `async function handleRun` in the file — which is in an *earlier*
+component — and deleted through to the next `handleDelete`, taking `AgentSkillsPanel`,
+`NewAgentSkillForm` and the head of `AgentSkillDetail` with it. The file had uncommitted changes, so
+`git HEAD` was not an exact copy, and no exact pre-edit copy existed. It was rebuilt by splicing an
+older `/tmp` snapshot into the intact head and tail, then correcting what the snapshot predated:
+the Agent Capabilities array (the Oct 19 production bundle in `dist/` still held the current 14
+entries and was converted back to TypeScript), the server-driven `usePlatformTools()` hook, and the
+de-duplicated sidebar operation badges. Verified by the page's own tests plus a string-level diff against the
+bundle (3 of 32 strings differed, all intentional or escape differences). **It is a reconstruction, not a
+byte-exact restore — review the diff of that file.** Lesson: anchor a scripted edit inside the function
+it targets (`s.index(fn)` then search from there); a bare `s.index("handleX")` finds the first match anywhere.
+
+**Test-harness notes**
+- Under jsdom axios stringifies `FormData`; read it off the outgoing request config via an axios
+  interceptor (as `ActionItemModal.test.tsx` already does), not from the MSW body.
+- TipTap normalises list items to `<li><p>…</p></li>`, so assert structure, not exact markup, on HTML that
+  has passed through the editor.
+- `npm run build` caught three unused imports in new test files that `tsc --noEmit` did not.
+- Sabotage-checked: dropping the skill-safe filter, Select all, the account gate and the voice-start call
+  each turn a test red.
+
+**Left open**
+- **Daphne must be restarted** to serve the new routes (`voice-start`, `parse-template`, `attachments`,
+  `resolve-keywords`, `voice-launch`, `slack/conversations`); verify with an unauthenticated hit (401, not 404).
+- Voice launch has not been exercised on a real call (same Zscaler/ngrok limit as 2026-08-31).
+- Slack picker and `get_slack_messages` are untested against a real workspace; they switch on when a
+  token is approved. `SLACK_SCOPES` is read-only, which is all this needs.
+- Twilio's limit on connect-param size was not confirmed; only a ~32-char key is sent.
+- Skills pinned to a role page render through `ProfilePage`'s chips (now `SkillLaunchButtons`); there is no
+  page-level test for that chip — the launcher itself is covered.
+
+---
+
+### 2026-10-20 — Over 2,000 calendar invitation emails: one gateway, one gate, approval everywhere
+
+**What happened.** The user moved one Google Calendar meeting; the customer (10 invitees) later
+reported receiving 2,000+ invitation emails from the user's Gmail, for events months, weeks and
+years ahead. The user killed the server (Django/Celery were down by 09:15 PT; nothing in this
+repo sends mail any other way).
+
+**What was established, and what was not.** *Established:* `_update_in_google` sent
+`sendUpdates="all"` on **every** edit of any event with guests, with no memory of having already
+emailed; the `send_invites` API default was **yes**; 6 of 7 Google write calls set no
+`sendUpdates` at all; **92% of stored Google events (6,724 of 7,270) are recurring *instances*
+from only 42 series**, some expanding to 730 instances, and the data holds events as far out as
+April 2087 — so one operation fanning out across a series reaches "years in advance". *Not
+established:* which specific write produced which email. That needs Google-side evidence (the
+event's edit history and the Gmail Sent / Workspace email log). The fix below is therefore
+structural — it does not depend on the cause being known.
+
+**What changed.**
+- `scheduler.CalendarEvent` gained `origin` (`agentpm`/`google`, **default `google`** so every
+  existing row fails closed), `invite_sent`, `invite_sent_at`, `invited_emails` (migration
+  `scheduler/0011`, unapplied until the user backs up and runs it).
+- `integrations.GoogleWriteLog` — the audit table (`integrations/0006`).
+- `integrations/invite_gate.py` (pure decision), `integrations/google_calendar_gateway.py` (the
+  only path to Google), and a source-scanning test that fails the build on any direct write.
+  All 7 call sites migrated.
+- `core/settings.py`: `GOOGLE_GUEST_NOTIFICATIONS` (**default off**), freshness, horizon, hourly
+  budget, per-event guest ceiling.
+- `agents/tool_policy.py`: `invite_to_meeting` and `log_time_week` added to `CONFIRM_REQUIRED`;
+  `agents/mcp_server.py::dispatch` marks a call approved for a spoken yes **or** a redeemed chat
+  token. `invite_to_meeting` fails closed and explains *why* no email went out.
+- `integrations/views.py`: `gmail.send` and full `calendar` removed from the requested scopes.
+- `CalendarPage.tsx`: the edit form no longer promises that saving notifies guests.
+- `npm run agent-pm` now runs `scripts/stop-voice-stack.sh` (relay + tunnels, narrowly matched).
+
+**Key decisions.**
+- **A new guest on an announced event is added silently.** The owner wanted "email only the new
+  address". Google's docs: `attendees` replaces the list and `sendUpdates="all"` notifies all
+  guests, with no new-guests-only option. The only way to guarantee nobody is emailed twice is to
+  send nothing on a later edit.
+- The `google` credential row keeps `gmail.modify` for the documented fallback in
+  `gmail_utils.py`; it cannot send. Left for the user to decide.
+- The stop script **stops, not restarts**, the relay/tunnels: a quick tunnel gets a new URL each
+  start, which would silently break voice until re-entered in Twilio and `DJANGO_ALLOWED_HOSTS`.
+
+**Tests that were rewritten, with the reason** (see rule 11 under "Outbound communication
+governance"): `test_reschedule_notifies_guests` → `…does_NOT_notify_guests`;
+`test_omitted_flag_defaults_to_sending…` → `…does_NOT_email_guests`; the third now runs with the
+switch on. Do not restore the old expectations.
+
+**Left open.**
+- The cause is unconfirmed pending Google-side evidence.
+- Migrations `scheduler/0011` and `integrations/0006` are **not applied** to the dev database.
+- The user must disconnect and reconnect Google to drop the old broad grant.
+- Existing rows are `origin="google"`; an old AgentPM-created event therefore never emails, which
+  is the intended fail-closed direction.
+
+
+---
+
+### 2026-11-03 — Google sync echo loop (61,000 audited writes); status check on invitations
+
+**Status found.** Since the incident: **0** writes with `sendUpdates="all"`, **0** events marked
+`invite_sent`, `GOOGLE_GUEST_NOTIFICATIONS` unset (off). Nobody was emailed. The gate held.
+
+**What was wrong.** `GoogleWriteLog` held ~61,000 `sync.push_edit` rows (all `sendUpdates="none"`) in
+bursts of ~700 events repeated ~30 times. Cause, two parts that fed each other:
+1. `_sync_google_calendar` created pulled rows with `updated_at` *after* its own `now`, which is what
+   `last_synced_at` is set to. The next run's PHASE 1 read them as "edited since last sync" and pushed
+   the whole pull back to Google.
+2. ~700 patches outlast the Celery soft limit (540s). The run was killed before `last_synced_at` was
+   saved, so the next run pushed the same ~700 again, until one finished. This is also why 115 audit
+   rows are stuck at `attempted` (written before the Google call, by design) and 110 failed with
+   `SoftTimeLimitExceeded`.
+
+**Fix** (`integrations/views.py`): rows created by the pull are pinned to `updated_at=now`; PHASE 1 has a
+circuit breaker (`MAX_PUSH_PER_SYNC = 100`) that refuses the whole batch and logs an ERROR, since no
+5-minute window holds that many real edits. Tests: `SyncEchoLoopTests` in
+`integrations/tests/test_incremental_sync.py`, each half sabotage-checked. Do not raise the cap to "make
+a sync catch up"; an ERROR from the breaker means rows are being mistaken for edits.
+
+**Verified:** 2,018/2,018 backend, guard tests unmodified. The running Celery worker predates the fix
+until `npm run agent-pm` is re-run.
+
+
+---
+
+### 2026-11-03 — One profile page, Notifications, Public section, and the actions on it
+
+**What was asked.** Merge the Role page and the Profile page into one (keeping the Role page's
+look and every function), add a **Notifications** section (all of a user's notifications, any
+channel) and a **Public** section (what others see when they open that person from Team), with
+*Schedule call with X*, *Email X* and *Leave a note for X*, and list those as skills.
+
+**Routes.** `/profile` is your own page. `/profile/:memberId` is someone else's: header + Public
+section only, none of the private sections are fetched. `/role/:slug` redirects to `/profile`. The
+sidebar role sub-links under Team are gone. A Team card/row click now navigates to the profile;
+the old staff drawer (edit, linked accounts, linked docs) is still reachable at
+`/team?member=<id>`, linked from a "Manage" link on the profile page.
+
+**The merge.** `pages/RolePage.tsx` was *renamed* into `pages/ProfilePage.tsx` rather than
+extracted into pieces: the old ProfilePage (and its fixed left rail, stats row, single-session
+list) is replaced; its unique behaviours that survive are pinned-by-me skills (now merged into
+the skills section) and the server-side `assigned_to_me` action-item filter (the old client-side
+filter dropped items beyond the first 20). The role comes from `getTitleRole(profile.title)`, not
+the URL. `/build` links were pointed at the real `/edit-preview`. Section choices persist
+(`profileVisibleSections-v1`). **Not carried over:** the old stats row and "Quick Open" doc grid
+(RolePage already has the quick-create links). `RolePage.test.tsx` and the old
+`ProfilePage.test.tsx` are merged into one file.
+
+**Backend (all in the `team` app, migration `team/0010`).**
+- `Notification` (user, channel, kind, title, body, link, status sent/failed/skipped, read_at).
+  `team/notifications.record_notification` never raises. Written by the reminder senders
+  (`scheduler/tasks.py`: every channel, including failed and *skipped* — the senders now return
+  `False` when a channel is unconfigured so a skip is not recorded as "sent"), comment replies,
+  meeting-notes imports and left notes. `GET /team/notifications/`, `POST …/mark-read/`; owner-only,
+  staff included. **No history before this change; push/Slack/SMS leave no record elsewhere.**
+- `PublicItem` (artifact link / file / note / record reference). Readable by any signed-in user
+  via `?member=<TeamMember id>`; **create/update/delete are owner-only and staff get no bypass**.
+  Links must be http(s) (blocks `javascript:`), note HTML is sanitized, files reuse the artifact
+  upload checks (blocked extensions, 25 MB, HTML sanitized).
+- `GET /team/members/<id>/profile/` — a safe header via `TeamMemberSerializer`, never
+  `UserProfileSerializer` (phone, push state and Gmail config). `LeftNote` +
+  `POST /team/members/<id>/leave-note/`: private, never in the public list, no notes to yourself,
+  none to a member without an account, and the recipient gets an in-app `Notification` + activity event.
+
+**Outbound governance (read the section above).**
+- *Schedule call* is the existing flow, not a new invite path. The profile modal creates the event
+  through `CalendarEventViewSet` with an **unchecked-by-default "Email the invitation" box**;
+  `send_invites` is that box. Its result text comes from the server, not from the request.
+- That exposed a gap: `create` returned `invites_sent` computed from the **request flag**, so it
+  said guests were emailed even when the invite gate refused (master switch off, past event, hourly
+  budget). It now reports `event.invite_sent`, which the gateway sets only when Google was told to
+  email. The three protected `MeetingInviteGooglePushTest` tests were not touched; a new test pins
+  the refused-but-approved case and was sabotage-checked.
+- *Email X* opens a Gmail compose tab (`mail.google.com/mail/?view=cm`, `noopener`). The app sends nothing.
+- *Leave a note* is in-app only, but it messages another person, so the agent tool is gated like an
+  outbound one.
+
+**Agent tools** (`agents/profile_tools.py`, registered from `AgentsConfig.ready()`):
+`email_person` (read; returns a compose link, sends nothing) and `leave_note_for`
+(`group="communicate"`, via the REST bridge, so it inherits the endpoint's rules). `leave_note_for`
+is in `CONFIRM_REQUIRED` (chat token) **and** `VOICE_CONFIRM_TOOLS` (spoken, reads the note back),
+and therefore can never run inside a saved skill. `agents/tests/test_outbound_approval.py` and
+`realtime/tests/test_voice_policy.py` were extended with a case for it — additions only, nothing
+loosened. Sabotage-checked: dropping it from `CONFIRM_REQUIRED` reds five tests.
+A "Contact a Colleague" card on the Agent Capabilities page lists the three actions; scheduling
+points at the existing *Meetings with Colleagues* tools.
+
+**Deliberately not done: seeded pinnable skills.** A saved skill can only call `skill_safe` tools,
+and `find_person`, `invite_to_meeting` and anything outbound are not (or can never be) skill-safe,
+so a seeded "Schedule call" / "Leave a note" skill would be blocked the moment it ran. The
+capabilities are listed on the Agent Capabilities page instead.
+
+**Test-harness notes.**
+- The profile page makes ~14 requests on mount behind the client's 6-wide cap. A test that returns
+  while they are still in flight lets them land in `lib/requestCache.ts` *after* the global
+  `afterEach` reset, so the **next** test is served stale defaults instead of its own `server.use()`
+  override. `ProfilePage.test.tsx` drains `requestCacheStats().inFlight` in its own `afterEach` and
+  widens `asyncUtilTimeout`. This looked like a flaky component for a while; it was the harness.
+- A short note appears twice once loaded (tab label = first 20 chars, plus the editor), so assert on
+  `.ProseMirror`, not `getByText`.
+- A card's summary line renders a beat after its title; keep both assertions inside the same
+  `waitFor`.
+- `TeamPage` drawer tests now open the drawer through `/team?member=<id>`.
+
+**Verified.** Backend 2019/2019, frontend 1712/1712 (138 files), `npm run build` clean. Not
+exercised: a real browser, real Google invitations, Slack/SMS delivery, a live voice call.
+
+**Left open.**
+- **Daphne must be restarted** for `email_person` / `leave_note_for` (the team routes already answer 401).
+- `makemigrations --check` still reports the old `account_feed` / `sync_review` drift (nothing for `team`).
+- A public file is served from `/media/` to anyone with the URL.
+- The profile page still contains RolePage's large inline components (~2,700 lines); a pure
+  extraction into `components/profile/` would be a follow-up.
+
+
+**Update 2026-11-04 (owner's decisions).** Invitation window is 14 days, or 60 days for a one-off event that
+does not repeat (a recurring event never gets the long window). `GOOGLE_GUEST_NOTIFICATIONS=on` was set in
+`app/.env` at the owner's explicit request, after a backup (`db.sqlite3.pre-switch-on.*`). The cause of the
+original flood, per the owner: moving one meeting in Google Calendar affected many later events and Google
+sent invites for them, years ahead. Whether Google's own UI or this app's old push sent them is unconfirmed.
+The sign-in page shows only Okta SSO when `OKTA_CLIENT_ID` is configured (`?local=1` is the break-glass form).
+
+
+---
+
+### 2026-11-04 — Profile page: logged-time allocation, scrolling rows, real mini-canvas components
+
+Follow-up to the 2026-11-03 profile-page entry. The "Could not load notifications / the public
+section" errors were not a code fault: **`team/0010` had never been applied to the dev DB**, so both
+endpoints queried tables that did not exist. Applied with `migrate team` only (backup at
+`/tmp/db.sqlite3.pre-profile-sections`); the unrelated pending `realtime/0005` was left alone.
+`npm run agent-pm` already `pkill`s daphne/Vite/ngrok/Celery and starts them fresh, so it picks up new
+Python (including the `email_person` / `leave_note_for` tools) with no change.
+
+**Time Allocation = logged time, last month through today.**
+- Source is `SalesforceTimeEntry` (what the Log Time panel records), **not** calendar events or action
+  items as before. It counts entries whether or not they have synced to Salesforce (`synced_to_sf` is
+  false for all 17 in the dev DB because Salesforce is not connected).
+- Window is the 1st of the previous calendar month through today (`allocationDays`), 32–62 days. Bar,
+  Table and Heatmap all scroll sideways and open scrolled to today. The 7d/14d/30d selector is gone.
+- Days are **local** dates: the old `toISOString().slice(0,10)` is UTC and names tomorrow for an evening user.
+- Backend (additive): `account_name` on the time-entry serializer, `?date_after=`/`?date_before=`
+  (inclusive; a malformed date narrows to nothing), `ClientPageSizePagination`. New `timeEntriesApi`.
+- Entries are grouped by Cloud Coach account, then project name, then a visible "No account" bucket.
+
+**Notifications / Public are one scrolling row** (`components/profile/HorizontalScroller.tsx`): inner
+edge shadows appear only on a side that has more to scroll (`pointer-events: none`, `aria-hidden`).
+Keyboard focusable. Empty state renders no region.
+
+**Mini canvas draws real components.** Cause: `MiniCanvasNode` had no per-type rendering, and dropped
+nodes carried no registry props. `MiniNode` + the converter moved to `components/profile/miniCanvas.ts`;
+`MiniNodePreview.tsx` renders Heading/Text/RichText/Label/Divider/Card/Section/Row/Column/Container/Page
+as themselves (mirroring `NodeRenderer`). Heading/Text/Label edit in place on double-click; containers
+still open the field picker. Palette types without a preview keep the generic card.
+
+**"Open full builder" now carries the canvas over.** The handoff already existed, and it was broken by
+`readHandoff()` reading **and deleting** the sessionStorage key inside the `useReducer` initializer:
+React StrictMode renders twice in development, the first pass consumed it, and the pass React keeps
+found nothing. Reading is now idempotent and the key is cleared in an effect after mount. Also: records
+convert to real `RecordCard`s (they were an unknown type), nodes get fresh ids (the mini counter restarts
+at 1 each load and collides), text goes to the key the target type reads, and a handoff is **merged below
+an existing saved draft** instead of replacing it (the autosave would have overwritten the draft within
+~1.5s). Sabotage-checked: restoring the destructive read reds the StrictMode and draft tests.
+
+**Icons.** `ProfilePage` carried a divergent copy of the artifact icon catalog that drew Google
+Docs/Sheets/Slides from the favicon service, which returns one generic "G" for every Google subdomain
+(the shared module's own comment says so). Deleted; the page, its quick-create rows and its icon pickers
+use `components/account/ArtifactIcon`.
+
+**Clickable lists.** An action item opens `ActionItemModal` (looked up by `airtable_record_id`; an
+unlinked one says why instead of doing nothing). A comment opens the comment panel via
+`useCommentContext().openComments`.
+
+**Working Sessions.** The Notepad/Components row and Working Sessions now sit below the two columns and
+span the full content width. Default canvas height 280 -> 420. A "Search" button dispatches
+`open-global-search`; the search modal gained **"Add N to export tray"** (adds every selected result,
+skips ones already there, clears the selection, closes, stays on the page). "Export to Layouts ->" shares
+the same helper.
+
+**Test-harness notes.**
+- `ProfilePage.test.tsx` needs `vi.mock("…/Corporate.svg?react")` once `ActionItemModal` can open.
+- The page's ~14 mount requests plus the client's 6-wide semaphore let a finished test leak requests into
+  the next test's cache. The file's `afterEach` now **unmounts first, then drains `requestCache` in-flight
+  AND `requestSemaphore` in-flight/queued**. Counting only in-flight requests, or draining while still
+  mounted, each left a 1-in-5 full-suite failure; 8/8 full runs are green after both.
+- "+ File" is also a button in the Public section: query the modal by its "Attachments" heading.
+
+**Verified.** Backend 2044/2044, frontend 1817/1817 (8 consecutive full runs), `npm run build` clean.
+Not exercised in a real browser.
+
+**Left open.**
+- `NewBadge` buttons dispatch `open-new-action-item` / `open-new-reminder`; **nothing listens**, so they do nothing.
+- Reminder rows in the left column are still not clickable (not requested).
+- The page's "My Artifacts" grid now uses the shared icon but has no test for it.
+- The 7d/14d/30d choice was removed; a different window needs a code change.
+
+
+---
+
+### 2026-11-04 — Claude recommended tools; daily token budgets; skill token estimates
+
+**What was asked.** (1) A "Claude recommended tools" step that reads a skill's description and
+suggests the tools it needs. (2) Admins assign each user a token amount so the agent / a skill
+can't run up usage; on the Admin Data page, with Claude estimating what each skill costs.
+Product decisions from the owner: **daily** period; **warn** at one limit (user warned, admins
+notified, nothing stops) and **block** at a second; an admin can **restrict** a user so the warn
+limit blocks too, especially if they keep hitting it; a default **per role** that admins must set
+(nothing is limited until they do); tokens and dollars **both visible**, and the admin may enter
+either, converted by a clearly defined rate.
+
+**Recommended tools** — `POST /skills/agent-skills/recommend-tools/`, `skills/recommend.py`,
+`components/skills/ToolRecommender.tsx` (new-skill form and draft edit). Claude is shown only the
+`skill_safe` registry with descriptions, and **every returned name is re-checked against it**, so
+an invented tool, a delete or an SMS can never be offered (sabotage-checked). It also reports what
+a skill *can't* do ("Sending texts isn't available to skills"). Suggestions only: nothing is saved
+or applied until the author ticks and confirms. Failures return a fixed message (no exception text).
+
+**Budgets** — `agents/token_budget.py` is the single owner; models `TokenPricing` (one row),
+`RoleTokenDefault`, `UserTokenBudget` (override + `block_at_warn`), `TokenAlert` (migration `agents/0005`).
+- **Stored in tokens.** Dollars are a view through the blended rate
+  `input×(1−share) + output×share`. Typing dollars is converted **once, on the server**, at the rate in
+  force; the UI's live preview is only a preview. Actual usage is priced **exactly** from real
+  input/output counts — the blend is used only to convert a *budget*.
+- **The default prices ($3 in / $15 out per million, 20% output) are placeholders the admin must set to
+  match the model and contract.** Nothing in the code can know what Twilio pays.
+- **Interpretations to challenge:** "role" = the app's **job roles** (SA, PM, PgM, CSM, MA, TAM, AE, ENG,
+  other), derived from `UserProfile.title` by a Python port of `getTitleRole` (`title_role`, pinned by a
+  parity test) — *not* the Basic/PM/Admin access level. "Consistently hit" is **surfaced, not automatic**:
+  the People table shows distinct days at a limit in the last 14 and a "Keeps hitting it" flag at ≥3; the
+  admin ticks Restrict. Nothing escalates on its own.
+- **A user's own blank limit means "use my role's", not unlimited**; no number anywhere means no limit.
+  Overrides can't invert against the role default for the other limit (400).
+- **Counts:** assistant turns in the user's own `AgentSession`s (chat + voice, skill runs included) on their
+  **local** day (`UserProfile.timezone`). **Not counted:** skill generate / review / recommend / estimate,
+  meeting-note and Gmail summarisers (they don't write `AgentMessage`s). Shared-session turns count for the
+  session owner.
+- **Enforcement points** (all before a turn starts; a running turn is never cut off): chat
+  `send_message` (403 `token_budget_blocked`, nothing created), the voice consumer (speaks the refusal, no
+  model turn; a confirmed action runs without the model so isn't gated), and skill `run` / `voice-start`
+  (so a blocked user isn't handed a prompt the agent then refuses). The chat usage frame gained a
+  `budget` key *after* the existing keys (the framing test pins their order); the turn that crosses the warn
+  line says so.
+- **Gates fail open** (`gate_status`): a budget is a cost control, not a security boundary, so a broken check
+  (e.g. an unmigrated DB) logs an ERROR and lets the request through rather than 500-ing every chat turn. The
+  admin API calls `status_for` directly, so a real fault still shows there. Tested both ways.
+- Notifications: one `TokenAlert` per (user, day, level) de-duplicates; admins and the user get an in-app
+  `Notification(kind="token_budget")`.
+- Admin API `/agents/token-budgets/` (overview, `pricing/`, `roles/<role>/`, `users/<id>/`) is **admin-only
+  with no staff bypass**; `…/me/` shows a user only their own state. Limits accept `*_tokens` or `*_usd`,
+  never both; non-numeric, negative, fractional, boolean and >10¹⁰ are refused.
+- Frontend: `components/BudgetBanner.tsx` (app shell; re-reads on the existing `agentSessionUpdated`
+  broadcast), `components/admin/TokenBudgetsPanel.tsx` + `LimitField.tsx` (tokens ↔ dollars live),
+  `SkillEstimatesPanel.tsx`; two new Admin Data sections. `lib/tokenBudget.ts::budgetBlockedMessage`
+  recognises **only** the budget refusal at the four raw-`fetch` chat sites, so no other error changes. The footer
+  chat never checked `response.ok`, so a refusal would otherwise have streamed in as raw JSON.
+
+**Skill token estimates** — `skills/token_estimate.py`, `GET|POST /skills/agent-skills/token-estimates/`
+(admin only; fields `token_estimate`/`token_estimated_at` on `AgentSkill`, migration `skills/0010`, kept off
+the public serializer). **Claude judges the shape of a run** (rounds low/expected/high, tool-result size,
+output per round); **code does the arithmetic** from that plus *measured* facts (the agent's fixed per-round
+input = system prompt + every tool schema, resent each round; the skill's instructions, templates and attachment text).
+Same inputs always give the same totals, and Claude's numbers are clamped (≤10 rounds, matching the chat
+loop). Totals: input grows each round by the previous round's tool results and output. Prompt caching and
+the user's own request length are **not** modelled, and the UI says so. A skill edited after estimating is
+marked "outdated"; "Estimate all" works through 10 per request.
+
+**Test-harness notes.**
+- Every migration seeds `get-meeting-notes` into each test DB; count relative to it or delete it.
+- Layout now fires `GET /agents/token-budgets/me/` on every page, so a default handler lives in
+  `test/handlers/agents.ts` (plus `mockBudgetOverview` / `mockSkillEstimate`).
+- `TranscriptFooter` starts collapsed (expand with the "Show (N)" button, not "View chat →") and calls
+  `scrollIntoView`, which jsdom lacks — stub it.
+- Sabotage-checked: chat gate, restrict toggle, admin check, voice gate, fail-open, registry validation,
+  clamps, the dollar-preview conversion, the unit sent on save, and the footer guard each turn a test red.
+- A button whose visible text changes must change its `aria-label` too: "Estimate x" was announced for
+  a "Re-estimate" button (fixed).
+
+**Verified.** Backend 2170/2170 (new: 42 in `agents/tests/test_token_budget.py`, 22 in `skills/test_recommend_estimate.py`,
+3 voice-gate tests in `realtime/tests/test_consumers.py`); frontend 1983/1983 (170 files),
+`npm run build` clean. Dev DB migrated (`agents.0005`, `skills.0010`), backup `/tmp/db.sqlite3.pre-token-budgets`.
+Not exercised: a real browser, a real Claude call for recommend/estimate, or a real voice call.
+
+**Left open.**
+- **Daphne must be restarted** for the new routes (`token-budgets/*`, `recommend-tools/`, `token-estimates/`).
+- No limits exist yet: an admin must set the pricing and each role's warn/block, or nothing is enforced.
+- Author-side helper calls and background summarisers are unmetered; if they should count, they need a
+  usage ledger (they don't write `AgentMessage`s today).
+- Voice turns cost tokens but the voice loop's own usage is recorded only as the `AgentMessage` rows it writes;
+  a call that dies before writing its assistant message isn't counted.
+- The role mapping lives in two places (this module and `twilio-agent-pm-shared`); a parity test pins the cases,
+  not the source.
+
+
+---
+
+### 2026-11-05 — Profile page: user quick links, and Lucidchart back in the new-file list
+
+- **Lucidchart** is back in the "+ new file" rows (it was in the old Profile page's Quick Open grid and
+  was lost in the Role/Profile merge), with the shared artifact icon.
+- **Quick links.** Users add their own links at the bottom of that same box (`components/profile/QuickLinks.tsx`,
+  `hooks/useQuickLinks.ts`). The icon comes from the link through the shared `ArtifactIcon`: a known
+  service's icon, otherwise the site's own favicon. The label is the host. Stored in `localStorage`
+  (`profileQuickLinks-v1`, max 20) like focus pins, so the links **follow the browser, not the account**;
+  moving them to the server needs a `UserProfile` field + migration.
+- **Only web links are accepted** (`normalizeQuickLinkUrl`): http/https, no embedded credentials
+  (`https://google.com@evil.com`), and a scheme-less entry gets `https://`. `host:5173/x` is a host and port,
+  not a scheme. The stored value is re-validated on read because it is user-editable and becomes an `href`.
+  `javascript://example.com/%0aalert(1)` is the case only the protocol check stops (it has a real host);
+  it is in the tests, sabotage-checked.
+- `test/setup.ts` resets the store (`reloadQuickLinks()`) after each test — module-level, no storage event.
+- Verified: frontend 2031 tests, `npm run build` clean. Not exercised in a browser.
+
+
+---
+
+### 2026-11-05 — Time Allocation showed only "No account": logged time had no account
+
+**Root cause.** Time Allocation groups logged time by account, but a `SalesforceTimeEntry` took its
+account only from its Cloud Coach `project`. Both write paths (`write_back.log_time`,
+`log_week.write_week`) look the project up in `SalesforceProject`, which is empty until Salesforce syncs,
+so every entry was saved with `project = NULL`. All 17 dev entries were therefore unattributable and the
+panel put them all under "No account". The frontend was correct; the data had nothing to group by.
+
+**Fix.**
+- `SalesforceTimeEntry.account` (FK to `accounts.Account`, nullable, `salesforce_sync/0004`), recorded
+  **at log time** by `time_entry_accounts.account_for_project_sf_id` (project id -> `AccountProject.sf_project_id`,
+  else a synced `SalesforceProject`'s account by name). Both write paths use it, falling back to `infer_account`.
+- The API's `account_name` is that account, else a synced project's account, else blank. `account` is read-only.
+- `manage.py backfill_time_entry_accounts` fixes entries logged before this (dry run by default, `--commit`
+  writes, idempotent, `--username`, repeatable `--alias "phrase=Account Name"`). Inference order: same-titled
+  calendar event with an account (+/-1 day) -> same-titled action item -> an explicit alias -> exactly one of
+  **the user's own** accounts named as a whole word in the description. Never the Admin workspace.
+- Dev DB: migrated (backup `/tmp/db.sqlite3.pre-timeentry-account`) and backfilled: 13 of 17 entries placed
+  (Autodesk 5.75h, JPMC 8.75h, Siemens 6.5h); 4 left because nothing identifies them safely.
+
+**Deliberate non-feature: no loose word matching.** "Segment" is a word in the account "Segment Data
+Deletion" and in many meeting titles; matching on words would have filed "Chase/Segment Engage Office
+Hours" there. Ambiguity (two accounts named) places nothing. `--alias` is how a human resolves the rest.
+
+**Still unattributed (dev).** Schnucks x2 (the account is "Festival Foods & Schnucks", so the name
+does not match whole), Chase, and "MDP - CCM / List Ingestion". Placing Schnucks:
+`backfill_time_entry_accounts --alias "schnucks=Festival Foods & Schnucks" --commit`.
+
+**Left open.**
+- The panel lists accounts that have logged time, not every account the user is on (a zero row per account
+  would bury the real ones for someone on dozens).
+- `AccountProject.sf_project_id` is the link at log time; a project id that exists nowhere resolves only via
+  the description, so a typo'd or local-only project still lands in "No account".
+- Daphne must be restarted (`npm run agent-pm`) for the serializer change.
+
+**Verified.** Backend 2204/2204, frontend 2035/2035, `npm run build` clean.
+
+
+
+---
+
+### 2026-11-05 — Calendar header no longer covered; "Sync Google Calendar" button removed; deleted-in-Google events now vanish from an open page
+
+**Reported.** An event deleted in Google Calendar stayed in AgentPM for 10+ minutes.
+
+**The server was right; the page was stale.** Measured end to end against the real calendar (a guestless
+test event, `source="manual.sync_test"` in `GoogleWriteLog`): create → sync → `created 1`; delete in Google →
+sync → `deleted 1`, local row gone. Celery beat does fire `google-calendar-sync-every-5-minutes` (`:x4:32`/`:x9:32`).
+The bug: `useGoogleCalendarAutoSync` re-read the grid only when **its own** call reported `changed > 0`. Beat
+normally applies a Google deletion first, so the page's poll said `changed: 0` and the page never refetched.
+
+**What changed (frontend only).**
+- `hooks/useGoogleCalendarAutoSync.ts`: every 5-minute and tab-focus tick now re-reads the visible range
+  regardless of `changed`; it also syncs once when the page opens (re-reading only if that call changed
+  something, so the initial load and the session cache are not thrown away).
+- `CalendarPage.tsx`: the Sync Google Calendar button, `handleSync` and `isSyncing` are deleted. The content
+  area is `pt-16` (was `py-8`) so the "Calendar" heading clears the absolute top-right button row.
+- `test/handlers/integrations.ts`: default `google/sync/` handler (`changed: 0`). The CalendarPage `FullCalendar`
+  stub's `view` gained `activeStart`/`activeEnd` (without them `refetchVisibleRange` returns early in tests).
+
+**Verified.** 2038/2038 frontend, `npm run build` clean; the new hook test is red with the old `changed` gate
+restored. No backend change. **Not exercised in a real browser.**
+
+**Left open.** Page re-reads still depend on the tab being open/visible or on another tab's broadcast; nothing
+consumes the backend's `calendar.synced` activity event yet. Google push (near-real-time) still needs a public
+`GOOGLE_WEBHOOK_BASE_URL`.
+
+
+---
+
+### 2026-11-05 (2) — Time Allocation: logged time + calendar fallback, did-not-attend excluded
+
+**Asked for.** (1) A meeting marked did-not-attend must not appear at all. (2) Missing data in early and
+late October. (3) This week must show even though it is not logged yet. (4) A calendar item linked to an
+account must show under that account.
+
+**Why October looked empty.** Logged entries only exist for Oct 12-21 (the days Log Time was run). The
+other weeks had calendar events and nothing logged, and the panel only read logged entries.
+
+**New: `GET /api/v1/salesforce/time-allocation/?start=&end=`** (`salesforce_sync/time_allocation.py`),
+the panel's only data source now. Per (day, account): **logged time if there is any, else that account's
+calendar events for the day.** Owner-only (staff included), range capped at 125 days.
+- Dropped everywhere: `attended is False`, cancelled, all-day, out-of-office / working-location /
+  focus-time, zero-length, events not yet started (an in-progress one counts up to now).
+- **Did-not-attend is also subtracted from already-logged entries.** Log Time skips such meetings, but one
+  marked afterwards is still inside a saved entry. The entry's description lists `Title (1h 15m)` lines;
+  a line whose title matches a did-not-attend meeting that day is subtracted. Dev: Autodesk logged
+  5.75h -> 4.8h from this alone. A day whose logged entry nets to zero does **not** fall back to the
+  calendar (the user logged that day; re-adding its events would resurrect the dropped meeting).
+- Days are the user's local days (profile timezone); an event is filed on its local start day.
+- An event's account: its link -> the account of the action item it is a block for -> the one of **the
+  user's own accounts named as a whole word in its title** (same conservative rule as the entry backfill:
+  exactly one, never Admin, never an account they are not on; display only, nothing is written).
+- Events that still have no account are **left out of the rows** and reported as
+  `unlinked_calendar_minutes`. Dev data, Oct 1 - Nov 5: 8h linked, 39h matched by name, **100h unlinked**
+  (internal meetings and the like). Including them would have made the chart ~97% "No account" - the
+  original complaint again. The panel states the number instead of hiding it.
+
+**UI.** Calendar-sourced time is lighter and dashed in the bar chart, italic with a tooltip in the table,
+dashed-outlined in the heatmap, with a legend line. A breakdown line reads e.g. "25h logged + 28h from your
+calendar, not logged yet (25h matched to an account by name) - 100h of calendar time isn't linked to an
+account". The header total no longer says "logged" since it is not only logged.
+
+**Decisions to know about.**
+- Name-matching is a judgment call beyond "linked": it is what recovers most of the missing 39h (events
+  about Autodesk / JPMC / Siemens that were never linked in the calendar). It is flagged in the UI. To
+  require a real link, drop the `match(e.title)` branch in `_event_account_names`.
+- The window still ends today; events later this week are not counted until they start.
+- Partially logged days: if any time is logged for a day+account, the calendar is ignored for that
+  day+account, even if the logged time is less than the meetings.
+
+**Test notes.** The did-not-attend exclusion on the calendar side is guarded twice (the sum loop and the
+account lookup), so removing one guard alone does not fail a test; both were removed to confirm the main test
+goes red. `inferred_minutes` counts only rows actually returned (an earlier version counted events hidden by
+logged time and exceeded the calendar total).
+
+**Verified.** Backend 2241/2241, frontend 2038/2038 (x3), `npm run build` clean. The old
+`/salesforce/time-entries/` list endpoint is unchanged and no longer used by the panel.
+
+
+---
+
+### 2026-11-05 (3) — Profile page console warnings (nested buttons, border/background conflicts)
+
+Three React warnings on `/profile`, all in code inherited from the old Role page and now owned by
+`ProfilePage.tsx`:
+- **`<button>` inside `<button>`:** `CollapsibleSection`'s header was one `<button>` containing
+  `headerRight` (GET Meeting Notes, + New, remove). Now a row of siblings: a title button (takes the spare
+  width, so the left side still toggles), the controls, and a chevron button (`aria-label` "Collapse/Expand
+  <title>", both buttons carry `aria-expanded`). This also lets `getByRole("button", {name: /GET Meeting
+  Notes/})` work; the 2026-08-18 note about querying it by title is no longer needed.
+- **`border` + `borderLeft`/`borderBottom` in one style object** (session tabs, the notepad delete button,
+  mini-canvas nodes, session record cards): the new `borderSides(base, edges)` helper writes all four edges
+  as longhands. **Never mix the `border` shorthand with a side override in a style object that changes
+  between renders.**
+- **`background` + `backgroundImage`/`backgroundSize`** on the two dotted-grid canvases (they re-render
+  while something is dragged over them): `backgroundColor`. Not in the report, but the test run showed it.
+
+Guarded by `ProfilePage.test.tsx` "React warnings": it spies on `console.error`, drives the interactions
+that re-render these styles (collapse/expand, tab switches, drag over the canvases) and fails on any
+`validateDOMNesting` / "conflicting property" message. Confirmed red when the canvas fix is reverted.
+Frontend 2042/2042 (x3), build clean.
+
+
+---
+
+### 2026-11-06 — "Open full builder" still brought nothing over: it was landing off-screen
+
+**Symptom.** After the 2026-11-04 StrictMode fix, the mini-canvas still appeared not to carry into the full
+builder.
+
+**Real cause (reproduced by mounting the real `PageBuilder` under StrictMode with a handoff):** with an
+empty slate it worked; with a **saved draft** — which the builder autosaves after any use, so nearly
+everyone has one — the handoff was *appended below the draft* (`mergeHandoff`, my choice on 2026-11-04) at
+`y` past the draft's bottom, i.e. off-screen. The user saw their old draft and none of the mini-canvas.
+The request had been "a new canvas".
+
+**Fix.** A handoff now opens as **its own canvas containing exactly the mini-canvas** (`mergeHandoff` is
+deleted). An existing draft is not destroyed: it is stored under `SET_ASIDE_KEY`
+(`agentpm_canvas_draft_previous`) — a separate key, because the builder autosaves `CANVAS_DRAFT_KEY`
+within ~1.5s and would overwrite it. A banner in the builder ("Opened a new canvas from your profile
+mini-canvas. Your earlier canvas is saved.") offers **Switch to my earlier canvas**, which is a toggle
+(the canvas you leave becomes the set-aside one, so neither is lost), and **Delete earlier canvas**, the only
+way it is ever lost, behind `window.confirm`. The banner survives a reload while a set-aside canvas exists.
+`useCanvasState` returns `setAside`, `swapSetAside`, `discardSetAside`.
+- The initializer (`resolveInitial`) is pure — StrictMode double-invokes it; storage writes happen in a mount
+  effect, together with clearing the single-use handoff.
+- Clicking "Open full builder" with an empty mini-canvas now clears any leftover handoff so it cannot replay.
+
+**Tests.** `canvasHandoff.test.tsx` (19) covers the hook and mounts the real `PageBuilder` under StrictMode.
+Sabotage-checked: letting a saved draft win over the handoff reds four tests, including the real-builder
+ones. Frontend 2051/2051 (x3), build clean.
+
+**Lesson.** The 2026-11-04 test only covered the clean-slate case, so it passed while the common case was
+broken. A handoff test must run against the state users actually have (a saved draft), through the real
+component.
+

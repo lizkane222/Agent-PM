@@ -670,22 +670,24 @@ class SyncMeetingNotesTests(TestCase):
         self.assertEqual(self.meeting.gong_notes, "Recap\n- gong summary")
         self.assertEqual(report["updated"][0]["sources"], ["gong"])
 
-    def test_notification_without_a_summary_is_not_imported_as_notes(self):
-        """Zoom's notification body is link text. Saving it would be worse than empty."""
+    def test_notification_without_a_summary_fills_the_tab_with_the_recording_block(self):
+        """Zoom's notification has no recap, but its link and duration still belong on the
+        Zoom tab — as a clearly separate "Recording" block, never dressed up as a summary."""
         report = self._sync([gmail_message(
             "m1", "Meeting assets for Acme Q3 Planning are ready!", ZOOM_FROM,
             rfc2822(self.meeting_at + timedelta(hours=1)), NOTIFICATION_BODY,
         )])
 
         self.meeting.refresh_from_db()
-        self.assertEqual(self.meeting.zoom_notes, "")
-        self.assertEqual(report["updated"], [])
-        self.assertEqual(report["skipped"][0]["reason"], "email_has_no_summary")
-        self.assertEqual(report["skipped"][0]["sources_without_summary"], ["zoom"])
-        self.assertEqual(report["no_summary_in_email"], 1)
+        self.assertEqual(
+            self.meeting.zoom_notes,
+            "Recording\n- Recording link: https://twilio.zoom.us/rec/share/abc123",
+        )
+        self.assertEqual(report["updated"][0]["sources"], ["zoom"])
+        self.assertEqual(report["updated"][0]["recording_only"], ["zoom"])
+        self.assertEqual(report["skipped"], [])
 
     def test_notification_still_contributes_its_recording_link(self):
-        """The link is the only useful thing in a notification, so keep that much."""
         report = self._sync([gmail_message(
             "m1", "Meeting assets for Acme Q3 Planning are ready!", ZOOM_FROM,
             rfc2822(self.meeting_at + timedelta(hours=1)), NOTIFICATION_BODY,
@@ -693,11 +695,34 @@ class SyncMeetingNotesTests(TestCase):
 
         self.meeting.refresh_from_db()
         self.assertEqual(self.meeting.zoom_url, "https://twilio.zoom.us/rec/share/abc123")
-        self.assertEqual(self.meeting.zoom_notes, "")
         self.assertEqual(report["recordings_linked"], 1)
 
-    def test_a_gong_recap_still_imports_when_zoom_only_notified(self):
-        """The real-world shape: Gong carries the recap, Zoom only links the recording."""
+    def test_a_rerun_over_the_same_notification_reports_nothing_new(self):
+        """The 10-minute check sees the same email every time; it must not re-announce it."""
+        msg = lambda: [gmail_message(
+            "m1", "Meeting assets for Acme Q3 Planning are ready!", ZOOM_FROM,
+            rfc2822(self.meeting_at + timedelta(hours=1)), NOTIFICATION_BODY,
+        )]
+        self._sync(msg())
+        report = self._sync(msg())
+        self.assertEqual(report["updated"], [])
+
+    def test_a_real_zoom_recap_replaces_the_recording_block(self):
+        self.meeting.zoom_notes = "Recording\n- Recording link: https://zoom.us/rec/x"
+        self.meeting.save()
+
+        report = self._sync([gmail_message(
+            "m1", "Meeting Summary with Acme Q3 Planning", ZOOM_FROM,
+            rfc2822(self.meeting_at + timedelta(hours=1)), RECAP_BODY,
+        )])
+
+        self.meeting.refresh_from_db()
+        self.assertEqual(self.meeting.zoom_notes, "Recap\n- zoom summary")
+        self.assertEqual(report["updated"][0]["sources"], ["zoom"])
+        self.assertNotIn("recording_only", report["updated"][0])
+
+    def test_gong_and_zoom_emails_for_one_meeting_both_land(self):
+        """Each provider writes its own column from its own email."""
         report = self._sync([
             gmail_message("m1", "Meeting assets for Acme Q3 Planning are ready!", ZOOM_FROM,
                           rfc2822(self.meeting_at + timedelta(hours=2)), NOTIFICATION_BODY),
@@ -707,10 +732,8 @@ class SyncMeetingNotesTests(TestCase):
 
         self.meeting.refresh_from_db()
         self.assertEqual(self.meeting.gong_notes, "Recap\n- gong summary")
-        self.assertEqual(self.meeting.zoom_notes, "")
-        self.assertEqual(self.meeting.zoom_url, "https://twilio.zoom.us/rec/share/abc123")
-        self.assertEqual(report["updated"][0]["sources"], ["gong"])
-        self.assertEqual(report["updated"][0]["linked_sources"], ["zoom"])
+        self.assertIn("https://twilio.zoom.us/rec/share/abc123", self.meeting.zoom_notes)
+        self.assertEqual(report["updated"][0]["sources"], ["gong", "zoom"])
 
     def test_an_existing_recording_link_is_not_replaced_by_a_notification(self):
         self.meeting.zoom_url = "https://zoom.us/rec/original"
@@ -1020,6 +1043,20 @@ class UnlinkedCalendarEventTests(TestCase):
         self.assertEqual(report["scanned_unlinked_events"], 0)
         self.assertFalse(AirtableMeeting.objects.exists())
 
+    def test_a_scoped_scan_keeps_an_unlinked_event_whose_title_names_the_account(self):
+        """Google-synced meetings often have no account FK; the title is the signal."""
+        from accounts.models import Account
+        Account.objects.create(company_name="Acme", airtable_id="recACCT1")
+        self.event.title = " Acme / Twilio - Implementation Call"
+        self.event.save(update_fields=["title"])
+
+        report = self._sync([self._recap(
+            subject="Acme / Twilio - Implementation Call: Call recording and analysis is ready"
+        )], account="recACCT1")
+
+        self.assertEqual(report["scanned_unlinked_events"], 1)
+        self.assertEqual(report["meetings_created"], 1)
+
     def test_a_scoped_scan_drops_an_event_with_no_account(self):
         """A scoped run must not import a meeting that may belong elsewhere."""
         report = self._sync([self._recap()], account="recACCT1")
@@ -1064,3 +1101,182 @@ class BuildGmailServiceTests(TestCase):
             user=self.user, provider="gmail", access_token="t", scopes="a", is_active=False
         )
         self.assertIsNone(gmail_utils.find_gmail_credential(self.user))
+
+
+class MeetingNotesNotificationTests(TestCase):
+    """The scheduled check announces notes it added, exactly once per meeting+provider."""
+
+    def setUp(self):
+        # The scan mirrors notes to Airtable; without this the tests call the real API.
+        patcher = patch("airtable_sync.write_back.get_table")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.user = User.objects.create_user("notifyme", password="{PASSWORD}", is_staff=True)
+        self.meeting_at = timezone.now() - timedelta(hours=3)
+        self.meeting = AirtableMeeting.objects.create(
+            airtable_id="recMTGN", name="Acme Q3 Planning", date=self.meeting_at,
+        )
+        self.messages = [gmail_message(
+            "m1", "Acme Q3 Planning: Call recording and analysis is ready", GONG_FROM,
+            rfc2822(self.meeting_at + timedelta(hours=1)), RECAP_BODY,
+        )]
+
+    def _run(self):
+        with patch(
+            "integrations.meeting_notes.summarize_email",
+            side_effect=lambda body, name, source: f"Recap\n- {source} summary",
+        ):
+            report = meeting_notes.sync_meeting_notes_from_email(
+                self.user, days=meeting_notes.AUTO_LOOKBACK_DAYS,
+                gmail=FakeGmail(self.messages),
+            )
+        return report, meeting_notes.notify_notes_added(self.user, report)
+
+    def test_notes_added_creates_one_notification(self):
+        from realtime.models import AgentActivityEvent
+        _, created = self._run()
+        self.assertEqual(created, 1)
+        ev = AgentActivityEvent.objects.get(user=self.user, event_type="meeting_notes")
+        self.assertEqual(ev.title, "Gong notes added to Acme Q3 Planning")
+        self.assertEqual(ev.metadata["airtable_id"], "recMTGN")
+        self.assertEqual(ev.metadata["source"], "gong")
+
+    def test_announcing_the_same_report_twice_does_not_duplicate(self):
+        from realtime.models import AgentActivityEvent
+        report, _ = self._run()
+        self.assertEqual(meeting_notes.notify_notes_added(self.user, report), 0)
+        self.assertEqual(AgentActivityEvent.objects.filter(event_type="meeting_notes").count(), 1)
+
+    def test_a_scan_that_adds_nothing_notifies_nothing(self):
+        from realtime.models import AgentActivityEvent
+        self.messages = []
+        _, created = self._run()
+        self.assertEqual(created, 0)
+        self.assertFalse(AgentActivityEvent.objects.filter(event_type="meeting_notes").exists())
+
+
+class ScheduledMeetingNotesTaskTests(TestCase):
+    def test_runs_each_google_user_and_survives_one_failing(self):
+        from integrations import tasks
+        good = User.objects.create_user("good", password="{PASSWORD}")
+        bad = User.objects.create_user("bad", password="{PASSWORD}")
+        for u in (bad, good):
+            OAuthCredential.objects.create(user=u, provider="google", is_active=True)
+
+        seen = []
+
+        def fake_sync(user, **kwargs):
+            seen.append(user.pk)
+            if user.pk == bad.pk:
+                raise RuntimeError("boom")
+            return {"updated": []}
+
+        with patch("integrations.meeting_notes.sync_meeting_notes_from_email", side_effect=fake_sync):
+            tasks.check_meeting_notes_all_users()
+
+        self.assertCountEqual(seen, [good.pk, bad.pk])
+
+    def test_is_scheduled_every_ten_minutes(self):
+        from django.conf import settings
+        entry = settings.CELERY_BEAT_SCHEDULE["meeting-notes-every-10-minutes"]
+        self.assertEqual(entry["schedule"], 600)
+        self.assertEqual(entry["task"], "integrations.tasks.check_meeting_notes_all_users")
+
+
+GONG_TITLED_BODY = """\
+Key points
+1.  Debugger Navigation: The Twilio team demonstrated how to access the Unify Settings debugger by modifying the URL.
+
+2.  Payload Retrieval: The Twilio team showed how to obtain raw event payloads for testing by pausing the debugger.
+
+3.  The customer asked a question that has no topic title in the source email at all.
+"""
+
+
+class TopicTitleTests(TestCase):
+    """Gong prefixes many key points with "Title:"; the rewrite must not drop it."""
+
+    def test_titles_are_found_in_the_email(self):
+        titles = [t for t, _ in meeting_notes.topic_titled_points(GONG_TITLED_BODY)]
+        self.assertEqual(titles, ["Debugger Navigation", "Payload Retrieval"])
+
+    def test_clock_times_and_urls_are_not_titles(self):
+        body = "Duration: 00:31:24 (thirty minutes)\nShareable link: https://zoom.us/rec/share/abc123def456"
+        self.assertEqual(meeting_notes.topic_titled_points(body), [])
+
+    def test_a_dropped_title_is_put_back(self):
+        summary = (
+            "Key Points\n"
+            "- The Twilio team demonstrated how to access the Unify Settings debugger by modifying the URL.\n"
+            "- A bullet with no counterpart in the email.\n"
+        )
+        out = meeting_notes.restore_topic_titles(summary, GONG_TITLED_BODY)
+        self.assertIn("- Debugger Navigation: The Twilio team demonstrated", out)
+        self.assertIn("- A bullet with no counterpart in the email.", out)
+
+    def test_a_bullet_that_already_has_its_title_is_not_doubled(self):
+        summary = "Key Points\n- Debugger Navigation: The Twilio team demonstrated how to access the Unify Settings debugger.\n"
+        out = meeting_notes.restore_topic_titles(summary, GONG_TITLED_BODY)
+        self.assertEqual(out.count("Debugger Navigation"), 1)
+
+    def test_summarize_email_restores_titles_from_the_model_output(self):
+        fake = MagicMock()
+        fake.messages.create.return_value.content = [MagicMock(
+            type="text",
+            text="Key Points\n- The Twilio team showed how to obtain raw event payloads for testing by pausing the debugger.",
+        )]
+        with patch("core.llm.build_sync_client", return_value=fake):
+            out = meeting_notes.summarize_email(GONG_TITLED_BODY, "Sync", "gong")
+        self.assertIn("- Payload Retrieval: The Twilio team showed", out)
+
+    def test_the_prompt_asks_for_titles_to_be_kept(self):
+        self.assertIn("topic title", meeting_notes._SUMMARY_PROMPT)
+
+
+class RecordingNotesTests(TestCase):
+    ZOOM = (
+        "Meeting assets for X are ready!\n\nRecording\n\nDuration:\n00:31:24\n\n"
+        "Shareable link:\n\nhttps://twilio.zoom.us/rec/share/AAA?pwd=BBB\n\nView in Zoom\n"
+    )
+
+    def test_duration_and_labelled_link_are_extracted(self):
+        out = meeting_notes.build_recording_notes(self.ZOOM, ("zoom.us",))
+        self.assertEqual(
+            out,
+            "Recording\n- Duration: 00:31:24\n- Shareable link: https://twilio.zoom.us/rec/share/AAA?pwd=BBB",
+        )
+
+    def test_no_provider_link_means_no_notes(self):
+        self.assertEqual(meeting_notes.build_recording_notes("Duration: 10:00\nhttps://example.com/x", ("zoom.us",)), "")
+
+    def test_only_the_recording_block_counts_as_recording_only(self):
+        self.assertTrue(meeting_notes.is_recording_only("Recording\n- Duration: 1:00"))
+        self.assertFalse(meeting_notes.is_recording_only("Recap\n- something"))
+        self.assertFalse(meeting_notes.is_recording_only("Recording\n- x\nKey Points\n- y"))
+        self.assertFalse(meeting_notes.is_recording_only(""))
+
+
+class NotificationLinkTests(TestCase):
+    def test_link_opens_the_meeting_on_its_account_page(self):
+        from accounts.models import Account
+        at = AirtableAccount.objects.create(airtable_id="recLINKACCT", name="Acme")
+        acct = Account.objects.create(company_name="Acme", airtable_id="recLINKACCT")
+        m = AirtableMeeting.objects.create(airtable_id="recLM", account=at, name="Sync", date=timezone.now())
+        self.assertEqual(meeting_notes._meeting_link(m.pk), f"/accounts/{acct.pk}?meeting={m.pk}")
+
+    def test_no_account_means_no_link(self):
+        m = AirtableMeeting.objects.create(airtable_id="recLM2", name="Solo", date=timezone.now())
+        self.assertEqual(meeting_notes._meeting_link(m.pk), "")
+
+    def test_a_recording_announcement_says_so_and_is_distinct_from_a_recap(self):
+        from realtime.models import AgentActivityEvent
+        user = User.objects.create_user("rec-user", password="{PASSWORD}")
+        report = {"updated": [{
+            "meeting_id": 1, "airtable_id": "recX", "meeting_name": "Sync",
+            "sources": ["zoom"], "recording_only": ["zoom"],
+        }]}
+        meeting_notes.notify_notes_added(user, report)
+        report["updated"][0].pop("recording_only")
+        meeting_notes.notify_notes_added(user, report)
+        titles = set(AgentActivityEvent.objects.filter(user=user).values_list("title", flat=True))
+        self.assertEqual(titles, {"Zoom recording link added to Sync", "Zoom notes added to Sync"})

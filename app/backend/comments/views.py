@@ -129,6 +129,14 @@ def _notify_reply_author(replier, parent_comment, reply):
         },
         client_id=client_id,
     )
+    from team.notifications import account_for_resource, record_notification
+
+    record_notification(
+        parent_comment.author, "in_app", "comment_reply",
+        f"{replier.username} replied to your comment on {parent_comment.resource_label}",
+        reply.content[:500],
+        account=account_for_resource(parent_comment.resource_type, parent_comment.resource_id),
+    )
 
 
 class CommentViewSet(viewsets.ModelViewSet):

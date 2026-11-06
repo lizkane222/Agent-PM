@@ -145,6 +145,13 @@ class SalesforceTimeEntry(models.Model):
     task = models.ForeignKey(
         SalesforceTask, on_delete=models.SET_NULL, null=True, blank=True
     )
+    # The app account this time was for. Recorded when the time is logged, because the Cloud
+    # Coach `project` is blank whenever Salesforce hasn't been synced — which left every entry
+    # unattributable and the profile page's Time Allocation panel showing only "No account".
+    account = models.ForeignKey(
+        "accounts.Account", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="time_entries",
+    )
     date = models.DateField()
     duration_minutes = models.IntegerField()
     description = models.TextField(blank=True, default="")

@@ -465,3 +465,40 @@ class ResourceActivityFeedTests(APITestCase):
         self.client.force_authenticate(user=self.alice)
         titles = [e["title"] for e in self.client.get("/api/v1/realtime/activity/").data["results"]]
         self.assertNotIn("bob reassigned", titles)
+
+
+class VoiceTwiMLLaunchParameterTests(APITestCase):
+    """The browser's `ctx` key is forwarded as a signed <Parameter> only for the owner."""
+
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(username="launch_caller", password="{PASSWORD}")
+        self.other = User.objects.create_user(username="launch_other2", password="{PASSWORD}")
+
+    def _post(self, **form):
+        with patch("twilio.request_validator.RequestValidator.validate", return_value=True):
+            return self.client.post("/api/v1/realtime/voice/twiml/", data=urlencode(form),
+                                    content_type="application/x-www-form-urlencoded")
+
+    def _key(self, user):
+        from skills.models import VoiceLaunchContext
+
+        VoiceLaunchContext.objects.create(key="abc", user=user, payload={})
+        return "abc"
+
+    def test_owner_key_is_forwarded_and_call_bound(self):
+        from realtime.voice_identity import read_launch_token
+
+        body = self._post(From=f"client:{self.user.pk}", CallSid=CALL_SID_ALICE, ctx=self._key(self.user)).content.decode()
+        match = re.search(r'<Parameter name="launch_token" value="([^"]+)"', body)
+        self.assertIsNotNone(match)
+        self.assertEqual(read_launch_token(match.group(1), CALL_SID_ALICE), "abc")
+        self.assertIsNone(read_launch_token(match.group(1), CALL_SID_BOB))
+
+    def test_someone_elses_key_is_dropped(self):
+        body = self._post(From=f"client:{self.user.pk}", CallSid=CALL_SID_ALICE, ctx=self._key(self.other)).content.decode()
+        self.assertNotIn("launch_token", body)
+
+    def test_no_ctx_no_parameter(self):
+        body = self._post(From=f"client:{self.user.pk}", CallSid=CALL_SID_ALICE).content.decode()
+        self.assertNotIn("launch_token", body)

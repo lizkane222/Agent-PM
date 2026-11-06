@@ -481,6 +481,14 @@ class WriteWeekTest(LogWeekTestBase):
         self.assertEqual(entry.duration_minutes, 60)
         self.assertEqual(entry.project, self.project)
 
+    def test_audit_rows_record_the_app_account(self):
+        # The Cloud Coach project can be blank (never synced); the account must not depend on it.
+        self.event(account=self.account)
+
+        self._write()
+
+        self.assertEqual(SalesforceTimeEntry.objects.get(user=self.user).account, self.account)
+
     def test_the_resource_field_is_omitted_and_reported_when_unresolved(self):
         self.event(account=self.account)
         sf = full_org(query_results={"FROM Resource__c": {"records": []}})
@@ -584,3 +592,45 @@ class ScopedManualAssignmentTest(LogWeekTestBase):
         plan = plan_week(self.user, MONDAY)
 
         self.assertEqual([e.project_sf_id for e in plan.entries], ["a0BPROJ000000001"])
+
+
+class TimeLoggedActivityTest(LogWeekTestBase):
+    """Logging time shows up in the Events tab, one entry per event that was logged."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch("realtime.sync._get_sync_client", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.project = self.sf_project()
+        AccountProject.objects.create(
+            account=self.account, name="P", sf_project_id=self.project.sf_id
+        )
+
+    def _write(self):
+        sf = full_org(query_results={"FROM Resource__c": {"records": [{"Id": "a0R000000000001"}]}})
+        plan = plan_week(self.user, MONDAY)
+        with mock.patch("salesforce_sync.client.get_client", return_value=sf):
+            return write_week(self.user, plan)
+
+    def test_each_logged_event_gets_an_entry(self):
+        from realtime.models import AgentActivityEvent
+
+        self.event(account=self.account, minutes=60, title="Design review")
+        self._write()
+
+        entries = list(AgentActivityEvent.objects.filter(
+            user=self.user, event_type="calendar_event.time_logged"))
+        self.assertEqual(len(entries), 1)
+        self.assertIn('"Design review"', entries[0].title)
+        self.assertEqual(entries[0].metadata["hours"], 1.0)
+
+    def test_a_failed_write_records_nothing(self):
+        from realtime.models import AgentActivityEvent
+        from salesforce_sync.cloudcoach import CloudCoachError
+
+        self.event(account=self.account, minutes=60)
+        with mock.patch("salesforce_sync.log_week.composite_create", side_effect=CloudCoachError("no")):
+            with self.assertRaises(CloudCoachError):
+                self._write()
+        self.assertFalse(AgentActivityEvent.objects.filter(event_type="calendar_event.time_logged").exists())

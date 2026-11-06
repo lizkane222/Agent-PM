@@ -36,7 +36,7 @@ import { useGoogleCalendarAutoSync } from "../hooks/useGoogleCalendarAutoSync";
 import { AccountRecordLink, ActionItemRecordButton } from "../components/calendar/EventRecordLinks";
 import { useAvailability } from "../hooks/useAvailability";
 import ComparePeoplePicker, { type ComparedPerson } from "../components/calendar/ComparePeoplePicker";
-import { findFreeSlots, isCompareEvent, overlayEvents } from "../lib/availability";
+import { findFreeSlots, isCompareEvent, isFreeSlotBand, overlayEvents } from "../lib/availability";
 import { CALENDAR_CHANGED_KEY, cancelLiveTimer, refreshLiveTimers, startLiveTimer } from "../lib/liveTimers";
 import {
   eventSeconds, isLoggableMeeting, itemBelongsToAccount, localDate, localProjectPillId,
@@ -835,10 +835,11 @@ function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAcc
           </div>
 
           {evEditNotifiesGuests && (
-            /* Saving pushes to Google, which emails the guest list. Said before the
-               click, not discovered after it. */
+            /* Saving pushes the change to Google but never emails the guests (a customer once
+               received 2,000+ invitations from one move). Said before the click so the user
+               knows to tell the guests themselves if the time changed. */
             <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1.5">
-              This event is on your Google Calendar with {event.attendees.length} guest{event.attendees.length === 1 ? "" : "s"} — saving will update it in Google and notify them.
+              This event is on your Google Calendar with {event.attendees.length} guest{event.attendees.length === 1 ? "" : "s"} — saving will update it in Google but will not email them. Let them know yourself if the time changed.
             </p>
           )}
           {evError && <p role="alert" className="text-[12px] text-red-600">{evError}</p>}
@@ -3483,7 +3484,6 @@ export default function CalendarPage() {
   // synchronously while `fetchEvents` is still in flight, so gating the legacy migration on
   // it ran the migration against an empty `eventsRef` and duplicated every row.
   const [firstFetchDone, setFirstFetchDone] = useState(false);
-  const [isSyncing, setIsSyncing] = useState(false);
   const [showWeekends, setShowWeekends] = useState(false);
   const [userEmail, setUserEmail] = useState<string | null>(null);
   const [accountPanelOpen, setAccountPanelOpen] = useState(false);
@@ -3592,6 +3592,11 @@ export default function CalendarPage() {
   const eventsRef = useRef<CalendarEvent[]>([]);
   // Set to true during optimistic drag/resize updates so fetchEvents doesn't clobber them
   const localMutationRef = useRef(false);
+  // A range whose fetch landed while the latch above was held, and so was not written to
+  // state. Replayed by releaseLocalMutation(); without it, paging to another week during an
+  // in-flight save (e.g. the ~100ms of an attendance PATCH) showed the old week until the
+  // next navigation, because nothing ever asked for that week again.
+  const skippedFetchRef = useRef<{ start: string; end: string } | null>(null);
   const { openComments } = useCommentContext();
   const { reportError } = useAppError();
   // User-chosen colors per event type, plus per-event "important" overrides
@@ -3723,10 +3728,14 @@ export default function CalendarPage() {
           data = resp.data;
           writeEventCache(start, end, data);
         }
-        // Skip overwriting events when a local drag/resize mutation is in-flight
+        // Skip overwriting events when a local drag/resize mutation is in-flight; remember
+        // the range so releaseLocalMutation() can apply it once the mutation settles.
         if (!localMutationRef.current) {
           setEvents(data);
           eventsRef.current = data;
+          skippedFetchRef.current = null;
+        } else {
+          skippedFetchRef.current = { start, end };
         }
         // Bulk-load account links for all events in this range (always — cached events
         // still need their account names loaded since eventAccountLinks is not persisted).
@@ -3775,22 +3784,37 @@ export default function CalendarPage() {
     []
   );
 
+  /**
+   * Release the in-flight-mutation latch and apply any fetch it caused to be skipped.
+   *
+   * The skipped fetch already wrote its result to the session cache before the latch check,
+   * so the replay is served from there (no extra request) unless that entry has expired.
+   */
+  const releaseLocalMutation = useCallback(() => {
+    localMutationRef.current = false;
+    const skipped = skippedFetchRef.current;
+    skippedFetchRef.current = null;
+    if (skipped) void fetchEvents(skipped.start, skipped.end);
+  }, [fetchEvents]);
+
   /** Re-read the visible range from the DB, busting the session cache first. */
   const refetchVisibleRange = useCallback(async () => {
     bustEventCache();
     const api = calendarRef.current?.getApi();
     if (!api) return;
-    const { activeStart, activeEnd } = api.view;
+    const { activeStart, activeEnd } = api.view ?? {};
+    // Before FullCalendar has rendered a view there is no visible range to refetch; the
+    // first datesSet will fetch it. Without this guard the legacy-migration effect's
+    // refetch threw an unhandled rejection whenever it ran ahead of the first view.
+    if (!activeStart || !activeEnd) return;
     await fetchEvents(activeStart.toISOString(), activeEnd.toISOString(), { bustCache: true });
   }, [fetchEvents]);
 
   // Pull Google changes on our own: every 5 minutes and on tab focus while the page is open.
-  // Skipped while a manual sync or a drag/resize is in flight; the button is unaffected.
-  const isSyncingRef = useRef(isSyncing);
-  isSyncingRef.current = isSyncing;
+  // Skipped while a drag/resize is in flight. There is no manual sync button: this is the only client trigger.
   useGoogleCalendarAutoSync({
     enabled: true,
-    busy: () => isSyncingRef.current || localMutationRef.current,
+    busy: () => localMutationRef.current,
     onChanged: () => { void refetchVisibleRange(); },
   });
 
@@ -3997,7 +4021,7 @@ export default function CalendarPage() {
   const handleEventClick = useCallback(
     (info: EventClickArg) => {
       // Someone else's busy block (or a free-slot band) has nothing to open.
-      if (isCompareEvent(info.event.extendedProps as CalendarEvent) || info.event.extendedProps?.freeSlot) return;
+      if (isCompareEvent(info.event.extendedProps as CalendarEvent) || isFreeSlotBand(info.event.extendedProps)) return;
       // Resolve to the DB row up front: extendedProps has no `id`, so a panel opened
       // from a raw snapshot could not save anything.
       const extProps = resolveEventRow(info.event.extendedProps as CalendarEvent);
@@ -4171,9 +4195,9 @@ export default function CalendarPage() {
       // its request and then discard the response — the calendar silently renders the
       // week it was on when the edit happened, for the rest of the session. `finally`,
       // not a tail assignment, because this function re-throws on failure.
-      localMutationRef.current = false;
+      releaseLocalMutation();
     }
-  }, [resolveEventRow, reportError]);
+  }, [resolveEventRow, reportError, releaseLocalMutation]);
 
   /**
    * Change an event's type in place from the right-click menu.
@@ -4251,9 +4275,9 @@ export default function CalendarPage() {
       reportError("Could not save attendance. Please try again.");
     } finally {
       // See saveEventDetails: an unreleased latch blanks every subsequent week.
-      localMutationRef.current = false;
+      releaseLocalMutation();
     }
-  }, [reportError]);
+  }, [reportError, releaseLocalMutation]);
 
   const unlinkEvent = useCallback(async (eventUid: string) => {
     setEventAccountLinks((prev) => {
@@ -4510,7 +4534,7 @@ export default function CalendarPage() {
         setSelectedEvent((prev) => prev?.id === ev.id ? { ...prev, start_datetime: ev.start_datetime, end_datetime: ev.end_datetime } : prev);
         onFail?.();
       })
-      .finally(() => { localMutationRef.current = false; });
+      .finally(() => { releaseLocalMutation(); });
     // Bust cache so next navigation reflects the updated time
     if (uid) bustEventCache();
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -4537,7 +4561,7 @@ export default function CalendarPage() {
       setSelectedEvent((prev) => prev && isThis(prev) ? { ...prev, start_datetime: newStart, end_datetime: newEnd } : prev);
       schedulerApi.updateEvent(Number(rowId), { start_datetime: newStart, end_datetime: newEnd })
         .catch(() => { info.revert(); })
-        .finally(() => { localMutationRef.current = false; });
+        .finally(() => { releaseLocalMutation(); });
       airtableApi.updateActionItemFields(ev.agentpm_airtable_id, { due_date: newStart.slice(0, 10) })
         .then(() => logActionItemUpdate({ airtable_id: ev.agentpm_airtable_id, task: ev.title ?? "" } as AirtableActionItem, { due_date: newStart.slice(0, 10) }))
         .catch(() => {});
@@ -4600,7 +4624,7 @@ export default function CalendarPage() {
       setSelectedEvent((prev) => prev && isThis(prev) ? { ...prev, start_datetime: newStart, end_datetime: newEnd } : prev);
       schedulerApi.updateEvent(Number(rowId), { start_datetime: newStart, end_datetime: newEnd })
         .catch(() => { info.revert(); })
-        .finally(() => { localMutationRef.current = false; });
+        .finally(() => { releaseLocalMutation(); });
       airtableApi.updateActionItemFields(ev.agentpm_airtable_id, { due_date: newStart.slice(0, 10) })
         .then(() => logActionItemUpdate({ airtable_id: ev.agentpm_airtable_id, task: ev.title ?? "" } as AirtableActionItem, { due_date: newStart.slice(0, 10) }))
         .catch(() => {});
@@ -5062,41 +5086,6 @@ export default function CalendarPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visibleRange]);
 
-  const handleSync = useCallback(async () => {
-    setIsSyncing(true);
-    const showToast = (msg: string, type: "success" | "warn") => {
-      setDropToast({ msg, type });
-      setTimeout(() => setDropToast(null), 4000);
-    };
-    try {
-      // Sync, then re-read the range. That is the whole operation now.
-      //
-      // This used to be a four-step push-then-prune dance, and it was the bug behind
-      // "Sync Google Calendar removed the action items I had added":
-      //
-      //   Step 1 pushed `scheduledActionItems` (a localStorage-only representation) to
-      //   Google and then DELETED those entries, on the assumption that Step 2's pull would
-      //   bring each one back as a database row. Step 4 pruned anything left over by
-      //   `airtableId`. When the round trip did not complete — and it could not for a second
-      //   occurrence of an action item, because the push view deduped on `airtableId` alone
-      //   and answered with the FIRST occurrence's Google id — the scheduling was deleted
-      //   from the only place it had ever existed.
-      //
-      // Scheduling now writes a real `CalendarEvent` up front (lib/calendarScheduling.ts) and
-      // the server mirrors it to Google in the sync's own PHASE 1b, so there is nothing here
-      // for the client to push and, crucially, nothing for it to delete.
-      await integrationsApi.syncGoogleCalendar();
-      await refetchVisibleRange();
-      window.dispatchEvent(new StorageEvent("storage", { key: "calendarUpdated", newValue: "1" }));
-    } catch (err) {
-      console.error("[Sync] Sync failed:", err);
-      const is429 = (err as { response?: { status?: number } })?.response?.status === 429;
-      showToast(is429 ? "Google Calendar rate limit hit — wait a moment and try again" : "Google Calendar sync failed — check console", "warn");
-    } finally {
-      setIsSyncing(false);
-    }
-  }, [refetchVisibleRange]);
-
   // When accounts view is active, fetch Airtable meetings for all linked accounts.
   // Derive a stable string key from the actual account IDs so the effect only
   // re-fires when the set of linked accounts changes, not on every Map reference change.
@@ -5404,13 +5393,6 @@ export default function CalendarPage() {
             setSearchQuery(ev.title || "");
           }}
         />
-        <button
-          onClick={() => void handleSync()}
-          disabled={isSyncing}
-          className="flex items-center gap-2 rounded-full px-4 py-2 text-sm font-semibold border shadow-sm transition-colors bg-indigo-600 border-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
-        >
-          {isSyncing ? "Syncing…" : "Sync Google Calendar"}
-        </button>
         {/* Divider */}
         <div className="w-px h-5 bg-gray-300 mx-2 shrink-0" />
         <button
@@ -5925,7 +5907,7 @@ export default function CalendarPage() {
 
       {/* ── Scrollable main content ── */}
       <div
-        className="flex-1 overflow-auto py-8 transition-[padding] duration-200"
+        className="flex-1 overflow-auto pt-16 pb-8 transition-[padding] duration-200"
         style={{
           paddingLeft,
           paddingRight: (selectedEvent ? (meetingPanelCollapsed ? GAP : MEETING_W + GAP) : 0) + (itemsPanelOpen ? ACTION_W + GAP : 72),
@@ -6154,6 +6136,9 @@ export default function CalendarPage() {
               return base;
             })]}
             eventContent={(arg) => {
+              // A "Find free time" band is a bare background event with no attendees; reading
+              // CalendarEvent fields off it threw and took the whole grid down.
+              if (isFreeSlotBand(arg.event.extendedProps)) return true;
               const e = arg.event.extendedProps as CalendarEvent;
               const isWorkSession = e.calendar_id === "work_tracking";
               const rsvp = isWorkSession ? null : getRsvp(e, userEmail);

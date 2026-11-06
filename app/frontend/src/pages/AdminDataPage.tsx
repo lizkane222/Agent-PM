@@ -4,8 +4,10 @@ import { useCurrentUser } from "../context/CurrentUserContext";
 import { accessLevel } from "../lib/permissions";
 import { salesforceApi, skillsApi, realtimeApi, teamApi } from "../lib/api";
 import type { SalesforceAccount, Tag, VoiceSession } from "../types";
+import TokenBudgetsPanel from "../components/admin/TokenBudgetsPanel";
+import SkillEstimatesPanel from "../components/admin/SkillEstimatesPanel";
 
-type Section = "tags" | "teams" | "memberships" | "invocations" | "voice" | "sf-accounts";
+type Section = "tags" | "teams" | "memberships" | "invocations" | "voice" | "sf-accounts" | "token-budgets" | "skill-estimates";
 
 interface TeamRow { id: number; name: string; description: string; member_count: number; created_at: string }
 interface MembershipRow { id: number; user: number; user_display_name: string; user_email: string; team: number; team_name: string; role: string; created_at: string }
@@ -33,6 +35,8 @@ const SECTIONS: { key: Section; label: string; description: string }[] = [
   { key: "invocations", label: "Skill Invocations", description: "Log of every Claude skill execution." },
   { key: "voice", label: "Voice Sessions", description: "Recorded voice-agent calls." },
   { key: "sf-accounts", label: "Salesforce Accounts", description: "Accounts pulled from Salesforce sync." },
+  { key: "token-budgets", label: "Token Budgets", description: "Daily token allowance per role and per person, with the token ↔ dollar rate." },
+  { key: "skill-estimates", label: "Skill Token Estimates", description: "Claude's estimate of what one run of each skill costs." },
 ];
 
 export default function AdminDataPage() {
@@ -95,6 +99,8 @@ function SectionView({ section }: { section: Section }) {
       {section === "invocations" && <InvocationsTable />}
       {section === "voice" && <VoiceSessionsTable />}
       {section === "sf-accounts" && <SFAccountsTable />}
+      {section === "token-budgets" && <TokenBudgetsPanel />}
+      {section === "skill-estimates" && <SkillEstimatesPanel />}
     </>
   );
 }

@@ -75,6 +75,20 @@ def _label(arguments: dict, *keys: str) -> str:
     return "that record"
 
 
+def _spoken_list(names) -> str:
+    """"A", "A and B", "A, B, and C" — tolerant of None, a bare string, or non-strings."""
+    if isinstance(names, str):
+        names = [names]
+    cleaned = [" ".join(str(n).split()) for n in (names or []) if str(n or "").strip()]
+    if not cleaned:
+        return "the people you named"
+    if len(cleaned) == 1:
+        return cleaned[0]
+    if len(cleaned) == 2:
+        return f"{cleaned[0]} and {cleaned[1]}"
+    return ", ".join(cleaned[:-1]) + f", and {cleaned[-1]}"
+
+
 def _week_phrase(week_start: str) -> str:
     """"the week of 2026-08-31", or "this week" when the tool was called with no date."""
     cleaned = (week_start or "").strip()
@@ -93,10 +107,6 @@ VOICE_CONFIRM_TOOLS: dict[str, ConfirmSpec] = {
     "delete_action_item": ConfirmSpec(
         "destructive",
         lambda a: f"permanently delete the action item {_label(a, 'airtable_id')}",
-    ),
-    "delete_meeting": ConfirmSpec(
-        "destructive",
-        lambda a: f"permanently delete the meeting {_label(a, 'airtable_id')}",
     ),
     "delete_calendar_event": ConfirmSpec(
         "destructive",
@@ -121,6 +131,19 @@ VOICE_CONFIRM_TOOLS: dict[str, ConfirmSpec] = {
             + (f" for {a['account_name']}" if a.get("account_name") else "")
             + f" for {_week_phrase(a.get('week_start', ''))} to Cloud Coach"
         ),
+    ),
+    # "outbound": Google emails the invitation to a real person, and a misheard name over a
+    # lossy speech channel would email the wrong one. The question names everyone, so a
+    # misheard name is audible before anything is sent.
+    "invite_to_meeting": ConfirmSpec(
+        "outbound",
+        lambda a: f"email a calendar invitation to {_spoken_list(a.get('attendee_names'))}",
+    ),
+    # Spoken so a misheard name is audible before the note is delivered. The question reads the
+    # note back, because over speech the user cannot review it any other way.
+    "leave_note_for": ConfirmSpec(
+        "outbound",
+        lambda a: f"leave a note for {_label(a, 'person')} saying: {_trim(a.get('note', ''))}",
     ),
 }
 

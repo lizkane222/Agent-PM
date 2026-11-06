@@ -78,3 +78,22 @@ describe("AdminDataPage", () => {
     expect(screen.getByRole("link", { name: /Settings/ })).toHaveAttribute("href", "/settings");
   });
 });
+
+describe("AdminDataPage — token sections", () => {
+  it("lists Token Budgets and Skill Token Estimates and opens each", async () => {
+    server.use(http.get("/api/v1/team/tags/", () => page([])));
+    await renderPage();
+    fireEvent.click(screen.getByRole("button", { name: "Token Budgets" }));
+    expect(await screen.findByText("Default allowance by role")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Skill Token Estimates" }));
+    expect(await screen.findByText("No skills yet.")).toBeInTheDocument();
+  });
+
+  it("is still closed to non-admins", async () => {
+    mockProfile = { ...mockUserProfile, is_staff: true, access_level: "basic" };
+    await renderPage();
+    expect(screen.queryByRole("button", { name: "Token Budgets" })).not.toBeInTheDocument();
+    mockProfile = { ...mockUserProfile, is_staff: true, access_level: "admin" };
+  });
+});
+

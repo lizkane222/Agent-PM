@@ -1468,3 +1468,166 @@ class AccountFieldHistoryTest(APITestCase):
     def test_unchanged_fields_are_not_logged(self):
         self.client.patch(f"{ACCOUNTS_URL}{self.account.id}/", {"industry": "Retail"}, format="json")
         self.assertEqual(self._events(), [])
+
+
+import shutil
+import tempfile
+
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import override_settings
+
+from accounts.artifact_images import sniff_image_type
+
+_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+_JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 32
+_WEBP = b"RIFF\x00\x00\x00\x00WEBP" + b"\x00" * 16
+_SVG = b"<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>"
+
+_TMP_MEDIA = tempfile.mkdtemp(prefix="artifact-image-tests-")
+
+
+@override_settings(MEDIA_ROOT=_TMP_MEDIA)
+class AccountArtifactCustomImageTest(APITestCase):
+    """Optional custom image on an artifact: validated by content, replaceable, removable."""
+
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+        shutil.rmtree(_TMP_MEDIA, ignore_errors=True)
+
+    def setUp(self):
+        cache.clear()
+        self.user = _make_user("artifact_img_user")
+        self.acct = _make_account("Acme", admin_owner=self.user)
+        self.url = f"/api/v1/accounts/accounts/{self.acct.id}/artifacts/"
+        self.client.force_authenticate(user=self.user)
+
+    def _image(self, data=_PNG, name="logo.png"):
+        return SimpleUploadedFile(name, data, content_type="image/png")
+
+    def test_sniff_recognises_supported_types_only(self):
+        self.assertEqual(sniff_image_type(_PNG[:12]), "image/png")
+        self.assertEqual(sniff_image_type(_JPEG[:12]), "image/jpeg")
+        self.assertEqual(sniff_image_type(_WEBP[:12]), "image/webp")
+        self.assertIsNone(sniff_image_type(_SVG[:12]))
+
+    def test_create_link_with_image_returns_image_url(self):
+        resp = self.client.post(self.url, {
+            "artifact_type": "link", "name": "Brand", "url": "https://example.com", "custom_image": self._image(),
+        }, format="multipart")
+        self.assertEqual(resp.status_code, 201)
+        self.assertTrue(resp.data["image_url"].startswith("http"))
+        self.assertNotIn("custom_image", resp.data)
+
+    def test_create_without_image_has_null_image_url(self):
+        resp = self.client.post(self.url, {"artifact_type": "link", "name": "Plain", "url": "https://example.com"})
+        self.assertEqual(resp.status_code, 201)
+        self.assertIsNone(resp.data["image_url"])
+
+    def test_create_rejects_svg_even_with_image_content_type(self):
+        resp = self.client.post(self.url, {
+            "artifact_type": "link", "name": "Bad", "url": "https://example.com",
+            "custom_image": self._image(_SVG, "x.png"),
+        }, format="multipart")
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(AccountArtifact.objects.filter(name="Bad").count(), 0)
+
+    def test_create_rejects_oversize_image(self):
+        big = self._image(_PNG + b"\x00" * (5 * 1024 * 1024))
+        resp = self.client.post(self.url, {
+            "artifact_type": "link", "name": "Big", "url": "https://example.com", "custom_image": big,
+        }, format="multipart")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_upload_file_with_image_and_icon_key(self):
+        resp = self.client.post(self.url, {
+            "artifact_type": "file", "name": "plan.pdf", "icon_key": "file_pdf",
+            "file": SimpleUploadedFile("plan.pdf", b"%PDF-1.4", content_type="application/pdf"),
+            "custom_image": self._image(),
+        }, format="multipart")
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["icon_key"], "file_pdf")
+        self.assertIsNotNone(resp.data["image_url"])
+
+    def test_patch_adds_replaces_and_removes_image(self):
+        artifact = AccountArtifact.objects.create(
+            account=self.acct, uploaded_by=self.user, artifact_type="link", name="A", url="https://example.com",
+        )
+        patch_url = f"/api/v1/accounts/artifacts/{artifact.id}/"
+
+        resp = self.client.patch(patch_url, {"custom_image": self._image()}, format="multipart")
+        self.assertEqual(resp.status_code, 200)
+        artifact.refresh_from_db()
+        first = artifact.custom_image.name
+        self.assertTrue(first)
+
+        resp = self.client.patch(patch_url, {"custom_image": self._image(_JPEG, "b.jpg")}, format="multipart")
+        self.assertEqual(resp.status_code, 200)
+        artifact.refresh_from_db()
+        self.assertNotEqual(artifact.custom_image.name, first)
+
+        resp = self.client.patch(patch_url, {"remove_image": True}, format="json")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(resp.data["image_url"])
+        artifact.refresh_from_db()
+        self.assertFalse(artifact.custom_image)
+
+    def test_patch_without_image_fields_leaves_image_alone(self):
+        artifact = AccountArtifact.objects.create(
+            account=self.acct, uploaded_by=self.user, artifact_type="link", name="A", url="https://example.com",
+            custom_image=self._image(),
+        )
+        resp = self.client.patch(f"/api/v1/accounts/artifacts/{artifact.id}/", {"name": "Renamed"}, format="json")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNotNone(resp.data["image_url"])
+
+    def test_patch_rejects_bad_image(self):
+        artifact = AccountArtifact.objects.create(
+            account=self.acct, uploaded_by=self.user, artifact_type="link", name="A", url="https://example.com",
+        )
+        resp = self.client.patch(
+            f"/api/v1/accounts/artifacts/{artifact.id}/", {"custom_image": self._image(_SVG)}, format="multipart",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_other_users_artifact_cannot_be_modified(self):
+        other = _make_user("artifact_img_other")
+        artifact = AccountArtifact.objects.create(
+            account=self.acct, uploaded_by=other, artifact_type="link", name="Theirs", url="https://example.com",
+        )
+        resp = self.client.patch(
+            f"/api/v1/accounts/artifacts/{artifact.id}/", {"custom_image": self._image()}, format="multipart",
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_unauthenticated_is_rejected(self):
+        self.client.force_authenticate(user=None)
+        resp = self.client.post(self.url, {"artifact_type": "link", "name": "x"})
+        self.assertIn(resp.status_code, (401, 403))
+
+
+@override_settings(MEDIA_ROOT=_TMP_MEDIA)
+class AccountArtifactZipUploadTest(APITestCase):
+    """Zip archives are accepted as file artifacts (and are not on the blocked list)."""
+
+    def setUp(self):
+        cache.clear()
+        self.user = _make_user("artifact_zip_user")
+        self.acct = _make_account("Acme", admin_owner=self.user)
+        self.url = f"/api/v1/accounts/accounts/{self.acct.id}/artifacts/"
+        self.client.force_authenticate(user=self.user)
+
+    def test_zip_upload_succeeds_and_keeps_chosen_icon(self):
+        import io, zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("hello.txt", "hi")
+        resp = self.client.post(self.url, {
+            "artifact_type": "file", "name": "bundle.zip", "icon_key": "file_archive",
+            "file": SimpleUploadedFile("bundle.zip", buf.getvalue(), content_type="application/zip"),
+        }, format="multipart")
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["name"], "bundle.zip")
+        self.assertEqual(resp.data["mime_type"], "application/zip")
+        self.assertEqual(resp.data["icon_key"], "file_archive")
+        self.assertTrue(resp.data["file_url"])

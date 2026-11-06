@@ -73,10 +73,13 @@ class _FakeAgent:
     records_per_turn: list = []
     constructed: list = []
 
-    def __init__(self, *, user, state=None, skill_inventory="", client=None, model=None):
+    def __init__(self, *, user, state=None, skill_inventory="", client=None, model=None, tz_name="UTC",
+                 active_workflow=None):
         self.user = user
+        self.active_workflow = active_workflow
         self.state = state
         self.skill_inventory = skill_inventory
+        self.tz_name = tz_name
         self.records: list[ToolCallRecord] = []
         type(self).constructed.append(self)
 
@@ -418,6 +421,18 @@ class SetupTests(_RelayTestBase):
 
 
 class PromptTests(_RelayTestBase):
+    def test_the_agent_is_given_the_callers_profile_timezone(self):
+        # Loaded once at setup, in sync context, and handed to every agent. Reading it lazily
+        # inside the async agent raised SynchronousOnlyOperation and crashed every call.
+        from team.models import UserProfile
+        UserProfile.objects.create(user=self.user, timezone="America/Los_Angeles")
+        self._drive(["hello"])
+        self.assertEqual([a.tz_name for a in _FakeAgent.constructed], ["America/Los_Angeles"])
+
+    def test_a_caller_with_no_profile_gets_utc(self):
+        self._drive(["hello"])
+        self.assertEqual([a.tz_name for a in _FakeAgent.constructed], ["UTC"])
+
     def _drive(self, prompts, scripts=None, records=None, extra_frames=()):
         """Complete setup, then send each prompt and collect every outbound frame."""
         if scripts is not None:
@@ -736,7 +751,9 @@ class ConfirmationGateTests(_RelayTestBase):
 
     def test_saying_yes_dispatches_the_tool_with_the_original_arguments(self):
         _, dispatch = self._drive(["yes"])
-        dispatch.assert_awaited_once_with(self.ARMED_TOOL, self.ARMED_ARGS, user=self.user)
+        dispatch.assert_awaited_once_with(
+            self.ARMED_TOOL, self.ARMED_ARGS, user=self.user, confirmed=True
+        )
 
     def test_a_confirmed_tool_writes_a_tool_call_row(self):
         self._drive(["yes"])
@@ -751,7 +768,9 @@ class ConfirmationGateTests(_RelayTestBase):
 
     def test_pressing_1_confirms(self):
         _, dispatch = self._drive([{"type": "dtmf", "digit": "1"}])
-        dispatch.assert_awaited_once_with(self.ARMED_TOOL, self.ARMED_ARGS, user=self.user)
+        dispatch.assert_awaited_once_with(
+            self.ARMED_TOOL, self.ARMED_ARGS, user=self.user, confirmed=True
+        )
 
     def test_pressing_2_cancels(self):
         _, dispatch = self._drive([{"type": "dtmf", "digit": "2"}])
@@ -759,7 +778,9 @@ class ConfirmationGateTests(_RelayTestBase):
 
     def test_an_irrelevant_keypress_is_ignored_and_the_pending_survives(self):
         _, dispatch = self._drive([{"type": "dtmf", "digit": "7"}, "yes"])
-        dispatch.assert_awaited_once_with(self.ARMED_TOOL, self.ARMED_ARGS, user=self.user)
+        dispatch.assert_awaited_once_with(
+            self.ARMED_TOOL, self.ARMED_ARGS, user=self.user, confirmed=True
+        )
 
     def test_one_unclear_reply_re_asks_verbatim_without_a_model_call(self):
         frames, dispatch = self._drive(["maybe later"])
@@ -787,3 +808,111 @@ class ConfirmationGateTests(_RelayTestBase):
         self.assertTrue(frames[-1]["last"])
         row = ToolCall.objects.get(tool_name=self.ARMED_TOOL)
         self.assertEqual(row.status, "error")
+
+
+class SkillLaunchContextTests(_RelayTestBase):
+    """A "Use in Voice" launch key reaches the agent only when signed for this call and owned by the caller."""
+
+    def _launch(self, key, call_sid=CALL_SID):
+        from realtime.voice_identity import mint_launch_token
+
+        frame = json.loads(self._setup_frame(call_sid=call_sid))
+        frame["customParameters"]["launch_token"] = mint_launch_token(key, call_sid)
+        return json.dumps(frame)
+
+    def _context(self, user=None):
+        from skills.models import AgentSkill, VoiceLaunchContext
+
+        skill = AgentSkill.objects.create(name="launch-skill", description="d", instructions="i",
+                                          allowed_tools=["search_records"], status="approved")
+        VoiceLaunchContext.objects.create(
+            key="k1", user=user or self.user, skill=skill,
+            payload={"script": "Workflow: launch-skill. Steps: do it", "allowed_tools": ["search_records"]})
+
+    def _run_prompt(self, frame):
+        async def inner():
+            _FakeAgent.constructed.clear()
+            _FakeAgent.scripts = [[VoiceEvent("text", "ok"), VoiceEvent("done")]]
+            with self._patches():
+                comm = WebsocketCommunicator(ConversationRelayConsumer.as_asgi(), "/ws/voice-relay/")
+                await comm.connect()
+                await comm.send_to(text_data=frame)
+                await comm.send_to(text_data=json.dumps({"type": "prompt", "voicePrompt": "go"}))
+                await self._drain_frames(comm)
+                await comm.disconnect()
+
+        self._run(inner())
+        return _FakeAgent.constructed
+
+    def test_launch_context_reaches_the_agent_and_is_consumed(self):
+        from skills.models import VoiceLaunchContext
+
+        self._context()
+        agents = self._run_prompt(self._launch("k1"))
+        self.assertEqual(agents[-1].active_workflow["skill_name"], "launch-skill")
+        self.assertFalse(VoiceLaunchContext.objects.filter(key="k1").exists())
+
+    def test_another_users_context_is_ignored(self):
+        other = User.objects.create_user("launch_other", password="x")
+        self._context(user=other)
+        agents = self._run_prompt(self._launch("k1"))
+        self.assertIsNone(agents[-1].active_workflow)
+
+    def test_token_for_another_call_is_ignored(self):
+        self._context()
+        agents = self._run_prompt(self._setup_with_wrong_call())
+        self.assertIsNone(agents[-1].active_workflow)
+
+    def _setup_with_wrong_call(self):
+        from realtime.voice_identity import mint_launch_token
+
+        frame = json.loads(self._setup_frame())
+        frame["customParameters"]["launch_token"] = mint_launch_token("k1", OTHER_CALL_SID)
+        return json.dumps(frame)
+
+
+class TokenBudgetGateTests(_RelayTestBase):
+    """A caller over their daily token limit is told so, and no model turn starts."""
+
+    def _prompt(self, text="what are my action items"):
+        async def inner():
+            _FakeAgent.constructed.clear()
+            _FakeAgent.scripts = [[VoiceEvent("speak", "Here you go."), VoiceEvent("end_utterance")]]
+            with self._patches():
+                comm = WebsocketCommunicator(ConversationRelayConsumer.as_asgi(), "/ws/voice-relay/")
+                await comm.connect()
+                await comm.send_to(text_data=self._setup_frame())
+                await comm.send_to(text_data=json.dumps({"type": "prompt", "voicePrompt": text}))
+                frames = await self._drain_frames(comm)
+                await comm.disconnect()
+            return frames
+
+        return self._run(inner())
+
+    def _limits(self, warn, block, used):
+        from agents.models import AgentMessage, AgentSession, RoleTokenDefault
+
+        RoleTokenDefault.objects.update_or_create(role="other", defaults={"warn_tokens": warn, "block_tokens": block})
+        s = AgentSession.objects.create(user=self.user, title="earlier")
+        AgentMessage.objects.create(session=s, role="assistant", content="x", input_tokens=used, output_tokens=0)
+
+    def test_blocked_caller_hears_why_and_no_model_turn_runs(self):
+        self._limits(100, 200, used=500)
+        frames = self._prompt()
+        spoken = " ".join(f.get("token", "") for f in frames if f.get("type") == "text")
+        self.assertIn("daily token limit", spoken)
+        self.assertNotIn("Here you go.", spoken)
+        self.assertEqual(_FakeAgent.calls, [])
+        from agents.models import TokenAlert
+        self.assertTrue(TokenAlert.objects.filter(user=self.user, level="block").exists())
+
+    def test_caller_under_the_limit_gets_a_normal_turn(self):
+        self._limits(100, 200, used=10)
+        frames = self._prompt()
+        spoken = " ".join(f.get("token", "") for f in frames if f.get("type") == "text")
+        self.assertIn("Here you go.", spoken)
+
+    def test_no_limit_set_means_no_gate(self):
+        frames = self._prompt()
+        spoken = " ".join(f.get("token", "") for f in frames if f.get("type") == "text")
+        self.assertIn("Here you go.", spoken)

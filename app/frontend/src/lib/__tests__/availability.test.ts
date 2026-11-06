@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { findFreeSlots, isCompareEvent, overlayEvents, type PersonAvailability } from "../availability";
+import { findFreeSlots, isCompareEvent, isFreeSlotBand, overlayEvents, type PersonAvailability } from "../availability";
 
 const local = (d: number, h: number, m = 0) => new Date(2026, 9, d, h, m).toISOString(); // Oct 2026
 
@@ -51,5 +51,32 @@ describe("findFreeSlots", () => {
     const slots = findFreeSlots([], ...range, { now: new Date(2026, 9, 19, 15, 0) });
     expect(slots).toHaveLength(1);
     expect(slots[0].start.getHours()).toBe(15);
+  });
+});
+
+describe("isFreeSlotBand", () => {
+  // Find Free Time adds plain FullCalendar events carrying only { freeSlot: true }. They have no
+  // attendees, so passing them to getRsvp (which reads attendees.length) crashed the whole grid.
+  it("recognises a free-slot band by its extendedProps flag", () => {
+    expect(isFreeSlotBand({ freeSlot: true })).toBe(true);
+  });
+
+  it("is false for a real calendar event", () => {
+    expect(isFreeSlotBand({ attendees: [], calendar_id: "primary", title: "Sync" })).toBe(false);
+  });
+
+  it("is false for a compare (colleague busy) event", () => {
+    expect(isFreeSlotBand({ attendees: [], calendar_id: "compare" })).toBe(false);
+  });
+
+  it("is false when freeSlot is absent, falsy or not exactly true", () => {
+    expect(isFreeSlotBand({})).toBe(false);
+    expect(isFreeSlotBand({ freeSlot: false })).toBe(false);
+    expect(isFreeSlotBand({ freeSlot: "yes" })).toBe(false);
+  });
+
+  it("tolerates missing props instead of throwing", () => {
+    expect(isFreeSlotBand(undefined)).toBe(false);
+    expect(isFreeSlotBand(null)).toBe(false);
   });
 });
