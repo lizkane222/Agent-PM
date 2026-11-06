@@ -394,3 +394,116 @@ class ProjectQuerysetTest(APITestCase):
             role="Solution_Architect_Secondary__c",
         )
         self.assertEqual(SalesforceTeamMember.objects.get(sf_id=key).project, project)
+
+
+TIME_ENTRIES_URL = "/api/v1/salesforce/time-entries/"
+
+
+class TimeEntryListTest(APITestCase):
+    """The logged-time list behind the profile page's Time Allocation panel."""
+
+    def setUp(self):
+        cache.clear()
+        self.user = User.objects.create_user(username="liz", email="liz@example.com", password="{PASSWORD}")
+        self.other = User.objects.create_user(username="ana", email="ana@example.com", password="{PASSWORD}")
+        acct = SalesforceAccount.objects.create(sf_id="001A", name="Acme Corp")
+        self.project = SalesforceProject.objects.create(sf_id="a0B1", name="Acme Phase 1", account=acct)
+        self.bare = SalesforceProject.objects.create(sf_id="a0B2", name="Internal")  # no account
+
+    def _entry(self, user, day, minutes=30, project=None):
+        return SalesforceTimeEntry.objects.create(
+            user=user, project=project or self.project, date=day, duration_minutes=minutes
+        )
+
+    def test_requires_auth(self):
+        self.assertEqual(self.client.get(TIME_ENTRIES_URL).status_code, 401)
+
+    def test_lists_only_the_callers_entries_even_for_staff(self):
+        self._entry(self.user, date(2026, 10, 20))
+        self._entry(self.other, date(2026, 10, 20))
+        self.user.is_staff = True
+        self.user.save()
+        self.client.force_authenticate(self.user)
+        rows = self.client.get(TIME_ENTRIES_URL).data["results"]
+        self.assertEqual(len(rows), 1)
+
+    def test_includes_the_account_name_and_blank_when_the_project_has_none(self):
+        self._entry(self.user, date(2026, 10, 20))
+        self._entry(self.user, date(2026, 10, 21), project=self.bare)
+        self.client.force_authenticate(self.user)
+        by_date = {r["date"]: r for r in self.client.get(TIME_ENTRIES_URL).data["results"]}
+        self.assertEqual(by_date["2026-10-20"]["account_name"], "Acme Corp")
+        self.assertEqual(by_date["2026-10-21"]["account_name"], "")
+        self.assertEqual(by_date["2026-10-21"]["project_name"], "Internal")
+
+    def test_date_window_is_inclusive(self):
+        for d in (date(2026, 9, 30), date(2026, 10, 1), date(2026, 10, 15), date(2026, 11, 4), date(2026, 11, 5)):
+            self._entry(self.user, d)
+        self.client.force_authenticate(self.user)
+        rows = self.client.get(TIME_ENTRIES_URL, {"date_after": "2026-10-01", "date_before": "2026-11-04"}).data["results"]
+        self.assertEqual(sorted(r["date"] for r in rows), ["2026-10-01", "2026-10-15", "2026-11-04"])
+
+    def test_a_malformed_date_narrows_to_nothing(self):
+        self._entry(self.user, date(2026, 10, 20))
+        self.client.force_authenticate(self.user)
+        resp = self.client.get(TIME_ENTRIES_URL, {"date_after": "not-a-date"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["results"], [])
+
+    def test_page_size_is_honoured_so_a_two_month_range_fits_one_request(self):
+        for i in range(60):
+            self._entry(self.user, date(2026, 10, 1) + timedelta(days=i % 30), minutes=15)
+        self.client.force_authenticate(self.user)
+        self.assertEqual(len(self.client.get(TIME_ENTRIES_URL).data["results"]), 50)  # default page
+        self.assertEqual(len(self.client.get(TIME_ENTRIES_URL, {"page_size": 500}).data["results"]), 60)
+
+    def test_unsynced_entries_count_as_logged_time(self):
+        # synced_to_sf only says whether Cloud Coach has it; the user still logged the time.
+        e = self._entry(self.user, date(2026, 10, 20))
+        self.assertFalse(e.synced_to_sf)
+        self.client.force_authenticate(self.user)
+        self.assertEqual(len(self.client.get(TIME_ENTRIES_URL).data["results"]), 1)
+
+
+class LogTimeEventActivityTest(APITestCase):
+    """The per-day Log button also lands in the Events tab, but only when it really synced."""
+
+    URL = "/api/v1/salesforce/log-time/"
+
+    def setUp(self):
+        patcher = mock.patch("realtime.sync._get_sync_client", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        cache.clear()
+        self.user = get_user_model().objects.create_user("daylog", password="{PASSWORD}")
+        self.client.force_authenticate(user=self.user)
+        self.body = {
+            "project_sf_id": "a0B000000000009", "date": "2026-08-31",
+            "duration_minutes": 60, "description": "Kickoff (1.00h)",
+        }
+
+    def _post(self, synced):
+        from salesforce_sync.models import SalesforceTimeEntry
+
+        def fake(**kwargs):
+            return SalesforceTimeEntry.objects.create(
+                user=kwargs["user"], date=kwargs["entry_date"],
+                duration_minutes=kwargs["duration_minutes"],
+                description=kwargs["description"], synced_to_sf=synced,
+            )
+
+        with mock.patch("salesforce_sync.write_back.log_time", side_effect=fake):
+            return self.client.post(self.URL, self.body, format="json")
+
+    def test_a_synced_entry_is_recorded(self):
+        from realtime.models import AgentActivityEvent
+
+        self.assertEqual(self._post(True).status_code, 201)
+        entry = AgentActivityEvent.objects.get(user=self.user, event_type="calendar_event.time_logged")
+        self.assertEqual(entry.title, 'Time logged: "Kickoff (1.00h)" on 2026-08-31')
+
+    def test_an_entry_that_failed_to_sync_is_not(self):
+        from realtime.models import AgentActivityEvent
+
+        self._post(False)
+        self.assertFalse(AgentActivityEvent.objects.filter(event_type="calendar_event.time_logged").exists())

@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
+import { truncateWords } from "../../lib/truncateWords";
 import type { AccountTeamMember, AirtableActionItem, AirtableMeeting, GoalResource, GoalSection, ProjectMember, SalesforceProjectData } from "../../types";
 import { accountsApi } from "../../lib/api";
 import { summarizeSyncReport, type CloudCoachPushResult, type CloudCoachSyncReport } from "../../lib/cloudCoachPush";
@@ -817,6 +818,7 @@ export function ProjectGoals({
   meetings,
   onChange,
   onSelectAction,
+  onSelectMeeting,
   onNoteDropped,
   accountTeamMembers = [],
   projectMembers = [],
@@ -829,6 +831,8 @@ export function ProjectGoals({
   meetings: AirtableMeeting[];
   onChange: (g: GoalSection[]) => void;
   onSelectAction?: (i: AirtableActionItem) => void;
+  /** Click on a meeting / calendar event listed under a project or goal. */
+  onSelectMeeting?: (m: AirtableMeeting) => void;
   onNoteDropped?: (noteText: string, goalId: string) => void;
   /** The account's own roster — the pool a project's Team Members are picked from. */
   accountTeamMembers?: AccountTeamMember[];
@@ -1065,11 +1069,11 @@ export function ProjectGoals({
               const m = meetingMap[mid];
               if (!m) return null;
               return (
-                <div key={mid} className="group flex items-center gap-1.5 bg-white rounded px-2 py-1 border border-gray-200 text-[11px] text-[var(--twilio-navy)]">
+                <div key={mid} onClick={() => onSelectMeeting?.(m)} data-testid="goal-meeting-row" className={`group flex items-start gap-1.5 bg-white rounded px-2 py-1 border border-gray-200 text-[11px] text-[var(--twilio-navy)] ${onSelectMeeting ? "cursor-pointer" : ""}`}>
                   <svg viewBox="0 0 16 16" fill="currentColor" className="w-2.5 h-2.5 shrink-0" style={{ color: "var(--twilio-red,#e22)", opacity: 0.6 }}><path d="M2 3a2 2 0 012-2h8a2 2 0 012 2v10a2 2 0 01-2 2H4a2 2 0 01-2-2V3zm8 1H6v1h4V4zM6 7h4v1H6V7zm0 3h3v1H6v-1z"/></svg>
-                  <span className="flex-1 truncate">{m.name || "Meeting"}</span>
+                  <span className="flex-1 break-words whitespace-normal leading-snug" title={m.name || "Meeting"}>{truncateWords(m.name || "Meeting", 10)}</span>
                   {m.date && <span className="text-[var(--twilio-gray-60)] shrink-0 text-[10px]">{new Date(m.date).toLocaleDateString(undefined, { month: "short", day: "numeric" })}</span>}
-                  <button onClick={() => removeMeeting(goal.id, mid)} className="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-red-400 transition-all shrink-0">✕</button>
+                  <button onClick={(e) => { e.stopPropagation(); removeMeeting(goal.id, mid); }} className="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-red-400 transition-all shrink-0">✕</button>
                 </div>
               );
             })}
@@ -1256,6 +1260,8 @@ export function ProjectGoals({
 
   // ── Project card with nested goals ─────────────────────────────────────────
 
+  const GOAL_COLUMN_WIDTH = 232;
+
   function renderProjectCard(project: GoalSection) {
     const sf = project.sfData ?? {};
     const nestedGoals = (project.goalIds ?? []).map((id) => goals.find((g) => g.id === id)).filter(Boolean) as GoalSection[];
@@ -1279,6 +1285,7 @@ export function ProjectGoals({
     const clusterView = clusterViewByProject[project.id] ?? "tree";
     const clusterSearch = clusterSearchByProject[project.id] ?? "";
     const showClusterView = clusterView !== "tree" || clusterSearch.trim().length > 0;
+    const wideLayout = nestedGoals.length > 0 && !showClusterView;
 
     return (
       <div
@@ -1310,7 +1317,10 @@ export function ProjectGoals({
         }}
         className="flex flex-col rounded-lg transition-all shrink-0"
         style={{
-          width: 268, minHeight: 90,
+          // A project with goals grows to fit them side by side (capped at the section width);
+          // goals wrap to a new row rather than stacking in one tall column.
+          width: wideLayout ? `min(100%, ${nestedGoals.length * GOAL_COLUMN_WIDTH + (nestedGoals.length - 1) * 8 + 20}px)` : 268,
+          minWidth: 268, minHeight: 90,
           ...(isGoalDrop
             ? { border: "2px dashed #6366f1", background: "rgba(99,102,241,0.06)", boxShadow: "0 4px 16px rgba(99,102,241,0.15)" }
             : isItemDrop
@@ -1392,8 +1402,9 @@ export function ProjectGoals({
         ) : (
         <div className="flex-1 overflow-y-auto px-2.5 pt-2 pb-1" style={{ scrollbarWidth: "thin" }}>
           {nestedGoals.length > 0 && (
-            <div className="flex flex-col gap-1.5 mb-2">
-              <p className="text-[9px] font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide">Goals</p>
+            <div className="mb-2">
+              <p className="text-[9px] font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide mb-1.5">Goals</p>
+              <div className="flex flex-row flex-wrap items-start gap-2">
               {nestedGoals.map((goal) => {
                 const isExpanded = expandedGoals.has(goal.id);
                 const itemCount = goal.actionIds.length + goal.meetingIds.length + goal.resources.length;
@@ -1422,6 +1433,7 @@ export function ProjectGoals({
                     }}
                     className="rounded-md transition-all"
                     style={{
+                      width: GOAL_COLUMN_WIDTH, maxWidth: "100%",
                       background: isGoalItemDrop ? "rgba(226,34,34,0.04)" : "#ede9fe",
                       border: isGoalItemDrop ? "1px solid var(--twilio-red,#e22)" : "1px solid rgba(99,102,241,0.2)",
                     }}
@@ -1479,6 +1491,7 @@ export function ProjectGoals({
                   </div>
                 );
               })}
+              </div>
             </div>
           )}
 
@@ -1541,7 +1554,7 @@ export function ProjectGoals({
 
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex flex-row gap-3 overflow-x-auto pb-1" style={{ scrollbarWidth: "thin" }}>
+      <div className="flex flex-row flex-wrap items-start gap-3 pb-1">
         {projects.map(renderProjectCard)}
         {standaloneGoals.map(renderGoalCard)}
       </div>

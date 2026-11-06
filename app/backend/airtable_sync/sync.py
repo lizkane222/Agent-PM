@@ -286,9 +286,11 @@ def sync_action_items() -> int:
             "status": _AT_TO_STATUS.get(_str(f.get("Status", "")), "Open") or "Open",
             "priority": _AT_TO_PRIORITY.get(_str(f.get("Priority", "")), "Medium") or "Medium",
             "due_date": _parse_dt(f.get("Due Date")),
-            "estimated_time": int(f.get("Estimated Time") or 0) * 60,
-            "time_spent": int(f.get("Time Spent") or 0) * 60,
-            "prep_time": int(f.get("Prep Time") or 0) * 60,
+            # Airtable "duration" fields hold SECONDS (durationFormat h:mm is display only),
+            # and so do these columns — no unit conversion either way. See write_back.py.
+            "estimated_time": int(f.get("Estimated Time") or 0),
+            "time_spent": int(f.get("Time Spent") or 0),
+            "prep_time": int(f.get("Prep Time") or 0),
             "slack_thread_url": _str(f.get("Slack Thread URL", "")),
             "salesforce_task_id": _str(f.get("Salesforce Task ID", "")),
             "assignee_airtable_id": assignee_airtable_id,
@@ -296,10 +298,26 @@ def sync_action_items() -> int:
         }
         if f.get("Marked Done At"):
             defaults["marked_done_at"] = _parse_dt(f.get("Marked Done At"))
+        existing = AirtableActionItem.objects.filter(airtable_id=record["id"]).first()
+        keep_local_status = bool(existing and existing.status_locally_modified)
+        if keep_local_status:
+            # The user changed the status here and Airtable has not (or cannot) hold it
+            # ("Done" push rejected, or "Backlogged", which Airtable has no option for).
+            # Taking Airtable's value would silently revert their change.
+            from .write_back import airtable_status_for
+            if airtable_status_for(existing.status) == _str(f.get("Status", "")) and existing.status != "Backlogged":
+                keep_local_status = False  # Airtable caught up
+                defaults["status_locally_modified"] = False
+            else:
+                defaults.pop("status")
         air_item, _ = AirtableActionItem.objects.update_or_create(
             airtable_id=record["id"],
             defaults=defaults,
         )
+        if keep_local_status and air_item.status != "Backlogged":
+            from .write_back import push_action_item_status
+            if push_action_item_status(air_item):
+                AirtableActionItem.objects.filter(pk=air_item.pk).update(status_locally_modified=False)
         mirror_action_item_to_scheduler(air_item)
         seen_ids.add(record["id"])
         upserted += 1

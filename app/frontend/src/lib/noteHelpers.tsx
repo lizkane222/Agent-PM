@@ -84,6 +84,40 @@ export function renderNoteInline(text: string): React.ReactNode[] {
   return parts;
 }
 
+// Meeting-summary bullets: bare URLs and [text](url) become hyperlinks, @mentions stay blue.
+// Long URLs (Zoom share links run past 150 chars) are shortened for display only.
+const MEETING_NOTE_TOKEN = /(\[([^\]]+)\]\((https?:\/\/[^)\s]+)\))|(https?:\/\/[^\s<>"')]+)|(@\S+)/g;
+
+function shortenUrl(url: string): string {
+  const bare = url.replace(/^https?:\/\//, "");
+  return bare.length > 48 ? `${bare.slice(0, 45)}…` : bare;
+}
+
+export function renderMeetingNoteText(text: string): React.ReactNode[] {
+  const parts: React.ReactNode[] = [];
+  let last = 0, match: RegExpExecArray | null;
+  const re = new RegExp(MEETING_NOTE_TOKEN.source, "g");
+  const link = (key: number, href: string, label: string) => (
+    <a key={key} href={href} target="_blank" rel="noopener noreferrer" className="text-indigo-600 underline underline-offset-2 hover:opacity-75" style={{ overflowWrap: "anywhere" }} onClick={(e) => e.stopPropagation()}>{label}</a>
+  );
+  while ((match = re.exec(text)) !== null) {
+    if (match.index > last) parts.push(text.slice(last, match.index));
+    if (match[1]) {
+      parts.push(link(match.index, match[3], match[2]));
+    } else if (match[4]) {
+      // Sentence punctuation right after a link belongs to the sentence, not the URL.
+      const url = match[4].replace(/[.,;:!?]+$/, "");
+      parts.push(link(match.index, url, shortenUrl(url)));
+      if (url.length < match[4].length) parts.push(match[4].slice(url.length));
+    } else {
+      parts.push(<span key={match.index} style={{ color: "#2563eb", fontWeight: 600 }}>{match[0]}</span>);
+    }
+    last = match.index + match[0].length;
+  }
+  if (last < text.length) parts.push(text.slice(last));
+  return parts;
+}
+
 // Renders HTML note content with structured references as interactive links
 // References are lazy-loaded to avoid circular dependency with ReferenceLink component
 export function renderNoteWithReferences(

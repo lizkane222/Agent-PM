@@ -27,6 +27,7 @@ Set ``AGENT_REQUIRE_ANTHROPIC_MODEL=0`` to lift it deliberately.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -36,6 +37,7 @@ import threading
 import time
 
 import anthropic
+import httpx
 import truststore
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
@@ -278,6 +280,61 @@ def reset_gateway_token_cache() -> None:
 
 # ── Clients ───────────────────────────────────────────────────────────────────
 
+# Statuses on which a gateway request is retried once with a freshly minted token.
+# The gateway sits behind an nginx edge that answers some requests with a bare HTML
+# ``403 Forbidden`` even when the bearer token is valid (seen 2026-10-16: one 403
+# from a token that worked for every later request in the same process). A 401 is
+# the expired/revoked-token case. Either way one retry with a fresh token is cheap,
+# and without it the chat surfaces "Model access denied" for a transient fault.
+GATEWAY_AUTH_RETRY_STATUSES = (401, 403)
+
+
+def _refresh_bearer(request: httpx.Request) -> None:
+    token = gateway_token(force=True)
+    request.headers["Authorization"] = f"Bearer {token}"
+
+
+class _GatewayRetryTransport(httpx.BaseTransport):
+    """Retry a 401/403 once with a re-minted token. Static API keys are not retried."""
+
+    def __init__(self, inner: httpx.BaseTransport):
+        self._inner = inner
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        response = self._inner.handle_request(request)
+        if response.status_code not in GATEWAY_AUTH_RETRY_STATUSES or settings.ANTHROPIC_API_KEY:
+            return response
+        logger.warning("Gateway answered %s; retrying once with a fresh token", response.status_code)
+        response.read()
+        response.close()
+        _refresh_bearer(request)
+        return self._inner.handle_request(request)
+
+    def close(self) -> None:
+        self._inner.close()
+
+
+class _AsyncGatewayRetryTransport(httpx.AsyncBaseTransport):
+    """Async twin of `_GatewayRetryTransport`."""
+
+    def __init__(self, inner: httpx.AsyncBaseTransport):
+        self._inner = inner
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        response = await self._inner.handle_async_request(request)
+        if response.status_code not in GATEWAY_AUTH_RETRY_STATUSES or settings.ANTHROPIC_API_KEY:
+            return response
+        logger.warning("Gateway answered %s; retrying once with a fresh token", response.status_code)
+        await response.aread()
+        await response.aclose()
+        # Minting may fork the helper subprocess; keep it off the event loop.
+        await asyncio.to_thread(_refresh_bearer, request)
+        return await self._inner.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
 def _gateway_kwargs() -> dict:
     # base_url is always explicit: Claude Code's managed settings export
     # ANTHROPIC_BASE_URL, so a bare client would silently inherit it from whichever
@@ -289,14 +346,44 @@ def _gateway_kwargs() -> dict:
     }
 
 
-def build_async_client():
-    """Async Anthropic client for the configured backend."""
+def _resilience(*, voice: bool = False) -> dict:
+    """
+    Explicit timeout and retry policy for every client.
+
+    The SDK already retries 408 / 409 / 429 / 5xx — including 529 Overloaded — with backoff,
+    and honours a server ``retry-after`` up to 60s, so that is configured rather than
+    re-implemented. What the defaults got wrong was the *budget*: a 600s read timeout and 2
+    retries meant a stuck gateway could hold a chat request for half an hour, and a mid-call
+    429 could leave a voice caller in a minute of silence. Voice gets a short leash because
+    dead air is worse than a spoken "try again".
+    """
+    if voice:
+        return {
+            "timeout": anthropic.Timeout(
+                float(getattr(settings, "VOICE_LLM_TIMEOUT_SECONDS", 10)), connect=3.0,
+            ),
+            "max_retries": int(getattr(settings, "VOICE_LLM_MAX_RETRIES", 1)),
+        }
+    return {
+        "timeout": anthropic.Timeout(float(getattr(settings, "AGENT_LLM_TIMEOUT_SECONDS", 120)), connect=5.0),
+        "max_retries": int(getattr(settings, "AGENT_LLM_MAX_RETRIES", 3)),
+    }
+
+
+def build_async_client(*, voice: bool = False):
+    """Async Anthropic client for the configured backend. `voice=True` uses the short-leash policy."""
     backend = settings.AGENT_BACKEND
     if backend == "gateway":
-        return anthropic.AsyncAnthropic(**_gateway_kwargs())
+        return anthropic.AsyncAnthropic(
+            **_gateway_kwargs(),
+            **_resilience(voice=voice),
+            http_client=anthropic.DefaultAsyncHttpxClient(
+                transport=_AsyncGatewayRetryTransport(httpx.AsyncHTTPTransport())
+            ),
+        )
     if backend == "bedrock":
         # Credentials resolve from AWS_PROFILE / AWS_REGION via botocore.
-        return anthropic.AsyncAnthropicBedrock()
+        return anthropic.AsyncAnthropicBedrock(**_resilience(voice=voice))
     raise ImproperlyConfigured(
         f"AGENT_BACKEND={backend!r} is not one of {sorted(settings.AGENT_MODEL_TIERS)}."
     )
@@ -306,9 +393,15 @@ def build_sync_client():
     """Blocking Anthropic client, for Celery tasks and DRF request paths."""
     backend = settings.AGENT_BACKEND
     if backend == "gateway":
-        return anthropic.Anthropic(**_gateway_kwargs())
+        return anthropic.Anthropic(
+            **_gateway_kwargs(),
+            **_resilience(),
+            http_client=anthropic.DefaultHttpxClient(
+                transport=_GatewayRetryTransport(httpx.HTTPTransport())
+            ),
+        )
     if backend == "bedrock":
-        return anthropic.AnthropicBedrock()
+        return anthropic.AnthropicBedrock(**_resilience())
     raise ImproperlyConfigured(
         f"AGENT_BACKEND={backend!r} is not one of {sorted(settings.AGENT_MODEL_TIERS)}."
     )

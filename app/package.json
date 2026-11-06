@@ -2,8 +2,9 @@
   "name": "agent-pm",
   "private": true,
   "scripts": {
-    "agent-pm": "pkill -f 'manage.py runserver' 2>/dev/null; pkill -f daphne 2>/dev/null; pkill -f 'vite' 2>/dev/null; pkill -f 'ngrok' 2>/dev/null; sleep 1 && concurrently --names \"django,react,ngrok\" --prefix-colors \"cyan,magenta,yellow\" \"cd backend && .venv/bin/daphne -b 0.0.0.0 -p 8000 core.asgi:application\" \"sleep 3 && cd frontend && npm run dev\" \"ngrok http --url=untouched-roving-procurer.ngrok-free.dev 8000\"",
-    "security-review": "claude --print --dangerously-skip-permissions -p \"$(cat ../.claude/commands/runSecurityReview.md)\""
+    "agent-pm": "pkill -f 'manage.py runserver' 2>/dev/null; pkill -f daphne 2>/dev/null; pkill -f 'vite' 2>/dev/null; pkill -f 'ngrok' 2>/dev/null; pkill -f \"$PWD/backend/.venv/bin/celery\" 2>/dev/null; sh scripts/stop-voice-stack.sh; sleep 1 && (redis-cli -u ${REDIS_URL:-redis://localhost:6379/0} ping >/dev/null 2>&1 || (echo 'Redis is not running on ${REDIS_URL:-redis://localhost:6379/0}. Start it (e.g. brew services start redis) — the 5-minute Google sync, reminders and Airtable/Salesforce syncs need it.' && exit 1)) && concurrently --names \"django,react,ngrok,worker,beat\" --prefix-colors \"cyan,magenta,yellow,green,blue\" \"cd backend && .venv/bin/daphne -b 0.0.0.0 -p 8000 core.asgi:application\" \"sleep 3 && cd frontend && npm run dev\" \"ngrok http --url=untouched-roving-procurer.ngrok-free.dev 8000\" \"cd backend && $PWD/backend/.venv/bin/celery -A core.celery worker --loglevel=info --concurrency=2\" \"cd backend && $PWD/backend/.venv/bin/celery -A core.celery beat --loglevel=info --schedule=/tmp/agentpm-celerybeat-schedule\"",
+    "security-review": "claude --print --dangerously-skip-permissions -p \"$(cat ../.claude/commands/runSecurityReview.md)\"",
+    "start-agent-pm": "npm run agent-pm"
   },
   "devDependencies": {
     "concurrently": "^8.2.2"

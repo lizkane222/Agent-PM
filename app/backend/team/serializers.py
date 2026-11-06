@@ -5,7 +5,13 @@ import re
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
-from .models import Tag, Team, TeamMember, TeamMemberDocument, TeamMembership, UserProfile
+from .models import (
+    LeftNote, Notification, PublicItem, Tag, Team, TeamMember, TeamMemberDocument,
+    TeamMembership, UserProfile,
+)
+
+# E.164: "+", a non-zero country code digit, 7–15 digits total.
+E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
 
 User = get_user_model()
 
@@ -22,12 +28,13 @@ class TeamMembershipSerializer(serializers.ModelSerializer):
     user_display_name = serializers.CharField(
         source="user.profile.display_name", read_only=True, default=""
     )
+    team_name = serializers.CharField(source="team.name", read_only=True)
 
     class Meta:
         model = TeamMembership
         fields = [
             "id", "user", "user_email", "user_display_name",
-            "team", "role", "joined_at", "created_at", "updated_at",
+            "team", "team_name", "role", "joined_at", "created_at", "updated_at",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
 
@@ -101,6 +108,8 @@ class UserProfileSerializer(serializers.ModelSerializer):
             "push_subscription_active",
             # Staff view mode
             "staff_view_override",
+            # Authorisation tier — read-only here; set via the Admin-only access-level action
+            "access_level",
             # Calendar appearance
             "calendar_colors",
             # Gmail watch configuration
@@ -111,13 +120,28 @@ class UserProfileSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = [
             "id", "email", "username", "is_staff", "okta_uid", "airtable_collaborator_id",
-            "push_subscription_active", "created_at", "updated_at",
+            "push_subscription_active", "access_level", "created_at", "updated_at",
         ]
 
     push_subscription_active = serializers.SerializerMethodField()
 
     def get_push_subscription_active(self, obj) -> bool:
         return bool(obj.push_subscription)
+
+    def validate_phone_number(self, value):
+        """Store E.164 (`+<country><number>`), which Twilio requires.
+
+        Spaces, dashes, dots and parentheses are stripped. A number without a country code
+        used to be saved as-is and then fail silently at Twilio when an SMS reminder fired.
+        """
+        if not value:
+            return ""
+        cleaned = re.sub(r"[\s().-]", "", str(value))
+        if not E164_RE.match(cleaned):
+            raise serializers.ValidationError(
+                "Enter the number with its country code, e.g. +1 415 555 0123."
+            )
+        return cleaned
 
     def validate_calendar_colors(self, value):
         """Validate the calendar_colors blob.
@@ -252,3 +276,74 @@ class TeamMemberSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
+
+
+class NotificationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Notification
+        fields = ["id", "channel", "kind", "title", "body", "link", "status", "read_at", "created_at"]
+        read_only_fields = fields
+
+
+def _safe_url(value: str) -> str:
+    """Only http(s) links may be shown to other users (blocks javascript: and data:)."""
+    value = (value or "").strip()
+    if value and not re.match(r"^https?://", value, re.IGNORECASE):
+        raise serializers.ValidationError("Links must start with http:// or https://.")
+    return value
+
+
+class PublicItemSerializer(serializers.ModelSerializer):
+    file_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PublicItem
+        fields = [
+            "id", "owner", "item_type", "title", "url", "file", "file_url",
+            "body", "ref", "position", "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "owner", "file_url", "created_at", "updated_at"]
+        extra_kwargs = {"file": {"write_only": True, "required": False}}
+
+    def get_file_url(self, obj):
+        return obj.file.url if obj.file else ""
+
+    def validate_url(self, value):
+        return _safe_url(value)
+
+    def validate_ref(self, value):
+        if not isinstance(value, dict):
+            raise serializers.ValidationError("ref must be an object.")
+        if value.get("url"):
+            value = {**value, "url": str(value["url"])}
+            if not str(value["url"]).startswith("/"):
+                _safe_url(value["url"])
+        return value
+
+    def validate_body(self, value):
+        from core.html_sanitize import sanitize_html
+
+        return sanitize_html(value or "")
+
+    def validate(self, attrs):
+        item_type = attrs.get("item_type") or getattr(self.instance, "item_type", "")
+        if not (attrs.get("title") or getattr(self.instance, "title", "")):
+            raise serializers.ValidationError({"title": "A title is required."})
+        if item_type == "artifact_link" and not (attrs.get("url") or getattr(self.instance, "url", "")):
+            raise serializers.ValidationError({"url": "A link needs a URL."})
+        if item_type == "record_ref" and not (attrs.get("ref") or getattr(self.instance, "ref", {})):
+            raise serializers.ValidationError({"ref": "A record reference needs a record."})
+        return attrs
+
+
+class LeftNoteSerializer(serializers.ModelSerializer):
+    author_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = LeftNote
+        fields = ["id", "author", "author_name", "body", "created_at"]
+        read_only_fields = ["id", "author", "author_name", "created_at"]
+
+    def get_author_name(self, obj):
+        profile = getattr(obj.author, "profile", None)
+        return (profile.display_name if profile and profile.display_name else "") or obj.author.get_full_name() or obj.author.username

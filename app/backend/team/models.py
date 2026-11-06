@@ -81,6 +81,28 @@ class UserProfile(models.Model):
     # Null means push notifications are not registered for this browser/device.
     push_subscription = models.JSONField(null=True, blank=True)
 
+    # ── Access level ──────────────────────────────────────────────────────────
+    # The app's authorisation tier (enforced via core.mixins.access_level & friends):
+    #   basic — edits their own records; on an account they belong to may edit its fields
+    #           and assign action items to its team, but may only add/remove *themselves*
+    #           as an account member.
+    #   pm    — additionally assigns anyone to accounts (and accounts to anyone).
+    #   admin — full access, including other users' access levels and the staff data view.
+    # Changed only through the Admin-only /team/profiles/<id>/access-level/ endpoint.
+    ACCESS_BASIC, ACCESS_PM, ACCESS_ADMIN = "basic", "pm", "admin"
+    ACCESS_LEVEL_CHOICES = [(ACCESS_BASIC, "Basic"), (ACCESS_PM, "PM"), (ACCESS_ADMIN, "Admin")]
+    access_level = models.CharField(max_length=10, choices=ACCESS_LEVEL_CHOICES, default=ACCESS_BASIC)
+
+    def save(self, *args, **kwargs):
+        # A brand-new profile for a Django staff user starts as Admin, matching the data
+        # migration — profiles are created lazily (first /me/ visit, fixtures, admin), and a
+        # Basic default would otherwise silently demote every newly-provisioned staff user.
+        # Existing rows are never touched: after creation the level is only ever what an
+        # Admin set it to.
+        if self._state.adding and self.access_level == self.ACCESS_BASIC and getattr(self.user, "is_staff", False):
+            self.access_level = self.ACCESS_ADMIN
+        super().save(*args, **kwargs)
+
     # ── Staff view mode ───────────────────────────────────────────────────────
     # When True (default), staff users see all records. When False, staff users
     # see only the records they are personally assigned to — same as a regular user.
@@ -212,3 +234,91 @@ class TeamMemberDocument(models.Model):
 
     def __str__(self) -> str:
         return f"{self.name} — {self.team_member.full_name}"
+
+
+class Notification(models.Model):
+    """
+    One notification delivered (or attempted) to a user on one channel.
+
+    Senders call `team.notifications.record_notification`, so a user's history
+    covers in-app, push, SMS and Slack alike. Nothing is backfilled.
+    """
+
+    CHANNEL_CHOICES = [
+        ("in_app", "In app"),
+        ("push", "Push"),
+        ("sms", "SMS"),
+        ("slack", "Slack"),
+        ("email", "Email"),
+    ]
+    STATUS_CHOICES = [
+        ("sent", "Sent"),
+        ("failed", "Failed"),
+        ("skipped", "Skipped"),
+    ]
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="notifications")
+    channel = models.CharField(max_length=20, choices=CHANNEL_CHOICES, default="in_app")
+    kind = models.CharField(max_length=40, db_index=True)
+    title = models.CharField(max_length=300)
+    body = models.TextField(blank=True)
+    link = models.CharField(max_length=500, blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="sent")
+    read_at = models.DateTimeField(null=True, blank=True)
+    # The account this notification is about, when it is about one. Drives the per-account
+    # Activity Log; it never widens who can read the notification (still owner-only).
+    account = models.ForeignKey(
+        "accounts.Account", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="notifications",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+        indexes = [models.Index(fields=["user", "-created_at"])]
+
+    def __str__(self) -> str:
+        return f"{self.kind}/{self.channel} → {self.user_id}"
+
+
+class PublicItem(models.Model):
+    """
+    Something a user chooses to show on their public profile. Readable by any
+    authenticated user; only the owner may create, edit or delete one.
+    """
+
+    TYPE_CHOICES = [
+        ("artifact_link", "Artifact link"),
+        ("artifact_file", "Artifact file"),
+        ("note", "Note"),
+        ("record_ref", "Record reference"),
+    ]
+
+    owner = models.ForeignKey(User, on_delete=models.CASCADE, related_name="public_items")
+    item_type = models.CharField(max_length=20, choices=TYPE_CHOICES)
+    title = models.CharField(max_length=300)
+    url = models.TextField(blank=True)
+    file = models.FileField(upload_to="public_items/", null=True, blank=True)
+    body = models.TextField(blank=True)  # sanitized HTML for notes
+    ref = models.JSONField(default=dict, blank=True)  # {resource_type, resource_id, label, url}
+    position = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["position", "created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.item_type}: {self.title}"
+
+
+class LeftNote(models.Model):
+    """A private note one user leaves for another. Never shown on the public page."""
+
+    author = models.ForeignKey(User, on_delete=models.CASCADE, related_name="notes_left")
+    recipient = models.ForeignKey(User, on_delete=models.CASCADE, related_name="notes_received")
+    body = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]

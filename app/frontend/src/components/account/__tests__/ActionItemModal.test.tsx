@@ -469,6 +469,25 @@ describe("ActionItemModal attachments", () => {
     });
   });
 
+  it("Save PATCHes only edited fields — never a stale time_spent", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    server.use(
+      http.patch("/api/v1/airtable/action-items/:id/fields/", async ({ request }) => {
+        bodies.push((await request.json()) as Record<string, unknown>);
+        return HttpResponse.json({ ...mockItem, task: "Renamed task" });
+      }),
+      http.post("/api/v1/realtime/activity/", () => HttpResponse.json({ id: 1 }, { status: 201 }))
+    );
+    render(<ActionItemModal item={{ ...mockItem, time_spent: 900 }} accountId={1} onClose={vi.fn()} />);
+    await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
+
+    fireEvent.change(screen.getByDisplayValue("Fix billing issue"), { target: { value: "Renamed task" } });
+    fireEvent.click(screen.getByRole("button", { name: /Save changes/ }));
+
+    await waitFor(() => expect(bodies).toHaveLength(1));
+    expect(bodies[0]).toEqual({ task: "Renamed task" });
+  });
+
   it("writes no activity entry when Save changes nothing", async () => {
     localStorage.clear();
     server.use(
@@ -495,5 +514,30 @@ describe("ActionItemModal attachments", () => {
     renderModal();
 
     await waitFor(() => expect(screen.getByText("already-there.pdf")).toBeInTheDocument());
+  });
+});
+
+describe("ActionItemModal — positioning", () => {
+  beforeEach(registerHandlers);
+
+  it("portals to document.body so a transformed ancestor cannot confine it", () => {
+    // CalendarPage renders the sidebar (and so this modal) inside a translate-x panel;
+    // a transform on any ancestor makes `position: fixed` resolve against it.
+    const { container } = render(
+      <div data-testid="sliding-panel" style={{ transform: "translateX(0)" }}>
+        <ActionItemModal item={mockItem} accountId={1} onClose={vi.fn()} />
+      </div>,
+    );
+    const panel = screen.getByTestId("action-item-modal-panel");
+    expect(screen.getByTestId("sliding-panel").contains(panel)).toBe(false);
+    expect(container.contains(panel)).toBe(false);
+    expect(panel.parentElement?.parentElement).toBe(document.body);
+  });
+
+  it("still closes on backdrop click after portalling", () => {
+    const onClose = vi.fn();
+    render(<ActionItemModal item={mockItem} accountId={1} onClose={onClose} />);
+    fireEvent.click(screen.getByTestId("action-item-modal-panel").parentElement!);
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 });

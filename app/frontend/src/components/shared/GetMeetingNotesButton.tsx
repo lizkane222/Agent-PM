@@ -137,6 +137,8 @@ function MeetingNotesResult({
                 : ""}
               {" · "}
               <span style={{ textTransform: "capitalize" }}>{item.sources.join(" + ")}</span>
+              {/* A Zoom notification with no recap: only the recording link was added. */}
+              {item.recording_only?.length ? " · recording link only" : ""}
               {/* The account is only worth naming when the scan spanned several. */}
               {!scopedTo && item.account_name ? ` · ${item.account_name}` : ""}
               {/* Flagged because the meeting record didn't exist before this run — it

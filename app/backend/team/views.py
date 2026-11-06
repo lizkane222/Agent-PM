@@ -9,7 +9,7 @@ from rest_framework.permissions import IsAuthenticated, SAFE_METHODS
 from rest_framework.response import Response
 
 
-from core.mixins import _staff_sees_all
+from core.mixins import _staff_sees_all, admin_wants_all, is_admin
 from core.pagination import ClientPageSizePagination
 from .models import Tag, Team, TeamMember, TeamMemberDocument, TeamMembership, UserProfile
 from .serializers import (
@@ -79,10 +79,79 @@ class UserProfileViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        # Regular users only see their own profile; staff can see all (unless override disabled).
+        # Regular users only see their own profile; Admins can see all (unless override disabled).
         if _staff_sees_all(self.request.user):
             return UserProfile.objects.select_related("user").all()
         return UserProfile.objects.filter(user=self.request.user).select_related("user")
+
+    def check_object_permissions(self, request, obj):
+        super().check_object_permissions(request, obj)
+        # The generic detail routes are read-only for someone else's profile: edits to your own
+        # go through /me/, and an Admin changes another user's tier via /access-level/.
+        if request.method not in SAFE_METHODS and obj.user_id != request.user.pk:
+            raise PermissionDenied("You can only edit your own profile.")
+
+    @action(detail=False, methods=["get"], url_path="directory")
+    def directory(self, request):
+        """GET /team/profiles/directory/?search= — Admin-only user search with access levels.
+
+        Lists every login (creating the profile lazily, as /me/ does), so a user who has
+        never opened Settings can still be found and promoted.
+        """
+        if not is_admin(request.user):
+            raise PermissionDenied("Only Admins can manage user access.")
+        from django.contrib.auth import get_user_model
+
+        User = get_user_model()
+        q = (request.query_params.get("search") or "").strip()
+        users = User.objects.filter(is_active=True).select_related("profile").order_by("first_name", "username")
+        if q:
+            users = users.filter(
+                models.Q(username__icontains=q) | models.Q(email__icontains=q)
+                | models.Q(first_name__icontains=q) | models.Q(last_name__icontains=q)
+                | models.Q(profile__display_name__icontains=q)
+            )
+        out = []
+        for u in users[:50]:
+            profile = getattr(u, "profile", None) or UserProfile.objects.get_or_create(user=u)[0]
+            out.append({
+                "profile_id": profile.pk,
+                "user_id": u.pk,
+                "username": u.username,
+                "email": u.email,
+                "display_name": profile.display_name or u.get_full_name() or u.username,
+                "access_level": profile.access_level,
+                "is_self": u.pk == request.user.pk,
+            })
+        return Response({"results": out})
+
+    @action(detail=True, methods=["patch"], url_path="access-level")
+    def access_level(self, request, pk=None):
+        """PATCH /team/profiles/<id>/access-level/ {access_level} — Admin only."""
+        if not is_admin(request.user):
+            raise PermissionDenied("Only Admins can change access levels.")
+        profile = get_object_or_404(UserProfile.objects.select_related("user"), pk=pk)
+        level = request.data.get("access_level")
+        if level not in dict(UserProfile.ACCESS_LEVEL_CHOICES):
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError({"access_level": "Must be basic, pm or admin."})
+        if profile.user_id == request.user.pk and level != UserProfile.ACCESS_ADMIN:
+            # Otherwise the last Admin can lock everyone out of access management.
+            remaining = UserProfile.objects.filter(access_level=UserProfile.ACCESS_ADMIN).exclude(pk=profile.pk)
+            if not remaining.exists():
+                raise PermissionDenied("You are the only Admin — promote someone else first.")
+        before = profile.access_level
+        if before != level:
+            profile.access_level = level
+            profile.save(update_fields=["access_level", "updated_at"])
+            from realtime.sync import publish_activity_event
+            publish_activity_event(
+                request.user, "user.access_level",
+                f"**Access changed** for {profile.user.username}",
+                detail=f"{before} → {level}",
+                metadata={"profile_id": profile.pk, "user_id": profile.user_id, "from": before, "to": level},
+            )
+        return Response({"profile_id": profile.pk, "access_level": profile.access_level})
 
     @action(detail=False, methods=["get", "patch"], url_path="me")
     def me(self, request):
@@ -186,7 +255,7 @@ class TeamViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        if _staff_sees_all(self.request.user):
+        if _staff_sees_all(self.request.user) or admin_wants_all(self.request):
             return Team.objects.prefetch_related("memberships__user__profile").all()
         return Team.objects.filter(
             memberships__user=self.request.user
@@ -203,6 +272,8 @@ class TeamMembershipViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
+        if admin_wants_all(self.request):
+            return TeamMembership.objects.select_related("user__profile", "team").all()
         user_team_ids = self.request.user.memberships.values_list("team_id", flat=True)
         return TeamMembership.objects.filter(
             team_id__in=user_team_ids

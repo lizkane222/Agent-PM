@@ -168,6 +168,22 @@ def close_agent_session(session_id: int | None) -> None:
 
 
 @database_sync_to_async
+def load_user_timezone(user) -> str:
+    """
+    The caller's profile timezone, or "UTC" when there is none.
+
+    Read once at call start and handed to the agent. It must not be read lazily from the
+    async voice loop: `user.profile` is a reverse one-to-one, and touching it uncached runs a
+    query, which Django forbids in async code (SynchronousOnlyOperation).
+    """
+    if user is None:
+        return "UTC"
+    from team.models import UserProfile
+
+    return UserProfile.objects.filter(user=user).values_list("timezone", flat=True).first() or "UTC"
+
+
+@database_sync_to_async
 def load_skill_inventory(user) -> str:
     """
     "name — description" lines for the skills this user may run.

@@ -76,6 +76,35 @@ class CalendarEvent(models.Model):
         blank=True,
         related_name="calendar_events",
     )
+    # The account-page project this block belongs to. Set when an action item (or meeting)
+    # that is filed under a project -- directly, or under a goal whose parent is a project --
+    # is dropped onto the calendar, so the project carries over from the item to its time.
+    # SET_NULL: deleting a project must not delete the user's calendar blocks.
+    project = models.ForeignKey(
+        "accounts.AccountProject",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="calendar_events",
+    )
+    # ── Guest-notification governance ────────────────────────────────────────────────────
+    # A customer once received 2,000+ invitations from a single meeting move. Whether Google
+    # may email this event's guests is decided in one place (integrations/invite_gate.py), and
+    # these three fields are what that decision reads and records.
+    #
+    # Where the event came from. Only "agentpm" events may ever email anyone; an event pulled
+    # from Google is Google's to announce. The DEFAULT is "google" on purpose: every row that
+    # existed before this field, and any code path that forgets to set it, fails *closed*.
+    ORIGIN_CHOICES = [("agentpm", "AgentPM"), ("google", "Google")]
+    origin = models.CharField(max_length=10, choices=ORIGIN_CHOICES, default="google")
+    # Has an invitation email already gone out for this event? Once True it is never reset.
+    invite_sent = models.BooleanField(default=False)
+    # When it went out.
+    invite_sent_at = models.DateTimeField(null=True, blank=True)
+    # WHO was emailed. Once this is non-empty the event is never notified again: Google's
+    # sendUpdates="all" notifies every guest and has no "new guests only", so notifying for a
+    # late addition would re-email everyone already invited.
+    invited_emails = models.JSONField(default=list, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     # Rich references: list of {resource_type, resource_id, label, url} objects added via @# trigger

@@ -13,6 +13,7 @@ import { consumeExportToChat } from "../components/ExportBar";
 import ConversationIcon from "../assets/icons/Conversation.svg?react";
 import PageBuilder from "../components/pagebuilder/PageBuilder";
 import { getAccessToken, isTokenExpired, refreshAccessToken } from "../lib/auth";
+import { budgetBlockedMessage } from "../lib/tokenBudget";
 import type { AgentSession, ClaudeSkill, SessionParticipant } from "../types";
 
 const LAST_SESSION_KEY = "agentpm_last_session_id";
@@ -1089,7 +1090,7 @@ export default function ChatPage() {
 
       if (!response.ok) {
         const errText = await response.text();
-        throw new Error(`Server error ${response.status}: ${errText.slice(0, 200)}`);
+        throw new Error(budgetBlockedMessage(response.status, errText) ?? `Server error ${response.status}: ${errText.slice(0, 200)}`);
       }
 
       const reader = response.body?.getReader();
@@ -1201,7 +1202,7 @@ export default function ChatPage() {
 
       if (!response.ok) {
         const errText = await response.text();
-        throw new Error(`Server error ${response.status}: ${errText.slice(0, 200)}`);
+        throw new Error(budgetBlockedMessage(response.status, errText) ?? `Server error ${response.status}: ${errText.slice(0, 200)}`);
       }
 
       const reader = response.body?.getReader();

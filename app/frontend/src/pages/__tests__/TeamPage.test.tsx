@@ -1,6 +1,6 @@
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { http, HttpResponse } from "msw";
 import { server } from "../../test/msw-server";
 import { mockTeamMembers, mockTeamMemberDocuments, mockUserProfile } from "../../test/handlers/team";
@@ -32,13 +32,25 @@ server.use(
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-async function renderPage() {
+function LocationProbe() {
+  return <div data-testid="loc">{useLocation().pathname}</div>;
+}
+
+async function renderPage(path = "/team") {
   const { default: TeamPage } = await import("../TeamPage");
   render(
-    <MemoryRouter>
-      <TeamPage />
+    <MemoryRouter initialEntries={[path]}>
+      <Routes>
+        <Route path="/team" element={<TeamPage />} />
+        <Route path="/profile/:memberId" element={<LocationProbe />} />
+      </Routes>
     </MemoryRouter>
   );
+}
+
+/** The staff drawer opens from the profile page's "Manage" link: /team?member=<id>. */
+async function renderPageWithDrawer(memberIndex = 0) {
+  await renderPage(`/team?member=${mockTeamMembers[memberIndex].id}`);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -82,14 +94,19 @@ describe("TeamPage", () => {
     expect(screen.getByText(/0 member/i)).toBeInTheDocument();
   });
 
-  it("clicking a member card opens the detail panel", async () => {
+  it("clicking a member card opens that member's profile page", async () => {
     await renderPage();
     await waitFor(() => screen.getByText(mockTeamMembers[0].full_name));
 
-    // Click the first member card
     fireEvent.click(screen.getByText(mockTeamMembers[0].full_name));
 
-    // The detail panel shows "Edit Member" button
+    await waitFor(() =>
+      expect(screen.getByTestId("loc")).toHaveTextContent(`/profile/${mockTeamMembers[0].id}`)
+    );
+  });
+
+  it("/team?member=<id> opens the staff detail panel for that member", async () => {
+    await renderPageWithDrawer();
     await waitFor(() =>
       expect(screen.getByText("Edit Member")).toBeInTheDocument()
     );
@@ -134,9 +151,7 @@ describe("TeamPage", () => {
         HttpResponse.json(mockTeamMemberDocuments)
       )
     );
-    await renderPage();
-    await waitFor(() => screen.getByText(mockTeamMembers[0].full_name));
-    fireEvent.click(screen.getByText(mockTeamMembers[0].full_name));
+    await renderPageWithDrawer();
 
     await waitFor(() =>
       expect(screen.getByText(mockTeamMemberDocuments[0].name)).toBeInTheDocument()
@@ -151,9 +166,7 @@ describe("TeamPage", () => {
         HttpResponse.json(mockTeamMemberDocuments)
       )
     );
-    await renderPage();
-    await waitFor(() => screen.getByText(mockTeamMembers[0].full_name));
-    fireEvent.click(screen.getByText(mockTeamMembers[0].full_name));
+    await renderPageWithDrawer();
 
     await waitFor(() =>
       expect(screen.getByText(mockTeamMemberDocuments[0].name)).toBeInTheDocument()
@@ -178,9 +191,7 @@ describe("TeamPage", () => {
       })
     );
 
-    await renderPage();
-    await waitFor(() => screen.getByText(mockTeamMembers[0].full_name));
-    fireEvent.click(screen.getByText(mockTeamMembers[0].full_name));
+    await renderPageWithDrawer();
 
     await waitFor(() => expect(screen.getByText("No linked docs.")).toBeInTheDocument());
 
@@ -217,9 +228,7 @@ describe("TeamPage", () => {
       })
     );
 
-    await renderPage();
-    await waitFor(() => screen.getByText(mockTeamMembers[0].full_name));
-    fireEvent.click(screen.getByText(mockTeamMembers[0].full_name));
+    await renderPageWithDrawer();
 
     await waitFor(() =>
       expect(screen.getByText(mockTeamMemberDocuments[0].name)).toBeInTheDocument()

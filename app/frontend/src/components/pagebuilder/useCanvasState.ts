@@ -1,4 +1,4 @@
-import { useReducer, useCallback } from "react";
+import { useReducer, useCallback, useEffect, useState } from "react";
 import type { CanvasNode } from "./types";
 import { findNode, removeNode } from "twilio-agent-pm-shared";
 export { findNode, removeNode };
@@ -110,13 +110,78 @@ function reducer(state: HistoryState, action: Action): HistoryState {
 export const MINI_CANVAS_HANDOFF_KEY = "mini_canvas_handoff";
 export const CANVAS_DRAFT_KEY = "agentpm_canvas_draft";
 
+/**
+ * Read the mini-canvas handoff WITHOUT consuming it.
+ *
+ * It used to read and delete in one step, inside the `useReducer` initializer. React StrictMode
+ * (on in this app) renders a component twice in development; the first pass took the nodes and
+ * deleted the key, the second pass — the one React keeps — found nothing and started an empty
+ * canvas. So "Open full builder" carried nothing over in dev. Reading is now idempotent, and the
+ * key is cleared once the builder has mounted (see `useCanvasState`).
+ */
 function readHandoff(): CanvasNode[] | null {
   try {
     const raw = sessionStorage.getItem(MINI_CANVAS_HANDOFF_KEY);
     if (!raw) return null;
-    sessionStorage.removeItem(MINI_CANVAS_HANDOFF_KEY);
-    return JSON.parse(raw) as CanvasNode[];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as CanvasNode[]) : null;
   } catch { return null; }
+}
+
+export function clearHandoff(): void {
+  try { sessionStorage.removeItem(MINI_CANVAS_HANDOFF_KEY); } catch { /* storage unavailable */ }
+}
+
+/**
+ * Where an earlier canvas is kept when the profile page's mini-canvas opens a NEW canvas here.
+ * It has its own key because the builder autosaves `CANVAS_DRAFT_KEY` within ~1.5s of opening,
+ * which would otherwise overwrite the user's earlier work.
+ */
+export const SET_ASIDE_KEY = "agentpm_canvas_draft_previous";
+
+/** Which version of the canvas is on screen when another is set aside. */
+export type SetAsideShown = "mini" | "earlier";
+export interface SetAside {
+  /** The canvas that is NOT on screen. */
+  nodes: CanvasNode[];
+  shown: SetAsideShown;
+}
+
+function readSetAside(): SetAside | null {
+  try {
+    const raw = localStorage.getItem(SET_ASIDE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.nodes) || parsed.nodes.length === 0) return null;
+    return { nodes: parsed.nodes as CanvasNode[], shown: parsed.shown === "earlier" ? "earlier" : "mini" };
+  } catch { return null; }
+}
+
+function writeSetAside(value: SetAside | null): void {
+  try {
+    if (value) localStorage.setItem(SET_ASIDE_KEY, JSON.stringify(value));
+    else localStorage.removeItem(SET_ASIDE_KEY);
+  } catch { /* storage full — ignore */ }
+}
+
+/**
+ * What the canvas starts as. Pure (reads storage, writes nothing) because React StrictMode calls
+ * initializers twice in development.
+ *
+ * A handoff from the profile mini-canvas always opens as its own canvas. A saved draft is not
+ * discarded — it becomes the "set aside" canvas, restorable from the banner. (Appending the new
+ * nodes below the draft instead put them off-screen, so it looked as if nothing had come over.)
+ */
+function resolveInitial(): { present: CanvasNode[]; setAside: SetAside | null } {
+  const handoff = readHandoff();
+  const draft = readDraft();
+  if (handoff && handoff.length > 0) {
+    return {
+      present: handoff,
+      setAside: draft && draft.length > 0 ? { nodes: draft, shown: "mini" } : readSetAside(),
+    };
+  }
+  return { present: draft && draft.length > 0 ? draft : [], setAside: readSetAside() };
 }
 
 function readDraft(): CanvasNode[] | null {
@@ -133,12 +198,17 @@ const INITIAL: HistoryState = { past: [], present: [], future: [] };
 
 export function useCanvasState() {
   const [history, dispatch] = useReducer(reducer, INITIAL, () => {
-    const handoff = readHandoff();
-    if (handoff && handoff.length > 0) return { past: [], present: handoff, future: [] };
-    const draft = readDraft();
-    if (draft && draft.length > 0) return { past: [], present: draft, future: [] };
-    return INITIAL;
+    const { present } = resolveInitial();
+    return present.length > 0 ? { past: [], present, future: [] } : INITIAL;
   });
+  const [setAside, setSetAside] = useState<SetAside | null>(() => resolveInitial().setAside);
+
+  // Once the builder is up: the handoff is single-use, and the set-aside canvas is made durable.
+  useEffect(() => {
+    clearHandoff();
+    if (setAside) writeSetAside(setAside);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [selectedId, setSelectedId] = useStateWithCallback<string | null>(null);
 
   const nodes = history.present;
@@ -233,7 +303,32 @@ export function useCanvasState() {
     setSelectedId(clone.id);
   }, [nodes]);
 
+  /**
+   * Switch between the canvas on screen and the one set aside. The canvas you leave becomes the
+   * set-aside one, so this is a toggle and neither version is ever lost.
+   */
+  const swapSetAside = useCallback(() => {
+    if (!setAside) return;
+    const leaving = nodes;
+    dispatch({ type: "COMMIT", nodes: setAside.nodes });
+    setSelectedId(null);
+    const next: SetAside | null = leaving.length > 0
+      ? { nodes: leaving, shown: setAside.shown === "mini" ? "earlier" : "mini" }
+      : null;
+    setSetAside(next);
+    writeSetAside(next);
+  }, [nodes, setAside]);
+
+  /** Drop the set-aside canvas for good. Only ever called from an explicit user choice. */
+  const discardSetAside = useCallback(() => {
+    setSetAside(null);
+    writeSetAside(null);
+  }, []);
+
   return {
+    setAside,
+    swapSetAside,
+    discardSetAside,
     nodes,
     commit,
     live,

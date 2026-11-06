@@ -281,3 +281,107 @@ class SkillToolVisibilityTests(APITestCase):
 
     def test_load_for_an_anonymous_caller_is_refused(self):
         self.assertIn("error", self._load(None, "org-published"))
+
+
+class ApprovedSkillEditResetsReviewTests(APITestCase):
+    """
+    Editing what an approved skill does sends it back to draft.
+
+    Before this, the creator could PATCH an approved skill's instructions or allowed_tools
+    (e.g. add send_sms) or make it public, and it stayed approved with no new review.
+    """
+
+    def setUp(self):
+        self.author = User.objects.create_user("author-edit", password="x")
+        self.client.force_authenticate(user=self.author)
+        self.skill = AgentSkill.objects.create(
+            name="weekly-digest", description="d", instructions="i",
+            allowed_tools=["search_records"], created_by=self.author,
+            status="approved", review_verdict="PASS", visibility="private",
+        )
+
+    def _patch(self, body):
+        return self.client.patch(f"{LIST_URL}{self.skill.pk}/", body, format="json")
+
+    def test_changing_instructions_resets_to_draft(self):
+        resp = self._patch({"instructions": "now do something else"})
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.skill.refresh_from_db()
+        self.assertEqual((self.skill.status, self.skill.review_verdict, self.skill.version), ("draft", "", 2))
+
+    def test_widening_allowed_tools_resets_to_draft(self):
+        self._patch({"allowed_tools": ["search_records", "create_action_item"]})
+        self.skill.refresh_from_db()
+        self.assertEqual(self.skill.status, "draft")
+
+    def test_going_public_resets_to_draft(self):
+        self._patch({"visibility": "public"})
+        self.skill.refresh_from_db()
+        self.assertEqual(self.skill.status, "draft")
+
+    def test_pinning_roles_does_not_reset(self):
+        resp = self._patch({"pinned_to_roles": ["sa"]})
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.skill.refresh_from_db()
+        self.assertEqual(self.skill.status, "approved")
+
+    def test_an_unchanged_value_does_not_reset(self):
+        self._patch({"instructions": "i"})
+        self.skill.refresh_from_db()
+        self.assertEqual(self.skill.status, "approved")
+
+    def test_unknown_or_unsafe_tools_are_refused_on_update(self):
+        for tools in (["send_sms"], ["delete_action_item"], ["not_a_tool"]):
+            with self.subTest(tools=tools):
+                resp = self._patch({"allowed_tools": tools})
+                self.assertEqual(resp.status_code, 400)
+        self.skill.refresh_from_db()
+        self.assertEqual(self.skill.allowed_tools, ["search_records"])
+
+    def test_cannot_write_status_directly(self):
+        self.skill.status = "draft"
+        self.skill.save()
+        self._patch({"status": "approved"})
+        self.skill.refresh_from_db()
+        self.assertEqual(self.skill.status, "draft")
+
+    def test_another_user_cannot_edit_it(self):
+        other = User.objects.create_user("intruder", password="x")
+        self.client.force_authenticate(user=other)
+        self.skill.visibility = "public"
+        self.skill.save()
+        resp = self._patch({"instructions": "pwned"})
+        self.assertEqual(resp.status_code, 403)
+
+
+class SkillInvocationScopeTests(APITestCase):
+    """Invocation history carries run arguments and results, so it is per-user."""
+
+    URL = "/api/v1/skills/invocations/"
+
+    def setUp(self):
+        from .models import ClaudeSkill, SkillInvocation
+
+        self.me = User.objects.create_user("inv-me", password="x")
+        self.other = User.objects.create_user("inv-other", password="x")
+        self.staff = User.objects.create_user("inv-staff", password="x", is_staff=True)
+        skill = ClaudeSkill.objects.create(name="s1", description="d", code="async def f(): pass",
+                                           submitted_by=self.me)
+        SkillInvocation.objects.create(skill=skill, invoked_by=self.me, arguments={"a": 1})
+        SkillInvocation.objects.create(skill=skill, invoked_by=self.other, arguments={"secret": 1})
+
+    def _count(self, user):
+        self.client.force_authenticate(user=user)
+        resp = self.client.get(self.URL)
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        return len(body["results"] if isinstance(body, dict) else body)
+
+    def test_unauthenticated_returns_401(self):
+        self.assertEqual(self.client.get(self.URL).status_code, 401)
+
+    def test_non_staff_sees_only_their_own(self):
+        self.assertEqual(self._count(self.me), 1)
+
+    def test_staff_sees_all(self):
+        self.assertEqual(self._count(self.staff), 2)

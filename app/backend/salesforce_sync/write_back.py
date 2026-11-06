@@ -27,9 +27,14 @@ def log_time(
     project = SalesforceProject.objects.filter(sf_id=project_sf_id).first()
     task = SalesforceTask.objects.filter(sf_id=task_sf_id).first() if task_sf_id else None
 
+    from .time_entry_accounts import account_for_project_sf_id, infer_account
+
     entry = SalesforceTimeEntry.objects.create(
         user=user,
         project=project,
+        # Recorded now, from the project id, because `project` is blank when the Cloud Coach
+        # project was never synced and the entry would otherwise belong to no account.
+        account=account_for_project_sf_id(project_sf_id) or infer_account(user, entry_date, description),
         task=task,
         date=entry_date,
         duration_minutes=duration_minutes,

@@ -1,15 +1,24 @@
-import { useEffect, useMemo, useState } from "react";
-import { schedulerApi, airtableApi } from "../lib/api";
-import type { CalendarEvent, AirtableActionItem } from "../types";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { timeAllocationApi } from "../lib/api";
+import type { TimeAllocation, TimeAllocationRow } from "../types/salesforce";
 
 type ViewType = "bar" | "table" | "heatmap";
 
+/** Minutes for one account on one day, and whether they were logged or are just on the calendar. */
 interface DayAccountEntry {
-  date: string; // YYYY-MM-DD
+  date: string; // YYYY-MM-DD, local
   account: string;
-  meetingMinutes: number;
-  actionItemMinutes: number;
+  minutes: number;
+  source: "logged" | "calendar";
 }
+
+/** Key for "this account on this day", used to look up whether it came from the calendar. */
+const cellKey = (date: string, account: string) => `${date}__${account}`;
+
+const CALENDAR_NOTE = "From calendar events — not logged yet";
+
+/** Label for entries whose project has no account, so logged time never silently disappears. */
+export const NO_ACCOUNT_LABEL = "No account";
 
 const PALETTE = [
   "#DB131A", "#2563eb", "#16a34a", "#d97706", "#7c3aed",
@@ -23,14 +32,49 @@ function fmtMin(min: number) {
   return m ? `${h}h ${m}m` : `${h}h`;
 }
 
-function isoDate(dt: string) {
-  return dt.slice(0, 10);
+/** Local YYYY-MM-DD. `toISOString()` is UTC, which names tomorrow's date for an evening user. */
+export function localDate(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
-function addDays(base: Date, n: number) {
-  const d = new Date(base);
-  d.setDate(d.getDate() + n);
-  return d;
+/**
+ * Every day from the 1st of the previous calendar month through `today`, oldest first. That is
+ * between ~32 and ~62 days, which is why the views scroll sideways.
+ */
+export function allocationDays(today: Date): string[] {
+  const first = new Date(today.getFullYear(), today.getMonth() - 1, 1);
+  const last = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const out: string[] = [];
+  for (let d = first; d <= last; d = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1)) {
+    out.push(localDate(d));
+  }
+  return out;
+}
+
+/** Turn the server's rows into chart entries. Rows outside `days` are ignored. */
+export function rowsToDayAccounts(rows: TimeAllocationRow[], days: string[]): DayAccountEntry[] {
+  const inRange = new Set(days);
+  const map: Record<string, DayAccountEntry> = {};
+  for (const r of rows) {
+    const date = (r.date ?? "").slice(0, 10);
+    if (!inRange.has(date) || !r.minutes) continue;
+    const account = r.account || NO_ACCOUNT_LABEL;
+    const k = `${cellKey(date, account)}__${r.source}`;
+    if (!map[k]) map[k] = { date, account, minutes: 0, source: r.source };
+    map[k].minutes += r.minutes;
+  }
+  return Object.values(map);
+}
+
+/** Opens a horizontally scrolling view at its right edge, where today is. */
+function useScrollToEnd(dep: unknown) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (el) el.scrollLeft = el.scrollWidth;
+  }, [dep]);
+  return ref;
 }
 
 function formatLabel(iso: string) {
@@ -40,15 +84,17 @@ function formatLabel(iso: string) {
 
 // ── Bar chart (grouped per day, stacked by account) ──────────────────────────
 
-function BarChart({ data, days, accounts, colorMap }: {
+function BarChart({ data, days, accounts, colorMap, calendarCells }: {
   data: DayAccountEntry[];
   days: string[];
   accounts: string[];
   colorMap: Record<string, string>;
+  /** cellKey(date, account) of cells whose minutes come from the calendar, not from logged time. */
+  calendarCells: Set<string>;
 }) {
-  const W = 800;
   const H = 260;
   const MARGIN = { top: 16, right: 16, bottom: 64, left: 52 };
+  const W = Math.max(800, MARGIN.left + MARGIN.right + days.length * 30);
   const chartW = W - MARGIN.left - MARGIN.right;
   const chartH = H - MARGIN.top - MARGIN.bottom;
 
@@ -59,7 +105,7 @@ function BarChart({ data, days, accounts, colorMap }: {
     for (const d of days) map[d] = {};
     for (const e of data) {
       if (!map[e.date]) map[e.date] = {};
-      map[e.date][e.account] = (map[e.date][e.account] ?? 0) + e.meetingMinutes + e.actionItemMinutes;
+      map[e.date][e.account] = (map[e.date][e.account] ?? 0) + e.minutes;
     }
     return map;
   }, [data, days]);
@@ -84,11 +130,13 @@ function BarChart({ data, days, accounts, colorMap }: {
     return ticks;
   }, [maxMinutes]);
 
+  const scrollRef = useScrollToEnd(days.length);
+
   return (
-    <div style={{ position: "relative", overflowX: "auto" }}>
+    <div ref={scrollRef} style={{ position: "relative", overflowX: "auto" }}>
       <svg
         viewBox={`0 0 ${W} ${H}`}
-        style={{ width: "100%", minWidth: 400, display: "block" }}
+        style={{ width: W, minWidth: "100%", display: "block" }}
         onMouseLeave={() => setTooltip(null)}
       >
         <g transform={`translate(${MARGIN.left},${MARGIN.top})`}>
@@ -110,13 +158,13 @@ function BarChart({ data, days, accounts, colorMap }: {
             const cx = di * barGroupW + barGroupW / 2;
             const x0 = cx - barW / 2;
             let yOffset = chartH;
-            const segments: { account: string; height: number; y: number }[] = [];
+            const segments: { account: string; height: number; y: number; fromCalendar: boolean }[] = [];
             for (const acct of accounts) {
               const mins = totals[day]?.[acct] ?? 0;
               if (!mins) continue;
               const h = (mins / maxMinutes) * chartH;
               yOffset -= h;
-              segments.push({ account: acct, height: h, y: yOffset });
+              segments.push({ account: acct, height: h, y: yOffset, fromCalendar: calendarCells.has(cellKey(day, acct)) });
             }
             return (
               <g key={day}>
@@ -128,6 +176,11 @@ function BarChart({ data, days, accounts, colorMap }: {
                     width={barW}
                     height={s.height}
                     fill={colorMap[s.account] ?? "#ccc"}
+                    // Lighter and dashed: this time is on the calendar but has not been logged.
+                    opacity={s.fromCalendar ? 0.5 : 1}
+                    stroke={s.fromCalendar ? colorMap[s.account] ?? "#ccc" : undefined}
+                    strokeDasharray={s.fromCalendar ? "3 2" : undefined}
+                    data-source={s.fromCalendar ? "calendar" : "logged"}
                     rx={2}
                     style={{ cursor: "pointer" }}
                     onMouseMove={(e) => {
@@ -136,7 +189,7 @@ function BarChart({ data, days, accounts, colorMap }: {
                       setTooltip({
                         x: e.clientX - rect.left,
                         y: e.clientY - rect.top - 8,
-                        label: `${s.account}: ${fmtMin(totals[day]?.[s.account] ?? 0)} on ${formatLabel(day)}`,
+                        label: `${s.account}: ${fmtMin(totals[day]?.[s.account] ?? 0)} on ${formatLabel(day)}${s.fromCalendar ? " (calendar)" : ""}`,
                       });
                     }}
                   />
@@ -190,17 +243,19 @@ function BarChart({ data, days, accounts, colorMap }: {
 
 // ── Table view ────────────────────────────────────────────────────────────────
 
-function TableView({ data, days, accounts, colorMap }: {
+function TableView({ data, days, accounts, colorMap, calendarCells }: {
   data: DayAccountEntry[];
   days: string[];
   accounts: string[];
   colorMap: Record<string, string>;
+  /** cellKey(date, account) of cells whose minutes come from the calendar, not from logged time. */
+  calendarCells: Set<string>;
 }) {
   const totals = useMemo(() => {
     const map: Record<string, Record<string, number>> = {};
     for (const e of data) {
       if (!map[e.account]) map[e.account] = {};
-      map[e.account][e.date] = (map[e.account][e.date] ?? 0) + e.meetingMinutes + e.actionItemMinutes;
+      map[e.account][e.date] = (map[e.account][e.date] ?? 0) + e.minutes;
     }
     return map;
   }, [data]);
@@ -231,8 +286,10 @@ function TableView({ data, days, accounts, colorMap }: {
     return m || 1;
   }, [totals, accounts, days]);
 
+  const scrollRef = useScrollToEnd(days.length);
+
   return (
-    <div style={{ overflowX: "auto" }}>
+    <div ref={scrollRef} style={{ overflowX: "auto" }}>
       <table style={{ borderCollapse: "collapse", width: "100%", fontSize: "0.8125rem", fontFamily: "var(--font-base)" }}>
         <thead>
           <tr>
@@ -262,7 +319,11 @@ function TableView({ data, days, accounts, colorMap }: {
                 return (
                   <td key={day} style={{ textAlign: "center", padding: "5px 6px" }}>
                     {mins > 0 ? (
-                      <span style={{
+                      <span
+                        data-source={calendarCells.has(cellKey(day, acct)) ? "calendar" : "logged"}
+                        title={calendarCells.has(cellKey(day, acct)) ? CALENDAR_NOTE : undefined}
+                        style={{
+                        fontStyle: calendarCells.has(cellKey(day, acct)) ? "italic" : undefined,
                         display: "inline-block",
                         padding: "2px 6px",
                         borderRadius: 4,
@@ -305,17 +366,19 @@ function TableView({ data, days, accounts, colorMap }: {
 
 // ── Heatmap view ──────────────────────────────────────────────────────────────
 
-function HeatmapView({ data, days, accounts, colorMap }: {
+function HeatmapView({ data, days, accounts, colorMap, calendarCells }: {
   data: DayAccountEntry[];
   days: string[];
   accounts: string[];
   colorMap: Record<string, string>;
+  /** cellKey(date, account) of cells whose minutes come from the calendar, not from logged time. */
+  calendarCells: Set<string>;
 }) {
   const totals = useMemo(() => {
     const map: Record<string, Record<string, number>> = {};
     for (const e of data) {
       if (!map[e.account]) map[e.account] = {};
-      map[e.account][e.date] = (map[e.account][e.date] ?? 0) + e.meetingMinutes + e.actionItemMinutes;
+      map[e.account][e.date] = (map[e.account][e.date] ?? 0) + e.minutes;
     }
     return map;
   }, [data]);
@@ -336,11 +399,13 @@ function HeatmapView({ data, days, accounts, colorMap }: {
   const H = TOP + accounts.length * CELL + 8;
   const [tooltip, setTooltip] = useState<{ x: number; y: number; label: string } | null>(null);
 
+  const scrollRef = useScrollToEnd(days.length);
+
   return (
-    <div style={{ overflowX: "auto" }}>
+    <div ref={scrollRef} style={{ overflowX: "auto" }}>
       <svg
         viewBox={`0 0 ${W} ${H}`}
-        style={{ width: "100%", minWidth: Math.min(W, 500), display: "block" }}
+        style={{ width: W, minWidth: "100%", display: "block" }}
         onMouseLeave={() => setTooltip(null)}
       >
         {/* Column headers */}
@@ -380,6 +445,9 @@ function HeatmapView({ data, days, accounts, colorMap }: {
                     rx={4}
                     fill={mins ? `${base}` : "var(--surface-raised,rgba(0,0,0,0.04))"}
                     opacity={mins ? 0.15 + intensity * 0.85 : 1}
+                    stroke={mins && calendarCells.has(cellKey(day, acct)) ? base : undefined}
+                    strokeDasharray={mins && calendarCells.has(cellKey(day, acct)) ? "3 2" : undefined}
+                    data-source={mins ? (calendarCells.has(cellKey(day, acct)) ? "calendar" : "logged") : undefined}
                     style={{ cursor: mins ? "pointer" : "default" }}
                     onMouseMove={(e) => {
                       if (!mins) return;
@@ -388,7 +456,7 @@ function HeatmapView({ data, days, accounts, colorMap }: {
                       setTooltip({
                         x: e.clientX - rect.left,
                         y: e.clientY - rect.top - 8,
-                        label: `${acct}: ${fmtMin(mins)} on ${formatLabel(day)}`,
+                        label: `${acct}: ${fmtMin(mins)} on ${formatLabel(day)}${calendarCells.has(cellKey(day, acct)) ? " (calendar)" : ""}`,
                       });
                     }}
                   />
@@ -422,7 +490,7 @@ function HeatmapView({ data, days, accounts, colorMap }: {
 
 // ── Legend ────────────────────────────────────────────────────────────────────
 
-function Legend({ accounts, colorMap }: { accounts: string[]; colorMap: Record<string, string> }) {
+function Legend({ accounts, colorMap, hasCalendar }: { accounts: string[]; colorMap: Record<string, string>; hasCalendar: boolean }) {
   return (
     <div style={{ display: "flex", flexWrap: "wrap", gap: "6px 14px", marginTop: 8 }}>
       {accounts.map(a => (
@@ -431,81 +499,49 @@ function Legend({ accounts, colorMap }: { accounts: string[]; colorMap: Record<s
           {a}
         </span>
       ))}
+      {hasCalendar && (
+        <span style={{ display: "flex", alignItems: "center", gap: 5, fontSize: "0.75rem", color: "var(--text-secondary,#888)" }}>
+          <span style={{ width: 10, height: 10, borderRadius: 2, border: "1px dashed #666", opacity: 0.6, flexShrink: 0, display: "inline-block" }} />
+          Dashed / lighter = from calendar events, not logged yet
+        </span>
+      )}
     </div>
   );
 }
 
-// ── Range selector ────────────────────────────────────────────────────────────
-
-type Range = "7d" | "14d" | "30d";
-
 // ── Main panel ────────────────────────────────────────────────────────────────
+
+function formatRange(days: string[]) {
+  if (!days.length) return "";
+  return `${formatLabel(days[0])} – ${formatLabel(days[days.length - 1])}`;
+}
 
 export default function TimeAllocationPanel() {
   const [view, setView] = useState<ViewType>("bar");
-  const [range, setRange] = useState<Range>("14d");
-  const [events, setEvents] = useState<CalendarEvent[]>([]);
-  const [actionItems, setActionItems] = useState<AirtableActionItem[]>([]);
+  const [result, setResult] = useState<TimeAllocation | null>(null);
   const [loading, setLoading] = useState(true);
+  const [failed, setFailed] = useState(false);
+
+  // The window is the previous calendar month through today, fixed for the life of the mount.
+  const days = useMemo(() => allocationDays(new Date()), []);
 
   useEffect(() => {
+    let cancelled = false;
     setLoading(true);
-    const days = range === "7d" ? 7 : range === "14d" ? 14 : 30;
-    const now = new Date();
-    const start = addDays(now, -days);
-    const startStr = start.toISOString().slice(0, 10);
-    const endStr = now.toISOString().slice(0, 10);
+    setFailed(false);
+    timeAllocationApi
+      .get({ start: days[0], end: days[days.length - 1] })
+      .then(r => { if (!cancelled) setResult(r.data); })
+      .catch(() => { if (!cancelled) setFailed(true); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [days]);
 
-    Promise.all([
-      schedulerApi.listEvents({ page_size: "500", start_after: startStr + "T00:00:00Z", start_before: endStr + "T23:59:59Z" })
-        .then(r => setEvents(r.data))
-        .catch(() => {}),
-      airtableApi.listActionItems()
-        .then(r => setActionItems(r.data))
-        .catch(() => {}),
-    ]).finally(() => setLoading(false));
-  }, [range]);
-
-  const days = useMemo(() => {
-    const n = range === "7d" ? 7 : range === "14d" ? 14 : 30;
-    const result: string[] = [];
-    const now = new Date();
-    for (let i = n - 1; i >= 0; i--) result.push(isoDate(addDays(now, -i).toISOString()));
-    return result;
-  }, [range]);
-
-  const data: DayAccountEntry[] = useMemo(() => {
-    const map: Record<string, DayAccountEntry> = {};
-    const key = (date: string, account: string) => `${date}__${account}`;
-
-    for (const ev of events) {
-      if (!ev.account_name) continue;
-      if (ev.status === "cancelled") continue;
-      const date = isoDate(ev.start_datetime);
-      if (!days.includes(date)) continue;
-      const mins = (new Date(ev.end_datetime).getTime() - new Date(ev.start_datetime).getTime()) / 60000;
-      const k = key(date, ev.account_name);
-      if (!map[k]) map[k] = { date, account: ev.account_name, meetingMinutes: 0, actionItemMinutes: 0 };
-      map[k].meetingMinutes += mins;
-    }
-
-    for (const ai of actionItems) {
-      if (!ai.account_name) continue;
-      const totalSecs = (ai.time_spent ?? 0) + (ai.prep_time ?? 0);
-      if (!totalSecs) continue;
-      // distribute time across due_date or last_synced date
-      const rawDate = ai.due_date ?? ai.last_synced?.slice(0, 10);
-      if (!rawDate) continue;
-      const date = rawDate.slice(0, 10);
-      if (!days.includes(date)) continue;
-      const mins = totalSecs / 60;
-      const k = key(date, ai.account_name);
-      if (!map[k]) map[k] = { date, account: ai.account_name, meetingMinutes: 0, actionItemMinutes: 0 };
-      map[k].actionItemMinutes += mins;
-    }
-
-    return Object.values(map);
-  }, [events, actionItems, days]);
+  const data: DayAccountEntry[] = useMemo(() => rowsToDayAccounts(result?.rows ?? [], days), [result, days]);
+  const calendarCells = useMemo(
+    () => new Set(data.filter(e => e.source === "calendar").map(e => cellKey(e.date, e.account))),
+    [data],
+  );
 
   const accounts = useMemo(() => {
     const set = new Set<string>();
@@ -519,7 +555,7 @@ export default function TimeAllocationPanel() {
     return m;
   }, [accounts]);
 
-  const totalMins = useMemo(() => data.reduce((s, e) => s + e.meetingMinutes + e.actionItemMinutes, 0), [data]);
+  const totalMins = useMemo(() => data.reduce((s, e) => s + e.minutes, 0), [data]);
 
   const btnStyle = (active: boolean): React.CSSProperties => ({
     padding: "4px 10px",
@@ -545,13 +581,19 @@ export default function TimeAllocationPanel() {
           <p style={{ fontSize: "0.6875rem", color: "var(--text-secondary,#888)", fontFamily: "var(--font-base)", margin: "1px 0 0" }}>
             {loading ? "Loading…" : `${fmtMin(totalMins)} across ${accounts.length} account${accounts.length !== 1 ? "s" : ""}`}
           </p>
+          {!loading && !failed && result && (
+            <p data-testid="allocation-breakdown" style={{ fontSize: "0.6875rem", color: "var(--text-secondary,#888)", fontFamily: "var(--font-base)", margin: "1px 0 0" }}>
+              {fmtMin(result.logged_minutes)} logged
+              {result.calendar_minutes > 0 && ` + ${fmtMin(result.calendar_minutes)} from your calendar, not logged yet`}
+              {result.inferred_minutes > 0 && ` (${fmtMin(result.inferred_minutes)} matched to an account by name)`}
+              {result.unlinked_calendar_minutes > 0 && ` · ${fmtMin(result.unlinked_calendar_minutes)} of calendar time isn't linked to an account`}
+            </p>
+          )}
         </div>
 
-        <div style={{ display: "flex", gap: 4 }}>
-          {(["7d", "14d", "30d"] as Range[]).map(r => (
-            <button key={r} style={btnStyle(range === r)} onClick={() => setRange(r)}>{r}</button>
-          ))}
-        </div>
+        <span style={{ fontSize: "0.75rem", color: "var(--text-secondary,#888)", fontFamily: "var(--font-base)" }} title="Logged time, plus calendar events for days not logged yet, from the start of last month through today. Meetings marked did-not-attend are never counted. Scroll sideways for earlier days.">
+          {formatRange(days)}
+        </span>
       </div>
 
       {/* View tabs */}
@@ -583,16 +625,20 @@ export default function TimeAllocationPanel() {
         <div style={{ textAlign: "center", padding: 32, color: "var(--text-secondary,#888)", fontSize: "0.8125rem" }}>
           Loading…
         </div>
+      ) : failed ? (
+        <div style={{ textAlign: "center", padding: 32, color: "#b91c1c", fontSize: "0.8125rem" }}>
+          Could not load your logged time.
+        </div>
       ) : accounts.length === 0 ? (
         <div style={{ textAlign: "center", padding: 32, color: "var(--text-secondary,#888)", fontSize: "0.8125rem" }}>
-          No account-linked activity found in this range.
+          Nothing to show between {formatRange(days)}. Time you log from the Log Time panel, and calendar events linked to an account, show up here.
         </div>
       ) : (
         <>
-          {view === "bar" && <BarChart data={data} days={days} accounts={accounts} colorMap={colorMap} />}
-          {view === "table" && <TableView data={data} days={days} accounts={accounts} colorMap={colorMap} />}
-          {view === "heatmap" && <HeatmapView data={data} days={days} accounts={accounts} colorMap={colorMap} />}
-          <Legend accounts={accounts} colorMap={colorMap} />
+          {view === "bar" && <BarChart data={data} days={days} accounts={accounts} colorMap={colorMap} calendarCells={calendarCells} />}
+          {view === "table" && <TableView data={data} days={days} accounts={accounts} colorMap={colorMap} calendarCells={calendarCells} />}
+          {view === "heatmap" && <HeatmapView data={data} days={days} accounts={accounts} colorMap={colorMap} calendarCells={calendarCells} />}
+          <Legend accounts={accounts} colorMap={colorMap} hasCalendar={calendarCells.size > 0} />
         </>
       )}
     </div>

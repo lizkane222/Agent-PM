@@ -14,7 +14,6 @@ import LoginPage from "./pages/LoginPage";
 import RemindersPage from "./pages/RemindersPage";
 import SettingsPage from "./pages/SettingsPage";
 import TeamPage from "./pages/TeamPage";
-import RolePage from "./pages/RolePage";
 import ClaudeSkillsPage from "./pages/ClaudeSkillsPage";
 import DiscoverPage from "./pages/DiscoverPage";
 import ProfilePage from "./pages/ProfilePage";
@@ -119,15 +118,19 @@ export default function App() {
           <Route path="accounts" element={<AccountsPage />} />
           <Route path="accounts/:id" element={<AccountDetailPage />} />
           <Route path="team" element={<TeamPage />} />
-          <Route path="role/:roleSlug" element={<RolePage />} />
+          {/* Role pages were folded into the profile page; keep old bookmarks working. */}
+          <Route path="role/:roleSlug" element={<Navigate to="/profile" replace />} />
           <Route path="reminders" element={<RemindersPage />} />
           <Route path="skills" element={<ClaudeSkillsPage />} />
           <Route path="discover" element={<DiscoverPage />} />
           <Route path="settings" element={<SettingsPage />} />
-          <Route path="admin-data" element={<AdminDataPage />} />
+          <Route path="settings/admin-data" element={<AdminDataPage />} />
+          {/* Old location — Admin Data now lives under Settings. */}
+          <Route path="admin-data" element={<Navigate to="/settings/admin-data" replace />} />
           <Route path="logs" element={<LogsPage />} />
           <Route path="edit-preview" element={<PageBuilder />} />
           <Route path="profile" element={<ProfilePage />} />
+          <Route path="profile/:memberId" element={<ProfilePage />} />
         </Route>
       </Routes>
     </BrowserRouter>

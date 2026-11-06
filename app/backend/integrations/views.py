@@ -26,12 +26,21 @@ from .serializers import (
 logger = logging.getLogger(__name__)
 
 
+# The narrowest scopes that cover what the code does. A customer once received 2,000+ calendar
+# invitation emails from the user's Google account; code can be made safe, but a broad grant stays
+# a standing capability, so we ask Google for as little as possible. Pinned by
+# integrations/tests/test_google_scopes.py — do not widen without reading it.
+#   calendar.events    events.list / watch / insert / patch / update / delete
+#   calendar.freebusy  availability for "compare calendars" and the voice agent
+# NOT the full `calendar` scope (it also grants calendar settings, sharing and ACLs), and NEVER
+# gmail.send. gmail.modify stays only for the documented combined-credential fallback — see
+# integrations/gmail_utils.py; it cannot send mail.
 GOOGLE_SCOPES = [
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile",
-    "https://www.googleapis.com/auth/calendar",
-    "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/calendar.freebusy",
     "https://www.googleapis.com/auth/gmail.modify",
 ]
 
@@ -216,7 +225,9 @@ def _insert_agentpm_event_in_google(event, service):
         "colorId": "3",  # grape/purple, matching GoogleActionItemsPushView
     }
     try:
-        created = service.events().insert(calendarId="primary", body=body).execute()
+        from .google_calendar_gateway import write_event
+
+        created = write_event(service, "insert", event, body=body, source="sync.push_new", approved=False)
         return created.get("id", "")
     except Exception:
         logger.exception(
@@ -224,6 +235,10 @@ def _insert_agentpm_event_in_google(event, service):
             event.title, event.pk,
         )
         return ""
+
+
+# Most events PHASE 1 will push in one run. See the circuit breaker in _sync_google_calendar.
+MAX_PUSH_PER_SYNC = 100
 
 
 def _push_event_to_google(event, creds):
@@ -235,9 +250,6 @@ def _push_event_to_google(event, creds):
     from django.conf import settings
     from google.oauth2.credentials import Credentials
     from googleapiclient.discovery import build
-    from googleapiclient.errors import HttpError
-    import time as _time
-
     if not (event.is_synced and event.google_event_id):
         return
 
@@ -273,34 +285,35 @@ def _push_event_to_google(event, creds):
         "status": event.status,
     }
 
-    delay = 1
-    for attempt in range(5):
-        try:
-            service.events().patch(
-                calendarId="primary",
-                eventId=event.google_event_id,
-                body=body,
-            ).execute()
-            return
-        except HttpError as exc:
-            if exc.status_code == 429 and attempt < 4:
-                logger.warning(
-                    "Google Calendar rate limited (429) pushing event '%s'; retrying in %ds",
-                    event.title,
-                    delay,
-                )
-                _time.sleep(delay)
-                delay = min(delay * 2, 16)
-            else:
-                logger.exception("Failed to push event '%s' to Google Calendar", event.title)
-                return
-        except Exception:
-            # Any other failure — a network timeout, connection reset, or transport-level
-            # error from one of a batch of sequential pushes — must not escape either.
-            # One flaky call among hundreds would otherwise abort the whole sync and
-            # surface as a 500; the local row stays authoritative regardless.
-            logger.exception("Failed to push event '%s' to Google Calendar", event.title)
-            return
+    from .google_calendar_gateway import write_event
+
+    try:
+        # Through the gateway so `sendUpdates` is set explicitly and the write is audited. A
+        # sync is never the user's approval to email anyone: approved=False, always.
+        write_event(service, "patch", event, body=body, source="sync.push_edit", approved=False)
+    except Exception:
+        # The local row stays authoritative; one flaky push must not abort a whole sync.
+        logger.exception("Failed to push event '%s' to Google Calendar", event.title)
+
+
+def _apply_google_cancellation(user, google_event_id: str) -> int:
+    """
+    Apply one "this event was deleted in Google" change from an incremental pull.
+
+    Same ownership rule as `_reconcile_missing_google_events`: a plain Google meeting is
+    deleted (Google is authoritative for those), but an AgentPM-owned block — a scheduled
+    action item or reminder, where the DB is the original and Google the copy — is only
+    *unlinked*, so it stays on the calendar and the next sync re-pushes it. Returns the
+    number of rows deleted.
+    """
+    from scheduler.models import CalendarEvent
+
+    if not google_event_id:
+        return 0
+    rows = CalendarEvent.objects.filter(owner=user, google_event_id=google_event_id)
+    rows.filter(calendar_id__in=AGENTPM_OWNED_CALENDAR_IDS).update(google_event_id="", is_synced=False)
+    deleted, _ = rows.exclude(calendar_id__in=AGENTPM_OWNED_CALENDAR_IDS).delete()
+    return deleted
 
 
 def _reconcile_missing_google_events(user, seen_ids, window_start, window_end):
@@ -398,6 +411,20 @@ def _push_new_agentpm_events(user, service, window_start, window_end):
     return pushed
 
 
+def _differs(existing, defaults) -> bool:
+    """Whether a pull would change `existing` — so "updated" counts real changes, not every
+    event Google returned (which made every sync look like it changed something)."""
+    from django.utils.dateparse import parse_datetime
+
+    for field, new in defaults.items():
+        old = getattr(existing, field, None)
+        if field in ("start_datetime", "end_datetime") and isinstance(new, str):
+            new = parse_datetime(new)
+        if old != new:
+            return True
+    return False
+
+
 def _sync_google_calendar(user, creds):
     """Bi-directional sync: push recent edits to Google, then pull from Google.
 
@@ -407,17 +434,25 @@ def _sync_google_calendar(user, creds):
     PHASE 1b: Insert AgentPM-owned rows (scheduled action items / reminders) that have never
               been pushed, so PHASE 2 pulls them back as synced rows in this same cycle.
 
-    PHASE 2:  Pull the surrounding ±90 days of events from Google Calendar into CalendarEvent.
+    PHASE 2:  Pull from Google. Two modes, chosen by whether a change token is stored:
 
-    PHASE 3:  Reconcile local rows Google did not return — see
-              `_reconcile_missing_google_events` for why that is not simply a delete.
+              * **Incremental** (the normal case, every 5 minutes): ``events().list`` with the
+                ``syncToken`` from the last run returns *only what changed* since then —
+                edits, new events, and deletions as ``status: "cancelled"``. Nothing outside
+                those changes is touched, so past and future weeks are preserved exactly.
+              * **Full** (first sync, or Google answered 410 Gone because the token
+                expired): the surrounding ±90 days, which also yields a fresh token.
+
+    PHASE 3:  Full syncs only — reconcile local rows Google did not return (see
+              `_reconcile_missing_google_events` for why that is not simply a delete). An
+              incremental pull never infers a delete from absence: absence from a diff
+              means "unchanged".
     """
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
     from django.db import transaction
     from django.utils import timezone
     import datetime
-    import time
     from .models import SyncState
     from scheduler.models import CalendarEvent
     from airtable_sync.models import AirtableMeeting
@@ -439,6 +474,17 @@ def _sync_google_calendar(user, creds):
             updated_at__gt=sync_state.last_synced_at,
         )
         pushed_count = 0
+        # Circuit breaker. A 5-minute window never holds hundreds of genuine edits; that many
+        # "edits" is the echo loop (2026-11-03: ~710 pulled events pushed back, ~30 runs in a
+        # row, 61,000 writes). Refuse the whole batch and say so, rather than repeat it.
+        candidate_count = recent_edits.count()
+        if candidate_count > MAX_PUSH_PER_SYNC:
+            logger.error(
+                "Google Calendar sync: refusing to push %d events for %s (limit %d). That many "
+                "edits in one interval means rows are being mistaken for local edits.",
+                candidate_count, user, MAX_PUSH_PER_SYNC,
+            )
+            recent_edits = recent_edits.none()
         for event in recent_edits:
             _push_event_to_google(event, creds)
             pushed_count += 1
@@ -458,48 +504,48 @@ def _sync_google_calendar(user, creds):
     # so anything inserted here comes straight back as a synced row in this same cycle.
     _push_new_agentpm_events(user, service, window_start, window_end)
 
-    # PHASE 2: Pull from Google Calendar
+    # PHASE 2: Pull from Google Calendar — incremental when we hold a change token.
+    from .google_api import execute_with_retry
+
+    sync_token = sync_state.sync_token or ""
+    incremental = bool(sync_token)
+
+    def _list_request(page_token):
+        # syncToken cannot be combined with timeMin / timeMax / orderBy, and every other
+        # parameter must match the full sync that minted the token, so neither request
+        # passes orderBy and both expand recurring events.
+        params = {"calendarId": "primary", "singleEvents": True, "maxResults": 250,
+                  "pageToken": page_token}
+        if incremental:
+            params["syncToken"] = sync_token
+        else:
+            params.update(timeMin=time_min, timeMax=time_max, showDeleted=False)
+        return service.events().list(**params)
+
     page_token = None
     created = updated = 0
+    cancelled_count = 0
     seen_ids = set()
+    next_sync_token = ""
     while True:
-        request = service.events().list(
-            calendarId="primary",
-            timeMin=time_min,
-            timeMax=time_max,
-            singleEvents=True,
-            orderBy="startTime",
-            pageToken=page_token,
-            maxResults=250,
-        )
-        delay = 1
-        result = None
-        for attempt in range(4):
-            try:
-                result = request.execute()
-                break
-            except HttpError as exc:
-                if exc.status_code == 429 and attempt < 3:
-                    logger.warning("Google Calendar API rate limited (429); retrying in %ds (attempt %d/4)", delay, attempt + 1)
-                    time.sleep(delay)
-                    delay *= 2
-                    request = service.events().list(
-                        calendarId="primary",
-                        timeMin=time_min,
-                        timeMax=time_max,
-                        singleEvents=True,
-                        orderBy="startTime",
-                        pageToken=page_token,
-                        maxResults=250,
-                    )
-                else:
-                    raise
-        if result is None:
-            break
+        try:
+            result = execute_with_retry(_list_request(page_token), label="calendar events.list")
+        except HttpError as exc:
+            if incremental and exc.status_code == 410:
+                # The token expired or Google invalidated it. Start again with a full sync —
+                # which is non-destructive here, because reconciliation only unlinks
+                # AgentPM-owned rows and only deletes in-window Google meetings.
+                logger.info("Google Calendar sync token expired for %s; doing a full sync", user)
+                SyncState.objects.filter(pk=sync_state.pk).update(sync_token="")
+                sync_state.sync_token = ""
+                return _sync_google_calendar(user, creds)
+            raise
 
         for item in result.get("items", []):
-            # Skip cancelled events — treat them as deleted
             if item.get("status") == "cancelled":
+                # Deleted (or declined-and-removed) in Google. A full sync never sees these
+                # (showDeleted=False); an incremental one is the only way we learn of them.
+                cancelled_count += _apply_google_cancellation(user, item.get("id", ""))
                 continue
 
             start = item.get("start", {})
@@ -584,10 +630,19 @@ def _sync_google_calendar(user, creds):
                     CalendarEvent.objects.filter(pk=existing.pk).update(**defaults)
                     obj = existing
                     was_created = False
+                    was_changed = _differs(existing, defaults)
                 else:
+                    # origin="google" is set only here, on CREATE: an event that arrives from
+                    # Google is Google's to announce, never ours. The update branch above must
+                    # NOT touch origin, or an event created in AgentPM would lose its history.
                     obj = CalendarEvent.objects.create(
-                        owner=user, google_event_id=item["id"], **defaults
+                        owner=user, google_event_id=item["id"], origin="google", **defaults
                     )
+                    # `created` stamps updated_at (auto_now) AFTER this run's `now`, which is
+                    # what last_synced_at is set to. Left alone, the next run's PHASE 1 would read
+                    # every pulled row as "edited since the last sync" and push it all back.
+                    # Pin it to `now`; a real edit later moves it past last_synced_at again.
+                    CalendarEvent.objects.filter(pk=obj.pk).update(updated_at=now)
                     was_created = True
             # If we just created this row and there's a matching stub keyed by our
             # internal PK, link it now so future syncs won't lose the connection.
@@ -601,32 +656,40 @@ def _sync_google_calendar(user, creds):
             seen_ids.add(item["id"])
             if was_created:
                 created += 1
-            else:
+            elif was_changed:
                 updated += 1
 
         page_token = result.get("nextPageToken")
         if not page_token:
+            # Only the last page of a list carries nextSyncToken.
+            next_sync_token = result.get("nextSyncToken", "") or ""
             break
 
     # PHASE 3: Reconcile local rows Google did not return.
     # Guard: if Google returned nothing at all, skip reconciliation entirely — likely a
     # transient auth/quota failure, or a response whose every item was skipped as "cancelled".
     deleted_count = unlinked_count = 0
-    if seen_ids:
+    if not incremental and seen_ids:
         deleted_count, unlinked_count = _reconcile_missing_google_events(
             user, seen_ids, window_start, window_end
         )
+    deleted_count += cancelled_count
 
+    defaults = {"last_synced_at": now}
+    if next_sync_token:
+        defaults["sync_token"] = next_sync_token
     SyncState.objects.update_or_create(
         user=user,
         provider="google",
         resource="calendar",
-        defaults={"last_synced_at": now},
+        defaults=defaults,
     )
     logger.info(
-        "Google Calendar sync complete for %s: %d created, %d updated, %d deleted, %d unlinked",
-        user, created, updated, deleted_count, unlinked_count,
+        "Google Calendar %s sync complete for %s: %d created, %d updated, %d deleted, %d unlinked",
+        "incremental" if incremental else "full", user, created, updated, deleted_count, unlinked_count,
     )
+    return {"created": created, "updated": updated, "deleted": deleted_count, "unlinked": unlinked_count,
+            "mode": "incremental" if incremental else "full"}
 
 
 class GoogleOAuthInitView(APIView):
@@ -717,6 +780,12 @@ class GoogleOAuthCallbackView(APIView):
                 _sync_google_calendar(user, creds)
             except Exception as exc:
                 logger.warning("Initial Google Calendar sync failed: %s", exc)
+            # Ask Google to notify us of future changes (no-op without a public webhook URL).
+            try:
+                from .calendar_sync import ensure_watch
+                ensure_watch(user)
+            except Exception as exc:
+                logger.warning("Could not register Google Calendar push channel: %s", exc)
 
         from django.http import HttpResponse
         return HttpResponse(
@@ -746,22 +815,28 @@ class GoogleCalendarSyncView(APIView):
             client_secret=settings.GOOGLE_CLIENT_SECRET,
             scopes=cred.scopes.split(),
         )
+        # `auto` = the calendar page's 5-minute / tab-focus refresh. Same sync as the button,
+        # but quiet: it skips the activity-log entry so the feed isn't flooded every 5 minutes.
+        auto = str(request.data.get("auto", "")).lower() in ("1", "true") if hasattr(request, "data") else False
         try:
-            _sync_google_calendar(request.user, google_creds)
+            counts = _sync_google_calendar(request.user, google_creds) or {}
         except Exception:
-            logger.exception("Manual Google Calendar sync failed")
+            logger.exception("Google Calendar sync failed (auto=%s)", auto)
             return Response({"detail": "An unexpected error occurred."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         from scheduler.models import CalendarEvent
         from realtime.sync import publish_activity_event
         count = CalendarEvent.objects.filter(owner=request.user).count()
-        publish_activity_event(
-            request.user, "sync.google_calendar",
-            "**Synced** Google Calendar",
-            detail=f"{count} events",
-            metadata={"event_count": count},
-        )
-        return Response({"detail": "Sync complete.", "event_count": count})
+        changed = sum(counts.get(k, 0) for k in ("created", "updated", "deleted", "unlinked"))
+        if not auto:
+            publish_activity_event(
+                request.user, "sync.google_calendar",
+                "**Synced** Google Calendar",
+                detail=f"{count} events",
+                metadata={"event_count": count},
+            )
+        # Additive keys: `changed` lets the page skip a reload when Google had nothing new.
+        return Response({"detail": "Sync complete.", "event_count": count, "changed": changed})
 
 
 class GoogleActionItemsPushView(APIView):
@@ -800,20 +875,7 @@ class GoogleActionItemsPushView(APIView):
         import time as _time
         from googleapiclient.errors import HttpError as _HttpError
 
-        def _gcal_execute_with_retry(request_obj, label=""):
-            """Execute a Google Calendar API request with exponential backoff on 429."""
-            delay = 1
-            for attempt in range(5):
-                try:
-                    return request_obj.execute()
-                except _HttpError as exc:
-                    if exc.status_code == 429 and attempt < 4:
-                        logger.warning("Google Calendar rate limited (429) for %s; retrying in %ds", label, delay)
-                        _time.sleep(delay)
-                        delay = min(delay * 2, 16)
-                    else:
-                        raise
-            return None  # unreachable
+        from .google_api import execute_with_retry as _gcal_execute_with_retry
 
         results = []
         for idx, item in enumerate(items):
@@ -886,25 +948,21 @@ class GoogleActionItemsPushView(APIView):
                 if existing_google_id:
                     # Try to update; if the event was deleted from Google, fall through to create
                     try:
-                        updated = _gcal_execute_with_retry(
-                            service.events().update(
-                                calendarId="primary",
-                                eventId=existing_google_id,
-                                body=event_body,
-                            ),
-                            label=airtable_id,
+                        from .google_calendar_gateway import write_guestless
+
+                        updated = write_guestless(
+                            service, "update", request.user, body=event_body,
+                            google_event_id=existing_google_id, source="actionitem.push",
                         )
                         results.append({"airtableId": airtable_id, "start": item.get("start"), "googleEventId": updated["id"]})
                         continue
                     except Exception:
                         logger.warning("Google event %s not found for action item %s — will create a new one", existing_google_id, airtable_id)
                 # Create new event (either no existing ID, or update failed above)
-                created = _gcal_execute_with_retry(
-                    service.events().insert(
-                        calendarId="primary",
-                        body=event_body,
-                    ),
-                    label=airtable_id,
+                from .google_calendar_gateway import write_guestless
+
+                created = write_guestless(
+                    service, "insert", request.user, body=event_body, source="actionitem.push",
                 )
                 results.append({"airtableId": airtable_id, "start": item.get("start"), "googleEventId": created["id"]})
             except Exception:
@@ -914,12 +972,13 @@ class GoogleActionItemsPushView(APIView):
         return Response({"results": results})
 
 
+# gmail.send removed: no code sends mail, and the permission would let a bug email from the
+# user's address. gmail.modify covers threads/history/watch/labels and the one label write.
 GMAIL_SCOPES = [
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile",
     "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/gmail.send",
 ]
 
 
@@ -1362,9 +1421,14 @@ class MeetingNotesFromEmailView(APIView):
                 return default
             return max(1, min(value, ceiling))
 
-        days = _int_param("days", DEFAULT_LOOKBACK_DAYS, 180)
+        # `auto` is the background poll: a short recent window, no Gmail labelling.
+        auto = request.data.get("auto") is True
+        from .meeting_notes import AUTO_LOOKBACK_DAYS, AUTO_MAX_SUMMARIES, notify_notes_added
+        days = _int_param("days", AUTO_LOOKBACK_DAYS if auto else DEFAULT_LOOKBACK_DAYS, 180)
         max_emails = _int_param("max_emails", MAX_EMAILS, MAX_EMAILS)
-        max_summaries = _int_param("max_summaries", MAX_SUMMARIES, MAX_SUMMARIES)
+        max_summaries = _int_param(
+            "max_summaries", AUTO_MAX_SUMMARIES if auto else MAX_SUMMARIES, MAX_SUMMARIES
+        )
         account_name = (request.data.get("account_name") or "").strip()
         account = str(request.data.get("account") or "").strip()
 
@@ -1388,6 +1452,14 @@ class MeetingNotesFromEmailView(APIView):
                 {"detail": "Could not read Gmail. Check the connection in Settings."},
                 status=status.HTTP_502_BAD_GATEWAY,
             )
+
+        try:
+            notify_notes_added(request.user, report)
+        except Exception:
+            logger.exception("Could not record meeting-notes notifications")
+
+        if auto:
+            return Response(report)
 
         # ── Apply "Agent PM - Account Meeting Notes" label to synced emails ──────
         from integrations.gmail_watch_utils import (
@@ -1454,6 +1526,17 @@ class IntegrationDisconnectView(APIView):
 
 
 SLACK_SCOPES = "channels:history,channels:read,groups:history,groups:read,im:history,im:read,mpim:history,mpim:read,reactions:read,users:read,users.profile:read"
+
+
+class SlackConversationsView(APIView):
+    """GET /integrations/slack/conversations/?q= — channels/DMs for skill context pickers."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from .slack_channels import list_conversations
+
+        return Response(list_conversations(request.user, request.query_params.get("q", "")))
 
 
 class SlackOAuthInitView(APIView):
@@ -2480,12 +2563,24 @@ class ScraperStatusView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
+        atlassian = settings.ATLASSIAN_API_TOKEN
+        gong = settings.GONG_ACCESS_KEY
+        notion = settings.NOTION_INTEGRATION_TOKEN
         return Response({
-            "confluence": bool(settings.ATLASSIAN_API_TOKEN),
-            "jira": bool(settings.ATLASSIAN_API_TOKEN),
+            "confluence": bool(atlassian),
+            "jira": bool(atlassian),
             "zendesk": self._has_zendesk_admin_cred(),
-            "gong": bool(settings.GONG_ACCESS_KEY),
-            "notion": bool(settings.NOTION_INTEGRATION_TOKEN),
+            "gong": bool(gong),
+            "notion": bool(notion),
+            # Additive: a masked hint per configured token (last 4 chars only), so the page
+            # can confirm *which* token is set without the value ever reaching the browser.
+            "hints": {
+                "confluence": mask_secret(atlassian),
+                "jira": mask_secret(atlassian),
+                "zendesk": "",
+                "gong": mask_secret(gong),
+                "notion": mask_secret(notion),
+            },
         })
 
     @staticmethod
@@ -2677,3 +2772,119 @@ class ZendeskAdminCallbackView(APIView):
             "<script>setTimeout(() => window.close(), 2000)</script>"
         )
 
+
+
+
+def mask_secret(value) -> str:
+    """`"••••••••3f9a"` for a configured secret, `""` when unset.
+
+    Shows at most the last 4 characters, and none at all for short values (a 6-char secret
+    would give away two-thirds of itself). Never returns any other part of the value.
+    """
+    value = (value or "").strip() if isinstance(value, str) else ""
+    if not value:
+        return ""
+    tail = value[-4:] if len(value) >= 12 else ""
+    return "••••••••" + tail
+
+
+# Providers with a working connect flow in this deployment. Everything else on the
+# Settings page is "not configured yet" and gets the vote modal instead of a dead link.
+def _configured_providers() -> dict[str, bool]:
+    return {
+        "google": bool(settings.GOOGLE_CLIENT_ID and settings.GOOGLE_CLIENT_SECRET),
+        "gmail": bool(settings.GOOGLE_CLIENT_ID and settings.GOOGLE_CLIENT_SECRET),
+        "google_drive": bool(settings.GOOGLE_CLIENT_ID and settings.GOOGLE_CLIENT_SECRET),
+        "slack": bool(getattr(settings, "SLACK_CLIENT_ID", "") and getattr(settings, "SLACK_CLIENT_SECRET", "")),
+        "airtable": bool(getattr(settings, "AIRTABLE_API_KEY", "")),
+        "salesforce": bool(getattr(settings, "SALESFORCE_CLIENT_ID", "")),
+        "github": bool(getattr(settings, "GITHUB_CLIENT_ID", "") and getattr(settings, "GITHUB_CLIENT_SECRET", "")),
+        "notion": bool(getattr(settings, "NOTION_CLIENT_ID", "") and getattr(settings, "NOTION_CLIENT_SECRET", "")),
+        "microsoft": bool(getattr(settings, "MICROSOFT_CLIENT_ID", "") and getattr(settings, "MICROSOFT_CLIENT_SECRET", "")),
+        # No connect view exists for these yet.
+        "gong": False,
+        "zoom": False,
+        "lucidchart": False,
+    }
+
+
+class IntegrationAvailabilityView(APIView):
+    """GET /integrations/availability/ — which providers can be connected, plus the
+    caller's own votes and the YES tally for each not-yet-configured one."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from django.db.models import Count, Q
+
+        from .models import IntegrationVote
+
+        configured = _configured_providers()
+        mine = dict(IntegrationVote.objects.filter(user=request.user).values_list("provider", "vote"))
+        tallies = {
+            row["provider"]: row["yes"]
+            for row in IntegrationVote.objects.values("provider").annotate(yes=Count("pk", filter=Q(vote="yes")))
+        }
+        return Response({
+            "providers": {
+                p: {"configured": ok, "my_vote": mine.get(p), "yes_votes": tallies.get(p, 0)}
+                for p, ok in configured.items()
+            },
+        })
+
+
+class IntegrationVoteView(APIView):
+    """POST /integrations/votes/ {provider, vote: "yes" | "not_now"} — record (or change) a vote."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from .models import IntegrationVote
+
+        provider = str(request.data.get("provider") or "").strip()
+        vote = str(request.data.get("vote") or "").strip()
+        configured = _configured_providers()
+        if provider not in configured:
+            return Response({"provider": "Unknown integration."}, status=400)
+        if configured[provider]:
+            return Response({"provider": "That integration is already available — connect it instead."}, status=400)
+        if vote not in dict(IntegrationVote.VOTE_CHOICES):
+            return Response({"vote": 'Must be "yes" or "not_now".'}, status=400)
+        IntegrationVote.objects.update_or_create(user=request.user, provider=provider, defaults={"vote": vote})
+        return Response({"provider": provider, "vote": vote}, status=200)
+
+
+
+class GoogleCalendarWebhookView(APIView):
+    """POST /integrations/google/calendar-webhook/ — Google Calendar push notifications.
+
+    Unauthenticated by necessity (Google calls it), so the caller is identified only by the
+    channel id *and* the secret token we registered with that channel; anything else is
+    ignored. Google sends no event data — just "something changed" — so we queue a sync for
+    that user and answer immediately (Google retries slow or failing endpoints).
+    """
+
+    authentication_classes = []
+    permission_classes = []
+    throttle_classes = []
+
+    def post(self, request):
+        from .calendar_sync import user_for_channel
+
+        state = request.headers.get("X-Goog-Resource-State", "")
+        user = user_for_channel(
+            request.headers.get("X-Goog-Channel-ID", ""),
+            request.headers.get("X-Goog-Channel-Token", ""),
+        )
+        if user is None:
+            return Response(status=status.HTTP_200_OK)  # unknown/stale channel: ack, do nothing
+        if state == "sync":
+            return Response(status=status.HTTP_200_OK)  # the handshake sent on registration
+        from .tasks import sync_google_calendar_for_user
+        try:
+            sync_google_calendar_for_user.delay(user.pk, "webhook")
+        except Exception:
+            # No broker reachable: run inline rather than drop the change.
+            logger.warning("Celery unavailable — syncing calendar inline for webhook")
+            sync_google_calendar_for_user(user.pk, "webhook")
+        return Response(status=status.HTTP_200_OK)

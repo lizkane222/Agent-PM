@@ -53,6 +53,20 @@ export default function GlobalSearch({ pageContext = "" }: Props) {
   const navigate = useNavigate();
   const { toggleItem, isSelected: isExportSelected, exportMode, toggleMode } = useExport();
 
+  /**
+   * Put every selected result in the export tray, skipping ones already there. `toggleItem`
+   * removes an item that is present, so the `isExportSelected` guard is what keeps this from
+   * un-adding anything. Opens the tray if it was closed so the user can see what landed.
+   */
+  function addSelectedToTray() {
+    const toAdd = results.filter((r) => selected.has(resultKey(r)));
+    if (!exportMode) toggleMode();
+    toAdd.forEach((r) => {
+      const item = searchResultToExportItem(r);
+      if (!isExportSelected(item.id)) toggleItem(item);
+    });
+  }
+
   const debouncedQuery = useDebounce(query, 220);
 
   // Open on Cmd+K / Ctrl+K
@@ -386,28 +400,36 @@ export default function GlobalSearch({ pageContext = "" }: Props) {
                 Send
               </button>
               {selected.size > 0 && (
-                <button
-                  title="Add selected items to Layouts export tray and go to Layouts"
-                  onClick={() => {
-                    // Add all selected results to the export context
-                    const toAdd = results.filter((r) => selected.has(resultKey(r)));
-                    if (!exportMode) toggleMode();
-                    toAdd.forEach((r) => {
-                      const item = searchResultToExportItem(r);
-                      if (!isExportSelected(item.id)) toggleItem(item);
-                    });
-                    setOpen(false);
-                    navigate("/edit-preview");
-                  }}
-                  className="px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors"
-                  style={{
-                    background: "rgba(226,35,26,0.08)",
-                    borderColor: "var(--twilio-red, #DB131A)",
-                    color: "var(--twilio-red, #DB131A)",
-                  }}
-                >
-                  Export to Layouts →
-                </button>
+                <>
+                  <button
+                    title="Put every selected item in the export tray so you can drag them into a working session"
+                    onClick={() => { addSelectedToTray(); setSelected(new Set()); setOpen(false); }}
+                    className="px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors"
+                    style={{
+                      background: "rgba(2,99,224,0.08)",
+                      borderColor: "#0263E0",
+                      color: "#0263E0",
+                    }}
+                  >
+                    Add {selected.size} to export tray
+                  </button>
+                  <button
+                    title="Add selected items to Layouts export tray and go to Layouts"
+                    onClick={() => {
+                      addSelectedToTray();
+                      setOpen(false);
+                      navigate("/edit-preview");
+                    }}
+                    className="px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors"
+                    style={{
+                      background: "rgba(226,35,26,0.08)",
+                      borderColor: "var(--twilio-red, #DB131A)",
+                      color: "var(--twilio-red, #DB131A)",
+                    }}
+                  >
+                    Export to Layouts →
+                  </button>
+                </>
               )}
             </div>
           </div>

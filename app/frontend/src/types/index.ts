@@ -12,7 +12,7 @@ export interface AuthUser {
 }
 
 // ── Agent (moved to types/agents.ts — re-exported here for backwards compat) ────
-export type { SessionParticipant, AgentSession, AgentMessage, ToolCall, AgentSkill, AgentSkillStatus, AgentSkillVisibility, AgentSkillScript } from "./agents";
+export type { SessionParticipant, AgentSession, AgentMessage, ToolCall, AgentSkill, AgentSkillStatus, AgentSkillVisibility, AgentSkillScript, AgentTool, SkillContextRecord, SlackSource, SkillContextDefaults, SkillTemplate, AgentSkillAttachment, SkillRunInput, SkillRunResult, KeywordTemplate, KeywordExpansion, SlackConversations } from "./agents";
 
 // ── Scheduler (moved to types/scheduler.ts — re-exported here for backwards compat) ────
 export type { Reminder, ReminderStatus, ReminderResourceType, CalendarEvent, MeetingNote, Attendee } from "./scheduler";
@@ -53,7 +53,11 @@ export interface Task {
 }
 
 // ── Team (moved to types/team.ts — re-exported here for backwards compat) ────
-export type { Tag, TeamMember, TeamMemberDocument, UserProfile } from "./team";
+export type {
+  Tag, TeamMember, TeamMemberDocument, UserProfile,
+  AppNotification, NotificationChannel, PublicItem, PublicItemType, PublicItemRef,
+  MemberPublicProfile, LeftNote,
+} from "./team";
 
 // ── Realtime ──────────────────────────────────────────────────────────────────
 
@@ -188,6 +192,8 @@ export interface SalesforceTimeEntry {
   sf_id: string;
   project: number | null;
   project_name: string;
+  /** Cloud Coach account of the project; blank when the project has none. */
+  account_name: string;
   task: number | null;
   task_subject: string;
   date: string;
@@ -271,6 +277,8 @@ export interface AirtableActionItem {
   due_date: string | null;
   estimated_time: number;
   time_spent: number;
+  /** Seconds added by Live Tracking only; also included in time_spent. */
+  tracked_time?: number;
   prep_time: number;
   slack_thread_url: string;
   salesforce_task_id: string;

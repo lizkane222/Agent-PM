@@ -374,6 +374,78 @@ describe("AccountDetailPage — Project Goals", () => {
   });
 });
 
+describe("AccountDetailPage — kanban scroll cap, search and full-screen view", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    localStorage.clear();
+    registerHandlers();
+  });
+
+  it("caps each populated column's card list so it scrolls instead of growing", async () => {
+    await renderPage();
+    const section = await getSection();
+    await waitFor(() => within(section).getByText("Alice task"));
+    const scrollers = section.querySelectorAll('[data-testid^="kanban-col-scroll-"]');
+    expect(scrollers.length).toBeGreaterThan(0);
+    scrollers.forEach((el) => {
+      expect((el as HTMLElement).style.maxHeight).toBe("480px");
+      expect((el as HTMLElement).className).toContain("overflow-y-auto");
+    });
+  });
+
+  it("search narrows the kanban to matching items", async () => {
+    await renderPage();
+    const section = await getSection();
+    await waitFor(() => within(section).getByText("Alice task"));
+    fireEvent.change(within(section).getByTestId("kanban-search"), { target: { value: "bob" } });
+    expect(within(section).getByText("Bob task")).toBeInTheDocument();
+    expect(within(section).queryByText("Alice task")).not.toBeInTheDocument();
+  });
+
+  it("double-clicking the section's own chrome opens the full-screen view on All", async () => {
+    await renderPage();
+    const section = await getSection();
+    await waitFor(() => within(section).getByText("Alice task"));
+    fireEvent.doubleClick(within(section).getByText(/drag to goals or timeline/));
+    const modal = await screen.findByTestId("kanban-fullscreen-modal");
+    expect(within(modal).getByTestId("kanban-modal-grid")).toBeInTheDocument();
+    expect(within(modal).getByText("Alice task")).toBeInTheDocument();
+    expect(within(modal).getByText("Bob task")).toBeInTheDocument();
+  });
+
+  it("double-clicking a status column opens the modal on that tab, and tabs switch sections", async () => {
+    await renderPage();
+    const section = await getSection();
+    await waitFor(() => within(section).getByText("Alice task"));
+    const header = within(section).getAllByText("In Progress")[0];
+    fireEvent.doubleClick(header);
+    const modal = await screen.findByTestId("kanban-fullscreen-modal");
+    expect(within(modal).getByTestId("kanban-modal-tab-In Progress").className).toContain("bg-indigo-600");
+    fireEvent.click(within(modal).getByTestId("kanban-modal-tab-all"));
+    expect(within(modal).getByTestId("kanban-modal-tab-all").className).toContain("bg-indigo-600");
+  });
+
+  it("the modal's search filters its grid and shares state with the section search", async () => {
+    await renderPage();
+    const section = await getSection();
+    await waitFor(() => within(section).getByText("Alice task"));
+    fireEvent.doubleClick(within(section).getByText(/drag to goals or timeline/));
+    const modal = await screen.findByTestId("kanban-fullscreen-modal");
+    fireEvent.change(within(modal).getByTestId("kanban-modal-search"), { target: { value: "zzz-no-match" } });
+    expect(within(modal).getByText("No action items match your search.")).toBeInTheDocument();
+    expect((within(section).getByTestId("kanban-search") as HTMLInputElement).value).toBe("zzz-no-match");
+  });
+
+  it("closes the full-screen view", async () => {
+    await renderPage();
+    const section = await getSection();
+    await waitFor(() => within(section).getByText("Alice task"));
+    fireEvent.doubleClick(within(section).getByText(/drag to goals or timeline/));
+    fireEvent.click(await screen.findByLabelText("Close"));
+    expect(screen.queryByTestId("kanban-fullscreen-modal")).not.toBeInTheDocument();
+  });
+});
+
 describe("AccountDetailPage — kanban views", () => {
   beforeEach(() => {
     vi.resetModules();

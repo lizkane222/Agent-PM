@@ -112,6 +112,17 @@ class ToolDispatchTest(TestCase):
     # `tool`, not `name`: find_cloud_coach_project takes a `name` argument of its own, and
     # a positional-or-keyword clash here reads as a confusing TypeError from asgiref.
     async def _dispatch(self, tool, **args):
+        # `log_time_week` writes timesheets into Salesforce on the user's behalf, so it needs the
+        # user's explicit approval on every surface (agents.tool_policy.CONFIRM_REQUIRED). These
+        # tests exercise what the tool DOES once approved, so they dispatch as a user who said
+        # yes; the refusal without approval is tested separately in test_an_unapproved_*.
+        from agents import tool_policy
+
+        approved = tool in tool_policy.CONFIRM_REQUIRED
+        with mock.patch("salesforce_sync.client.get_client", return_value=self.sf):
+            return await mcp_server.dispatch(tool, args, user=self.user, confirmed=approved)
+
+    async def _dispatch_unapproved(self, tool, **args):
         with mock.patch("salesforce_sync.client.get_client", return_value=self.sf):
             return await mcp_server.dispatch(tool, args, user=self.user)
 
@@ -160,7 +171,7 @@ class ToolDispatchTest(TestCase):
     async def test_preview_without_a_user_is_not_authorized(self):
         result = await self._dispatch_anon("preview_time_log_week")
 
-        self.assertEqual(result["message"], "Not authorized for this record")
+        self.assertEqual(result["error_code"], "not_authenticated")
 
     # ── writing ──────────────────────────────────────────────────────────────
     #
@@ -179,6 +190,18 @@ class ToolDispatchTest(TestCase):
         self.assertEqual(self.sf.composite_call_count, 1)
         self.assertEqual(await self._acount_entries(), 1)
 
+    async def test_an_unapproved_call_writes_nothing_to_salesforce(self):
+        # The governance rule: nothing that acts on another system on the user's behalf runs
+        # without their explicit approval. An unapproved call must be refused BEFORE any write.
+        await self._acreate_event(minutes=90)
+
+        result = await self._dispatch_unapproved("log_time_week", week_start="2026-08-31")
+
+        self.assertEqual(result["error_code"], "confirmation_required")
+        self.assertTrue(result["confirmation_token"])
+        self.assertEqual(self.sf.composite_call_count, 0)
+        self.assertEqual(await self._acount_entries(), 0)
+
     async def test_an_empty_week_writes_nothing(self):
         result = await self._dispatch("log_time_week", week_start="2026-08-31")
 
@@ -193,8 +216,10 @@ class ToolDispatchTest(TestCase):
             "salesforce_sync.client.get_client",
             side_effect=PermissionError("nope"),
         ):
+            # confirmed=True: this test is about how an APPROVED call fails; without approval
+            # the tool is refused before it ever reaches Salesforce.
             result = await mcp_server.dispatch(
-                "log_time_week", {"week_start": "2026-08-31"}, user=self.user,
+                "log_time_week", {"week_start": "2026-08-31"}, user=self.user, confirmed=True,
             )
 
         self.assertEqual(result["status"], "error")
@@ -207,8 +232,10 @@ class ToolDispatchTest(TestCase):
         ]})
 
         with mock.patch("salesforce_sync.client.get_client", return_value=sf):
+            # confirmed=True: this test is about how an APPROVED call fails; without approval
+            # the tool is refused before it ever reaches Salesforce.
             result = await mcp_server.dispatch(
-                "log_time_week", {"week_start": "2026-08-31"}, user=self.user,
+                "log_time_week", {"week_start": "2026-08-31"}, user=self.user, confirmed=True,
             )
 
         self.assertEqual(result["status"], "error")
@@ -217,7 +244,7 @@ class ToolDispatchTest(TestCase):
     async def test_log_without_a_user_is_not_authorized(self):
         result = await self._dispatch_anon("log_time_week")
 
-        self.assertEqual(result["message"], "Not authorized for this record")
+        self.assertEqual(result["error_code"], "not_authenticated")
 
     # ── find a project by name ───────────────────────────────────────────────
 
@@ -287,7 +314,7 @@ class ToolDispatchTest(TestCase):
     async def test_lookup_without_a_user_is_not_authorized(self):
         result = await self._dispatch_anon("find_cloud_coach_project", name="acme")
 
-        self.assertEqual(result["message"], "Not authorized for this record")
+        self.assertEqual(result["error_code"], "not_authenticated")
 
     # ── async ORM helpers ────────────────────────────────────────────────────
 

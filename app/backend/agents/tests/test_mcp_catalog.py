@@ -17,23 +17,35 @@ from django.test import SimpleTestCase
 
 from agents.mcp_server import GROUP_LABELS, GROUP_ORDER, MCPServer, mcp_server
 
-# The curated 13 that skills/views.py has always allowed. Deliberately NOT all
-# registered tools: deriving "everything" would silently let a skill author wire up
-# outbound SMS or phone calls, which is a policy change, not a refactor.
+# Tools a saved workflow may use. Deliberately NOT all registered tools: deriving
+# "everything" would silently let a skill author wire up deletes, outbound SMS / calls /
+# invites, or Cloud Coach writes, which is a policy change, not a refactor. Every entry is
+# create/read/update only and runs through the app's own REST permissions.
+#
+# 2026-10-19: deletes removed (they need the user's explicit approval, which a saved
+# workflow cannot give); delete_meeting removed entirely; the record_tools set added.
 EXPECTED_SKILL_SAFE = {
-    "add_account_note",
-    "create_action_item",
-    "create_calendar_event",
-    "delete_action_item",
-    "delete_calendar_event",
-    "delete_meeting",
-    "get_airtable_records",
-    "get_meeting_notes_from_email",
-    "search_records",
-    "update_account",
-    "update_action_item",
-    "update_calendar_event",
-    "update_meeting",
+    # Original curated set, minus the deletes.
+    "add_account_note", "create_action_item", "create_calendar_event", "get_airtable_records",
+    "get_meeting_notes_from_email", "search_records", "update_account", "update_action_item",
+    "update_calendar_event", "update_meeting",
+    # agents/record_tools.py
+    "list_reminders", "create_reminder", "update_reminder",
+    "list_account_notes", "update_account_note",
+    "list_quick_links", "create_quick_link", "update_quick_link",
+    "list_artifacts", "create_artifact", "update_artifact",
+    "list_customer_contacts", "create_customer_contact", "update_customer_contact",
+    "add_contact_note", "update_contact_note",
+    "list_projects", "create_project", "update_project", "list_project_members",
+    "list_action_item_steps", "create_action_item_step", "update_action_item_step",
+    "add_action_item_dependency", "attach_link_to_action_item",
+    "list_meeting_notes", "add_meeting_note", "update_meeting_note",
+    "list_comments", "add_comment", "update_comment",
+    "list_tasks", "create_task", "update_task",
+    "list_feedback", "submit_feedback", "add_feedback_comment",
+    "list_working_sessions", "create_working_session", "rename_working_session",
+    "get_page_notes", "set_page_notes",
+    "list_team_members",
 }
 
 
@@ -75,6 +87,13 @@ class GroupedCatalogTests(SimpleTestCase):
 class SkillSafeToolsTests(SimpleTestCase):
     def test_skill_safe_tools_is_exactly_todays_catalog(self):
         self.assertEqual(set(mcp_server.skill_safe_tools()), EXPECTED_SKILL_SAFE)
+
+    def test_delete_tools_are_not_skill_safe(self):
+        """A saved workflow must never be able to delete; deletes need the user's approval."""
+        safe = set(mcp_server.skill_safe_tools())
+        for name in mcp_server.list_tools():
+            if mcp_server._meta[name]["group"] == "delete":
+                self.assertNotIn(name, safe, name)
 
     def test_outbound_communication_tools_are_not_skill_safe(self):
         safe = set(mcp_server.skill_safe_tools())

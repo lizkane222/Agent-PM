@@ -22,6 +22,9 @@ from .serializers import (
 )
 from .sync import publish_activity_event
 from .voice_identity import (
+    LAUNCH_BROWSER_PARAM,
+    LAUNCH_PARAM,
+    mint_launch_token,
     IDENTITY_PARAM,
     mint_identity_token,
     resolve_user_sync,
@@ -34,6 +37,7 @@ from rest_framework.decorators import action
 
 # Cap for the shared per-record feed; one card never needs more than this.
 RESOURCE_ACTIVITY_LIMIT = 200
+EVENT_UPDATES_LIMIT = 300
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +232,10 @@ class VoiceTwiMLView(TwilioSignatureRequiredMixin, APIView):
                 name=IDENTITY_PARAM,
                 value=mint_identity_token(user.pk, call_sid),
             )
+            # "Use in Voice": forward the browser's launch key only if it is the caller's own.
+            ctx_key = (request.data.get(LAUNCH_BROWSER_PARAM) or "").strip()
+            if ctx_key and _launch_key_belongs_to(user, ctx_key):
+                relay.parameter(name=LAUNCH_PARAM, value=mint_launch_token(ctx_key, call_sid))
         else:
             # No error and no 500 — Twilio must receive valid TwiML. The consumer
             # detects the absent parameter on setup and ends the call with a spoken
@@ -239,6 +247,12 @@ class VoiceTwiMLView(TwilioSignatureRequiredMixin, APIView):
             )
         response.append(connect)
         return HttpResponse(str(response), content_type="application/xml")
+
+
+def _launch_key_belongs_to(user, key: str) -> bool:
+    from skills.models import VoiceLaunchContext
+
+    return VoiceLaunchContext.objects.filter(key=key, user=user).exists()
 
 
 class VoiceStatusCallbackView(TwilioSignatureRequiredMixin, APIView):
@@ -320,6 +334,10 @@ class VoiceSessionViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
+        from core.mixins import admin_wants_all
+        if admin_wants_all(self.request):
+            # Includes sessions with no linked user (inbound PSTN calls never resolve one).
+            return VoiceSession.objects.all().order_by("-started_at")
         return VoiceSession.objects.filter(user=self.request.user)
 
 
@@ -341,6 +359,23 @@ class AgentActivityEventViewSet(viewsets.ModelViewSet):
             if AgentActivityEvent.objects.filter(user=self.request.user, client_id=client_id).exists():
                 return
         serializer.save(user=self.request.user)
+
+    @action(detail=False, methods=["get"], url_path="event-updates")
+    def event_updates(self, request):
+        """GET /realtime/activity/event-updates/ — what happened to the caller's calendar events.
+
+        Created, edited, deleted, attendance, time logged and Gong/Zoom notes added,
+        newest first. This is a history of *changes*; it never lists events that merely
+        exist, so a far-future event nobody touched has no place here. Owner-scoped.
+        """
+        from scheduler.event_log import EVENT_UPDATE_TYPES
+
+        events = (
+            AgentActivityEvent.objects
+            .filter(user=request.user, event_type__in=EVENT_UPDATE_TYPES)
+            .order_by("-created_at")[:EVENT_UPDATES_LIMIT]
+        )
+        return Response({"results": AgentActivityEventSerializer(events, many=True).data})
 
     @action(detail=False, methods=["get"], url_path="for-resource")
     def for_resource(self, request):

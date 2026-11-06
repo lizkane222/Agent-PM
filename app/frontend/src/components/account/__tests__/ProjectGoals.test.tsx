@@ -168,6 +168,26 @@ describe("ProjectGoals — single-owner move (project vs. nested goal)", () => {
   });
 });
 
+describe("ProjectGoals — horizontal goal layout", () => {
+  it("lays a project's goals out in a wrapping row, each goal its own column", () => {
+    const project = baseGoal({ id: "1", kind: "project", goalIds: ["10", "11", "12"] });
+    const goals = ["10", "11", "12"].map((id) => baseGoal({ id, kind: "goal", name: `Goal ${id}` }));
+    renderBoard({ goals: [project, ...goals], actionItems: [] });
+
+    const row = screen.getByTestId("goal-row-10").parentElement!;
+    expect(row.className).toContain("flex-row");
+    expect(row.className).toContain("flex-wrap");
+    expect(row).toContainElement(screen.getByTestId("goal-row-12"));
+    // Widened to fit the goals side by side, not the old fixed 268px column.
+    expect(screen.getByTestId("project-row-1").style.width).toContain("min(100%");
+  });
+
+  it("keeps a project with no goals at the original compact width", () => {
+    renderBoard({ goals: [baseGoal({ id: "1", kind: "project" })], actionItems: [] });
+    expect(screen.getByTestId("project-row-1").style.width).toBe("268px");
+  });
+});
+
 describe("ProjectGoals — resource drag reassignment", () => {
   it("moving a resource from a goal onto its parent project removes it from the goal", () => {
     const project = baseGoal({ id: "1", kind: "project", goalIds: ["10"] });

@@ -506,6 +506,11 @@ class AirtableActionItemViewSet(viewsets.ModelViewSet):
         status_filter = self.request.query_params.get("status")
         if status_filter:
             qs = qs.filter(status__in=status_filter.split(","))
+        # ?airtable_id=recA,recB — direct lookup, so a caller needing one item (the calendar
+        # panel) doesn't download the whole list and filter it client-side.
+        airtable_ids = csv_params(self.request.query_params.get("airtable_id"))
+        if airtable_ids:
+            qs = qs.filter(airtable_id__in=airtable_ids)
         return _exclude_private_admin_items(qs, self.request.user)
 
     def check_object_permissions(self, request, obj):
@@ -610,11 +615,16 @@ class AirtableActionItemViewSet(viewsets.ModelViewSet):
         elif new_status != "Done" and old_status == "Done":
             extra["marked_done_at"] = None
         item = serializer.save(**extra)
+        pushed = False
         try:
             from .write_back import push_action_item_update
-            push_action_item_update(item)
+            pushed = push_action_item_update(item)
         except Exception:
             logger.exception("Airtable write-through failed for action item update '%s'", item.task)
+        if new_status != old_status:
+            from .write_back import status_fits_airtable
+            item.status_locally_modified = (not pushed) or (not status_fits_airtable(item.status))
+            item.save(update_fields=["status_locally_modified"])
         from .sync import mirror_action_item_to_scheduler
         mirror_action_item_to_scheduler(item)
 
@@ -907,11 +917,6 @@ def update_action_item_status(request, airtable_id):
     if not _can_write_action_item(request.user, item):
         return Response({"error": ACTION_ITEM_WRITE_DENIED}, status=status.HTTP_403_FORBIDDEN)
 
-    STATUS_TO_AT = {
-        "Open": "Not Started", "In Progress": "In Progress",
-        "Done": "Done", "Blocked": "Blocked",
-    }
-
     from django.utils import timezone as tz
     old_status = item.status
     item.status = new_status
@@ -925,11 +930,12 @@ def update_action_item_status(request, airtable_id):
     item.save(update_fields=update_fields)
 
     # Push to Airtable best-effort — local save already committed above.
-    try:
-        table = get_table(TABLE_ACTION_ITEMS)
-        table.update(airtable_id, {"Status": STATUS_TO_AT.get(new_status, new_status)})
-    except Exception:
-        logger.exception("Failed to sync action item status to Airtable: %s", airtable_id)
+    # Airtable's option is "Completed" (not "Done") and it has no "Backlogged" at all. A status
+    # that does not reach Airtable is marked locally modified so the next pull cannot revert it.
+    from .write_back import push_action_item_status, status_fits_airtable
+    pushed = push_action_item_status(item)
+    item.status_locally_modified = (not pushed) or (not status_fits_airtable(new_status))
+    item.save(update_fields=["status_locally_modified"])
 
     from .sync import mirror_action_item_to_scheduler
     mirror_action_item_to_scheduler(item)
@@ -961,6 +967,8 @@ def update_action_item_fields(request, airtable_id):
         "estimated_time": "Estimated Time",
         "time_spent": "Time Spent",
         "slack_thread_url": "Slack Thread URL",
+        # Local-only (no Airtable column): a manual correction of the Live Tracking total.
+        "tracked_time": None,
     }
     airtable_payload = {}
     local_fields = []
@@ -981,10 +989,7 @@ def update_action_item_fields(request, airtable_id):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    STATUS_TO_AT = {
-        "Open": "Not Started", "In Progress": "In Progress",
-        "Done": "Done", "Blocked": "Blocked",
-    }
+    from .write_back import airtable_status_for as _at_status
     PRIORITY_TO_AT = {"Critical": "Urgent", "High": "High", "Medium": "Medium", "Low": "Low"}
 
     for field, at_field in FIELD_MAP.items():
@@ -992,8 +997,10 @@ def update_action_item_fields(request, airtable_id):
             val = request.data[field]
             setattr(item, field, val)
             local_fields.append(field)
+            if at_field is None:
+                continue
             if field == "status":
-                airtable_payload[at_field] = STATUS_TO_AT.get(val, val)
+                airtable_payload[at_field] = _at_status(val)
             elif field == "priority":
                 airtable_payload[at_field] = PRIORITY_TO_AT.get(val, val)
             else:
@@ -1040,6 +1047,9 @@ def update_action_item_fields(request, airtable_id):
     # Assignee is a collaborator field — send {"id": "usrXXX"} to Airtable.
     if "assignee_airtable_id" in request.data:
         collab_id = request.data["assignee_airtable_id"] or None
+        from .assignment import ASSIGN_DENIED, can_assign
+        if not can_assign(request.user, item.account, collab_id):
+            return Response({"error": ASSIGN_DENIED}, status=status.HTTP_403_FORBIDDEN)
         item.assignee_airtable_id = collab_id or ""
         local_fields.append("assignee_airtable_id")
         if "assignee_name" in request.data:
@@ -1063,12 +1073,18 @@ def update_action_item_fields(request, airtable_id):
         item.save(update_fields=local_fields)
 
     # Push to Airtable best-effort — a failure doesn't roll back the local save.
+    airtable_ok = True
     if airtable_payload:
         try:
             table = get_table(TABLE_ACTION_ITEMS)
             table.update(airtable_id, airtable_payload)
         except Exception:
+            airtable_ok = False
             logger.exception("Failed to sync action item fields to Airtable: %s", airtable_id)
+    if "status" in request.data:
+        from .write_back import status_fits_airtable
+        item.status_locally_modified = (not airtable_ok) or (not status_fits_airtable(item.status))
+        item.save(update_fields=["status_locally_modified"])
 
     from .sync import mirror_action_item_to_scheduler
     mirror_action_item_to_scheduler(item)
@@ -1280,3 +1296,78 @@ def trigger_sync(request):
         metadata=result,
     )
     return Response(result)
+
+
+
+# ── Live Tracking timers (server-side; see live_tracking.py) ─────────────────
+
+
+def _timer_item(request):
+    """Resolve + authorise the action item named in the body. Returns (item, error_response)."""
+    airtable_id = (request.data.get("airtable_id") or "").strip()
+    if not airtable_id or airtable_id.startswith("local-"):
+        return None, Response({"error": "airtable_id of a saved action item is required"}, status=status.HTTP_400_BAD_REQUEST)
+    item = AirtableActionItem.objects.select_related("account").filter(airtable_id=airtable_id).first()
+    if not item:
+        return None, Response({"error": "not found"}, status=status.HTTP_404_NOT_FOUND)
+    if not _can_write_action_item(request.user, item):
+        return None, Response({"error": ACTION_ITEM_WRITE_DENIED}, status=status.HTTP_403_FORBIDDEN)
+    return item, None
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def list_running_timers(request):
+    """The caller's running timers — what every tab/device renders as "tracking now"."""
+    from . import live_tracking
+    from .models import ActionItemTimeSession
+
+    rows = (
+        ActionItemTimeSession.objects
+        .filter(user=request.user, ended_at__isnull=True)
+        .select_related("action_item", "action_item__account")
+    )
+    return Response({"results": [live_tracking.serialize(r) for r in rows]})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def start_timer(request):
+    from . import live_tracking
+
+    item, err = _timer_item(request)
+    if err:
+        return err
+    session = live_tracking.start(request.user, item)
+    return Response({"session": live_tracking.serialize(session)}, status=status.HTTP_201_CREATED)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def stop_timer(request):
+    from . import live_tracking
+
+    item, err = _timer_item(request)
+    if err:
+        return err
+    session = live_tracking.stop(request.user, item)
+    if session is None:
+        return Response({"error": "no running timer for this item"}, status=status.HTTP_409_CONFLICT)
+    item.refresh_from_db()
+    return Response({
+        "session": live_tracking.serialize(session),
+        "item": AirtableActionItemSerializer(item, context={"request": request}).data,
+    })
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def cancel_timer(request):
+    from . import live_tracking
+
+    item, err = _timer_item(request)
+    if err:
+        return err
+    if not live_tracking.cancel(request.user, item):
+        return Response({"error": "no running timer for this item"}, status=status.HTTP_409_CONFLICT)
+    return Response(status=status.HTTP_204_NO_CONTENT)

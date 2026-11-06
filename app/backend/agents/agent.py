@@ -129,8 +129,9 @@ VAGUE REFERENCES — when the user says "that meeting where we discussed pricing
 TOOL USE — always call a tool when the user asks you to create, read, update, or delete a record. Never describe how they would do it themselves.
 
 CONFIRMATION BEFORE MUTATIONS:
-- DELETE or UPDATE: briefly confirm the specific record and the exact change with the user UNLESS they have already been explicit (e.g. "delete task 'Q3 report'" is explicit enough; "clean up my old tasks" is not — ask which ones first).
+- UPDATE: briefly confirm the specific record and the exact change with the user UNLESS they have already been explicit (e.g. "mark 'Q3 report' done" is explicit enough; "clean up my old tasks" is not — ask which ones first).
 - CREATE or ADD NOTE: proceed immediately, no confirmation needed.
+- DELETES, TEXTS AND PHONE CALLS ARE SERVER-GATED. Calling one returns error_code "confirmation_required" with a confirmation_token and the exact pending_arguments. Tell the user precisely what will happen (which record, which number, what message) and ask them to confirm. Only after they reply yes in a NEW message, call the same tool with the same arguments plus that confirmation_token. Never pass a token the user has not just approved, and never change the arguments between asking and confirming — the token is bound to them and will be rejected.
 
 NEVER INVENT DATA — if a required field (ID, name, date, etc.) is missing or ambiguous, ask the user rather than guessing.
 
@@ -147,7 +148,11 @@ HYPERLINKS — whenever you create, update, or reference a record, include a cli
 - Examples: [Update USER_STORIES.md](https://airtable.com/...) or [Q2 QBR with Acme](https://airtable.com/...)
 - If the tool response does NOT include a `url`, omit the link entirely — never invent one.
 
-ERRORS — if a tool returns an error, report it clearly and suggest a next step.
+ERRORS — tool errors come back as {"status": "error", "error_code", "message", "retryable", "retry_after"}. Report the message plainly and suggest a next step.
+- "rate_limited" / "upstream_rate_limited": say how long to wait (retry_after seconds). Do NOT retry in this turn.
+- "not_allowed_in_skill": the saved workflow cannot do that; tell the user to ask directly.
+- "invalid_arguments": fix the arguments and try once more, or ask the user for the missing detail.
+- Never claim an action succeeded unless the tool result says so.
 
 TONE — concise and natural. Match length to the user's message. Voice-friendly: short responses work better when the user is on a voice session.
 """
@@ -181,6 +186,12 @@ def build_system_prompt() -> str:
 # tests and the voice layer import it.
 SYSTEM_PROMPT = build_system_prompt()
 
+# The same system prompt as a cacheable block. The request prefix is tools -> system, and
+# both are identical on every round of every turn (~10K tokens with 70 tools), so one
+# breakpoint here lets every round after the first read them from the prompt cache instead
+# of paying for them again — up to 11 rounds per chat turn.
+SYSTEM_BLOCKS = [{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}]
+
 
 class AgentOrchestrator:
     """
@@ -201,6 +212,9 @@ class AgentOrchestrator:
         # caller on the token-usage sentinel.
         self.tier = TIER_DEFAULT
         self.model = model_for_tier(TIER_DEFAULT)
+        # The saved workflow active in this turn, if `load_skill` has run (see
+        # _dispatch_in_scope). One orchestrator handles one user turn.
+        self.skill_scope = None
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -307,7 +321,7 @@ class AgentOrchestrator:
             response = await self._client.messages.create(
                 model=self.model,
                 max_tokens=max_tokens_for_tier(self.tier, streaming=False),
-                system=SYSTEM_PROMPT,
+                system=SYSTEM_BLOCKS,
                 tools=turn_tools,
                 messages=messages,
                 stream=False,  # We handle streaming manually below after tool calls resolve.
@@ -393,7 +407,7 @@ class AgentOrchestrator:
         async with self._client.messages.stream(
             model=self.model,
             max_tokens=max_tokens_for_tier(self.tier, streaming=True),
-            system=SYSTEM_PROMPT,
+            system=SYSTEM_BLOCKS,
             tools=tools,
             messages=messages,
         ) as stream:
@@ -412,40 +426,64 @@ class AgentOrchestrator:
     async def _execute_tools(
         self, tool_use_blocks: list[Any], user=None
     ) -> list[dict]:
-        """Dispatch all tool_use blocks concurrently and return tool_result content."""
+        """
+        Dispatch all tool_use blocks concurrently and return tool_result content.
+
+        `mcp_server.dispatch` enforces every rule (auth, schema, skill scope,
+        confirmation, rate limit, timeout) and never raises: failures come back as the
+        standard ``{"status": "error", "error_code", ...}`` dict. So nothing here can put
+        exception text in front of the model or onto the user's activity feed.
+        """
 
         async def _call_one(block: Any) -> dict:
-            # Publish "tool_call" event to Sync feed before executing.
             if user:
                 await asyncio.get_running_loop().run_in_executor(
-                    None,
-                    lambda: _publish(user, "tool_call", block.name, str(block.input or {})),
+                    None, lambda: _publish(user, "tool_call", block.name, "")
                 )
             try:
-                result = await mcp_server.dispatch(block.name, block.input or {}, user=user)
-                result_str = json.dumps(result, default=str)
-                if user:
-                    await asyncio.get_running_loop().run_in_executor(
-                        None,
-                        lambda: _publish(user, "tool_result", block.name, result_str[:300]),
-                    )
-                return {
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": result_str,
-                }
-            except Exception as exc:
-                logger.exception("Tool '%s' raised an error: %s", block.name, exc)
-                if user:
-                    await asyncio.get_running_loop().run_in_executor(
-                        None,
-                        lambda: _publish(user, "error", block.name, str(exc)),
-                    )
-                return {
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "is_error": True,
-                    "content": str(exc),
-                }
+                result = await self._dispatch_in_scope(block.name, block.input or {}, user)
+            except Exception:  # noqa: BLE001 — defence in depth; dispatch should not raise
+                logger.exception("Tool '%s' raised past the dispatcher", block.name)
+                from .tool_policy import error_result
+
+                result = error_result("internal_error", "The tool failed unexpectedly.")
+            is_error = isinstance(result, dict) and result.get("status") == "error"
+            result_str = json.dumps(result, default=str)
+            if user:
+                summary = (
+                    f"error: {result.get('error_code', 'error')}" if is_error else result_str[:300]
+                )
+                await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    lambda: _publish(user, "error" if is_error else "tool_result", block.name, summary),
+                )
+            out = {"type": "tool_result", "tool_use_id": block.id, "content": result_str}
+            if is_error:
+                out["is_error"] = True
+            return out
 
         return await asyncio.gather(*[_call_one(b) for b in tool_use_blocks])
+
+    async def _dispatch_in_scope(self, name: str, arguments: dict, user) -> Any:
+        """
+        Dispatch one tool under this turn's saved-workflow scope.
+
+        Once `load_skill` succeeds, every later call in the same turn is confined to that
+        workflow's `allowed_tools` (agents.tool_policy.check_skill_scope). The scope lives
+        on the orchestrator, not in a ContextVar set by the tool: each tool runs as its own
+        asyncio task with a copied context, so a value set inside one would vanish the
+        moment that task finished.
+        """
+        from .tool_policy import SkillScope, active_skill
+
+        token = active_skill.set(self.skill_scope)
+        try:
+            result = await mcp_server.dispatch(name, arguments, user=user)
+        finally:
+            active_skill.reset(token)
+        if name == "load_skill" and isinstance(result, dict) and result.get("instructions"):
+            self.skill_scope = SkillScope(
+                name=result.get("name", ""),
+                allowed_tools=frozenset(result.get("allowed_tools") or []),
+            )
+        return result

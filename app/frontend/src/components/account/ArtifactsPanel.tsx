@@ -3,7 +3,9 @@ import { accountsApi, airtableApi, searchApi } from "../../lib/api";
 import type { SearchResult } from "../../lib/api";
 import type { AccountArtifact, ActionItemAttachment, CommentReference, GoalSection } from "../../types";
 import { resolveEmojiShortcodes } from "../../lib/emojiShortcodes";
-import { ArtifactIcon, ArtifactIconImg, type ArtifactIconEntry, ARTIFACT_ICON_CATALOG, getAutoIconKey } from "./ArtifactIcon";
+import { ArtifactIcon, ArtifactIconImg, type ArtifactIconEntry, ARTIFACT_ICON_CATALOG, getAutoIconKey, fileIconKeyFor } from "./ArtifactIcon";
+import { ArtifactImageField } from "./ArtifactImageField";
+import { UploadFileDialog, type PendingUpload } from "./UploadFileDialog";
 import { ArtifactViewer } from "./ArtifactViewer";
 import RichTextMentionEditor from "../shared/RichTextMentionEditor";
 
@@ -239,14 +241,8 @@ function ArtifactContextMenu({
 
 // ── Edit artifact modal ───────────────────────────────────────────────────────
 
-const CODE_EXTS_SET = new Set(["js", "ts", "tsx", "jsx", "mjs", "cjs", "css", "scss", "sass", "less", "html", "htm", "xml", "py", "rb", "go", "java", "c", "cpp", "h", "cs", "php", "rs", "swift", "kt", "json", "yaml", "yml", "toml", "sh", "bash", "zsh", "sql", "graphql", "gql", "vue", "svelte"]);
-
 function iconKeyFromFile(f: File): string {
-  const ext = f.name.split(".").pop()?.toLowerCase() ?? "";
-  if (f.type.startsWith("image/")) return "file_image";
-  if (f.type.includes("spreadsheet") || ext === "xlsx" || ext === "csv") return "file_sheet";
-  if (CODE_EXTS_SET.has(ext)) return "file_code";
-  return "file_upload";
+  return fileIconKeyFor(f.type, f.name);
 }
 
 function EditArtifactModal({
@@ -268,6 +264,8 @@ function EditArtifactModal({
   const [category, setCategory] = useState(currentCategory);
   const [showCatDropdown, setShowCatDropdown] = useState(false);
   const [pendingFile, setPendingFile] = useState<File | null>(null);
+  const [imageFile, setImageFile] = useState<File | null>(null);
+  const [imageRemoved, setImageRemoved] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -317,7 +315,7 @@ function EditArtifactModal({
           icon_key: iconKey,
           description,
           references,
-        });
+        }, { file: imageFile ?? undefined });
         await accountsApi.deleteArtifact(artifact.id);
         onSaved(patched, category.trim(), artifact.id);
       } else {
@@ -331,7 +329,7 @@ function EditArtifactModal({
           patch.url = url.trim() || null;
           patch.secondary_url = secondaryUrl.trim() || "";
         }
-        const { data } = await accountsApi.updateArtifact(artifact.id, patch);
+        const { data } = await accountsApi.updateArtifact(artifact.id, patch, { file: imageFile, remove: imageRemoved && !imageFile });
         onSaved(data, category.trim());
       }
     } catch {
@@ -466,6 +464,15 @@ function EditArtifactModal({
             />
           </div>
         </div>
+
+        <ArtifactImageField
+          existingUrl={artifact.image_url}
+          file={imageFile}
+          removed={imageRemoved}
+          onPick={(f) => { setImageFile(f); setImageRemoved(false); }}
+          onRemove={() => { setImageFile(null); setImageRemoved(true); }}
+          fallback={<ArtifactIcon artifactType={artifact.artifact_type} mime={artifact.mime_type} name={name} url={url} iconKey={iconKey} size={22} />}
+        />
 
         {/* Icon picker */}
         <div style={{ marginTop: "14px" }}>
@@ -694,13 +701,20 @@ export function ArtifactsPanel({
     return () => window.removeEventListener("artifact-added", handler);
   }, [load]);
 
-  async function handleFiles(files: FileList | File[]) {
+  // Picked/dropped files wait here while the user chooses their icons (UploadFileDialog).
+  const [pendingUploads, setPendingUploads] = useState<File[] | null>(null);
+
+  function handleFiles(files: FileList | File[]) {
     const arr = Array.from(files);
-    if (!arr.length) return;
+    if (arr.length) setPendingUploads(arr);
+  }
+
+  async function uploadFiles(uploads: PendingUpload[]) {
+    setPendingUploads(null);
     setUploading(true);
     try {
-      for (const f of arr) {
-        await accountsApi.uploadArtifactFile(accountId, f);
+      for (const u of uploads) {
+        await accountsApi.uploadArtifactFile(accountId, u.file, { iconKey: u.iconKey, image: u.image });
       }
       load();
     } finally {
@@ -831,14 +845,14 @@ export function ArtifactsPanel({
         }}
         title="Click to preview · Cmd+Click to open · Right-click for options · Drag to a project"
       >
-        {a.mime_type.toLowerCase().startsWith("image/") && (a.file_url ?? a.url) ? (
+        {!a.image_url && a.mime_type.toLowerCase().startsWith("image/") && (a.file_url ?? a.url) ? (
           <img
             src={a.file_url ?? a.url ?? ""}
             alt={a.name}
             style={{ width: 32, height: 32, objectFit: "cover", borderRadius: 4, flexShrink: 0, border: "1px solid rgba(0,0,0,0.08)" }}
           />
         ) : (
-          <ArtifactIcon artifactType={a.artifact_type} mime={a.mime_type} name={a.name} url={a.url} iconKey={a.icon_key} />
+          <ArtifactIcon artifactType={a.artifact_type} mime={a.mime_type} name={a.name} url={a.url} iconKey={a.icon_key} imageUrl={a.image_url} />
         )}
         <div style={{ minWidth: 0, flex: 1 }}>
           <p style={{ margin: 0, fontSize: "0.75rem", fontWeight: 600, color: "var(--text-primary, #111)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
@@ -1042,6 +1056,9 @@ export function ArtifactsPanel({
         </div>
       )}
 
+      {pendingUploads && (
+        <UploadFileDialog files={pendingUploads} onCancel={() => setPendingUploads(null)} onConfirm={(u) => void uploadFiles(u)} />
+      )}
       {uploading && (
         <p style={{ marginTop: "8px", fontSize: "0.75rem", color: "var(--twilio-red, #e22)" }}>Uploading…</p>
       )}
@@ -1190,6 +1207,7 @@ function AddArtifactModal({
   const [iconKey, setIconKey] = useState("link");
   const [description, setDescription] = useState("");
   const [references, setReferences] = useState<CommentReference[]>([]);
+  const [imageFile, setImageFile] = useState<File | null>(null);
   const [category, setCategory] = useState("");
   const [showCatDropdown, setShowCatDropdown] = useState(false);
   const catInputRef = useRef<HTMLInputElement>(null);
@@ -1250,7 +1268,7 @@ function AddArtifactModal({
     setError(null);
     try {
       const displayName = name.trim() || url.trim();
-      const { data } = await accountsApi.addArtifactLink(accountId, displayName, url.trim(), iconKey, secondaryUrl.trim() || undefined, description, references);
+      const { data } = await accountsApi.addArtifactLink(accountId, displayName, url.trim(), iconKey, secondaryUrl.trim() || undefined, description, references, imageFile);
       onAdded(data, category.trim());
     } catch {
       setError("Failed to add link — please try again.");
@@ -1418,6 +1436,14 @@ function AddArtifactModal({
             />
           </div>
         </div>
+
+        <ArtifactImageField
+          file={imageFile}
+          removed={false}
+          onPick={setImageFile}
+          onRemove={() => setImageFile(null)}
+          fallback={<ArtifactIcon artifactType="link" mime="" name={name} url={url} iconKey={iconKey} size={22} />}
+        />
 
         <div style={{ marginTop: "14px" }}>
           <p style={{ margin: "0 0 8px", fontSize: "0.75rem", fontWeight: 600, color: "var(--text-secondary, #888)" }}>Icon</p>

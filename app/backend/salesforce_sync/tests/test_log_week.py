@@ -481,6 +481,14 @@ class WriteWeekTest(LogWeekTestBase):
         self.assertEqual(entry.duration_minutes, 60)
         self.assertEqual(entry.project, self.project)
 
+    def test_audit_rows_record_the_app_account(self):
+        # The Cloud Coach project can be blank (never synced); the account must not depend on it.
+        self.event(account=self.account)
+
+        self._write()
+
+        self.assertEqual(SalesforceTimeEntry.objects.get(user=self.user).account, self.account)
+
     def test_the_resource_field_is_omitted_and_reported_when_unresolved(self):
         self.event(account=self.account)
         sf = full_org(query_results={"FROM Resource__c": {"records": []}})
@@ -537,3 +545,92 @@ class ReportShapeTest(LogWeekTestBase):
 
     def test_week_range_label_is_inclusive(self):
         self.assertEqual(week_range_label(MONDAY), "Mon 31 Aug – Sun 06 Sep")
+
+
+class ScopedManualAssignmentTest(LogWeekTestBase):
+    """Day assignments are per user, not per account — a per-account run must not let a
+    project dragged in from another account's panel capture this account's events."""
+
+    def test_another_accounts_dragged_project_does_not_capture_this_accounts_events(self):
+        AccountProject.objects.create(account=self.account, name="Acme Phase 1", sf_project_id="a0BACMEPHASE0001")
+        beta = self.sf_project(name="Beta Rollout", sf_id="a0BBETAROLL00001", account_name="Beta")
+        LogTimeDayAssignment.objects.create(user=self.user, date=MONDAY, project=beta)
+        self.event(account=self.account)
+
+        plan = plan_week(self.user, MONDAY, account_name="Acme")
+
+        self.assertEqual([e.project_sf_id for e in plan.entries], ["a0BACMEPHASE0001"])
+        self.assertEqual(plan.entries[0].source, "auto")
+
+    def test_this_accounts_dragged_project_still_wins(self):
+        AccountProject.objects.create(account=self.account, name="Auto", sf_project_id="a0BAUTO000000001")
+        mine = self.sf_project(name="Manual", sf_id="a0BMANUAL0000001", account_name="Acme")
+        LogTimeDayAssignment.objects.create(user=self.user, date=MONDAY, project=mine)
+        self.event(account=self.account)
+
+        plan = plan_week(self.user, MONDAY, account_name="acme")
+
+        self.assertEqual([e.project_sf_id for e in plan.entries], ["a0BMANUAL0000001"])
+
+    def test_scoped_run_reports_a_no_account_event_instead_of_filing_it(self):
+        mine = self.sf_project(name="Manual", sf_id="a0BMANUAL0000001", account_name="Acme")
+        LogTimeDayAssignment.objects.create(user=self.user, date=MONDAY, project=mine)
+        self.event(account=None, title="Mystery")
+
+        plan = plan_week(self.user, MONDAY, account_name="Acme")
+
+        self.assertEqual(plan.entries, [])
+        self.assertEqual([s.title for s in plan.unlinked_events], ["Mystery"])
+
+    def test_goal_rows_are_never_the_auto_project(self):
+        AccountProject.objects.create(account=self.account, name="A goal", sf_project_id="a0BGOAL000000001",
+                                      kind="goal", position=0)
+        AccountProject.objects.create(account=self.account, name="The project", sf_project_id="a0BPROJ000000001",
+                                      position=1)
+        self.event(account=self.account)
+
+        plan = plan_week(self.user, MONDAY)
+
+        self.assertEqual([e.project_sf_id for e in plan.entries], ["a0BPROJ000000001"])
+
+
+class TimeLoggedActivityTest(LogWeekTestBase):
+    """Logging time shows up in the Events tab, one entry per event that was logged."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch("realtime.sync._get_sync_client", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.project = self.sf_project()
+        AccountProject.objects.create(
+            account=self.account, name="P", sf_project_id=self.project.sf_id
+        )
+
+    def _write(self):
+        sf = full_org(query_results={"FROM Resource__c": {"records": [{"Id": "a0R000000000001"}]}})
+        plan = plan_week(self.user, MONDAY)
+        with mock.patch("salesforce_sync.client.get_client", return_value=sf):
+            return write_week(self.user, plan)
+
+    def test_each_logged_event_gets_an_entry(self):
+        from realtime.models import AgentActivityEvent
+
+        self.event(account=self.account, minutes=60, title="Design review")
+        self._write()
+
+        entries = list(AgentActivityEvent.objects.filter(
+            user=self.user, event_type="calendar_event.time_logged"))
+        self.assertEqual(len(entries), 1)
+        self.assertIn('"Design review"', entries[0].title)
+        self.assertEqual(entries[0].metadata["hours"], 1.0)
+
+    def test_a_failed_write_records_nothing(self):
+        from realtime.models import AgentActivityEvent
+        from salesforce_sync.cloudcoach import CloudCoachError
+
+        self.event(account=self.account, minutes=60)
+        with mock.patch("salesforce_sync.log_week.composite_create", side_effect=CloudCoachError("no")):
+            with self.assertRaises(CloudCoachError):
+                self._write()
+        self.assertFalse(AgentActivityEvent.objects.filter(event_type="calendar_event.time_logged").exists())

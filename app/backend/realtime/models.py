@@ -69,6 +69,7 @@ class AgentActivityEvent(models.Model):
         ("action_item", "Action Item"),
         ("calendar", "Calendar"),
         ("comment_reply", "Comment Reply"),
+        ("meeting_notes", "Meeting Notes"),
     ]
 
     user = models.ForeignKey(

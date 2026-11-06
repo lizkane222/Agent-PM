@@ -7,9 +7,12 @@ import { commentsApi, agentApi, skillsApi } from "../lib/api";
 import type { TokenStats, SkillTokenStats } from "../lib/api";
 import type { Comment } from "../types";
 import type { FeedbackItem } from "../types/feedback";
+import type { Reminder } from "../types/scheduler";
+import type { AppNotification } from "../types/team";
 import FeedbackDetailModal from "../components/feedback/FeedbackDetailModal";
-import { useCalendarEvents } from "../hooks/useCalendarEvents";
+import { useEventUpdates } from "../hooks/useEventUpdates";
 import { useReminders } from "../hooks/useReminders";
+import { useNotifications } from "../hooks/useNotifications";
 import { useFeedbackItems } from "../hooks/useFeedbackItems";
 
 // ── Tab definition ────────────────────────────────────────────────────────────
@@ -71,48 +74,58 @@ function EmptyState({ text }: { text: string }) {
 
 // ── Events tab ────────────────────────────────────────────────────────────────
 
-const EVENT_STATUS_COLOR: Record<string, string> = {
-  confirmed: "bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200",
-  tentative: "bg-amber-50 text-amber-700 ring-1 ring-amber-200",
-  cancelled: "bg-gray-100 text-gray-500 ring-1 ring-gray-200",
+// A history of what happened TO calendar events — created, edited, deleted, marked
+// attended, time logged, Gong/Zoom notes added — not a list of the events themselves, so an
+// event nobody has touched (however far ahead) never appears here.
+
+const EVENT_UPDATE_BADGE: Record<string, { label: string; color: string }> = {
+  "calendar_event.created": { label: "Created", color: "bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200" },
+  "calendar_event.updated": { label: "Updated", color: "bg-amber-50 text-amber-700 ring-1 ring-amber-200" },
+  "calendar_event.deleted": { label: "Deleted", color: "bg-rose-50 text-rose-700 ring-1 ring-rose-200" },
+  "calendar_event.attendance": { label: "Attendance", color: "bg-slate-100 text-slate-600 ring-1 ring-slate-200" },
+  "calendar_event.time_logged": { label: "Time logged", color: "bg-sky-50 text-sky-700 ring-1 ring-sky-200" },
+  meeting_notes: { label: "Notes added", color: "bg-indigo-50 text-indigo-700 ring-1 ring-indigo-200" },
 };
 
 function EventsTab() {
-  const { data: events, loading } = useCalendarEvents({ ordering: "-start_datetime", page_size: "200" });
+  const { data: updates, loading } = useEventUpdates();
 
   if (loading) return <LoadingState />;
-  if (events.length === 0) return <EmptyState text="No events found." />;
+  if (updates.length === 0) return <EmptyState text="No event updates yet." />;
 
   return (
     <div className="space-y-2">
-      {events.map(ev => (
-        <div key={ev.id} className="flex items-start gap-3 rounded-xl border border-gray-100 bg-white px-4 py-3 shadow-sm">
-          <span className={`mt-0.5 shrink-0 inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold ${EVENT_STATUS_COLOR[ev.status] ?? "bg-gray-100 text-gray-500"}`}>
-            {ev.status}
-          </span>
-          <div className="flex-1 min-w-0">
-            <p className="text-sm font-medium truncate" style={{ color: "var(--twilio-navy)" }}>{ev.title}</p>
-            <div className="flex flex-wrap gap-x-3 mt-0.5">
-              <span className="text-xs" style={{ color: "var(--twilio-gray-60)" }}>
-                {formatDate(ev.start_datetime)} – {formatDate(ev.end_datetime)}
-              </span>
-              {ev.account_name && (
-                <span className="text-xs" style={{ color: "var(--twilio-gray-60)" }}>
-                  {ev.account_name}
-                </span>
-              )}
-              {ev.attendees?.length > 0 && (
-                <span className="text-xs" style={{ color: "var(--twilio-gray-60)" }}>
-                  {ev.attendees.length} attendee{ev.attendees.length !== 1 ? "s" : ""}
-                </span>
-              )}
+      {updates.map(ev => {
+        const badge = EVENT_UPDATE_BADGE[ev.event_type] ?? { label: ev.event_type, color: "bg-gray-100 text-gray-500" };
+        const meta = ev.metadata as { event_start?: string | null; account_name?: string | null; links?: { label: string; path: string }[] };
+        const link = ev.event_type === "calendar_event.deleted" ? undefined : meta.links?.[0];
+        return (
+          <div key={ev.id} data-testid="event-update" className="flex items-start gap-3 rounded-xl border border-gray-100 bg-white px-4 py-3 shadow-sm">
+            <span className={`mt-0.5 shrink-0 inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold ${badge.color}`}>
+              {badge.label}
+            </span>
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-medium" style={{ color: "var(--twilio-navy)" }}>{ev.title}</p>
+              <div className="flex flex-wrap gap-x-3 mt-0.5">
+                {meta.event_start && (
+                  <span className="text-xs" style={{ color: "var(--twilio-gray-60)" }}>
+                    Event on {formatDate(meta.event_start)}
+                  </span>
+                )}
+                {meta.account_name && (
+                  <span className="text-xs" style={{ color: "var(--twilio-gray-60)" }}>{meta.account_name}</span>
+                )}
+                {link && (
+                  <Link to={link.path} className="text-xs text-indigo-600 underline underline-offset-2">{link.label}</Link>
+                )}
+              </div>
             </div>
+            <span className="shrink-0 text-[11px] tabular-nums" style={{ color: "var(--twilio-gray-40)" }}>
+              {formatDate(ev.created_at)}
+            </span>
           </div>
-          <span className="shrink-0 text-[11px] tabular-nums" style={{ color: "var(--twilio-gray-40)" }}>
-            {formatDate(ev.created_at)}
-          </span>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -202,41 +215,76 @@ const NOTIF_STATUS_COLOR: Record<string, string> = {
 
 function NotificationsTab() {
   const { data: allReminders, loading } = useReminders({ tab: "all" });
-  const items = allReminders.filter(rem => rem.notify_in_app);
+  const { data: recorded, loading: loadingRecorded } = useNotifications();
+  // Reminders keep their own richer rows above (and predate the notification history), so
+  // the history's "reminder" rows would just list each one twice.
+  const others = recorded.filter(n => n.kind !== "reminder");
+  const reminders = allReminders.filter(rem => rem.notify_in_app);
 
-  if (loading) return <LoadingState />;
-  if (items.length === 0) return <EmptyState text="No in-app notifications on record." />;
+  if (loading || loadingRecorded) return <LoadingState />;
+  if (reminders.length === 0 && others.length === 0) return <EmptyState text="No in-app notifications on record." />;
 
+  const rows = [
+    ...others.map(n => ({ at: n.created_at, node: <RecordedNotificationRow key={`n-${n.id}`} n={n} /> })),
+    ...reminders.map(rem => ({ at: rem.due_at, node: <ReminderNotificationRow key={`r-${rem.id}`} rem={rem} /> })),
+  ].sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
+
+  return <div className="space-y-2">{rows.map(r => r.node)}</div>;
+}
+
+const NOTIF_KIND_LABEL: Record<string, string> = {
+  meeting_notes: "Meeting notes",
+  comment_reply: "Reply",
+  note_for_you: "Note",
+};
+
+function RecordedNotificationRow({ n }: { n: AppNotification }) {
   return (
-    <div className="space-y-2">
-      {items.map(rem => (
-        <div key={rem.id} className="flex items-start gap-3 rounded-xl border border-gray-100 bg-white px-4 py-3 shadow-sm">
-          <span className={`mt-0.5 shrink-0 inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold ${NOTIF_STATUS_COLOR[rem.status] ?? "bg-gray-100 text-gray-500"}`}>
-            {rem.status}
-          </span>
-          <div className="flex-1 min-w-0">
-            <p className="text-sm font-medium" style={{ color: "var(--twilio-navy)" }}>{rem.title}</p>
-            {rem.body && (
-              <p className="text-xs mt-0.5 leading-snug" style={{ color: "var(--twilio-gray-60)" }}>{rem.body}</p>
-            )}
-            {rem.resource_label && (
-              <p className="text-xs mt-0.5" style={{ color: "var(--twilio-gray-60)" }}>
-                {RESOURCE_TYPE_LABEL[rem.resource_type] ?? rem.resource_type}: {rem.resource_label}
-              </p>
-            )}
-            <div className="flex gap-1 mt-1 flex-wrap">
-              {rem.notify_slack && <ChannelBadge label="Slack" />}
-              {rem.notify_push && <ChannelBadge label="Push" />}
-              {rem.notify_sms && <ChannelBadge label="SMS" />}
-            </div>
-          </div>
-          <div className="shrink-0 flex flex-col items-end gap-1">
-            <span className="text-[11px] tabular-nums" style={{ color: "var(--twilio-gray-40)" }}>
-              Due {formatDate(rem.due_at)}
-            </span>
-          </div>
+    <div data-testid="recorded-notification" className="flex items-start gap-3 rounded-xl border border-gray-100 bg-white px-4 py-3 shadow-sm">
+      <span className="mt-0.5 shrink-0 inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold bg-indigo-50 text-indigo-700 ring-1 ring-indigo-200">
+        {NOTIF_KIND_LABEL[n.kind] ?? n.kind}
+      </span>
+      <div className="flex-1 min-w-0">
+        <p className="text-sm font-medium" style={{ color: "var(--twilio-navy)" }}>{n.title}</p>
+        {n.body && <p className="text-xs mt-0.5 leading-snug" style={{ color: "var(--twilio-gray-60)" }}>{n.body}</p>}
+        {n.link && (
+          <Link to={n.link} className="text-xs mt-0.5 inline-block text-indigo-600 underline underline-offset-2">Open</Link>
+        )}
+      </div>
+      <span className="shrink-0 text-[11px] tabular-nums" style={{ color: "var(--twilio-gray-40)" }}>
+        {formatDate(n.created_at)}
+      </span>
+    </div>
+  );
+}
+
+function ReminderNotificationRow({ rem }: { rem: Reminder }) {
+  return (
+    <div className="flex items-start gap-3 rounded-xl border border-gray-100 bg-white px-4 py-3 shadow-sm">
+      <span className={`mt-0.5 shrink-0 inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold ${NOTIF_STATUS_COLOR[rem.status] ?? "bg-gray-100 text-gray-500"}`}>
+        {rem.status}
+      </span>
+      <div className="flex-1 min-w-0">
+        <p className="text-sm font-medium" style={{ color: "var(--twilio-navy)" }}>{rem.title}</p>
+        {rem.body && (
+          <p className="text-xs mt-0.5 leading-snug" style={{ color: "var(--twilio-gray-60)" }}>{rem.body}</p>
+        )}
+        {rem.resource_label && (
+          <p className="text-xs mt-0.5" style={{ color: "var(--twilio-gray-60)" }}>
+            {RESOURCE_TYPE_LABEL[rem.resource_type] ?? rem.resource_type}: {rem.resource_label}
+          </p>
+        )}
+        <div className="flex gap-1 mt-1 flex-wrap">
+          {rem.notify_slack && <ChannelBadge label="Slack" />}
+          {rem.notify_push && <ChannelBadge label="Push" />}
+          {rem.notify_sms && <ChannelBadge label="SMS" />}
         </div>
-      ))}
+      </div>
+      <div className="shrink-0 flex flex-col items-end gap-1">
+        <span className="text-[11px] tabular-nums" style={{ color: "var(--twilio-gray-40)" }}>
+          Due {formatDate(rem.due_at)}
+        </span>
+      </div>
     </div>
   );
 }

@@ -212,14 +212,23 @@ describe("AccountsPage — Cloud Coach member push", () => {
     // rejection unhandled.
     reportError.mockClear();
     await renderWithAccount(() =>
-      HttpResponse.json({ detail: "You cannot add team members…" }, { status: 403 })
+      HttpResponse.json({ detail: "Only PMs and Admins can add or remove other people on an account." }, { status: 403 })
     );
 
     dropMemberOnAcme();
 
     await waitFor(() => expect(reportError).toHaveBeenCalled());
-    expect(reportError.mock.calls[0][0]).toMatch(/Could not add that team member/);
+    // A permission refusal shows the server's reason, so a Basic user learns why.
+    expect(reportError.mock.calls[0][0]).toMatch(/Only PMs and Admins/);
     expect(screen.queryByTestId("cloud-coach-toast")).not.toBeInTheDocument();
+  });
+
+  it("falls back to a generic message when the failure isn't a permission refusal", async () => {
+    reportError.mockClear();
+    await renderWithAccount(() => HttpResponse.json({}, { status: 500 }));
+    dropMemberOnAcme();
+    await waitFor(() => expect(reportError).toHaveBeenCalled());
+    expect(reportError.mock.calls[0][0]).toMatch(/Could not add that team member/);
   });
 
   it("reports a failed push through the error channel as well as the toast", async () => {

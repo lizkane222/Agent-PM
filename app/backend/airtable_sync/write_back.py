@@ -9,7 +9,10 @@ Every function is safe to call from any context: errors are logged and
 never re-raised so a failing Airtable write never blocks the local save.
 """
 
+import ast
 import logging
+import re
+import threading
 import time
 
 from django.conf import settings
@@ -140,12 +143,43 @@ def push_account_segment_workspaces(airtable_account) -> bool:
 # ── Action Items ──────────────────────────────────────────────────────────────
 
 # Map our internal values → Airtable select option names
+#
+# Status is a single-select field and the sync token cannot create new options, so a
+# value the base does not already have fails the whole write with
+# INVALID_MULTIPLE_CHOICE_OPTIONS ("Insufficient permissions to create new select
+# option"). The base's options are: Not Started, In Progress, Blocked, Ready, Completed.
 _STATUS_TO_AT = {
     "Open": "Not Started",
     "In Progress": "In Progress",
-    "Done": "Done",
+    "Done": "Completed",
     "Blocked": "Blocked",
+    # No Backlogged option exists in Airtable. Not Started is the closest, but it means
+    # a Backlogged item reads back as Open on the next pull (sync._AT_TO_STATUS).
+    "Backlogged": "Not Started",
 }
+def airtable_status_for(status: str) -> str:
+    """The Status option name Airtable uses for one of our statuses."""
+    return _STATUS_TO_AT.get(status, status)
+
+
+def status_fits_airtable(status: str) -> bool:
+    """False for a status Airtable has no option for (it would read back as another one)."""
+    return status != "Backlogged"
+
+
+def push_action_item_status(item) -> bool:
+    """Push only the Status of one action item. True when Airtable accepted it."""
+    if not item.airtable_id or item.airtable_id.startswith("local-"):
+        return False
+    try:
+        table = get_table(TABLE_ACTION_ITEMS)
+        _airtable_call(table.update, item.airtable_id, {"Status": airtable_status_for(item.status)})
+        return True
+    except Exception:
+        logger.exception("Failed to push status of action item %s", item.airtable_id)
+        return False
+
+
 _PRIORITY_TO_AT = {
     "Critical": "Urgent",
     "High": "High",
@@ -165,11 +199,11 @@ def _action_item_fields(item, account_airtable_id: str | None = None) -> dict:
         due = item.due_date
         fields["Due Date"] = due.isoformat() if hasattr(due, "isoformat") else str(due)
     if item.estimated_time:
-        fields["Estimated Time"] = item.estimated_time // 60
+        fields["Estimated Time"] = item.estimated_time  # seconds; Airtable duration fields are seconds
     if item.time_spent:
-        fields["Time Spent"] = item.time_spent // 60
+        fields["Time Spent"] = item.time_spent  # seconds; Airtable duration fields are seconds
     if item.prep_time:
-        fields["Prep Time"] = item.prep_time // 60
+        fields["Prep Time"] = item.prep_time  # seconds; Airtable duration fields are seconds
     if item.slack_thread_url:
         fields["Slack Thread URL"] = item.slack_thread_url
     if item.marked_done_at:
@@ -181,18 +215,53 @@ def _action_item_fields(item, account_airtable_id: str | None = None) -> dict:
     return fields
 
 
+# The reason the most recent Airtable write failed, kept per thread so a caller that got
+# ``None`` back can say *why* (e.g. a voice agent that would otherwise only know "failed").
+_last_error = threading.local()
+
+
+def last_airtable_error() -> str:
+    """Short reason for this thread's most recent failed Airtable write, or ''."""
+    return getattr(_last_error, "message", "")
+
+
+def _describe_airtable_error(exc: Exception) -> str:
+    """
+    Airtable's own message, e.g. 'Insufficient permissions to create new select option "X"'.
+
+    pyairtable appends ``repr(response.json()["error"])`` to the HTTPError's args, so the
+    last arg is the repr of a ``{"type": ..., "message": ...}`` dict.
+    """
+    detail = ""
+    for arg in reversed(getattr(exc, "args", ())):
+        if not isinstance(arg, str):
+            continue
+        try:
+            parsed = ast.literal_eval(arg)
+        except (ValueError, SyntaxError):
+            continue
+        if isinstance(parsed, dict) and parsed.get("message"):
+            detail = f"{parsed.get('type', '')}: {parsed['message']}".strip(": ")
+            break
+    if not detail:
+        detail = str(exc)
+    return " ".join(detail.replace('""', '"').split())[:200]
+
+
 def push_action_item_create(item, account_airtable_id: str | None = None) -> str | None:
     """
     Create a new record in the Airtable Action Items table.
-    Returns the Airtable record ID on success, None on failure.
+    Returns the Airtable record ID on success, None on failure (reason in last_airtable_error()).
     """
+    _last_error.message = ""
     try:
         table = get_table(TABLE_ACTION_ITEMS)
         record = _airtable_call(table.create, _action_item_fields(item, account_airtable_id))
         logger.info("Created Airtable action item record %s for '%s'", record["id"], item.task)
         return record["id"]
-    except Exception:
+    except Exception as exc:
         logger.exception("Failed to create Airtable action item for '%s'", item.task)
+        _last_error.message = _describe_airtable_error(exc)
         return None
 
 

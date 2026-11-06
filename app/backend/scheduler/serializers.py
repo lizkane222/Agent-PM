@@ -8,6 +8,7 @@ from .models import ActionItem, CalendarEvent, MeetingNote, Reminder, Task
 class CalendarEventSerializer(serializers.ModelSerializer):
     owner_username = serializers.CharField(source="owner.username", read_only=True)
     account_name = serializers.CharField(source="account.company_name", read_only=True, allow_null=True)
+    project_name = serializers.CharField(source="project.name", read_only=True, allow_null=True)
 
     class Meta:
         model = CalendarEvent
@@ -33,6 +34,8 @@ class CalendarEventSerializer(serializers.ModelSerializer):
             "attended",
             "agentpm_airtable_id",
             "reminder",
+            "project",
+            "project_name",
             "references",
             "artifact_ids",
             "created_at",
@@ -50,7 +53,8 @@ class CalendarEventSerializer(serializers.ModelSerializer):
         # and the row comes back as an untitled work-tracking block belonging to nothing.
         read_only_fields = [
             "id", "owner", "google_event_id", "attended",
-            "agentpm_airtable_id", "reminder", "created_at", "updated_at",
+            "agentpm_airtable_id", "reminder", "project", "project_name",
+            "created_at", "updated_at",
         ]
 
 

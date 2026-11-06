@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import CorporateIcon from "../../assets/icons/Corporate.svg?react";
 import { airtableApi } from "../../lib/api";
 import type { ActionItemAttachment, AirtableActionItem, AirtableMeeting, TeamMember } from "../../types";
@@ -10,8 +11,9 @@ import { AccPillSelect, AccPillDate, AccPillNumber, AccPillUrl } from "../shared
 import { ActionItemCardOccurrences } from "./ActionItemCardOccurrences";
 import StepsPanel from "../action-items/StepsPanel";
 import { convertActionItemToEvent, restoreConversion } from "../../hooks/useConvert";
-import { logActionItemUpdate } from "../../lib/actionItemLog";
+import { logActionItemUpdate, changedActionItemFields } from "../../lib/actionItemLog";
 import ActivityLogSection from "../ActivityLogSection";
+import ActionItemCalendarNotes from "./ActionItemCalendarNotes";
 import { ArtifactIconImg, CATALOG_BY_KEY, getAutoIconKey } from "./ArtifactIcon";
 import ArtifactPicker from "../action-items/ArtifactPicker";
 
@@ -127,8 +129,9 @@ export function ActionItemModal({
     setSaving(true);
     setSaveError(null);
     try {
-      const { data } = await airtableApi.updateActionItemFields(item.airtable_id, form as Parameters<typeof airtableApi.updateActionItemFields>[1]);
-      logActionItemUpdate(item, form as Partial<AirtableActionItem>);
+      const changes = changedActionItemFields(item, form);
+      const { data } = await airtableApi.updateActionItemFields(item.airtable_id, changes);
+      logActionItemUpdate(item, changes);
       onUpdated?.(data);
       onClose();
     } catch (err: unknown) {
@@ -209,7 +212,10 @@ export function ActionItemModal({
     }
   }
 
-  return (
+  // Portalled to <body>: a `transform` on any ancestor (e.g. CalendarPage's sliding
+  // items sidebar) makes `position: fixed` resolve against that ancestor, which
+  // squeezed the modal into the sidebar's width instead of centring it on the page.
+  return createPortal(
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
       onClick={onClose}
@@ -484,6 +490,9 @@ export function ActionItemModal({
 
           <ActionItemCardOccurrences airtableId={item.airtable_id} />
 
+          {/* Notes added under this item's calendar blocks ("Meeting notes" on the calendar). */}
+          <ActionItemCalendarNotes airtableId={item.airtable_id} />
+
           {/* Comments — the latest few, in place. The panel behind the header icon is
               still where you read the full thread and reply; this exists so an item
               with a conversation on it doesn't look identical to one without. */}
@@ -589,6 +598,7 @@ export function ActionItemModal({
           </div>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

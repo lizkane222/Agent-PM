@@ -450,3 +450,110 @@ class GmailKeywordsTest(APITestCase):
         keywords = [f"keyword-{i}" for i in range(101)]
         resp = self.client.put(GMAIL_KEYWORDS_URL, {"keywords": keywords}, format="json")
         self.assertEqual(resp.status_code, 400)
+
+
+
+class AccessLevelManagementTest(APITestCase):
+    """Admin-only user directory + access-level changes (team/views.py)."""
+
+    def setUp(self):
+        from django.core.cache import cache
+        cache.clear()
+        self.admin = User.objects.create_user("acc_admin", email="acc_admin@x.test", password="{PASSWORD}", is_staff=True)
+        UserProfile.objects.create(user=self.admin)  # staff → admin on create
+        self.basic = User.objects.create_user("acc_basic", email="acc_basic@x.test", password="{PASSWORD}", first_name="Bea")
+        self.basic_profile = UserProfile.objects.create(user=self.basic)
+
+    def test_new_staff_profile_starts_as_admin_and_others_basic(self):
+        self.assertEqual(self.admin.profile.access_level, "admin")
+        self.assertEqual(self.basic_profile.access_level, "basic")
+
+    def test_access_level_is_read_only_through_me(self):
+        self.client.force_authenticate(user=self.basic)
+        resp = self.client.patch("/api/v1/team/profiles/me/", {"access_level": "admin"}, format="json")
+        self.assertEqual(resp.status_code, 200)
+        self.basic_profile.refresh_from_db()
+        self.assertEqual(self.basic_profile.access_level, "basic")
+        self.assertEqual(resp.data["access_level"], "basic")
+
+    def test_directory_is_admin_only_and_searches(self):
+        self.client.force_authenticate(user=self.basic)
+        self.assertEqual(self.client.get("/api/v1/team/profiles/directory/").status_code, 403)
+        self.client.force_authenticate(user=self.admin)
+        resp = self.client.get("/api/v1/team/profiles/directory/", {"search": "bea"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual([r["username"] for r in resp.data["results"]], ["acc_basic"])
+        self.assertEqual(resp.data["results"][0]["access_level"], "basic")
+
+    def test_directory_includes_users_without_a_profile_yet(self):
+        User.objects.create_user("acc_fresh", email="fresh@x.test", password="{PASSWORD}")
+        self.client.force_authenticate(user=self.admin)
+        resp = self.client.get("/api/v1/team/profiles/directory/", {"search": "fresh"})
+        self.assertEqual(resp.data["results"][0]["access_level"], "basic")
+
+    def test_admin_can_promote_and_demote(self):
+        self.client.force_authenticate(user=self.admin)
+        url = f"/api/v1/team/profiles/{self.basic_profile.pk}/access-level/"
+        self.assertEqual(self.client.patch(url, {"access_level": "pm"}, format="json").status_code, 200)
+        self.basic_profile.refresh_from_db()
+        self.assertEqual(self.basic_profile.access_level, "pm")
+        self.client.patch(url, {"access_level": "basic"}, format="json")
+        self.basic_profile.refresh_from_db()
+        self.assertEqual(self.basic_profile.access_level, "basic")
+
+    def test_change_is_logged(self):
+        from realtime.models import AgentActivityEvent
+        self.client.force_authenticate(user=self.admin)
+        self.client.patch(f"/api/v1/team/profiles/{self.basic_profile.pk}/access-level/", {"access_level": "pm"}, format="json")
+        ev = AgentActivityEvent.objects.get(event_type="user.access_level")
+        self.assertEqual((ev.metadata["from"], ev.metadata["to"]), ("basic", "pm"))
+
+    def test_non_admin_cannot_change_levels(self):
+        self.client.force_authenticate(user=self.basic)
+        resp = self.client.patch(f"/api/v1/team/profiles/{self.basic_profile.pk}/access-level/", {"access_level": "admin"}, format="json")
+        self.assertEqual(resp.status_code, 403)
+
+    def test_invalid_level_is_rejected(self):
+        self.client.force_authenticate(user=self.admin)
+        resp = self.client.patch(f"/api/v1/team/profiles/{self.basic_profile.pk}/access-level/", {"access_level": "owner"}, format="json")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_the_last_admin_cannot_demote_themselves(self):
+        self.client.force_authenticate(user=self.admin)
+        resp = self.client.patch(f"/api/v1/team/profiles/{self.admin.profile.pk}/access-level/", {"access_level": "basic"}, format="json")
+        self.assertEqual(resp.status_code, 403)
+
+    def test_admin_cannot_edit_another_users_profile_via_generic_route(self):
+        self.client.force_authenticate(user=self.admin)
+        resp = self.client.patch(f"/api/v1/team/profiles/{self.basic_profile.pk}/", {"display_name": "Hijacked"}, format="json")
+        self.assertEqual(resp.status_code, 403)
+
+    def test_pm_is_not_admin(self):
+        self.basic_profile.access_level = "pm"
+        self.basic_profile.save()
+        self.client.force_authenticate(user=self.basic)
+        self.assertEqual(self.client.get("/api/v1/team/profiles/directory/").status_code, 403)
+
+    def test_unauthenticated_is_rejected(self):
+        self.assertEqual(self.client.get("/api/v1/team/profiles/directory/").status_code, 401)
+
+
+class PhoneNumberE164Test(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user("phone_user", password="{PASSWORD}")
+        self.client.force_authenticate(user=self.user)
+
+    def _save(self, value):
+        return self.client.patch("/api/v1/team/profiles/me/", {"phone_number": value}, format="json")
+
+    def test_formatted_number_is_stored_as_e164(self):
+        resp = self._save("+1 (415) 555-0123")
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(resp.data["phone_number"], "+14155550123")
+
+    def test_number_without_country_code_is_rejected(self):
+        self.assertEqual(self._save("4155550123").status_code, 400)
+
+    def test_blank_clears(self):
+        self._save("+14155550123")
+        self.assertEqual(self._save("").data["phone_number"], "")

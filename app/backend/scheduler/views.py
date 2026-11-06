@@ -13,6 +13,7 @@ from core.mixins import RequireAccountMembershipMixin, RequireCalendarEventOwner
 from core.pagination import ClientPageSizePagination
 from core.query_params import csv_int_params
 from realtime.sync import publish_activity_event
+from .event_log import changed_labels, record_event_change, snapshot as event_snapshot
 
 from .models import ActionItem, CalendarEvent, MeetingNote, Reminder, Task
 from .serializers import ActionItemSerializer, CalendarEventSerializer, MeetingNoteSerializer, ReminderSerializer, TaskSerializer
@@ -50,7 +51,42 @@ GOOGLE_OWNED_EVENT_FIELDS = (
     "end_datetime",
     "all_day",
     "status",
+    "attendees",
 )
+
+
+# What CreateEventModal sends for "Google Meet": a placeholder, replaced by a real
+# conference link that Google creates on insert.
+MEET_PLACEHOLDER_URL = "https://meet.google.com/new"
+
+
+def _guest_emails(event) -> list[str]:
+    """Attendee emails on `event`, skipping the owner's own address and blanks."""
+    own = (getattr(event.owner, "email", "") or "").lower()
+    seen, out = set(), []
+    for a in event.attendees or []:
+        email = (a.get("email") or "").strip() if isinstance(a, dict) else ""
+        if email and email.lower() != own and email.lower() not in seen:
+            seen.add(email.lower())
+            out.append(email)
+    return out
+
+
+def _send_invites_flag(data, event) -> bool:
+    """
+    Did the caller explicitly approve emailing the guests? **Absent means no.**
+
+    This used to be the opposite — "an API caller that adds attendees expects them to hear
+    about it" — so any API or voice caller that added guests emailed them with no approval at
+    all. After a customer received 2,000+ invitations from one meeting move, approval is
+    never assumed: it must be a deliberate, explicit yes in the request.
+    """
+    raw = data.get("send_invites") if hasattr(data, "get") else None
+    if raw is None:
+        return False
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("1", "true", "yes")
+    return bool(raw)
 
 
 def _google_owned_snapshot(event):
@@ -66,7 +102,8 @@ class CalendarEventViewSet(RequireAccountMembershipMixin, viewsets.ModelViewSet)
     serializer_class = CalendarEventSerializer
     permission_classes = [IsAuthenticated]
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
-    search_fields = ["title", "description", "location"]
+    # `?search=` backs the calendar search box; account name so "Acme" finds Acme meetings.
+    search_fields = ["title", "description", "location", "account__company_name"]
     ordering_fields = ["start_datetime", "end_datetime", "created_at"]
     ordering = ["start_datetime"]
     pagination_class = None  # Calendar events are always fetched for a bounded range — never paginate
@@ -119,7 +156,21 @@ class CalendarEventViewSet(RequireAccountMembershipMixin, viewsets.ModelViewSet)
 
         event.attended = value
         event.save(update_fields=["attended", "updated_at"])
+        if value is not None:
+            record_event_change(
+                request.user, "attendance", event,
+                message=f'Marked {"attended" if value else "did not attend"}: "{event.title}"',
+                extra={"attended": value},
+            )
         return Response(CalendarEventSerializer(event, context={"request": request}).data)
+
+    def create(self, request, *args, **kwargs):
+        response = super().create(request, *args, **kwargs)
+        result = getattr(self, "_google_sync_result", None)
+        if result is not None and isinstance(response.data, dict):
+            # Additive key, present only for primary-calendar creates.
+            response.data["google_sync"] = result
+        return response
 
     def perform_create(self, serializer):
         self._autolink_account_from_action_item(serializer)
@@ -128,20 +179,33 @@ class CalendarEventViewSet(RequireAccountMembershipMixin, viewsets.ModelViewSet)
         # the subclass wins the MRO. Call the mixin's helper explicitly so account
         # re-parenting is still gated on team membership.
         self._check_account_membership(self._resolve_target_account(serializer))
-        event = serializer.save(owner=self.request.user)
+        # origin="agentpm": the model default is "google" (fail closed), so an event is only
+        # ever eligible to email guests because this code path said it was created here.
+        event = serializer.save(owner=self.request.user, origin="agentpm")
         self._store_source_links(event)
 
-        # Push primary-calendar events straight to Google Calendar
+        # Push primary-calendar events straight to Google Calendar. The outcome is kept on
+        # the view so `create` can report it: a meeting saved locally but never sent to
+        # Google means the guests got no invite, and that must not look like success.
+        self._google_sync_result = None
         if event.calendar_id == "primary":
+            send_invites = _send_invites_flag(self.request.data, event)
             try:
-                self._push_to_google(event)
+                pushed = self._push_to_google(event, send_invites=send_invites)
+                self._google_sync_result = {
+                    "status": "ok" if pushed else "not_connected",
+                    # What the gateway actually did, not what was asked for: the invite gate
+                    # can refuse an approved send (switch off, past event, hourly budget), and
+                    # a caller must never be told guests were emailed when they were not.
+                    "invites_sent": bool(pushed and event.invite_sent),
+                }
             except Exception:
                 logger.exception("Failed to push new event '%s' to Google Calendar", event.title)
+                self._google_sync_result = {"status": "failed", "invites_sent": False}
 
-        publish_activity_event(
-            self.request.user, "calendar_event.created",
-            f"**Created** Calendar Event",
-            detail=event.title,
+        record_event_change(
+            self.request.user, "created", event,
+            message=f'Event created: "{event.title}"',
         )
 
     def _store_source_links(self, event):
@@ -179,6 +243,23 @@ class CalendarEventViewSet(RequireAccountMembershipMixin, viewsets.ModelViewSet)
                     "Ignoring reminder=%r on new calendar event for %s: not found or not theirs",
                     reminder_id, self.request.user,
                 )
+
+        # Project carry-over: an item filed under a project (or under a goal whose parent is a
+        # project) hands that project to the calendar block it is scheduled as. An explicit
+        # `project` in the body wins, but only if the caller can already see that project.
+        from accounts.project_links import project_for_record, visible_projects
+        project = None
+        explicit = self.request.data.get("project")
+        if explicit not in (None, ""):
+            try:
+                project = visible_projects(self.request.user).filter(pk=explicit).first()
+            except (ValueError, TypeError):
+                project = None
+        if project is None:
+            project = project_for_record(self.request.user, event.agentpm_airtable_id)
+        if project is not None:
+            event.project = project
+            update_fields.append("project")
 
         if update_fields:
             event.save(update_fields=[*update_fields, "updated_at"])
@@ -222,25 +303,24 @@ class CalendarEventViewSet(RequireAccountMembershipMixin, viewsets.ModelViewSet)
             return
         serializer.validated_data["account"] = account
 
-    def _push_to_google(self, event):
+    def _push_to_google(self, event, send_invites=False):
+        """Insert `event` into the owner's primary Google calendar.
+
+        Returns False when the owner has no Google connection (nothing was sent), True
+        once Google accepted the event. Raises on a Google error.
+        """
         from django.conf import settings
         from google.oauth2.credentials import Credentials
         from googleapiclient.discovery import build
         from integrations.models import OAuthCredential
 
-        try:
-            cred = OAuthCredential.objects.get(user=event.owner, provider="google", is_active=True)
-        except OAuthCredential.DoesNotExist:
-            return
-
-        google_creds = Credentials(
-            token=cred.access_token,
-            refresh_token=cred.refresh_token,
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=settings.GOOGLE_CLIENT_ID,
-            client_secret=settings.GOOGLE_CLIENT_SECRET,
-            scopes=cred.scopes.split(),
-        )
+        # Shared path: passes the stored expiry so a stale token refreshes before the
+        # request, and lets the refreshed token be saved (integrations.google_api).
+        from integrations.google_api import credentials_for, persist_refreshed
+        google_owner = event.owner
+        google_creds = credentials_for(google_owner)
+        if google_creds is None:
+            return False
         service = build("calendar", "v3", credentials=google_creds, cache_discovery=False)
 
         def _fmt(dt):
@@ -257,36 +337,65 @@ class CalendarEventViewSet(RequireAccountMembershipMixin, viewsets.ModelViewSet)
             "end":   {"date": event.end_datetime.date().isoformat()}   if event.all_day else {"dateTime": _fmt(event.end_datetime)},
             "status": event.status,
         }
-        if event.attendees:
-            body["attendees"] = [{"email": a["email"]} for a in event.attendees if a.get("email")]
+        guests = _guest_emails(event)
+        if guests:
+            body["attendees"] = [{"email": e} for e in guests]
 
-        result = service.events().insert(calendarId="primary", body=body).execute()
+        # `sendUpdates` is not chosen here. The gateway asks the invite gate, which says "all"
+        # only for a fresh AgentPM event the user approved and that has not already been
+        # announced; every other case is "none".
+        insert_kwargs = {}
+        if event.meet_link == MEET_PLACEHOLDER_URL:
+            # The modal's "Google Meet" choice is a placeholder, not a meeting — ask Google
+            # to create a real one. Without this the next sync blanks meet_link.
+            body["conferenceData"] = {"createRequest": {
+                "requestId": f"agentpm-{event.pk}",
+                "conferenceSolutionKey": {"type": "hangoutsMeet"},
+            }}
+            insert_kwargs["conferenceDataVersion"] = 1
+
+        from django.utils import timezone as _tz
+        from integrations.google_calendar_gateway import write_event
+
+        result = write_event(
+            service, "insert", event, body=body, source="calendar.create",
+            approved=bool(send_invites), approved_at=_tz.now() if send_invites else None,
+            extra=insert_kwargs,
+        )
+        persist_refreshed(google_owner, google_creds)
         google_event_id = result.get("id", "")
         if google_event_id:
             event.google_event_id = google_event_id
             event.is_synced = True
-            event.save(update_fields=["google_event_id", "is_synced"])
+            update_fields = ["google_event_id", "is_synced"]
+            meet = result.get("hangoutLink") or ""
+            if event.meet_link == MEET_PLACEHOLDER_URL:
+                event.meet_link = meet
+                update_fields.append("meet_link")
+            event.save(update_fields=update_fields)
+        return True
 
-    def _update_in_google(self, event):
-        """PATCH start/end (and optionally title/description) for an already-synced event."""
+    def _update_in_google(self, event, *, approved=False, approved_at=None, source="calendar.update"):
+        """
+        PATCH an already-synced event.
+
+        Guests are emailed only if the caller passes ``approved`` and the invite gate agrees
+        (fresh AgentPM edit, not already announced, switch on, within budget). This used to send
+        ``sendUpdates="all"`` on *every* edit of an event with guests, so moving one meeting
+        could email all of its guests every time anything touched it.
+        """
         from django.conf import settings
         from google.oauth2.credentials import Credentials
         from googleapiclient.discovery import build
         from integrations.models import OAuthCredential
 
-        try:
-            cred = OAuthCredential.objects.get(user=event.owner, provider="google", is_active=True)
-        except OAuthCredential.DoesNotExist:
+        # Shared path: passes the stored expiry so a stale token refreshes before the
+        # request, and lets the refreshed token be saved (integrations.google_api).
+        from integrations.google_api import credentials_for, persist_refreshed
+        google_owner = event.owner
+        google_creds = credentials_for(google_owner)
+        if google_creds is None:
             return
-
-        google_creds = Credentials(
-            token=cred.access_token,
-            refresh_token=cred.refresh_token,
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=settings.GOOGLE_CLIENT_ID,
-            client_secret=settings.GOOGLE_CLIENT_SECRET,
-            scopes=cred.scopes.split(),
-        )
         service = build("calendar", "v3", credentials=google_creds, cache_discovery=False)
 
         def _fmt(dt):
@@ -303,25 +412,27 @@ class CalendarEventViewSet(RequireAccountMembershipMixin, viewsets.ModelViewSet)
             "end":   {"date": event.end_datetime.date().isoformat()}   if event.all_day else {"dateTime": _fmt(event.end_datetime)},
             "status": event.status,
         }
-        service.events().patch(
-            calendarId="primary",
-            eventId=event.google_event_id,
-            body=body,
-        ).execute()
+        guests = _guest_emails(event)
+        if guests:
+            body["attendees"] = [{"email": e} for e in guests]
+        from integrations.google_calendar_gateway import write_event
+
+        write_event(
+            service, "patch", event, body=body, source=source,
+            approved=approved, approved_at=approved_at,
+        )
+        persist_refreshed(google_owner, google_creds)
 
     def perform_update(self, serializer):
         # Guard against re-parenting an event to an account the caller isn't on.
         self._check_account_membership(self._resolve_target_account(serializer))
         # Snapshot the Google-owned fields before save so we know whether to push.
         before = _google_owned_snapshot(serializer.instance)
+        logged_before = event_snapshot(serializer.instance)
 
         event = serializer.save()
 
-        publish_activity_event(
-            self.request.user, "calendar_event.updated",
-            f"**Updated** Calendar Event",
-            detail=event.title,
-        )
+        self._log_update(event, logged_before)
 
         # Push to Google whenever any field Google owns changed — not just the times.
         # `_sync_google_calendar` rewrites title/description/location/times/status from
@@ -329,18 +440,38 @@ class CalendarEventViewSet(RequireAccountMembershipMixin, viewsets.ModelViewSet)
         # the next time the sync runs.
         self._push_update_if_needed(event, before)
 
+    def _log_update(self, event, logged_before):
+        """Record an edit, naming what changed. A save that changed nothing logs nothing."""
+        labels = changed_labels(logged_before, event)
+        if not labels:
+            return
+        record_event_change(
+            self.request.user, "updated", event,
+            message=f'Event updated: "{event.title}" ({", ".join(labels)})',
+            extra={"changes": labels},
+        )
+
     def _push_update_if_needed(self, event, before):
         """Push to Google iff the event is synced and a Google-owned field changed.
 
         Failures are logged, never raised: the local row is authoritative and losing the
         edit because Google was unreachable would be worse than the row drifting.
+
+        Guests are emailed only when this request *explicitly* carries ``send_invites: true``
+        (and the invite gate then agrees). Moving or renaming a meeting is silent by default.
         """
         if not (event.is_synced and event.google_event_id):
             return
         if _google_owned_snapshot(event) == before:
             return
+        approved = _send_invites_flag(getattr(self.request, "data", None), event)
         try:
-            self._update_in_google(event)
+            from django.utils import timezone as _tz
+
+            self._update_in_google(
+                event, approved=approved, approved_at=_tz.now() if approved else None,
+                source="calendar.update",
+            )
         except Exception:
             logger.exception("Failed to update event '%s' in Google Calendar", event.title)
 
@@ -405,17 +536,14 @@ class CalendarEventViewSet(RequireAccountMembershipMixin, viewsets.ModelViewSet)
             return Response({"end_datetime": "Must be after start_datetime."}, status=400)
 
         before = _google_owned_snapshot(event)
+        logged_before = event_snapshot(event)
         updated = serializer.save()
 
         if link_id is not None:
             updated.agentpm_airtable_id = link_id
             updated.save(update_fields=["agentpm_airtable_id", "updated_at"])
 
-        publish_activity_event(
-            request.user, "calendar_event.updated",
-            "**Updated** Calendar Event",
-            detail=updated.title,
-        )
+        self._log_update(updated, logged_before)
 
         # `event_category` is deliberately absent from the snapshot: Google has no such
         # field, and `_sync_google_calendar` already preserves it across syncs, so a
@@ -429,22 +557,40 @@ class CalendarEventViewSet(RequireAccountMembershipMixin, viewsets.ModelViewSet)
         google_event_id = instance.google_event_id
         is_synced = instance.is_synced
         airtable_id = instance.agentpm_airtable_id
-        duration_secs = int((instance.end_datetime - instance.start_datetime).total_seconds())
+        # Only *tracked* time comes off the item: a planned block (dragged onto the
+        # calendar, never timed) contributed nothing, so deleting it must not subtract its
+        # length. A Live Tracking block carries its sessions; their seconds are the truth.
+        from django.db.models import Sum
+        tracked_secs = instance.time_sessions.filter(ended_at__isnull=False).aggregate(t=Sum("seconds"))["t"] or 0
+        running_ids = list(instance.time_sessions.filter(ended_at__isnull=True).values_list("pk", flat=True))
 
+        deleted_start = instance.start_datetime
+        pk = instance.pk
         instance.delete()
-        publish_activity_event(
-            self.request.user, "calendar_event.deleted",
-            "**Deleted** Calendar Event",
-            detail=title,
+        # The row is gone, so the entry carries its own title and start (see event_log).
+        record_event_change(
+            self.request.user, "deleted", instance, title=title,
+            message=f'Event deleted: "{title}"',
+            extra={"resource": {"type": "calendar_event", "id": pk},
+                   "event_start": deleted_start.isoformat() if deleted_start else None},
         )
-        # Subtract duration from the linked action item's time_spent
-        if airtable_id and duration_secs > 0:
+        if running_ids:
+            # Deleting the block of a running timer cancels that session (nothing logged yet).
+            from airtable_sync.models import ActionItemTimeSession
+            ActionItemTimeSession.objects.filter(pk__in=running_ids).delete()
+        if airtable_id and tracked_secs > 0:
             try:
+                from django.db.models import F
+                from django.db.models.functions import Greatest
                 from airtable_sync.models import AirtableActionItem
+                from airtable_sync.live_tracking import _push_totals
+                AirtableActionItem.objects.filter(airtable_id=airtable_id).update(
+                    time_spent=Greatest(F("time_spent") - tracked_secs, 0),
+                    tracked_time=Greatest(F("tracked_time") - tracked_secs, 0),
+                )
                 ai = AirtableActionItem.objects.filter(airtable_id=airtable_id).first()
                 if ai:
-                    ai.time_spent = max(0, ai.time_spent - duration_secs)
-                    ai.save(update_fields=["time_spent"])
+                    _push_totals(ai)  # the subtraction used to stay local and be undone by the next pull
             except Exception:
                 logger.exception("Failed to update time_spent for action item %s", airtable_id)
         # Also delete from Google Calendar so the event doesn't re-appear on the next sync
@@ -460,21 +606,18 @@ class CalendarEventViewSet(RequireAccountMembershipMixin, viewsets.ModelViewSet)
         from googleapiclient.discovery import build
         from integrations.models import OAuthCredential
 
-        try:
-            cred = OAuthCredential.objects.get(user=self.request.user, provider="google", is_active=True)
-        except OAuthCredential.DoesNotExist:
+        # Shared path: passes the stored expiry so a stale token refreshes before the
+        # request, and lets the refreshed token be saved (integrations.google_api).
+        from integrations.google_api import credentials_for, persist_refreshed
+        google_owner = self.request.user
+        google_creds = credentials_for(google_owner)
+        if google_creds is None:
             return
-
-        google_creds = Credentials(
-            token=cred.access_token,
-            refresh_token=cred.refresh_token,
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=settings.GOOGLE_CLIENT_ID,
-            client_secret=settings.GOOGLE_CLIENT_SECRET,
-            scopes=cred.scopes.split(),
-        )
         service = build("calendar", "v3", credentials=google_creds, cache_discovery=False)
-        service.events().delete(calendarId="primary", eventId=google_event_id).execute()
+        from integrations.google_calendar_gateway import delete_by_id
+
+        delete_by_id(service, google_owner, google_event_id, source="calendar.delete")
+        persist_refreshed(google_owner, google_creds)
 
 
 def _shared_team_or_self(user, target_user) -> bool:
@@ -779,8 +922,24 @@ class MeetingNoteViewSet(RequireCalendarEventOwnershipMixin, viewsets.ModelViewS
         # Notes are scoped to the calendar event's owner (mirroring CalendarEventViewSet).
         # Staff bypass, so admins can still audit any thread.
         # PATCH/DELETE are additionally scoped to the note's author via check_object_permissions.
-        qs = MeetingNote.objects.select_related("author", "event")
+        qs = MeetingNote.objects.select_related("author", "event", "author__profile")
         user = self.request.user
+
+        # ?action_item=<airtable_id>: every note on any calendar block of that action item —
+        # what its modal shows as "Calendar notes". Derived on read rather than copied into
+        # the item, so editing or deleting a note can never leave a stale duplicate behind.
+        # A shared item's notes are visible to anyone who can see the item, across owners.
+        action_item = (self.request.query_params.get("action_item") or "").strip()
+        if action_item and self.action == "list":
+            from airtable_sync.models import AirtableActionItem
+            from airtable_sync.views import _exclude_private_admin_items
+            visible = _exclude_private_admin_items(
+                AirtableActionItem.objects.filter(airtable_id=action_item), user
+            ).exists()
+            if not visible:
+                return qs.none()
+            return qs.filter(event__agentpm_airtable_id=action_item).order_by("event__start_datetime", "position", "created_at")
+
         if not (getattr(user, "is_staff", False)):
             qs = qs.filter(event__owner=user)
         # ?event= accepts a single PK or a comma-separated batch ("5" or "5,6,7") so a

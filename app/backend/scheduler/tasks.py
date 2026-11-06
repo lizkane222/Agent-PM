@@ -53,6 +53,14 @@ def deliver_due_reminders() -> None:
     )
 
     for reminder in due:
+        # Claim before delivering. One conditional UPDATE, so if two runs overlap (a slow
+        # minute, or two beat processes) exactly one of them flips the row out of
+        # `pending` and delivers; the other sees 0 rows changed and skips. Without this a
+        # reminder could be sent twice — including twice by SMS. Race-free on SQLite and
+        # Postgres alike, with no lock table.
+        claimed = Reminder.objects.filter(pk=reminder.pk, status="pending").update(status="sent")
+        if not claimed:
+            continue
         _dispatch_reminder(reminder)
 
 
@@ -67,8 +75,7 @@ def _dispatch_reminder(reminder) -> None:
             "Reminder %s skipped — %s is not in NOTIFICATION_ALLOWED_EMAILS",
             reminder.pk, user.email,
         )
-        # Still mark sent so the reminder doesn't loop forever.
-        Reminder.objects.filter(pk=reminder.pk).update(status="sent")
+        # Already claimed as sent by the caller, so it does not loop forever.
         return
 
     try:
@@ -78,43 +85,57 @@ def _dispatch_reminder(reminder) -> None:
 
     errors = []
 
+    def _record(channel, status):
+        from team.notifications import record_notification
+
+        from team.notifications import account_for_resource
+
+        record_notification(
+            user, channel, "reminder", f"⏰ {reminder.title}", reminder.body or "",
+            "/reminders", status,
+            account=account_for_resource(reminder.resource_type, reminder.resource_id),
+        )
+
     if reminder.notify_in_app:
         try:
             _send_in_app(user, reminder)
+            _record("in_app", "sent")
         except Exception as exc:
             errors.append(f"in_app: {exc}")
+            _record("in_app", "failed")
             logger.warning("Reminder %s in-app delivery failed: %s", reminder.pk, exc)
 
     if reminder.notify_slack:
         try:
-            _send_slack(user, profile, reminder)
+            _record("slack", "sent" if _send_slack(user, profile, reminder) else "skipped")
         except Exception as exc:
             errors.append(f"slack: {exc}")
+            _record("slack", "failed")
             logger.warning("Reminder %s Slack delivery failed: %s", reminder.pk, exc)
 
     if reminder.notify_push:
         try:
-            _send_push(profile, reminder)
+            _record("push", "sent" if _send_push(profile, reminder) else "skipped")
         except Exception as exc:
             errors.append(f"push: {exc}")
+            _record("push", "failed")
             logger.warning("Reminder %s push delivery failed: %s", reminder.pk, exc)
 
     if reminder.notify_sms:
         try:
-            _send_sms(profile, reminder)
+            _record("sms", "sent" if _send_sms(profile, reminder) else "skipped")
         except Exception as exc:
             errors.append(f"sms: {exc}")
+            _record("sms", "failed")
             logger.warning("Reminder %s SMS delivery failed: %s", reminder.pk, exc)
 
-    # Mark sent even if some channels failed — prevents infinite retry loops.
-    # Errors are logged; operators can inspect logs for delivery issues.
-    new_status = "sent" if not errors else "sent"
-    Reminder.objects.filter(pk=reminder.pk).update(status=new_status)
-    logger.info(
-        "Reminder %s delivered (errors=%s)",
-        reminder.pk,
-        errors or "none",
-    )
+    # The row was claimed as "sent" before delivery so it cannot be picked up twice. A
+    # channel failure does not re-arm it (that would retry every minute forever, and could
+    # re-send the channels that did succeed); it is logged at WARNING so it is visible.
+    if errors:
+        logger.warning("Reminder %s delivered with channel failures: %s", reminder.pk, errors)
+    else:
+        logger.info("Reminder %s delivered", reminder.pk)
 
 
 # ── Channel implementations ───────────────────────────────────────────────────
@@ -142,12 +163,12 @@ def _send_slack(user, profile, reminder) -> None:
     """Send a Slack DM to the user via the org bot token."""
     if not settings.SLACK_BOT_TOKEN:
         logger.debug("SLACK_BOT_TOKEN not set — skipping Slack reminder for user %s", user.pk)
-        return
+        return False
 
     slack_user_id = getattr(profile, "slack_user_id", "") if profile else ""
     if not slack_user_id:
         logger.debug("No slack_user_id for user %s — skipping Slack reminder", user.pk)
-        return
+        return False
 
     from slack_sdk import WebClient
     from slack_sdk.errors import SlackApiError
@@ -168,18 +189,18 @@ def _send_slack(user, profile, reminder) -> None:
         client.chat_postMessage(channel=slack_user_id, text=text)
     except SlackApiError as exc:
         raise RuntimeError(f"Slack API error: {exc.response['error']}") from exc
-
+    return True
 
 def _send_push(profile, reminder) -> None:
     """Send a Web Push notification using VAPID keys."""
     if not (settings.VAPID_PRIVATE_KEY and settings.VAPID_PUBLIC_KEY):
         logger.debug("VAPID keys not set — skipping push notification")
-        return
+        return False
 
     subscription = getattr(profile, "push_subscription", None) if profile else None
     if not subscription:
         logger.debug("No push subscription for profile %s", getattr(profile, "pk", "?"))
-        return
+        return False
 
     from pywebpush import webpush, WebPushException
 
@@ -204,18 +225,18 @@ def _send_push(profile, reminder) -> None:
                 type(profile).objects.filter(pk=profile.pk).update(push_subscription=None)
                 logger.info("Cleared expired push subscription for profile %s", profile.pk)
         raise
-
+    return True
 
 def _send_sms(profile, reminder) -> None:
     """Send an SMS via Twilio Programmable SMS."""
     if not (settings.TWILIO_ACCOUNT_SID and settings.TWILIO_AUTH_TOKEN and settings.TWILIO_PHONE_NUMBER):
         logger.debug("Twilio credentials not set — skipping SMS reminder")
-        return
+        return False
 
     phone = getattr(profile, "phone_number", "") if profile else ""
     if not phone:
         logger.debug("No phone_number on profile — skipping SMS reminder")
-        return
+        return False
 
     from twilio.rest import Client
 
@@ -228,3 +249,4 @@ def _send_sms(profile, reminder) -> None:
         from_=settings.TWILIO_PHONE_NUMBER,
         to=phone,
     )
+    return True

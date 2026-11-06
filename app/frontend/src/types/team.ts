@@ -60,6 +60,8 @@ export interface UserProfile {
   notify_default_sms: boolean;
   push_subscription_active: boolean;
   staff_view_override: boolean;
+  /** Authorisation tier. Read-only on /me/; Admins change it via teamApi.setAccessLevel. */
+  access_level?: "basic" | "pm" | "admin";
   calendar_colors?: CalendarColorPrefs;
   gmail_watch_config?: GmailWatchConfig;
 }
@@ -83,4 +85,56 @@ export interface GmailWatchConfig {
   label_name?: string; // Gmail label to watch (e.g., "Agent PM - Threads")
   keywords?: string[];
   block_keywords?: string[];
+}
+
+// ── Notifications, public profile, left notes ──────────────────────────────────
+
+export type NotificationChannel = "in_app" | "push" | "sms" | "slack" | "email";
+
+export interface AppNotification {
+  id: number;
+  channel: NotificationChannel;
+  kind: string;
+  title: string;
+  body: string;
+  link: string;
+  status: "sent" | "failed" | "skipped";
+  read_at: string | null;
+  created_at: string;
+}
+
+export type PublicItemType = "artifact_link" | "artifact_file" | "note" | "record_ref";
+
+export interface PublicItemRef {
+  resource_type: string;
+  resource_id: string | number;
+  label: string;
+  url: string;
+}
+
+export interface PublicItem {
+  id: number;
+  owner: number;
+  item_type: PublicItemType;
+  title: string;
+  url: string;
+  file_url: string;
+  body: string;
+  ref: Partial<PublicItemRef>;
+  position: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Safe public header for a team member, as served by /team/members/<id>/profile/. */
+export interface MemberPublicProfile extends TeamMember {
+  is_self: boolean;
+}
+
+export interface LeftNote {
+  id: number;
+  author: number;
+  author_name: string;
+  body: string;
+  created_at: string;
 }

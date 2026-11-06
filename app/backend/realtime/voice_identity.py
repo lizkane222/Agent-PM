@@ -46,6 +46,13 @@ IDENTITY_SALT = "realtime.voice.identity.v1"
 # The <Parameter name=...> Twilio echoes into setup.customParameters.
 IDENTITY_PARAM = "identity_token"
 
+# "Use in Voice" hand-off: the browser sends only a short key (connect param `ctx`); the
+# TwiML view verifies it belongs to the caller and forwards it as this signed, call-bound
+# <Parameter>. See skills.voice_launch.
+LAUNCH_SALT = "realtime.voice.launch.v1"
+LAUNCH_PARAM = "launch_token"
+LAUNCH_BROWSER_PARAM = "ctx"
+
 # Reasons surfaced in logs and in the call's handoffData — the only observability
 # available for a call that never reached the database.
 REASON_MISSING = "missing"
@@ -131,3 +138,21 @@ def load_user(user_pk: int):
     deactivated account unable to ride an in-flight token.
     """
     return resolve_user_sync(user_pk)
+
+
+def mint_launch_token(key: str, call_sid: str) -> str:
+    return signing.dumps({"k": key, "c": call_sid}, salt=LAUNCH_SALT)
+
+
+def read_launch_token(token: str, call_sid: str) -> str | None:
+    """The launch key in `token` if valid for `call_sid`; None otherwise (never raises)."""
+    if not token:
+        return None
+    try:
+        payload = signing.loads(token, salt=LAUNCH_SALT,
+                                max_age=getattr(settings, "VOICE_IDENTITY_MAX_AGE", 120))
+    except signing.BadSignature:
+        return None
+    if not isinstance(payload, dict) or payload.get("c") != call_sid:
+        return None
+    return payload.get("k") or None

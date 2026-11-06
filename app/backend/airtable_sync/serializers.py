@@ -88,23 +88,18 @@ class AirtableActionItemSerializer(serializers.ModelSerializer):
         request = self.context.get("request") if hasattr(self, "context") else None
         return getattr(request, "user", None)
 
-    def validate_assignee_airtable_id(self, value):
-        """Reject any write that would hand the item off to a different Airtable
-        collaborator. Callers may only assign to their own collaborator id
-        (or clear the assignee). Staff bypass."""
-        if not value:
-            return value  # clearing the assignee is always allowed
-        user = self._caller()
-        if user is None or not getattr(user, "is_authenticated", False):
-            return value
-        if getattr(user, "is_staff", False):
-            return value
-        collab_id = getattr(getattr(user, "profile", None), "airtable_collaborator_id", "") or ""
-        if collab_id and value == collab_id:
-            return value
-        raise serializers.ValidationError(
-            "You can only assign action items to yourself."
-        )
+    def validate(self, attrs):
+        """Assignee rule (airtable_sync/assignment.py), checked against the item's account —
+        the incoming one if this write also moves it, else the existing one."""
+        attrs = super().validate(attrs)
+        if "assignee_airtable_id" in attrs:
+            user = self._caller()
+            if user is not None and getattr(user, "is_authenticated", False):
+                from .assignment import ASSIGN_DENIED, can_assign
+                account = attrs["account"] if "account" in attrs else getattr(self.instance, "account", None)
+                if not can_assign(user, account, attrs["assignee_airtable_id"]):
+                    raise serializers.ValidationError({"assignee_airtable_id": ASSIGN_DENIED})
+        return attrs
 
     def validate_linked_meeting(self, value):
         """Only allow linking to meetings on an account the caller belongs to."""

@@ -16,9 +16,9 @@ import { BulletList, OrderedList, ListItem, TaskList, TaskItem } from "@tiptap/e
 // any clean `npm ci` would have failed on it.
 import { Placeholder } from "@tiptap/extensions";
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
-import { teamApi, searchApi, type SearchResult } from "../../lib/api";
+import { teamApi, searchApi, agentSkillsApi, type SearchResult } from "../../lib/api";
 import { plainToHtml } from "../../lib/noteHelpers";
-import type { TeamMember, CommentReference } from "../../types";
+import type { TeamMember, CommentReference, KeywordTemplate } from "../../types";
 
 export { plainToHtml };
 
@@ -91,7 +91,9 @@ const MENU_EST_HEIGHT = 240;
 
 interface UserItem { kind: "user"; id: number; label: string; member: TeamMember }
 interface RefItem { kind: "ref"; id: string; label: string; href: string; result: SearchResult }
-type MentionItem = UserItem | RefItem;
+/** A dynamic lookup template typed as `@#--`, expanded when a skill runs. */
+interface KeywordItem { kind: "keyword"; id: string; label: string; detail: string; template: string }
+type MentionItem = UserItem | RefItem | KeywordItem;
 
 function MentionDropdown({
   items,
@@ -158,6 +160,7 @@ function MentionDropdown({
                 </span>
               )}
               <span className="truncate">{item.label}</span>
+              {item.kind === "keyword" && <span className="truncate text-xs text-gray-400">{item.detail}</span>}
             </button>
           );
         })}
@@ -201,23 +204,28 @@ export interface RichTextMentionEditorProps {
   /** Fired with structured reference data when a record reference is inserted.
    * Only called when refMultiSelect is true (comment mode). */
   onReferenceInsert?: (reference: CommentReference) => void;
+  /** Offer dynamic lookup keywords when the user types `@#--`
+   * (e.g. `@#--all-action-items-${account_name}`). Off by default: only skill and
+   * template editors resolve them, so other editors keep plain `@#` behaviour. */
+  enableKeywords?: boolean;
 }
 
 const RichTextMentionEditor = forwardRef<RichTextMentionEditorHandle, RichTextMentionEditorProps>(
   function RichTextMentionEditor(
-    { value, onChange, placeholder, autoFocus, minHeightClassName, onKeyDownCapture, onSubmit, onBlur, refMultiSelect, onMentionSelect, onReferenceSelect, onReferenceInsert },
+    { value, onChange, placeholder, autoFocus, minHeightClassName, onKeyDownCapture, onSubmit, onBlur, refMultiSelect, onMentionSelect, onReferenceSelect, onReferenceInsert, enableKeywords },
     ref
   ) {
     const [showLink, setShowLink] = useState(false);
 
     // @mention state
-    type MentionMode = "user" | "ref" | null;
+    type MentionMode = "user" | "ref" | "keyword" | null;
     const [mentionMode, setMentionMode] = useState<MentionMode>(null);
     const [mentionQuery, setMentionQuery] = useState("");
     const [mentionAnchorPos, setMentionAnchorPos] = useState(0);
     const [mentionActiveIdx, setMentionActiveIdx] = useState(0);
     const [allMembers, setAllMembers] = useState<TeamMember[]>([]);
     const [refResults, setRefResults] = useState<SearchResult[]>([]);
+    const [keywordCatalog, setKeywordCatalog] = useState<KeywordTemplate[]>([]);
     const [refLoading, setRefLoading] = useState(false);
     const [pendingRefs, setPendingRefs] = useState<SearchResult[]>([]);
     // The dropdown opens upward by default, but an editor near the top of a
@@ -239,6 +247,22 @@ const RichTextMentionEditor = forwardRef<RichTextMentionEditorHandle, RichTextMe
             return !q || m.full_name.toLowerCase().includes(q) || m.email.toLowerCase().includes(q);
           })
           .map((m) => ({ kind: "user", id: m.id, label: m.full_name, member: m }))
+      : [];
+
+    // Keyword catalog is fetched the first time `@#--` is typed.
+    useEffect(() => {
+      if (mentionMode !== "keyword" || keywordCatalog.length > 0) return;
+      let cancelled = false;
+      agentSkillsApi.keywordCatalog()
+        .then((r) => { if (!cancelled) setKeywordCatalog(r.data.keywords ?? []); })
+        .catch(() => {});
+      return () => { cancelled = true; };
+    }, [mentionMode, keywordCatalog.length]);
+
+    const keywordItems: KeywordItem[] = mentionMode === "keyword"
+      ? keywordCatalog
+          .filter((k) => !mentionQuery || k.template.toLowerCase().includes(mentionQuery.toLowerCase()))
+          .map((k) => ({ kind: "keyword", id: k.template, label: k.template, detail: k.description, template: k.template }))
       : [];
 
     const refItems: RefItem[] = mentionMode === "ref"
@@ -292,6 +316,8 @@ const RichTextMentionEditor = forwardRef<RichTextMentionEditorHandle, RichTextMe
     useEffect(() => { submitRef.current = onSubmit; }, [onSubmit]);
     const blurRef = useRef(onBlur);
     useEffect(() => { blurRef.current = onBlur; }, [onBlur]);
+    const enableKeywordsRef = useRef(!!enableKeywords);
+    useEffect(() => { enableKeywordsRef.current = !!enableKeywords; }, [enableKeywords]);
     const mentionOpenRef = useRef(false);
     useEffect(() => { mentionOpenRef.current = mentionMode !== null; }, [mentionMode]);
 
@@ -352,6 +378,12 @@ const RichTextMentionEditor = forwardRef<RichTextMentionEditorHandle, RichTextMe
           const afterAt = textBefore.slice(atIdx + 1);
           // Only trigger if no space after @
           if (!afterAt.includes(" ") && !afterAt.includes("\n")) {
+            if (enableKeywordsRef.current && afterAt.startsWith("#--")) {
+              setMentionMode("keyword");
+              setMentionQuery(afterAt.slice(3));
+              setMentionAnchorPos(from - afterAt.length - 1);
+              return;
+            }
             if (afterAt.startsWith("#")) {
               const query = afterAt.slice(1);
               setMentionMode("ref");
@@ -419,6 +451,16 @@ const RichTextMentionEditor = forwardRef<RichTextMentionEditorHandle, RichTextMe
       dismissMention();
     }, [editor, mentionAnchorPos, dismissMention, onReferenceSelect, onReferenceInsert, refMultiSelect]);
 
+    const insertKeyword = useCallback((item: KeywordItem) => {
+      if (!editor) return;
+      const { from } = editor.state.selection;
+      editor.chain()
+        .deleteRange({ from: mentionAnchorPos, to: from })
+        .insertContent(`${item.template} `)
+        .run();
+      dismissMention();
+    }, [editor, mentionAnchorPos, dismissMention]);
+
     const togglePendingRef = useCallback((item: RefItem) => {
       setPendingRefs((prev) => {
         const exists = prev.find((r) => String(r.id) === item.id);
@@ -457,7 +499,7 @@ const RichTextMentionEditor = forwardRef<RichTextMentionEditorHandle, RichTextMe
     const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
       onKeyDownCapture?.(e);
       if (!mentionMode) return;
-      const items: MentionItem[] = mentionMode === "user" ? userItems : refItems;
+      const items: MentionItem[] = mentionMode === "user" ? userItems : mentionMode === "keyword" ? keywordItems : refItems;
       if (e.key === "ArrowDown") { e.preventDefault(); setMentionActiveIdx((i) => Math.min(i + 1, Math.max(items.length - 1, 0))); }
       if (e.key === "ArrowUp") { e.preventDefault(); setMentionActiveIdx((i) => Math.max(i - 1, 0)); }
       if (e.key === "Enter") {
@@ -467,6 +509,7 @@ const RichTextMentionEditor = forwardRef<RichTextMentionEditorHandle, RichTextMe
           if (selected) togglePendingRef(selected as RefItem);
         } else if (selected) {
           if (mentionMode === "user") insertMentionUser(selected as UserItem);
+          else if (mentionMode === "keyword") insertKeyword(selected as KeywordItem);
           else insertMentionRef(selected as RefItem);
         }
       }
@@ -478,19 +521,20 @@ const RichTextMentionEditor = forwardRef<RichTextMentionEditorHandle, RichTextMe
           const selected = items[mentionActiveIdx];
           if (selected) {
             if (mentionMode === "user") insertMentionUser(selected as UserItem);
+            else if (mentionMode === "keyword") insertKeyword(selected as KeywordItem);
             else insertMentionRef(selected as RefItem);
           }
         }
       }
       if (e.key === "Escape") { e.preventDefault(); dismissMention(); }
     }, [
-      onKeyDownCapture, mentionMode, userItems, refItems, mentionActiveIdx, refMultiSelect,
-      togglePendingRef, insertMentionUser, insertMentionRef, confirmPendingRefs, dismissMention,
+      onKeyDownCapture, mentionMode, userItems, refItems, keywordItems, mentionActiveIdx, refMultiSelect,
+      togglePendingRef, insertMentionUser, insertMentionRef, insertKeyword, confirmPendingRefs, dismissMention,
     ]);
 
     if (!editor) return null;
 
-    const activeItems: MentionItem[] = mentionMode === "user" ? userItems : refItems;
+    const activeItems: MentionItem[] = mentionMode === "user" ? userItems : mentionMode === "keyword" ? keywordItems : refItems;
     const selectedIds = mentionMode === "ref" && refMultiSelect
       ? new Set(pendingRefs.map((r) => String(r.id)))
       : undefined;
@@ -519,6 +563,12 @@ const RichTextMentionEditor = forwardRef<RichTextMentionEditorHandle, RichTextMe
       ) : refItems.length === 0 ? (
         <p className="text-xs text-gray-400 px-3 py-2">No results for “{mentionQuery}”</p>
       ) : undefined
+    ) : undefined;
+
+    const keywordStatusNode = mentionMode === "keyword" && keywordItems.length === 0 ? (
+      <p className="text-xs text-gray-400 px-3 py-2">
+        {keywordCatalog.length === 0 ? "Loading lookups…" : `No lookups match “${mentionQuery}”`}
+      </p>
     ) : undefined;
 
     return (
@@ -569,7 +619,9 @@ const RichTextMentionEditor = forwardRef<RichTextMentionEditorHandle, RichTextMe
             </TBtn>
           )}
           <span className="w-px h-4 bg-gray-300 mx-0.5" />
-          <span className="text-[10px] text-[var(--twilio-gray-60)] select-none">@ mentions · @# records</span>
+          <span className="text-[10px] text-[var(--twilio-gray-60)] select-none">
+            @ mentions · @# records{enableKeywords ? " · @#-- lookups" : ""}
+          </span>
         </div>
 
         {/* Editor */}
@@ -580,16 +632,17 @@ const RichTextMentionEditor = forwardRef<RichTextMentionEditorHandle, RichTextMe
           />
 
           {/* Mention dropdown */}
-          {mentionMode && (activeItems.length > 0 || multiHeader || refStatusNode) && (
+          {mentionMode && (activeItems.length > 0 || multiHeader || refStatusNode || keywordStatusNode) && (
             <MentionDropdown
               items={activeItems}
               activeIdx={mentionActiveIdx}
               selectedIds={selectedIds}
               multiHeader={multiHeader}
-              statusNode={refStatusNode}
+              statusNode={refStatusNode ?? keywordStatusNode}
               placement={placement}
               onSelect={(item) => {
                 if (item.kind === "user") insertMentionUser(item);
+                else if (item.kind === "keyword") insertKeyword(item);
                 else selectRefItem(item);
               }}
             />

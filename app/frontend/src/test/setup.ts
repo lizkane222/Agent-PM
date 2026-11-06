@@ -1,3 +1,4 @@
+import { profileHandlers } from "./handlers/profile";
 import "@testing-library/jest-dom";
 import { afterEach, beforeAll, afterAll } from "vitest";
 import { cleanup } from "@testing-library/react";
@@ -6,6 +7,10 @@ import { resetRequestCache } from "../lib/requestCache";
 import { resetCommentSummaries } from "../lib/commentSummaryStore";
 import { reloadActionItemZones } from "../hooks/useActionItemZoneSets";
 import { reloadStatusArrivalOrder } from "../hooks/useStatusArrivalOrder";
+import { reloadQuickLinks } from "../hooks/useQuickLinks";
+import { reloadAccountSectionCollapse } from "../hooks/useAccountSectionCollapse";
+import { resetLiveTimers } from "../lib/liveTimers";
+import { resetEmailThreads } from "../lib/emailThreadStore";
 import { resetCreatedEventIds } from "./handlers/scheduler";
 import { accountHandlers } from "./handlers/accounts";
 import { actionItemHandlers } from "./handlers/action_items";
@@ -33,6 +38,7 @@ const extraHandlers = [
   ...accountFeedHandlers,
   ...searchHandlers,
   ...layoutsHandlers,
+  ...profileHandlers,
   ...skillsHandlers,
   ...salesforceHandlers,
 ];
@@ -69,6 +75,16 @@ afterEach(() => {
   // Same trap again for the kanban status arrival order (hooks/useStatusArrivalOrder.ts):
   // a status move recorded by one test would otherwise still order the next test's columns.
   reloadStatusArrivalOrder();
+  // Module-level store: localStorage.clear() fires no event, so a link added by one test would
+  // otherwise still be listed in the next.
+  reloadQuickLinks();
+  // Account Detail section folding (hooks/useAccountSectionCollapse.ts) is module-level too.
+  reloadAccountSectionCollapse();
+  // Live Tracking timers (lib/liveTimers.ts) are a module-level cache of the server's
+  // running sessions; a timer started in one test must not still be "running" in the next.
+  resetLiveTimers();
+  // Loaded Gmail threads (lib/emailThreadStore.ts) are module-level; one test's load must not persist.
+  resetEmailThreads();
   // The create-event MSW handler hands out ascending ids from a module-level counter, so
   // without this an id assertion depends on how many events earlier tests created.
   resetCreatedEventIds();

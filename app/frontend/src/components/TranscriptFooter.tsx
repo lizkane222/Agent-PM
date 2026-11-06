@@ -13,6 +13,7 @@ import { skillsApi } from "../lib/api";
 import { fmtBytes } from "twilio-agent-pm-shared";
 import type { ClaudeSkill } from "../types";
 import VoiceButton, { type VoiceTurn } from "./VoiceButton";
+import { budgetBlockedMessage } from "../lib/tokenBudget";
 
 interface AttachedFile {
   name: string;
@@ -228,6 +229,10 @@ export default function TranscriptFooter() {
         }),
       });
 
+      if (response.status === 403) {
+        const blocked = budgetBlockedMessage(403, await response.clone().text());
+        if (blocked) throw new Error(blocked);
+      }
       // Read the session ID from the response header.
       const sessionId = response.headers.get("X-Session-Id");
       if (sessionId) {
@@ -280,6 +285,10 @@ export default function TranscriptFooter() {
             session_id: activeSessionIdRef.current ?? undefined,
           }),
         });
+        if (response.status === 403) {
+          const blocked = budgetBlockedMessage(403, await response.clone().text());
+          if (blocked) throw new Error(blocked);
+        }
         const sessionId = response.headers.get("X-Session-Id");
         if (sessionId) {
           const sid = parseInt(sessionId, 10);

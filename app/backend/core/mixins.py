@@ -13,13 +13,51 @@ from twilio.request_validator import RequestValidator
 logger = logging.getLogger(__name__)
 
 
+ACCESS_RANK = {"basic": 1, "pm": 2, "admin": 3}
+
+
+def access_level(user) -> str:
+    """The user's tier: "basic" | "pm" | "admin" (team.UserProfile.access_level).
+
+    Profiles are created lazily, so a user without one falls back to their Django flag —
+    is_staff → admin, else basic. Anonymous users are always basic.
+    """
+    if not getattr(user, "is_authenticated", False):
+        return "basic"
+    try:
+        profile = user.profile
+    except Exception:  # RelatedObjectDoesNotExist
+        profile = None
+    level = getattr(profile, "access_level", None)
+    if level in ACCESS_RANK:
+        return level
+    return "admin" if getattr(user, "is_staff", False) else "basic"
+
+
+def is_admin(user) -> bool:
+    return access_level(user) == "admin"
+
+
+def is_pm_or_above(user) -> bool:
+    return ACCESS_RANK[access_level(user)] >= ACCESS_RANK["pm"]
+
+
+def admin_wants_all(request) -> bool:
+    """`?scope=all` from an Admin: the Admin Data page's unscoped view of a shared table.
+
+    Deliberately opt-in per request (not `_staff_sees_all`), so endpoints that also feed
+    pickers and @mention lists keep their normal scoping everywhere else.
+    """
+    return request.query_params.get("scope") == "all" and is_admin(request.user)
+
+
 def _staff_sees_all(user) -> bool:
-    """True when the user has staff-level data visibility (is_staff AND staff_view_override enabled).
+    """True when the user sees all records: an Admin with the staff data view enabled.
 
     Import from here — this is the single canonical implementation. Do NOT re-define
     this helper in individual app views; use `from core.mixins import _staff_sees_all`.
     """
-    if not getattr(user, "is_staff", False):
+    if not is_admin(user):
         return False
     profile = getattr(user, "profile", None)
     if profile is None:

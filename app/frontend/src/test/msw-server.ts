@@ -1,6 +1,7 @@
 import { setupServer } from "msw/node";
 import { schedulerHandlers } from "./handlers/scheduler";
 import { teamHandlers } from "./handlers/team";
+import { profileHandlers } from "./handlers/profile";
 import { discoverHandlers } from "./handlers/discover";
 import { agentsHandlers } from "./handlers/agents";
 import { feedbackHandlers } from "./handlers/feedback";
@@ -20,6 +21,7 @@ import { salesforceHandlers } from "./handlers/salesforce";
 export const server = setupServer(
   ...schedulerHandlers,
   ...teamHandlers,
+  ...profileHandlers,
   ...discoverHandlers,
   ...agentsHandlers,
   ...feedbackHandlers,

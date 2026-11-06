@@ -319,6 +319,28 @@ def global_search(request):
     except Exception:
         logger.exception("search: skills section failed")
 
+    # ── Agent PM skills (so they can be @#-referenced and chained) ───────────
+    try:
+        from django.db.models import Q as _Q
+        from skills.models import AgentSkill
+        qs = AgentSkill.objects.filter(_icontains_q(["name", "description"], term))
+        if not is_staff:
+            qs = qs.filter(_Q(created_by=user) | _Q(visibility="public", status="approved"))
+        for obj in qs.distinct()[:5]:
+            results.append({
+                "type": "agent_skill",
+                "type_label": "Agent PM Skill",
+                "id": obj.id,
+                "title": obj.name,
+                "detail": obj.description[:120] if obj.description else "",
+                "account": "",
+                "meta": obj.status,
+                "url": "/skills",
+                "accent": "#f97316",
+            })
+    except Exception:
+        logger.exception("search: agent skills section failed")
+
     # ── Comments ──────────────────────────────────────────────────────────────
     try:
         from comments.models import Comment

@@ -205,3 +205,24 @@ describe("GongSummaryPanel — per-provider saves", () => {
     expect(screen.getByRole("button", { name: "Zoom" })).toHaveAttribute("aria-pressed", "true");
   });
 });
+
+
+describe("GongSummaryPanel — links and topic titles", () => {
+  it("renders the Zoom recording block's link as a hyperlink", async () => {
+    const zoom = "Recording\n- Duration: 00:31:24\n- Shareable link: https://twilio.zoom.us/rec/share/abc?pwd=xyz";
+    serveMeeting({ zoom_notes: zoom });
+    renderPanel({ existingZoomNotes: zoom });
+
+    const link = await screen.findByRole("link", { name: /twilio\.zoom\.us\/rec\/share\/abc/ });
+    expect(link).toHaveAttribute("href", "https://twilio.zoom.us/rec/share/abc?pwd=xyz");
+    expect(screen.getByText(/Duration: 00:31:24/)).toBeInTheDocument();
+  });
+
+  it("shows a Gong key point's topic title ahead of its sentence", async () => {
+    const gong = "Key Points\n- Debugger Navigation: The team showed the URL trick";
+    serveMeeting({ gong_notes: gong });
+    renderPanel({ existingNotes: gong });
+
+    expect(await screen.findByText("Debugger Navigation: The team showed the URL trick")).toBeInTheDocument();
+  });
+});

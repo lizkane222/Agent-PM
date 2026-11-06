@@ -14,7 +14,7 @@ touches the database.
 
 from unittest.mock import AsyncMock, patch
 
-from django.test import SimpleTestCase, override_settings
+from django.test import SimpleTestCase, TestCase, override_settings
 
 from realtime.voice_agent import (
     FILLERS,
@@ -23,6 +23,7 @@ from realtime.voice_agent import (
     WRAP_UP_NUDGE,
     VoiceAgent,
     build_voice_system_prompt,
+    current_date_line,
     dispatch_confirmed,
 )
 from realtime.voice_policy import CONFIRMATION_SENTINEL, VoiceTurnState
@@ -336,7 +337,7 @@ class VoiceAgentToolFailureTests(SimpleTestCase):
         self.assertNotIn("is_error", results["tu_b"])
         self.assertIn("ok", results["tu_b"]["content"])
 
-    async def test_exception_detail_is_recorded_but_not_spoken(self):
+    async def test_exception_detail_is_neither_spoken_nor_stored(self):
         client = FakeClient([
             _Round([], blocks=[_tool_use("search_records", id="tu_a")]),
             _Round(["sorry"]),
@@ -346,7 +347,10 @@ class VoiceAgentToolFailureTests(SimpleTestCase):
                    new=AsyncMock(side_effect=RuntimeError("secret-token-abc"))):
             events, _ = await _drain(agent)
         self.assertNotIn("secret-token-abc", _spoken(events))
-        self.assertIn("secret-token-abc", agent.records[0].error_message)
+        # The ToolCall row is visible in the Sessions list, so it records the exception
+        # type only; the detail stays in the server log (logger.exception).
+        self.assertEqual(agent.records[0].error_message, "RuntimeError")
+        self.assertNotIn("secret-token-abc", agent.records[0].error_message)
 
 
 @override_settings(**VOICE_SETTINGS)
@@ -475,7 +479,7 @@ class VoiceAgentConfirmationGateTests(SimpleTestCase):
         state = VoiceTurnState()
         blocks = [
             _tool_use("delete_action_item", id="tu_a", airtable_id="recA"),
-            _tool_use("delete_meeting", id="tu_b", airtable_id="recB"),
+            _tool_use("delete_calendar_event", id="tu_b", event_id=7),
         ]
         client = FakeClient([_Round([], blocks=blocks), _Round(["asking"])])
         agent = VoiceAgent(user=_User(), client=client, state=state)
@@ -493,7 +497,7 @@ class VoiceAgentConfirmationGateTests(SimpleTestCase):
         state = VoiceTurnState()
         state.arm("send_sms", {"to": "+1"}, "text someone", now=0.0)
         client = FakeClient([
-            _Round([], blocks=[_tool_use("delete_meeting", id="tu_a", airtable_id="recB")]),
+            _Round([], blocks=[_tool_use("delete_calendar_event", id="tu_a", event_id=7)]),
             _Round(["asking"]),
         ])
         agent = VoiceAgent(user=_User(), client=client, state=state)
@@ -510,7 +514,9 @@ class DispatchConfirmedTests(SimpleTestCase):
         with patch("realtime.voice_agent.mcp_server.dispatch",
                    new=AsyncMock(return_value={"sid": "SM1"})) as dispatch:
             result, record = await dispatch_confirmed("send_sms", {"to": "+1", "body": "x"}, user)
-        dispatch.assert_awaited_once_with("send_sms", {"to": "+1", "body": "x"}, user=user)
+        dispatch.assert_awaited_once_with(
+            "send_sms", {"to": "+1", "body": "x"}, user=user, confirmed=True
+        )
         self.assertEqual(result, {"sid": "SM1"})
         self.assertEqual(record.status, "success")
         self.assertGreaterEqual(record.duration_ms, 0)
@@ -521,7 +527,7 @@ class DispatchConfirmedTests(SimpleTestCase):
             result, record = await dispatch_confirmed("send_sms", {"to": "+1"}, _User())
         self.assertIsNone(result)
         self.assertEqual(record.status, "error")
-        self.assertIn("nope", record.error_message)
+        self.assertEqual(record.error_message, "RuntimeError")
 
 
 @override_settings(**VOICE_SETTINGS)
@@ -581,6 +587,32 @@ class BuildVoiceSystemPromptTests(SimpleTestCase):
         self.assertIn("CONFIRMATION", prompt)
         self.assertIn(CONFIRMATION_SENTINEL, prompt)
 
+    def test_prompt_grounds_replies_in_tool_results(self):
+        # A caller said "Orchestrator", the system linked "Archistrator", and the agent
+        # repeated the caller's word. It must also never call an error a success.
+        prompt = build_voice_system_prompt()
+        self.assertIn("REPORT WHAT THE TOOL DID", prompt)
+        self.assertIn("account_name", prompt)
+        self.assertIn("status error", prompt)
+        self.assertIn("candidates", prompt)
+        self.assertIn("account_fallback", prompt)
+
+    def test_prompt_teaches_the_meeting_with_a_colleague_workflow(self):
+        prompt = build_voice_system_prompt()
+        for tool in ("find_person", "get_colleague_availability", "create_calendar_event", "invite_to_meeting"):
+            self.assertIn(tool, prompt)
+        # The agent used to tell callers it had no access to a colleague's calendar.
+        self.assertIn("never say you cannot access their calendar", prompt)
+        # Privacy: availability only, never what the meetings are.
+        self.assertIn("never what their meetings are", prompt)
+
+    def test_every_tool_named_in_the_prompt_is_a_registered_tool(self):
+        from agents.mcp_server import mcp_server
+        prompt = build_voice_system_prompt()
+        for tool in ("find_person", "get_colleague_availability", "create_calendar_event", "invite_to_meeting"):
+            self.assertIn(tool, mcp_server.list_tools())
+            self.assertIn(tool, prompt)
+
     def test_empty_inventory_adds_no_heading(self):
         self.assertNotIn("SAVED WORKFLOWS", build_voice_system_prompt(""))
         self.assertNotIn("SAVED WORKFLOWS", build_voice_system_prompt("   \n  "))
@@ -602,3 +634,130 @@ def _tool_results(messages):
         for block in message["content"]
         if isinstance(block, dict) and block.get("type") == "tool_result"
     ]
+
+
+class CurrentDateLineTests(SimpleTestCase):
+    """
+    The voice prompt used to carry no date, so "next Monday" was resolved against the model's
+    training data: a meeting for "Monday, October 19th" was created in 2025 and never showed on
+    the caller's calendar.
+    """
+
+    def _line(self, now_utc, tz="UTC"):
+        from datetime import datetime, timezone as dt_tz
+
+        return current_date_line(tz, now=datetime(*now_utc, tzinfo=dt_tz.utc))
+
+    def test_names_today_with_the_year_and_weekday(self):
+        line = self._line((2026, 10, 16, 18, 0))
+        self.assertIn("Friday, October 16, 2026", line)
+        self.assertIn("2026-10-16", line)
+
+    def test_includes_the_time_so_free_slots_can_start_after_now(self):
+        self.assertIn("11:00", self._line((2026, 10, 16, 18, 0), "America/Los_Angeles"))
+
+    def test_uses_the_callers_timezone_for_the_date(self):
+        # 02:00 UTC on the 17th is still the evening of the 16th in Los Angeles.
+        line = self._line((2026, 10, 17, 2, 0), "America/Los_Angeles")
+        self.assertIn("Friday, October 16, 2026", line)
+        self.assertIn("America/Los_Angeles", line)
+
+    def test_states_how_to_write_times_for_the_tools(self):
+        line = self._line((2026, 10, 16, 18, 0), "America/Los_Angeles")
+        self.assertIn("ISO 8601", line)
+        self.assertIn("next Monday", line)
+
+    def test_a_typed_abbreviation_is_understood_not_silently_treated_as_utc(self):
+        # Settings is a free-text box and the real profile value was "PST". It used to fall
+        # through to UTC, so the agent announced the wrong day and hour.
+        line = self._line((2026, 10, 17, 2, 0), "PST")  # 02:00Z on the 17th
+        self.assertIn("Friday, October 16, 2026", line)
+        self.assertIn("19:00", line)  # 7pm Pacific daylight time, not 18:00 (fixed UTC-8)
+        self.assertIn("America/Los_Angeles", line)
+
+    def test_lists_the_upcoming_dates_so_the_model_does_not_do_weekday_arithmetic(self):
+        # On Friday 16 Oct 2026 the model resolved "next Monday" to the 20th, a Tuesday, in
+        # every tool call. It is bad at counting days, so the answers are handed to it.
+        line = self._line((2026, 10, 16, 18, 0))
+        self.assertIn("Monday 2026-10-19", line)
+        self.assertIn("Tuesday 2026-10-20", line)
+        self.assertIn("Friday 2026-10-23", line)
+
+    def test_upcoming_dates_start_tomorrow_and_cover_a_full_week_plus(self):
+        line = self._line((2026, 10, 16, 18, 0))
+        self.assertNotIn("Friday 2026-10-16 (", line.split("Upcoming")[-1])  # today is not "upcoming"
+        self.assertIn("Saturday 2026-10-17", line)
+        self.assertIn("Monday 2026-10-26", line)  # the Monday after next, 10 days out
+
+    def test_upcoming_dates_use_the_callers_local_calendar(self):
+        # 02:00Z on the 17th is still Friday evening the 16th in Los Angeles, so tomorrow is
+        # Saturday the 17th and the next Monday is still the 19th.
+        line = self._line((2026, 10, 17, 2, 0), "PST")
+        self.assertIn("Saturday 2026-10-17", line)
+        self.assertIn("Monday 2026-10-19", line)
+
+    def test_says_that_next_monday_means_the_first_monday_after_today(self):
+        self.assertIn("next Monday", self._line((2026, 10, 16, 18, 0)))
+        self.assertIn("first", self._line((2026, 10, 16, 18, 0)).lower())
+
+    def test_unknown_timezone_falls_back_to_utc_instead_of_raising(self):
+        line = self._line((2026, 10, 16, 18, 0), "Not/AZone")
+        self.assertIn("UTC", line)
+        self.assertIn("2026-10-16", line)
+
+    def test_blank_timezone_falls_back_to_utc(self):
+        self.assertIn("UTC", self._line((2026, 10, 16, 18, 0), ""))
+
+
+class VoiceAgentDateInRequestTests(SimpleTestCase):
+    async def _system(self):
+        agent = VoiceAgent(user=_User(), client=FakeClient([_Round(["ok"])]))
+        with patch("realtime.voice_agent.mcp_server.dispatch", new=AsyncMock()):
+            await _drain(agent)
+        return agent._client.messages.stream_calls[0]["system"]
+
+    async def test_every_request_carries_the_current_date(self):
+        from datetime import datetime
+
+        system = await self._system()
+        self.assertIn(str(datetime.now().year), system)
+        self.assertIn("Today is", system)
+
+    async def test_the_date_is_added_per_request_not_frozen_into_the_base_prompt(self):
+        # A call that crosses midnight must not keep announcing yesterday.
+        self.assertNotIn("Today is", build_voice_system_prompt())
+
+
+class VoiceAgentWithARealUserTests(TestCase):
+    """
+    The fake `_User` used elsewhere has no `.profile`, which hid a crash: the agent read
+    `user.profile.timezone` inside the async loop, and on a real Django User that lazy query
+    raises SynchronousOnlyOperation. The caller's timezone is now passed in, never fetched.
+    """
+
+    async def _real_user(self):
+        from channels.db import database_sync_to_async
+        from django.contrib.auth import get_user_model
+        from team.models import UserProfile
+
+        def make():
+            user = get_user_model().objects.create_user("real-voice-user", password="x")
+            UserProfile.objects.create(user=user, timezone="America/Los_Angeles")
+            return get_user_model().objects.get(pk=user.pk)  # fresh instance: profile NOT cached
+
+        return await database_sync_to_async(make)()
+
+    async def test_a_turn_runs_for_a_real_user_without_touching_the_database(self):
+        user = await self._real_user()
+        agent = VoiceAgent(user=user, client=FakeClient([_Round(["ok"])]), tz_name="America/Los_Angeles")
+        with patch("realtime.voice_agent.mcp_server.dispatch", new=AsyncMock()):
+            await _drain(agent)  # raised SynchronousOnlyOperation before the fix
+        system = agent._client.messages.stream_calls[0]["system"]
+        self.assertIn("America/Los_Angeles", system)
+
+    async def test_the_agent_does_not_read_the_profile_itself(self):
+        user = await self._real_user()
+        agent = VoiceAgent(user=user, client=FakeClient([_Round(["ok"])]))  # no timezone given
+        with patch("realtime.voice_agent.mcp_server.dispatch", new=AsyncMock()):
+            await _drain(agent)
+        self.assertIn("UTC", agent._client.messages.stream_calls[0]["system"])

@@ -11,7 +11,8 @@ import UnderstandLogo from "../assets/Product Logos/logo-understand-red.svg?reac
 import VirtualAgentLogo from "../assets/Product Logos/virtual-agent-logo-red.svg?react";
 import type { SkillFile } from "../lib/api";
 import { useLogGlow } from "../hooks/useLogGlow";
-import type { AgentSkill, AgentSkillStatus, ClaudeSkill, ClaudeSkillStatus } from "../types";
+import { useAgentTools } from "../hooks/useAgentTools";
+import type { AgentSkill, AgentSkillStatus, ClaudeSkill, ClaudeSkillStatus, SkillContextRecord, SlackSource, SkillTemplate } from "../types";
 import { ROLE_OPTIONS } from "../types";
 import { useCommentContext, useRightClickComment } from "../components/comments/CommentContext";
 import CommentIcon from "../components/CommentIcon";
@@ -22,74 +23,17 @@ import { useCurrentUser } from "../context/CurrentUserContext";
 
 // ── Static Twilio plugin skill registry ───────────────────────────────────────
 
-type TwilioSkillGroup = "Twilio" | "SendGrid";
-
-interface TwilioSkill {
-  slug: string;
-  name: string;
-  description: string;
-  group: TwilioSkillGroup;
-}
-
-const TWILIO_SKILLS: TwilioSkill[] = [
-  // Twilio
-  { group: "Twilio", slug: "twilio-account-setup", name: "Account Setup", description: "Create and configure a Twilio account from scratch. Covers free trial signup, credentials, phone numbers, and enabling products." },
-  { group: "Twilio", slug: "twilio-ai-agent-architect", name: "AI Agent Architect", description: "Planning skill for AI-powered conversational agents. Recommends the right Twilio Conversations architecture for your use case." },
-  { group: "Twilio", slug: "twilio-agent-augmentation-architect", name: "Agent Augmentation Architect", description: "Planning skill for augmenting human agents with real-time AI intelligence across coaching, compliance, QA, and routing." },
-  { group: "Twilio", slug: "twilio-agent-connect", name: "Agent Connect", description: "Connect third-party AI agents (OpenAI, Bedrock, LangChain) to Twilio voice and messaging channels." },
-  { group: "Twilio", slug: "twilio-call-recordings", name: "Call Recordings", description: "Record Twilio voice calls correctly. Covers storage, playback, compliance, and deletion." },
-  { group: "Twilio", slug: "twilio-cli-reference", name: "CLI Reference", description: "Twilio CLI reference for managing Twilio resources from the terminal." },
-  { group: "Twilio", slug: "twilio-compliance-onboarding", name: "Compliance Onboarding", description: "Registrations required BEFORE Twilio traffic works. Covers messaging registration, A2P 10DLC, toll-free verification." },
-  { group: "Twilio", slug: "twilio-compliance-traffic", name: "Compliance Traffic Rules", description: "Rules you must follow for Twilio messaging and voice traffic. Covers TCPA, opt-outs, and carrier requirements." },
-  { group: "Twilio", slug: "twilio-conference-calls", name: "Conference Calls", description: "Build multi-party calls using Twilio Conference. Covers warm transfer, recording, and moderator controls." },
-  { group: "Twilio", slug: "twilio-content-template-builder", name: "Content Template Builder", description: "Create, manage, and send message templates using Twilio's Content API." },
-  { group: "Twilio", slug: "twilio-conversation-intelligence", name: "Conversation Intelligence", description: "Analyze calls and messages with Twilio Conversation Intelligence. Covers transcription, sentiment, and operator scoring." },
-  { group: "Twilio", slug: "twilio-conversation-orchestrator", name: "Conversation Orchestrator", description: "Configure automatic conversation capture and routing with Twilio Conversation Orchestrator." },
-  { group: "Twilio", slug: "twilio-conversations-classic-api", name: "Conversations Classic API", description: "Build multi-channel messaging experiences using the Twilio Conversations (classic) API." },
-  { group: "Twilio", slug: "twilio-customer-memory", name: "Customer Memory", description: "Store and retrieve customer context using Twilio Conversation Memory." },
-  { group: "Twilio", slug: "twilio-customer-support-architect", name: "Customer Support Architect", description: "Planning skill for building customer service and support systems on Twilio." },
-  { group: "Twilio", slug: "twilio-debugging-observability", name: "Debugging & Observability", description: "Debug Twilio integrations and set up production observability. Covers logs, alerts, and error codes." },
-  { group: "Twilio", slug: "twilio-email-deliverability-advisor", name: "Email Deliverability Advisor", description: "Deliverability advisor for the Twilio Email API. Diagnoses inbox placement and reputation issues." },
-  { group: "Twilio", slug: "twilio-email-send", name: "Email Send (Twilio)", description: "Send email via the Twilio Email API using Twilio credentials." },
-  { group: "Twilio", slug: "twilio-enterprise-knowledge", name: "Enterprise Knowledge", description: "Add knowledge retrieval to AI agents using Twilio's Enterprise Knowledge API." },
-  { group: "Twilio", slug: "twilio-iam-auth-setup", name: "IAM & Auth Setup", description: "Set up and manage Twilio authentication credentials: Auth Tokens, API keys, and org-level IAM." },
-  { group: "Twilio", slug: "twilio-identity-verification-advisor", name: "Identity Verification Advisor", description: "Planning skill for identity verification and fraud prevention with Twilio Verify and Lookup." },
-  { group: "Twilio", slug: "twilio-lookup-phone-intelligence", name: "Lookup Phone Intelligence", description: "Look up phone number intelligence via Twilio Lookup v2 API. Covers number validation, carrier, and risk scoring." },
-  { group: "Twilio", slug: "twilio-marketing-promotions-advisor", name: "Marketing & Promotions Advisor", description: "Planning skill for marketing and promotional messaging campaigns on Twilio." },
-  { group: "Twilio", slug: "twilio-messaging-channel-advisor", name: "Messaging Channel Advisor", description: "Planning skill to pick the right Twilio messaging channel (SMS, WhatsApp, RCS, email)." },
-  { group: "Twilio", slug: "twilio-messaging-overview", name: "Messaging Overview", description: "Twilio Messaging channel overview and onboarding guide across SMS, WhatsApp, RCS, and email." },
-  { group: "Twilio", slug: "twilio-messaging-services", name: "Messaging Services", description: "Create and configure Twilio Messaging Services for production messaging with alpha sender and sticky sender." },
-  { group: "Twilio", slug: "twilio-messaging-webhooks", name: "Messaging Webhooks", description: "Receive inbound messages and track outbound delivery status via Twilio webhooks." },
-  { group: "Twilio", slug: "twilio-notifications-alerts-advisor", name: "Notifications & Alerts Advisor", description: "Planning skill for transactional notifications and alerts via Twilio." },
-  { group: "Twilio", slug: "twilio-numbers-senders", name: "Numbers & Senders", description: "Choose the right Twilio number type and sender before building. Covers long codes, short codes, toll-free, and alpha senders." },
-  { group: "Twilio", slug: "twilio-organizations-setup", name: "Organizations Setup", description: "Set up and manage Twilio Organizations for centralized account and user management." },
-  { group: "Twilio", slug: "twilio-rcs-messaging", name: "RCS Messaging", description: "Send RCS Business Messages via Twilio. Covers compliance onboarding, templates, and rich media." },
-  { group: "Twilio", slug: "twilio-regulatory-compliance-bundles", name: "Regulatory Compliance Bundles", description: "Manage regulatory compliance bundles for international phone numbers." },
-  { group: "Twilio", slug: "twilio-reliability-patterns", name: "Reliability Patterns", description: "Handle rate limits, retries, and failures when building on Twilio at scale." },
-  { group: "Twilio", slug: "twilio-security-api-auth", name: "Security: API Auth", description: "Choose the right Twilio authentication method and implement it correctly." },
-  { group: "Twilio", slug: "twilio-security-compliance-hipaa", name: "Security: HIPAA Compliance", description: "Configure Twilio accounts for HIPAA compliance. Covers BAA requirements and data handling." },
-  { group: "Twilio", slug: "twilio-security-hardening", name: "Security Hardening", description: "Secure Twilio applications against common attacks. Covers credential hygiene, webhook validation, and rate limiting." },
-  { group: "Twilio", slug: "twilio-send-message", name: "Send Message", description: "Send messages via Twilio's Programmable Messaging API across all supported channels." },
-  { group: "Twilio", slug: "twilio-sms-isv-setup", name: "SMS ISV Setup", description: "Best practices for ISVs building SMS features on top of Twilio." },
-  { group: "Twilio", slug: "twilio-sms-send-message", name: "SMS Send Message", description: "SMS and MMS deep-dive reference. Covers SMS-specific error codes, encoding, and carrier filtering." },
-  { group: "Twilio", slug: "twilio-taskrouter-routing", name: "TaskRouter Routing", description: "Route tasks to agents using Twilio TaskRouter. Covers Workers, Task Queues, and Workflows." },
-  { group: "Twilio", slug: "twilio-verify-send-otp", name: "Verify: Send OTP", description: "Send and verify one-time passcodes via Twilio Verify over SMS, RCS, WhatsApp, and voice." },
-  { group: "Twilio", slug: "twilio-voice-conversation-relay", name: "Voice: Conversation Relay", description: "Build AI-powered voice agents using Twilio ConversationRelay with real-time ASR, TTS, and WebSocket streaming." },
-  { group: "Twilio", slug: "twilio-voice-outbound-calls", name: "Voice: Outbound Calls", description: "Make outbound phone calls via Twilio's Programmable Voice REST API." },
-  { group: "Twilio", slug: "twilio-voice-twiml", name: "Voice: TwiML", description: "Build voice call logic using TwiML (Twilio Markup Language). Covers all TwiML verbs and nouns." },
-  { group: "Twilio", slug: "twilio-webhook-architecture", name: "Webhook Architecture", description: "Design, secure, and operate Twilio webhook endpoints. Covers inbound event handling and validation." },
-  { group: "Twilio", slug: "twilio-whatsapp-manage-senders", name: "WhatsApp: Manage Senders", description: "Create, configure, and manage WhatsApp Business senders via Twilio." },
-  { group: "Twilio", slug: "twilio-whatsapp-send-message", name: "WhatsApp: Send Message", description: "WhatsApp messaging deep-dive reference. Covers the 24-hour service window, templates, and media." },
-  // SendGrid
-  { group: "SendGrid", slug: "twilio-sendgrid-account-setup", name: "Account Setup", description: "Set up a SendGrid account for email delivery. Covers API key creation, sender authentication, and domain verification." },
-  { group: "SendGrid", slug: "twilio-sendgrid-deliverability-advisor", name: "Deliverability Advisor", description: "Diagnostic and advisory skill for email deliverability problems. Covers reputation, SPF, DKIM, and DMARC." },
-  { group: "SendGrid", slug: "twilio-sendgrid-email-send", name: "Email Send", description: "Send transactional and bulk email via the SendGrid v3 Mail Send API." },
-  { group: "SendGrid", slug: "twilio-sendgrid-email-settings", name: "Email Settings", description: "Configure SendGrid dynamic templates, tracking settings, and unsubscribe groups." },
-  { group: "SendGrid", slug: "twilio-sendgrid-engagement-quality", name: "Engagement Quality", description: "Monitor email program health with SendGrid Engagement Quality (SEQ) scores." },
-  { group: "SendGrid", slug: "twilio-sendgrid-inbound-parse", name: "Inbound Parse", description: "Receive inbound email via SendGrid Inbound Parse webhook. Covers MX record setup and payload handling." },
-  { group: "SendGrid", slug: "twilio-sendgrid-suppressions", name: "Suppressions", description: "Manage SendGrid email suppressions: bounces, blocks, spam reports, and unsubscribes." },
-  { group: "SendGrid", slug: "twilio-sendgrid-webhooks", name: "Webhooks", description: "Track email delivery and engagement via SendGrid Event Webhooks." },
-];
+import { TWILIO_SKILLS, type TwilioSkill, type TwilioSkillGroup } from "../lib/twilioSkills";
+import SkillLaunchButtons, { injectToChat, launchVoice } from "../components/skills/SkillLaunchButtons";
+import SkillMultiPicker from "../components/skills/SkillMultiPicker";
+import CapabilityPicker from "../components/skills/CapabilityPicker";
+import ToolRecommender from "../components/skills/ToolRecommender";
+import AttachmentDropzone, { type PendingAttachment } from "../components/skills/AttachmentDropzone";
+import AttachmentViewer from "../components/skills/AttachmentViewer";
+import ContextRecordsField from "../components/skills/ContextRecordsField";
+import SlackSourcesField from "../components/skills/SlackSourcesField";
+import AccountMultiSelect from "../components/skills/AccountMultiSelect";
+import TemplateTabs from "../components/skills/TemplateTabs";
 
 const STATUS_STYLES: Record<ClaudeSkillStatus, { bg: string; color: string; label: string; strip: string }> = {
   pending_review: { bg: "rgba(234,179,8,0.15)",  color: "#ca8a04", label: "Pending Review", strip: "PENDING" },
@@ -748,7 +692,6 @@ function SkillRunner({ skill }: { skill: ClaudeSkill }) {
   const [runError, setRunError] = useState<string | null>(null);
   const [durationMs, setDurationMs] = useState<number | null>(null);
   const [hasRun, setHasRun] = useState(false);
-
   async function handleRun() {
     setRunning(true);
     setResult(null);
@@ -774,11 +717,6 @@ function SkillRunner({ skill }: { skill: ClaudeSkill }) {
       setRunning(false);
       setHasRun(true);
     }
-  }
-
-  function handleUseInChat() {
-    const text = skill.command || `Run skill: ${skill.name}`;
-    window.dispatchEvent(new CustomEvent("chat-inject", { detail: { text } }));
   }
 
   const fieldStyle: React.CSSProperties = {
@@ -854,16 +792,11 @@ function SkillRunner({ skill }: { skill: ClaudeSkill }) {
             </>
           )}
         </button>
-        <button
-          onClick={handleUseInChat}
-          style={{
-            padding: "6px 14px", borderRadius: "6px", fontSize: "0.875rem", fontWeight: 600,
-            background: "transparent", border: "1px solid rgba(0,0,0,0.15)",
-            color: "var(--text-secondary, #666)", cursor: "pointer", fontFamily: "var(--font-base)",
-          }}
-        >
-          Use in Chat
-        </button>
+        <SkillLaunchButtons
+          compact
+          source={{ kind: "text", title: skill.name, chatText: skill.command || `Run skill: ${skill.name}`,
+                    voiceText: `Use the ${skill.name} tool. ${skill.description}` }}
+        />
       </div>
 
       {hasRun && !runError && resultText !== null && (
@@ -1017,18 +950,12 @@ function TwilioSkillDetail({ skill, onClose }: { skill: TwilioSkill; onClose: ()
 
       {/* Use skill button */}
       <div>
-        <button
-          onClick={() => window.dispatchEvent(new CustomEvent("chat-inject", { detail: { text: `/${skill.slug}` } }))}
-          style={{
-            padding: "8px 20px", borderRadius: "7px", fontSize: "0.875rem", fontWeight: 600,
-            background: "var(--twilio-red, #e22)", color: "#fff", border: "none",
-            cursor: "pointer", fontFamily: "var(--font-base)",
-          }}
-        >
-          Use in Chat
-        </button>
+        <SkillLaunchButtons
+          source={{ kind: "text", title: skill.name, chatText: `/${skill.slug}`,
+                    voiceText: `Apply the Twilio skill ${skill.name} (${skill.slug}). ${skill.description}` }}
+        />
         <p style={{ margin: "8px 0 0", fontSize: "0.75rem", color: "var(--text-secondary, #aaa)", lineHeight: 1.5 }}>
-          Sends <code>/{skill.slug}</code> to the chat bar below. This skill is provided by the{" "}
+          Chat sends <code>/{skill.slug}</code> to the chat bar below; Voice starts a call that already knows the task. This skill is provided by the{" "}
           <strong>twilio-developer-kit@twilio</strong> plugin and available in every Claude conversation.
         </p>
       </div>
@@ -1718,10 +1645,10 @@ const AGENT_SKILL_DEFS: SkillDef[] = [
   {
     icon: "✅",
     name: "Action Items",
-    description: "Tasks tracked across accounts and team members, synced bidirectionally with Airtable.",
+    description: "Tasks tracked across accounts and team members, synced bidirectionally with Airtable. Account names are matched to the closest real account, so a misheard name still links correctly. If no account matches, the item is still created under No Account.",
     ops: [
       { op: "Create", label: "create_action_item" },
-      { op: "Read",   label: "get_airtable_records / search_records" },
+      { op: "Read", label: "get_airtable_records / search_records" },
       { op: "Update", label: "update_action_item" },
       { op: "Delete", label: "delete_action_item" },
     ],
@@ -1731,23 +1658,28 @@ const AGENT_SKILL_DEFS: SkillDef[] = [
       "What are all open action items for Globex?",
       "Reassign that action item about the API migration to Sarah",
       "Delete the action item about the old Salesforce integration",
+      "Create an action item called prep deck and link it to Archistrator (it also understands a close name like Orchestrator)",
     ],
+    deleteNote: "Deleting always asks you to confirm first, in chat and on a call. Only items you could edit in the app can be changed.",
   },
   {
     icon: "📅",
     name: "Meetings",
-    description: "Meeting records synced from Airtable — includes topics, notes, and account links.",
+    description: "Meeting records synced from Airtable. The agent can find meetings and set their Gong or Zoom summary notes — the same thing you can edit in the app. Name, date and account come from Airtable and can't be changed by the agent.",
     ops: [
-      { op: "Read",   label: "get_airtable_records / search_records" },
+      { op: "Read", label: "get_airtable_records / search_records" },
       { op: "Update", label: "update_meeting" },
-      { op: "Delete", label: "delete_meeting" },
+      { op: "Read", label: "list_meeting_notes" },
+      { op: "Create", label: "add_meeting_note" },
+      { op: "Update", label: "update_meeting_note" },
     ],
     examples: [
       "Find the meeting where we discussed pricing with Acme",
-      "Update the notes for last week's Globex kickoff meeting",
+      "Set the Gong summary for last week's Globex kickoff",
+      "Add a follow-up bullet to today's Acme sync: send the SOW by Friday",
       "What were the expected topics for the Q2 QBR?",
-      "Delete the duplicate meeting stub for Initech",
     ],
+    deleteNote: "Meetings can't be deleted by the agent.",
   },
   {
     icon: "🗓️",
@@ -1755,7 +1687,7 @@ const AGENT_SKILL_DEFS: SkillDef[] = [
     description: "Scheduled events on the in-app calendar. Can push to Google Calendar for primary-calendar events.",
     ops: [
       { op: "Create", label: "create_calendar_event" },
-      { op: "Read",   label: "get_calendar_events / search_records" },
+      { op: "Read", label: "get_calendar_events / search_records" },
       { op: "Update", label: "update_calendar_event" },
       { op: "Delete", label: "delete_calendar_event" },
     ],
@@ -1765,17 +1697,27 @@ const AGENT_SKILL_DEFS: SkillDef[] = [
       "Move the Globex demo to Thursday at 3pm",
       "Cancel the standup on July 4th",
     ],
+    deleteNote: "Deleting always asks you to confirm first. Changes reach Google Calendar too.",
   },
   {
     icon: "🏢",
     name: "Accounts",
-    description: "Client accounts. The agent can read, update details, and add notes. Accounts cannot be deleted via the agent.",
+    description: "Client accounts and everything on them: notes, quick links, artifacts, customer contacts, projects and goals. The agent can only reach accounts you're on, and only account owners can change account details — the same rules as the app.",
     ops: [
-      { op: "Read",   label: "get_airtable_records / search_records" },
+      { op: "Read", label: "get_airtable_records / search_records" },
       { op: "Update", label: "update_account" },
       { op: "Create", label: "add_account_note" },
+      { op: "Read", label: "list_account_notes" },
+      { op: "Update", label: "update_account_note" },
+      { op: "Read", label: "list_quick_links" },
+      { op: "Create", label: "create_quick_link" },
+      { op: "Update", label: "update_quick_link" },
+      { op: "Read", label: "list_customer_contacts" },
+      { op: "Create", label: "create_customer_contact" },
+      { op: "Update", label: "update_customer_contact" },
+      { op: "Create", label: "add_contact_note" },
+      { op: "Update", label: "update_contact_note" },
     ],
-    deleteNote: "Accounts cannot be deleted via the agent — use the Accounts page.",
     examples: [
       "Show me all active accounts",
       "Update Acme's status to Active and set ARR to $120,000",
@@ -1783,6 +1725,188 @@ const AGENT_SKILL_DEFS: SkillDef[] = [
       "What's Initech's current health score?",
       "That meeting where Acme said they wanted 3 more seats — log that as a note",
     ],
+    deleteNote: "Accounts cannot be deleted via the agent — use the Accounts page.",
+  },
+  {
+    icon: "⏰",
+    name: "Reminders",
+    description: "Reminders that notify you at a set time — in the app, and optionally by Slack, push or SMS. Rescheduling a reminder that already fired re-arms it.",
+    ops: [
+      { op: "Read", label: "list_reminders" },
+      { op: "Create", label: "create_reminder" },
+      { op: "Update", label: "update_reminder" },
+    ],
+    examples: [
+      "Remind me tomorrow at 9am to send Acme the proposal",
+      "What reminders do I have this week?",
+      "Push my Globex reminder to Friday afternoon",
+    ],
+    deleteNote: "Reminders can be dismissed or snoozed by the agent; delete them in the app.",
+  },
+  {
+    icon: "📎",
+    name: "Artifacts",
+    description: "Documents, decks and pages linked to an account, and links attached to action items. The agent adds links; file uploads stay in the app.",
+    ops: [
+      { op: "Read", label: "list_artifacts" },
+      { op: "Create", label: "create_artifact" },
+      { op: "Update", label: "update_artifact" },
+      { op: "Create", label: "attach_link_to_action_item" },
+    ],
+    examples: [
+      "Add the Q3 QBR deck link to Acme's artifacts",
+      "What artifacts are on the Globex account?",
+      "Attach the Jira ticket link to the SSO action item",
+    ],
+    deleteNote: "Artifacts can't be deleted by the agent.",
+  },
+  {
+    icon: "🎯",
+    name: "Projects & Goals",
+    description: "Projects and their goals on an account, who's on each project, and which action items and meetings belong to it. Adding someone to a project linked to Salesforce also adds them in Cloud Coach.",
+    ops: [
+      { op: "Read", label: "list_projects" },
+      { op: "Create", label: "create_project" },
+      { op: "Update", label: "update_project" },
+      { op: "Read", label: "list_project_members" },
+      { op: "Create", label: "add_project_member" },
+    ],
+    examples: [
+      "Create a goal 'Launch SSO' under the Acme rollout project",
+      "Who's on the Globex migration project?",
+      "Link the onboarding action item to the Acme rollout project",
+    ],
+    deleteNote: "Projects and members can't be removed by the agent.",
+  },
+  {
+    icon: "☑️",
+    name: "Steps, Dependencies & Tasks",
+    description: "Checklist steps on an action item, which items are waiting on others, and your personal tasks.",
+    ops: [
+      { op: "Read", label: "list_action_item_steps" },
+      { op: "Create", label: "create_action_item_step" },
+      { op: "Update", label: "update_action_item_step" },
+      { op: "Update", label: "add_action_item_dependency" },
+      { op: "Read", label: "list_tasks" },
+      { op: "Create", label: "create_task" },
+      { op: "Update", label: "update_task" },
+    ],
+    examples: [
+      "Add a step 'draft the SOW' to the Acme proposal action item",
+      "Mark the 'review pricing' step as done",
+      "The rollout item is waiting on the security review item",
+    ],
+  },
+  {
+    icon: "💬",
+    name: "Comments & Feedback",
+    description: "Comment threads on any record you can see, and product feedback you've submitted.",
+    ops: [
+      { op: "Read", label: "list_comments" },
+      { op: "Create", label: "add_comment" },
+      { op: "Update", label: "update_comment" },
+      { op: "Read", label: "list_feedback" },
+      { op: "Create", label: "submit_feedback" },
+      { op: "Create", label: "add_feedback_comment" },
+    ],
+    examples: [
+      "Comment on the Acme kickoff: moved to next week",
+      "What did people say on the SSO action item?",
+      "Send feedback: the calendar takes a while to load",
+    ],
+  },
+  {
+    icon: "🗂️",
+    name: "Workspace",
+    description: "Your working sessions, personal notepad, and the team directory (read only).",
+    ops: [
+      { op: "Read", label: "list_working_sessions" },
+      { op: "Create", label: "create_working_session" },
+      { op: "Update", label: "rename_working_session" },
+      { op: "Read", label: "get_page_notes" },
+      { op: "Update", label: "set_page_notes" },
+      { op: "Read", label: "list_team_members" },
+    ],
+    examples: [
+      "Start a working session called Q4 planning",
+      "What's on my notepad?",
+      "Who's in the Solutions Engineering department?",
+    ],
+  },
+  {
+    icon: "📞",
+    name: "Messaging & Calls",
+    description: "Send a text or place a phone call on your behalf, to a number on file for you or a teammate. These leave the platform, so the agent always says exactly what it will do and waits for your yes before acting — in chat and on a call.",
+    ops: [
+      { op: "Create", label: "send_sms" },
+      { op: "Create", label: "make_phone_call" },
+    ],
+    examples: [
+      "Text 415 555 0100 that I'm running ten minutes late",
+      "Call 415 555 0100 and tell them the demo moved to Thursday",
+    ],
+    deleteNote: "Needs your confirmation first. Texts and calls cannot be undone.",
+  },
+  {
+    icon: "⏱️",
+    name: "Time Logging (Cloud Coach)",
+    description: "Look up a Cloud Coach project by name, preview what a week of calendar time would log, and write it to Cloud Coach. Logging asks for confirmation on a voice call.",
+    ops: [
+      { op: "Read", label: "find_cloud_coach_project" },
+      { op: "Read", label: "preview_time_log_week" },
+      { op: "Create", label: "log_time_week" },
+    ],
+    examples: [
+      "Do I have a Cloud Coach project called Archistrator?",
+      "What would logging my time for this week look like?",
+      "Log my time for this week to Cloud Coach",
+    ],
+    deleteNote: "Needs your confirmation first. Writes timesheet rows into Salesforce.",
+  },
+  {
+    icon: "📧",
+    name: "Email & Messages",
+    description: "Read recent email and Slack messages, and pull AI meeting summaries from Gong or Zoom recap emails onto the matching meeting.",
+    ops: [
+      { op: "Read", label: "get_emails" },
+      { op: "Read", label: "get_slack_messages" },
+      { op: "Read", label: "get_meeting_notes_from_email" },
+    ],
+    examples: [
+      "Any new email from Acme this week?",
+      "Get the meeting notes from my recap emails for Archistrator",
+    ],
+  },
+  {
+    icon: "🤝",
+    name: "Meetings with Colleagues",
+    description: "Find a colleague, see when they are busy, find free time you share, then create the meeting and invite them. You only ever see when someone is busy, never what their meetings are. Inviting emails them, so on a voice call the agent reads back who it will email and waits for a spoken yes first.",
+    ops: [
+      { op: "Read", label: "find_person" },
+      { op: "Read", label: "get_colleague_availability" },
+      { op: "Create", label: "invite_to_meeting" },
+    ],
+    examples: [
+      "Find a free 30 minutes for me and Melissa Ramirez on Monday",
+      "When is Ana Diaz free this week?",
+      "Create a meeting with Melissa on Monday at noon to go over Siemens and invite her",
+    ],
+    deleteNote: "Inviting needs your confirmation first. It emails a Google Calendar invitation.",
+  },
+  {
+    icon: "👋",
+    name: "Contact a Colleague",
+    description: "The same three actions as a colleague's Public profile. Schedule a call: find a time, create the meeting and invite them and anyone else (see Meetings with Colleagues). Email: get a Gmail link addressed to them, which sends nothing; you write and send it yourself. Leave a note: a private note that is not shown on their public page, and they are notified in the app. A note goes to another person, so on a voice call the agent reads it back and waits for a spoken yes first.",
+    ops: [
+      { op: "Read", label: "find_person / email_person" },
+      { op: "Create", label: "leave_note_for" },
+    ],
+    examples: [
+      "Email Melissa Ramirez",
+      "Leave a note for Ana Diaz saying the Siemens deck is ready for her review",
+      "Schedule a call with Melissa Ramirez on Monday at noon and add Ana Diaz",
+    ],
+    deleteNote: "Leaving a note needs your confirmation first. Emailing only opens a draft link and sends nothing.",
   },
 ];
 
@@ -1796,8 +1920,14 @@ const OP_COLORS: Record<string, { bg: string; color: string }> = {
 function AgentSkillsPanel() {
   const [activeIdx, setActiveIdx] = useState<number | null>(null);
 
-  function injectToChat(text: string) {
-    window.dispatchEvent(new CustomEvent("chat-inject", { detail: { text } }));
+  async function voiceExample(title: string, text: string) {
+    try {
+      const { data } = await agentSkillsApi.voiceLaunch(title, text);
+      launchVoice({ key: data.key, script: data.script, title });
+    } catch {
+      // Without a launch context the user can still read the prompt to the agent.
+      launchVoice({ script: text, title });
+    }
   }
 
   return (
@@ -1840,12 +1970,13 @@ function AgentSkillsPanel() {
                 {s.name}
               </div>
               <div style={{ display: "flex", gap: "4px", marginTop: "4px", flexWrap: "wrap" }}>
-                {s.ops.map(op => (
-                  <span key={op.op} style={{
+                {/* One badge per kind: an entry with several Read tools still shows a single "Read". */}
+                {Array.from(new Set(s.ops.map(o => o.op))).map(kind => (
+                  <span key={kind} style={{
                     fontSize: "0.5625rem", fontWeight: 700, padding: "1px 5px", borderRadius: "3px",
-                    background: OP_COLORS[op.op]?.bg, color: OP_COLORS[op.op]?.color,
+                    background: OP_COLORS[kind]?.bg, color: OP_COLORS[kind]?.color,
                     letterSpacing: "0.04em",
-                  }}>{op.op}</span>
+                  }}>{kind}</span>
                 ))}
               </div>
             </div>
@@ -1994,15 +2125,15 @@ function AgentSkillsPanel() {
                 {/* Example prompts */}
                 <div>
                   <div style={{ fontSize: "0.75rem", fontWeight: 700, letterSpacing: "0.07em", color: "var(--text-secondary, #999)", marginBottom: "10px" }}>
-                    EXAMPLE PROMPTS — click to send to chat
+                    EXAMPLE PROMPTS — click to send to chat, or use Voice
                   </div>
                   <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
                     {skill.examples.map((ex, i) => (
+                      <div key={i} style={{ display: "flex", gap: "6px", alignItems: "stretch" }}>
                       <button
-                        key={i}
                         onClick={() => injectToChat(ex)}
                         style={{
-                          textAlign: "left", padding: "10px 14px", borderRadius: "8px",
+                          flex: 1, textAlign: "left", padding: "10px 14px", borderRadius: "8px",
                           background: "var(--surface, #fff)",
                           border: "1px solid var(--border, rgba(0,0,0,0.08))",
                           cursor: "pointer", fontSize: "0.875rem", fontFamily: "var(--font-base)",
@@ -2027,6 +2158,20 @@ function AgentSkillsPanel() {
                           <path d="M5 12h14"/><polyline points="12 5 19 12 12 19"/>
                         </svg>
                       </button>
+                      <button
+                        type="button"
+                        onClick={() => void voiceExample(skill.name, ex)}
+                        title="Use in Voice Session"
+                        aria-label={`Use in Voice Session: ${ex}`}
+                        style={{
+                          padding: "0 12px", borderRadius: "8px", fontSize: "0.75rem", fontWeight: 600, cursor: "pointer",
+                          background: "transparent", border: "1px solid rgba(226,35,26,0.35)",
+                          color: "var(--twilio-red, #e22)", fontFamily: "var(--font-base)", whiteSpace: "nowrap",
+                        }}
+                      >
+                        🎙 Voice
+                      </button>
+                      </div>
                     ))}
                   </div>
                 </div>
@@ -2059,12 +2204,16 @@ function AgentSkillsPanel() {
 
 // ── Platform tool catalog (mirrors backend _PLATFORM_TOOL_CATALOG) ────────────
 
-const PLATFORM_TOOLS = [
-  "create_action_item", "update_action_item", "delete_action_item",
-  "create_calendar_event", "update_calendar_event", "delete_calendar_event",
-  "get_airtable_records", "search_records", "update_meeting", "delete_meeting",
-  "update_account", "add_account_note",
-];
+/**
+ * The tools a saved workflow may list in allowed_tools — read from the server's registry
+ * (GET /agents/tools/) rather than hard-coded here. The old literal list drifted: it kept
+ * offering delete_action_item / delete_calendar_event / delete_meeting after the server
+ * stopped allowing skills to use them, so a skill built here was refused on save.
+ */
+function usePlatformTools(): string[] {
+  const { data } = useAgentTools();
+  return data.filter((t) => t.skill_safe).map((t) => t.name);
+}
 
 // ── Agent Skill status styles ─────────────────────────────────────────────────
 
@@ -2093,6 +2242,18 @@ function NewAgentSkillForm({
   onCreated: (s: AgentSkill) => void;
   onBack: () => void;
 }) {
+  const { data: allTools, loading: toolsLoading } = useAgentTools();
+  const PLATFORM_TOOLS = allTools.filter((t) => t.skill_safe).map((t) => t.name);
+  const [twilioSkills, setTwilioSkills]   = useState<string[]>([]);
+  const [chainedSkills, setChainedSkills] = useState<string[]>([]);
+  const [existingSkills, setExistingSkills] = useState<AgentSkill[]>([]);
+  const [pendingFiles, setPendingFiles]   = useState<PendingAttachment[]>([]);
+  const [contextRecords, setContextRecords] = useState<SkillContextRecord[]>([]);
+  const [slackSources, setSlackSources]   = useState<SlackSource[]>([]);
+  const [needsAccounts, setNeedsAccounts] = useState(false);
+  const [defaultAccounts, setDefaultAccounts] = useState<number[]>([]);
+  const [filingAccount, setFilingAccount] = useState<number[]>([]);
+  const [templates, setTemplates]         = useState<SkillTemplate[]>([]);
   const [displayName, setDisplayName]   = useState("");
   const [description, setDescription]  = useState("");
   const [instructions, setInstructions] = useState("");
@@ -2114,6 +2275,12 @@ function NewAgentSkillForm({
     || "";
   const [saved, setSaved]               = useState<AgentSkill | null>(null);
 
+  useEffect(() => {
+    agentSkillsApi.list()
+      .then((r) => setExistingSkills(r.data.results ?? []))
+      .catch(() => {});
+  }, []);
+
   const inputStyle: React.CSSProperties = {
     width: "100%", boxSizing: "border-box",
     padding: "8px 12px", borderRadius: "7px", fontSize: "0.875rem",
@@ -2130,7 +2297,15 @@ function NewAgentSkillForm({
     if (!description.trim()) return;
     setGenerating(true); setError(null);
     try {
-      const { data } = await agentSkillsApi.generate(description.trim());
+      const { data } = await agentSkillsApi.generate(description.trim(), {
+        capabilities: allowedTools,
+        twilio_skills: twilioSkills,
+        chained_skills: chainedSkills,
+        attachments: pendingFiles.map((f) => f.name),
+        records: contextRecords.map((c) => `${c.resource_type}: ${c.label}`),
+        slack: slackSources.map((x) => x.label),
+        needs_accounts: needsAccounts,
+      });
       if (data.name && !displayName.trim()) setDisplayName(
         data.name.replace(/-/g, " ").replace(/\b\w/g, c => c.toUpperCase())
       );
@@ -2159,8 +2334,28 @@ function NewAgentSkillForm({
         name: codeName, description: description.trim(),
         instructions: instructions.trim(),
         allowed_tools: allowedTools, scripts,
+        twilio_skills: twilioSkills,
+        chained_skills: chainedSkills,
+        templates,
+        context_defaults: {
+          records: contextRecords, slack: slackSources, needs_accounts: needsAccounts,
+          account_ids: defaultAccounts,
+        },
       });
-      setSaved(data);
+      // Attachments need the skill to exist first. Report failures instead of dropping them.
+      const failed: string[] = [];
+      let final = data;
+      for (const f of pendingFiles) {
+        try {
+          const added = await agentSkillsApi.addAttachment(data.id, {
+            file: f.file, url: f.url, name: f.name, account_id: filingAccount[0],
+          });
+          final = { ...final, attachments: [...(final.attachments ?? []), added.data] };
+        } catch { failed.push(f.name); }
+      }
+      setPendingFiles([]);
+      setSaved(final);
+      if (failed.length) setError(`Saved, but couldn't attach: ${failed.join(", ")}. Add them again from the skill page.`);
     } catch (err: unknown) {
       const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? "Save failed.";
       setError(msg);
@@ -2227,6 +2422,70 @@ function NewAgentSkillForm({
             placeholder="e.g. Use when the user asks for a weekly summary of account health across all active accounts."
             required rows={3} style={{ ...inputStyle, resize: "vertical", lineHeight: 1.5, flex: 1 }} />
         </div>
+      </div>
+
+      {/* What the skill builds on */}
+      <SkillMultiPicker
+        testId="twilio-skill-picker"
+        label="TWILIO SKILLS"
+        hint="(search and pick any to build on)"
+        options={TWILIO_SKILLS.map((t) => ({ id: t.slug, label: t.name, detail: t.description, group: t.group }))}
+        selected={twilioSkills}
+        onChange={setTwilioSkills}
+        placeholder="Search Twilio skills, e.g. recordings, compliance, verify…"
+      />
+
+      <ToolRecommender description={description} instructions={instructions} selected={allowedTools} onApply={setAllowedTools} />
+
+      <CapabilityPicker tools={allTools} selected={allowedTools} onChange={setAllowedTools} loading={toolsLoading} />
+
+      <SkillMultiPicker
+        testId="chained-skill-picker"
+        label="BUILD ON OTHER AGENT PM SKILLS"
+        hint="(their steps run first, then this skill's)"
+        options={existingSkills.filter((x) => x.status === "approved").map((x) => ({ id: x.name, label: x.name, detail: x.description }))}
+        selected={chainedSkills}
+        onChange={setChainedSkills}
+        placeholder="Search existing approved skills…"
+        emptyText="No approved skills to chain yet"
+        chipColor="#7c3aed"
+      />
+
+      <AttachmentDropzone pending={pendingFiles} onPendingChange={setPendingFiles} />
+      {pendingFiles.length > 0 && (
+        <details>
+          <summary style={{ fontSize: "0.8125rem", cursor: "pointer", color: "var(--text-secondary, #666)" }}>
+            File these attachments as artifacts on an account (optional)
+          </summary>
+          <div style={{ marginTop: "8px" }}>
+            <AccountMultiSelect selected={filingAccount} onChange={(ids) => setFilingAccount(ids.slice(-1))} label="FILE ON ACCOUNT (pick one)" />
+          </div>
+        </details>
+      )}
+
+      <ContextRecordsField records={contextRecords} onChange={setContextRecords} />
+      <SlackSourcesField value={slackSources} onChange={setSlackSources} />
+
+      <div>
+        <label style={{ display: "flex", alignItems: "center", gap: "8px", fontSize: "0.8125rem", fontWeight: 600, color: "var(--text-secondary, #666)" }}>
+          <input type="checkbox" checked={needsAccounts} onChange={(e) => setNeedsAccounts(e.target.checked)} />
+          Ask for the account(s) to run this for each time
+        </label>
+        <p style={{ margin: "4px 0 0 26px", fontSize: "0.75rem", color: "var(--text-secondary, #aaa)", lineHeight: 1.5 }}>
+          Runners pick one or more of their own accounts (or Select all). Leave off for skills that don't need one.
+        </p>
+        {!needsAccounts && (
+          <div style={{ marginTop: "10px" }}>
+            <AccountMultiSelect selected={defaultAccounts} onChange={setDefaultAccounts} label="ALWAYS RUN FOR THESE ACCOUNTS (optional)" />
+          </div>
+        )}
+      </div>
+
+      {/* Generate */}
+      <div style={{ padding: "12px 14px", borderRadius: "8px", background: "rgba(226,35,26,0.04)", border: "1px solid rgba(226,35,26,0.15)" }}>
+        <p style={{ margin: "0 0 8px", fontSize: "0.8125rem", color: "var(--text-secondary, #555)", lineHeight: 1.5 }}>
+          Claude will design the <strong>instructions</strong> based on the description and the choices above. Your description stays as you wrote it.
+        </p>
         <button type="button" onClick={handleGenerate} disabled={generating || !description.trim()}
           style={{
             display: "inline-flex", alignItems: "center", gap: "6px",
@@ -2238,9 +2497,9 @@ function NewAgentSkillForm({
             opacity: generating ? 0.7 : 1, fontFamily: "var(--font-base)",
           }}>
           {generating ? (
-            <><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ animation: "spin 1s linear infinite" }}><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>Generating…</>
+            <><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ animation: "spin 1s linear infinite" }}><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>Designing instructions…</>
           ) : (
-            <><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>Generate with Claude</>
+            <><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>Generate instructions with Claude</>
           )}
         </button>
       </div>
@@ -2253,32 +2512,8 @@ function NewAgentSkillForm({
           required rows={8} style={{ ...inputStyle, resize: "vertical", lineHeight: 1.6, fontFamily: "var(--font-mono, monospace)", fontSize: "0.8125rem" }} />
       </div>
 
-      {/* Allowed tools */}
-      <div>
-        <label style={labelStyle}>ALLOWED TOOLS <span style={{ fontWeight: 400, opacity: 0.6 }}>(platform tools this skill may reference)</span></label>
-        <div style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}>
-          {PLATFORM_TOOLS.map(tool => {
-            const active = allowedTools.includes(tool);
-            return (
-              <button key={tool} type="button"
-                onClick={() => setAllowedTools(prev => active ? prev.filter(t => t !== tool) : [...prev, tool])}
-                style={{
-                  padding: "4px 12px", borderRadius: "20px", fontSize: "0.75rem", fontWeight: 600,
-                  fontFamily: "var(--font-mono, monospace)",
-                  border: active ? "1.5px solid var(--twilio-red, #e22)" : "1.5px solid rgba(0,0,0,0.12)",
-                  background: active ? "rgba(226,35,26,0.07)" : "transparent",
-                  color: active ? "var(--twilio-red, #e22)" : "var(--text-secondary, #888)",
-                  cursor: "pointer", transition: "all 0.12s",
-                }}>
-                {active ? "✓ " : ""}{tool}
-              </button>
-            );
-          })}
-        </div>
-        <p style={{ margin: "6px 0 0", fontSize: "0.75rem", color: "var(--text-secondary, #aaa)", lineHeight: 1.5 }}>
-          Instructions may only reference tools checked here. Claude will reject any unlisted tool during review.
-        </p>
-      </div>
+      {/* Templates */}
+      <TemplateTabs templates={templates} onChange={setTemplates} />
 
       {/* Script toggle + editor */}
       <div>
@@ -2349,6 +2584,7 @@ function AgentSkillDetail({ skill, currentUsername, onBack, onUpdated, onDeleted
   onUpdated: (s: AgentSkill) => void;
   onDeleted?: (id: number) => void;
 }) {
+  const PLATFORM_TOOLS = usePlatformTools();
   const isOwner = skill.created_by_username === currentUsername;
   const canEdit = skill.status === "draft" && isOwner;
 
@@ -2359,17 +2595,48 @@ function AgentSkillDetail({ skill, currentUsername, onBack, onUpdated, onDeleted
   const [saving, setSaving]                 = useState(false);
   const [reviewing, setReviewing]           = useState(false);
   const [pinning, setPinning]               = useState(false);
-  const [running, setRunning]               = useState(false);
-  const [runResult, setRunResult]           = useState<string | null>(null);
   const [actionError, setActionError]       = useState<string | null>(null);
   const [deleting, setDeleting]             = useState(false);
   const [confirmDelete, setConfirmDelete]   = useState(false);
+  const [viewingAttachment, setViewingAttachment] = useState<number | null>(null);
+  const [editTemplates, setEditTemplates]   = useState<SkillTemplate[]>(skill.templates ?? []);
+  const [pendingFiles, setPendingFiles]     = useState<PendingAttachment[]>([]);
+  const [uploading, setUploading]           = useState(false);
+
+  async function uploadPending(items: PendingAttachment[]) {
+    setPendingFiles(items);
+    const fresh = items.filter((i) => i.file || i.url);
+    if (fresh.length === 0) return;
+    setUploading(true); setActionError(null);
+    let latest = skill;
+    const failed: string[] = [];
+    for (const f of fresh) {
+      try {
+        const { data } = await agentSkillsApi.addAttachment(skill.id, { file: f.file, url: f.url, name: f.name });
+        latest = { ...latest, status: "draft", attachments: [...(latest.attachments ?? []), data] };
+      } catch { failed.push(f.name); }
+    }
+    setPendingFiles([]);
+    setUploading(false);
+    if (failed.length) setActionError(`Couldn't attach: ${failed.join(", ")}.`);
+    // The server returns the skill to draft when its context changes; re-read it.
+    try { onUpdated((await agentSkillsApi.get(skill.id)).data); } catch { onUpdated(latest); }
+  }
+
+  async function removeAttachment(id: number) {
+    setActionError(null);
+    try {
+      await agentSkillsApi.removeAttachment(skill.id, id);
+      onUpdated((await agentSkillsApi.get(skill.id)).data);
+    } catch { setActionError("Couldn't remove that attachment."); }
+  }
 
   // Keep edit state in sync when skill updates
   useEffect(() => {
     setEditInstructions(skill.instructions);
     setEditTools(skill.allowed_tools);
     setEditRoles(skill.pinned_to_roles ?? []);
+    setEditTemplates(skill.templates ?? []);
   }, [skill]);
 
   async function handleSaveEdit() {
@@ -2379,6 +2646,7 @@ function AgentSkillDetail({ skill, currentUsername, onBack, onUpdated, onDeleted
         instructions: editInstructions,
         allowed_tools: editTools,
         pinned_to_roles: editRoles,
+        templates: editTemplates,
       });
       onUpdated(data);
       setEditing(false);
@@ -2409,17 +2677,6 @@ function AgentSkillDetail({ skill, currentUsername, onBack, onUpdated, onDeleted
     } finally { setPinning(false); }
   }
 
-  async function handleRun() {
-    setRunning(true); setRunResult(null); setActionError(null);
-    try {
-      const { data } = await agentSkillsApi.run(skill.id);
-      window.dispatchEvent(new CustomEvent("chat-inject", { detail: { text: data.prompt } }));
-      setRunResult("Sent to chat.");
-    } catch {
-      setActionError("Run failed.");
-    } finally { setRunning(false); }
-  }
-
   async function handleDelete() {
     if (!confirmDelete) { setConfirmDelete(true); return; }
     setDeleting(true); setActionError(null);
@@ -2439,6 +2696,10 @@ function AgentSkillDetail({ skill, currentUsername, onBack, onUpdated, onDeleted
     fontSize: "0.75rem", fontWeight: 700, letterSpacing: "0.06em",
     color: "var(--text-secondary, #999)", marginBottom: "8px",
   };
+  const tag = (color: string): React.CSSProperties => ({
+    padding: "3px 10px", borderRadius: "20px", fontSize: "0.75rem", fontWeight: 600,
+    border: `1.5px solid ${color}`, color, background: "rgba(0,0,0,0.02)",
+  });
 
   return (
     <div style={{ padding: "28px 32px", display: "flex", flexDirection: "column", gap: "20px", overflowY: "auto" }}>
@@ -2508,6 +2769,10 @@ function AgentSkillDetail({ skill, currentUsername, onBack, onUpdated, onDeleted
       <div>
         <div style={labelStyle}>ALLOWED TOOLS</div>
         {editing ? (
+          <>
+          <div style={{ marginBottom: "10px" }}>
+            <ToolRecommender description={skill.description} instructions={editInstructions} selected={editTools} onApply={setEditTools} />
+          </div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}>
             {PLATFORM_TOOLS.map(tool => {
               const active = editTools.includes(tool);
@@ -2527,6 +2792,7 @@ function AgentSkillDetail({ skill, currentUsername, onBack, onUpdated, onDeleted
               );
             })}
           </div>
+          </>
         ) : (
           <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
             {skill.allowed_tools.length > 0 ? skill.allowed_tools.map(t => (
@@ -2568,6 +2834,75 @@ function AgentSkillDetail({ skill, currentUsername, onBack, onUpdated, onDeleted
           </pre>
         )}
       </div>
+
+      {/* What this skill builds on */}
+      {((skill.twilio_skills?.length ?? 0) > 0 || (skill.chained_skills?.length ?? 0) > 0 ||
+        (skill.context_defaults?.records?.length ?? 0) > 0 || (skill.context_defaults?.slack?.length ?? 0) > 0 ||
+        skill.context_defaults?.needs_accounts) && (
+        <div data-testid="skill-builds-on">
+          <div style={labelStyle}>BUILDS ON</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
+            {(skill.twilio_skills ?? []).map((slug) => (
+              <span key={`t-${slug}`} style={tag("#e22")}>Twilio · {TWILIO_SKILLS.find((t) => t.slug === slug)?.name ?? slug}</span>
+            ))}
+            {(skill.chained_skills ?? []).map((n) => <span key={`c-${n}`} style={tag("#7c3aed")}>Skill · {n}</span>)}
+            {(skill.context_defaults?.records ?? []).map((rec) => (
+              <span key={`r-${rec.resource_type}-${rec.resource_id}`} style={tag("#4f46e5")}>{rec.resource_type.replace(/_/g, " ")} · {rec.label}</span>
+            ))}
+            {(skill.context_defaults?.slack ?? []).map((sl) => <span key={`s-${sl.id}`} style={tag("#4a154b")}>Slack · {sl.label}</span>)}
+            {skill.context_defaults?.needs_accounts && <span style={tag("#0891b2")}>Asks for account(s) when run</span>}
+          </div>
+        </div>
+      )}
+
+      {/* Attachments */}
+      {((skill.attachments?.length ?? 0) > 0 || (isOwner && skill.status === "draft")) && (
+        <div>
+          {isOwner && skill.status === "draft" ? (
+            <>
+              <AttachmentDropzone
+                pending={pendingFiles}
+                onPendingChange={uploadPending}
+                saved={skill.attachments ?? []}
+                onRemoveSaved={removeAttachment}
+                onView={setViewingAttachment}
+                disabled={uploading}
+              />
+              {uploading && <p style={{ margin: "6px 0 0", fontSize: "0.75rem", color: "var(--text-secondary, #888)" }}>Uploading…</p>}
+            </>
+          ) : (
+            <>
+              <div style={labelStyle}>ATTACHMENTS</div>
+              <ul style={{ listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: "4px" }}>
+                {(skill.attachments ?? []).map((att) => (
+                  <li key={att.id} style={{ display: "flex", gap: "8px", alignItems: "center", fontSize: "0.8125rem" }}>
+                    <span>📎 {att.name}</span>
+                    {att.has_text && (
+                      <button type="button" onClick={() => setViewingAttachment(att.id)}
+                        style={{ border: "none", background: "none", padding: 0, cursor: "pointer", color: "var(--twilio-red, #e22)", fontWeight: 600, fontSize: "0.75rem" }}>View</button>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+        </div>
+      )}
+      {viewingAttachment !== null && (
+        <AttachmentViewer skillId={skill.id} attachmentId={viewingAttachment} onClose={() => setViewingAttachment(null)} />
+      )}
+
+      {/* Templates */}
+      {(editing || (skill.templates?.length ?? 0) > 0) && (
+        <div>
+          {!editing && <div style={labelStyle}>TEMPLATES</div>}
+          <TemplateTabs
+            templates={editing ? editTemplates : skill.templates}
+            onChange={setEditTemplates}
+            readOnly={!editing}
+          />
+        </div>
+      )}
 
       {/* Pin to role pages */}
       <div>
@@ -2633,27 +2968,13 @@ function AgentSkillDetail({ skill, currentUsername, onBack, onUpdated, onDeleted
         <div style={{ fontSize: "0.75rem", fontWeight: 700, letterSpacing: "0.06em",
           color: "var(--text-secondary, #999)", marginBottom: "12px" }}>TEST & RUN</div>
         <p style={{ margin: "0 0 12px", fontSize: "0.8125rem", color: "var(--text-secondary, #888)", lineHeight: 1.5 }}>
-          Sends this skill's instructions to the Agent chat. Only available for approved skills.
+          Use this skill in the Agent chat or start a voice session with it. Skills that need accounts or a template ask first. Only available for approved skills.
         </p>
-        <button onClick={handleRun} disabled={running || skill.status !== "approved"}
-          title={skill.status !== "approved" ? "Skill must be approved before running" : undefined}
-          style={{
-            display: "inline-flex", alignItems: "center", gap: "6px",
-            padding: "7px 18px", borderRadius: "7px", fontSize: "0.875rem", fontWeight: 600,
-            background: skill.status === "approved" ? "var(--twilio-red, #e22)" : "rgba(0,0,0,0.07)",
-            color: skill.status === "approved" ? "#fff" : "var(--text-secondary, #aaa)",
-            border: "none", cursor: running || skill.status !== "approved" ? "not-allowed" : "pointer",
-            opacity: running ? 0.7 : 1, fontFamily: "var(--font-base)",
-          }}>
-          {running ? (
-            <><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ animation: "spin 1s linear infinite" }}><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>Running…</>
-          ) : (
-            <><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>Run in Chat</>
-          )}
-        </button>
-        {runResult && (
-          <p style={{ margin: "8px 0 0", fontSize: "0.8125rem", color: "#16a34a" }}>{runResult}</p>
-        )}
+        <SkillLaunchButtons
+          source={{ kind: "agent-skill", skill }}
+          disabled={skill.status !== "approved"}
+          disabledReason="Skill must be approved before running"
+        />
       </div>
 
       {/* Edit save/cancel / review actions */}

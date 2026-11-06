@@ -25,3 +25,6 @@ SYNC_IMPLEMENTATION_SUMMARY.md
 SYNC_REVIEW.md
 VERIFICATION_CHECKLIST.md
 TWILIO_WIRING.md
+
+# ── Incident runbooks (local-only operational checklists) ─────────────────────
+INCIDENT_*_RUNBOOK.md

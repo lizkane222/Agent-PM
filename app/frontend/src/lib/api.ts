@@ -30,6 +30,13 @@ import type {
   AirtableMeeting,
   CalendarEvent,
   AgentSkill,
+  AgentSkillAttachment,
+  SkillRunInput,
+  SkillRunResult,
+  KeywordTemplate,
+  KeywordExpansion,
+  SlackConversations,
+  AgentTool,
   ClaudeSkill,
   Comment,
   CommentMention,
@@ -419,7 +426,13 @@ export const agentApi = {
 export const schedulerApi = {
   listEvents: (params?: Record<string, string>) =>
     apiClient.get<CalendarEvent[]>("/scheduler/events/", { params }),
-  createEvent: (data: Partial<CalendarEvent>) =>
+  /** Compare calendars: busy blocks for up to 8 people (titles only on shared accounts). */
+  getAvailability: (emails: string[], start: string, end: string) =>
+    apiClient.get<{ start: string; end: string; people: import("./availability").PersonAvailability[] }>(
+      "/scheduler/availability/", { params: { emails: emails.join(","), start, end } },
+    ),
+  /** `send_invites` asks Google to email the guests (default: yes when there are any). */
+  createEvent: (data: Partial<CalendarEvent> & { send_invites?: boolean }) =>
     apiClient.post<CalendarEvent>("/scheduler/events/", data),
   updateEvent: (id: number, data: Partial<CalendarEvent>) =>
     apiClient.patch<CalendarEvent>(`/scheduler/events/${id}/`, data),
@@ -472,6 +485,9 @@ export const schedulerApi = {
 
   listMeetingNotes: (eventId: number) =>
     apiClient.get<PaginatedResponse<MeetingNote>>("/scheduler/meeting-notes/", { params: { event: eventId, page_size: 200 } }),
+  /** Notes from every calendar block of one action item (read-only "Calendar notes"). */
+  listMeetingNotesForActionItem: (airtableId: string) =>
+    apiClient.get<PaginatedResponse<MeetingNote>>("/scheduler/meeting-notes/", { params: { action_item: airtableId, page_size: 200 } }),
   /**
    * Batched counterpart to listMeetingNotes — fetches notes for many events in one
    * request. Callers group the flat result by `note.event`. Returns an empty envelope
@@ -502,6 +518,12 @@ export const teamApi = {
     apiClient.get<UserProfile>("/team/profiles/me/", freshConfig(opts)),
   updateMyProfile: (data: Partial<UserProfile>) =>
     apiClient.patch<UserProfile>("/team/profiles/me/", data),
+  /** Admin only: search users with their access level. */
+  listUserDirectory: (search = "") =>
+    apiClient.get<{ results: DirectoryUser[] }>("/team/profiles/directory/", { params: search ? { search } : {}, noCache: true }),
+  /** Admin only. */
+  setAccessLevel: (profileId: number, access_level: AccessLevel) =>
+    apiClient.patch<{ profile_id: number; access_level: AccessLevel }>(`/team/profiles/${profileId}/access-level/`, { access_level }),
   savePushSubscription: (subscription: PushSubscriptionJSON) =>
     apiClient.post<{ push_subscription_active: boolean }>("/team/profiles/me/push-subscription/", subscription),
   deletePushSubscription: () =>
@@ -510,10 +532,11 @@ export const teamApi = {
     apiClient.get<PaginatedResponse<TeamMember>>("/team/members/", { params }),
   listTags: (params?: Record<string, string>) =>
     apiClient.get<PaginatedResponse<Tag>>("/team/tags/", { params }),
+  // Shapes match team/serializers.py (TeamSerializer / TeamMembershipSerializer).
   listTeams: (params?: Record<string, string>) =>
-    apiClient.get<PaginatedResponse<{ id: number; name: string; slug: string; description: string; created_at: string }>>("/team/teams/", { params }),
+    apiClient.get<PaginatedResponse<{ id: number; name: string; description: string; member_count: number; created_at: string }>>("/team/teams/", { params }),
   listMemberships: (params?: Record<string, string>) =>
-    apiClient.get<PaginatedResponse<{ id: number; user: number; user_display: string; team: number; team_name: string; role: string; created_at: string }>>("/team/memberships/", { params }),
+    apiClient.get<PaginatedResponse<{ id: number; user: number; user_email: string; user_display_name: string; team: number; team_name: string; role: string; created_at: string }>>("/team/memberships/", { params }),
   getGmailKeywords: () =>
     apiClient.get<{ keywords: string[] }>("/team/profiles/gmail-keywords/"),
   setGmailKeywords: (keywords: string[]) =>
@@ -545,10 +568,26 @@ export const discoverApi = {
   deleteApplet: (id: number) => apiClient.delete(`/discover/applets/${id}/`),
 };
 
+export type AccountLogCategory =
+  "activity" | "events" | "comments" | "notifications" | "reminders" | "feedback" | "tokens";
+export interface AccountLogRow {
+  id: string; category: AccountLogCategory; ts: string | null; title: string;
+  body: string; link: string; actor: string; status: string;
+}
+export interface AccountActivityLogResponse {
+  counts: Record<AccountLogCategory, number>;
+  results: AccountLogRow[];
+}
+
 export const accountsApi = {
   listAccounts: (params?: Record<string, string>, opts?: { fresh?: boolean }) =>
     apiClient.get<PaginatedResponse<Account>>("/accounts/accounts/", { params, ...freshConfig(opts) }),
   getAccount: (id: number) => apiClient.get<Account>(`/accounts/accounts/${id}/`),
+  /** Per-account Activity Log: counts for all seven categories plus rows (optionally one category). */
+  getActivityLog: (id: number, category?: string) =>
+    apiClient.get<AccountActivityLogResponse>(`/accounts/accounts/${id}/activity-log/`, {
+      params: category ? { category } : undefined,
+    }),
   createAccount: (data: Partial<Account>) =>
     apiClient.post<Account>("/accounts/accounts/", data),
   updateAccount: (id: number, data: Partial<Account>) =>
@@ -598,9 +637,10 @@ export const accountsApi = {
     iconKey?: string,
     secondaryUrl?: string,
     description?: string,
-    references?: CommentReference[]
-  ) =>
-    apiClient.post<AccountArtifact>(`/accounts/accounts/${accountId}/artifacts/`, {
+    references?: CommentReference[],
+    image?: File | null,
+  ) => {
+    const body = {
       artifact_type: "link",
       name,
       url,
@@ -608,12 +648,23 @@ export const accountsApi = {
       secondary_url: secondaryUrl ?? "",
       description: description ?? "",
       references: references ?? [],
-    }),
-  uploadArtifactFile: (accountId: number, file: File) => {
+    };
+    // Only go multipart when there is an image to send — plain JSON otherwise, as before.
+    if (!image) return apiClient.post<AccountArtifact>(`/accounts/accounts/${accountId}/artifacts/`, body);
+    const fd = new FormData();
+    Object.entries(body).forEach(([k, v]) => fd.append(k, typeof v === "string" ? v : JSON.stringify(v)));
+    fd.append("custom_image", image);
+    return apiClient.post<AccountArtifact>(`/accounts/accounts/${accountId}/artifacts/`, fd, {
+      headers: { "Content-Type": "multipart/form-data" },
+    });
+  },
+  uploadArtifactFile: (accountId: number, file: File, opts?: { iconKey?: string; image?: File | null }) => {
     const fd = new FormData();
     fd.append("artifact_type", "file");
     fd.append("name", file.name);
     fd.append("file", file);
+    if (opts?.iconKey) fd.append("icon_key", opts.iconKey);
+    if (opts?.image) fd.append("custom_image", opts.image);
     return apiClient.post<AccountArtifact>(`/accounts/accounts/${accountId}/artifacts/`, fd, {
       headers: { "Content-Type": "multipart/form-data" },
     });
@@ -623,8 +674,24 @@ export const accountsApi = {
   createUserArtifact: (data: { name: string; url: string; icon_key?: string; secondary_url?: string; account?: number | null; description?: string; references?: CommentReference[] }) =>
     apiClient.post<AccountArtifact>("/accounts/artifacts/", { artifact_type: "link", ...data }),
   // `url` accepts null: the edit modal clears a link by sending null explicitly.
-  updateArtifact: (artifactId: number, data: { name?: string; url?: string | null; icon_key?: string; secondary_url?: string; account?: number | null; description?: string; references?: CommentReference[] }) =>
-    apiClient.patch<AccountArtifact>(`/accounts/artifacts/${artifactId}/`, data),
+  updateArtifact: (
+    artifactId: number,
+    data: { name?: string; url?: string | null; icon_key?: string; secondary_url?: string; account?: number | null; description?: string; references?: CommentReference[] },
+    image?: { file?: File | null; remove?: boolean },
+  ) => {
+    if (!image?.file) {
+      return apiClient.patch<AccountArtifact>(`/accounts/artifacts/${artifactId}/`, image?.remove ? { ...data, remove_image: true } : data);
+    }
+    const fd = new FormData();
+    Object.entries(data).forEach(([k, v]) => {
+      if (v === undefined) return;
+      fd.append(k, v === null ? "" : typeof v === "string" || typeof v === "number" ? String(v) : JSON.stringify(v));
+    });
+    fd.append("custom_image", image.file);
+    return apiClient.patch<AccountArtifact>(`/accounts/artifacts/${artifactId}/`, fd, {
+      headers: { "Content-Type": "multipart/form-data" },
+    });
+  },
   listQuickLinks: (accountId: number) =>
     apiClient.get<AccountQuickLink[]>(`/accounts/accounts/${accountId}/quick-links/`),
   createQuickLink: (accountId: number, name: string, url: string) =>
@@ -798,6 +865,15 @@ export const airtableApi = {
     apiClient.patch<AirtableActionItem>(`/airtable/action-items/${airtableId}/fields/`, fields),
   logTime: (data: { airtable_id: string; account_name: string; task: string; seconds: number }) =>
     apiClient.post<AirtableActionItem>("/airtable/time-logs/", data),
+  // Live Tracking — server-owned timers. Use lib/liveTimers.ts, not these directly.
+  listTimers: () =>
+    apiClient.get<{ results: import("./liveTimers").LiveTimer[] }>("/airtable/timers/", { noCache: true }),
+  startTimer: (airtableId: string) =>
+    apiClient.post<{ session: import("./liveTimers").LiveTimer }>("/airtable/timers/start/", { airtable_id: airtableId }),
+  stopTimer: (airtableId: string) =>
+    apiClient.post<{ session: import("./liveTimers").LiveTimer; item: AirtableActionItem }>("/airtable/timers/stop/", { airtable_id: airtableId }),
+  cancelTimer: (airtableId: string) =>
+    apiClient.post<void>("/airtable/timers/cancel/", { airtable_id: airtableId }),
   triggerSync: () => apiClient.post<{ accounts: number; meetings: number; action_items: number; artifacts: number; action_item_attachments: number }>("/airtable/sync/"),
   listAttachments: (actionItemId: number) =>
     apiClient.get<ActionItemAttachment[]>(`/airtable/action-items/${actionItemId}/attachments/`),
@@ -833,6 +909,10 @@ export const realtimeApi = {
   getSyncToken: () => apiClient.get<SyncToken>("/realtime/sync-token/"),
   listActivity: (params?: { event_type?: string; since?: string; page_size?: number }) =>
     apiClient.get<PaginatedResponse<AgentActivityEvent>>("/realtime/activity/", { params }),
+  /** What happened to the caller's calendar events: created, edited, deleted, attended,
+   *  time logged, notes added. A history of changes — never a list of events themselves. */
+  listEventUpdates: () =>
+    apiClient.get<{ results: AgentActivityEvent[] }>("/realtime/activity/event-updates/", { noCache: true }),
   /** Every user's activity on one record (not just the caller's), newest first. */
   listActivityForResource: (type: string, id: string | number) =>
     apiClient.get<{ results: (AgentActivityEvent & { actor_id: number; actor_display: string })[] }>(
@@ -847,8 +927,8 @@ export const realtimeApi = {
     client_id: string;
     client_ts: number;
   }) => apiClient.post<AgentActivityEvent>("/realtime/activity/", data),
-  listVoiceSessions: () =>
-    apiClient.get<PaginatedResponse<VoiceSession>>("/realtime/voice-sessions/"),
+  listVoiceSessions: (params?: Record<string, string>) =>
+    apiClient.get<PaginatedResponse<VoiceSession>>("/realtime/voice-sessions/", { params }),
 };
 
 export interface SkillFile {
@@ -862,7 +942,7 @@ export const skillsApi = {
   list: () =>
     apiClient.get<PaginatedResponse<ClaudeSkill>>("/skills/skills/"),
   listInvocations: (params?: Record<string, string>) =>
-    apiClient.get<PaginatedResponse<{ id: number; skill: number; skill_name: string; invoked_by: number | null; invoked_by_username: string | null; arguments: unknown; result: unknown; error: string; created_at: string }>>("/skills/invocations/", { params }),
+    apiClient.get<PaginatedResponse<{ id: number; skill: number; skill_name: string; invoked_by: number | null; invoked_by_username: string | null; arguments: unknown; result: unknown; status: string; error: string; duration_ms: number | null; invoked_at: string }>>("/skills/invocations/", { params }),
   get: (id: number) =>
     apiClient.get<ClaudeSkill>(`/skills/skills/${id}/`),
   create: (data: { name: string; description: string; code: string; input_schema?: Record<string, unknown> }) =>
@@ -889,6 +969,27 @@ export const skillsApi = {
     apiClient.get<SkillTokenStats>("/skills/skills/token-stats/", freshConfig(opts)),
 };
 
+/** The agent's tool registry, exactly as the server enforces it. */
+export const agentToolsApi = {
+  list: () => apiClient.get<{ tools: AgentTool[] }>("/agents/tools/"),
+};
+
+/** Daily token budgets (admin) and the signed-in user's own state. */
+export const tokenBudgetApi = {
+  overview: () =>
+    apiClient.get<TokenBudgetOverview>("/agents/token-budgets/", { noCache: true }),
+  mine: () =>
+    apiClient.get<MyBudget>("/agents/token-budgets/me/", { noCache: true }),
+  setPricing: (data: { input_usd_per_million?: string | number; output_usd_per_million?: string | number; output_share?: string | number }) =>
+    apiClient.put<TokenPricingView>("/agents/token-budgets/pricing/", data),
+  setRole: (role: string, data: LimitInput) =>
+    apiClient.put<RoleBudgetRow>(`/agents/token-budgets/roles/${role}/`, data),
+  setUser: (userId: number, data: LimitInput & { block_at_warn?: boolean }) =>
+    apiClient.put(`/agents/token-budgets/users/${userId}/`, data),
+  clearUser: (userId: number) =>
+    apiClient.delete(`/agents/token-budgets/users/${userId}/`),
+};
+
 export const agentSkillsApi = {
   list: () =>
     apiClient.get<PaginatedResponse<AgentSkill>>("/skills/agent-skills/"),
@@ -900,18 +1001,63 @@ export const agentSkillsApi = {
     apiClient.patch<AgentSkill>(`/skills/agent-skills/${id}/`, data),
   delete: (id: number) =>
     apiClient.delete(`/skills/agent-skills/${id}/`),
-  generate: (description: string) =>
-    apiClient.post<{ name: string; description: string; instructions: string; allowed_tools: string[]; needs_script: boolean; script: string }>("/skills/agent-skills/generate/", { description }),
+  generate: (description: string, context?: Record<string, unknown>) =>
+    apiClient.post<{ name: string; description: string; instructions: string; allowed_tools: string[]; needs_script: boolean; script: string }>("/skills/agent-skills/generate/", { description, context }),
   review: (id: number) =>
     apiClient.post<AgentSkill>(`/skills/agent-skills/${id}/review/`),
   pin: (id: number) =>
     apiClient.post<AgentSkill>(`/skills/agent-skills/${id}/pin/`),
   unpin: (id: number) =>
     apiClient.post<AgentSkill>(`/skills/agent-skills/${id}/unpin/`),
-  run: (id: number, args?: Record<string, string>) =>
-    apiClient.post<{ prompt: string }>(`/skills/agent-skills/${id}/run/`, { args: args ?? {} }),
-  updateSkill: (id: number, data: Partial<Pick<AgentSkill, "name" | "description" | "instructions" | "allowed_tools" | "scripts" | "pinned_to_roles">>) =>
+  run: (id: number, input?: SkillRunInput) =>
+    apiClient.post<SkillRunResult>(`/skills/agent-skills/${id}/run/`, { args: {}, ...input }),
+  updateSkill: (id: number, data: Partial<Pick<AgentSkill, "name" | "description" | "instructions" | "allowed_tools" | "scripts" | "pinned_to_roles" | "twilio_skills" | "chained_skills" | "context_defaults" | "templates">>) =>
     apiClient.patch<AgentSkill>(`/skills/agent-skills/${id}/`, data),
+  listAttachments: (id: number) =>
+    apiClient.get<AgentSkillAttachment[]>(`/skills/agent-skills/${id}/attachments/`),
+  /** A file (multipart) or a link. `account_id` also files it as that account's artifact. */
+  addAttachment: (id: number, body: { file?: File; url?: string; name?: string; account_id?: number }) => {
+    if (body.file) {
+      const form = new FormData();
+      form.append("file", body.file);
+      if (body.name) form.append("name", body.name);
+      if (body.account_id) form.append("account_id", String(body.account_id));
+      return apiClient.post<AgentSkillAttachment>(`/skills/agent-skills/${id}/attachments/`, form);
+    }
+    return apiClient.post<AgentSkillAttachment>(`/skills/agent-skills/${id}/attachments/`, body);
+  },
+  getAttachment: (id: number, attachmentId: number) =>
+    apiClient.get<AgentSkillAttachment & { text: string }>(`/skills/agent-skills/${id}/attachments/${attachmentId}/`),
+  /** Read a document into selectable templates; nothing is stored. */
+  parseTemplate: (file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    return apiClient.post<{ text: string; intro: string; sections: { key: string; title: string; markdown: string }[] }>(
+      "/skills/agent-skills/parse-template/", form);
+  },
+  /** Voice launch for sources that are not an AgentSkill (Twilio skills, example prompts). */
+  voiceLaunch: (title: string, text: string) =>
+    apiClient.post<{ key: string; script: string }>("/skills/voice-launch/", { title, text }),
+  removeAttachment: (id: number, attachmentId: number) =>
+    apiClient.delete(`/skills/agent-skills/${id}/attachments/${attachmentId}/`),
+  /** Stash the run context for a voice call; the returned key rides the call as `ctx`. */
+  /** "Claude recommended tools": suggestions only, validated against the skill-safe registry. */
+  recommendTools: (description: string, instructions?: string) =>
+    apiClient.post<{ tools: RecommendedTool[]; limitations: string[] }>(
+      "/skills/agent-skills/recommend-tools/", { description, instructions }),
+  /** Admin: Claude's per-run token estimate for every skill. */
+  listTokenEstimates: () =>
+    apiClient.get<{ results: SkillEstimateRow[] }>("/skills/agent-skills/token-estimates/", { noCache: true }),
+  /** Admin: (re)estimate one skill, or the missing/stale ones (up to 10 per request) when skillId is omitted. */
+  estimateTokens: (skillId?: number) =>
+    apiClient.post<{ results: SkillEstimateRow[]; failed: string[]; remaining: number }>(
+      "/skills/agent-skills/token-estimates/", skillId === undefined ? {} : { skill_id: skillId }),
+  voiceStart: (id: number, input?: SkillRunInput) =>
+    apiClient.post<{ key: string; script: string; warnings: string[] }>(`/skills/agent-skills/${id}/voice-start/`, input ?? {}),
+  keywordCatalog: () =>
+    apiClient.get<{ keywords: KeywordTemplate[] }>("/skills/agent-skills/resolve-keywords/"),
+  resolveKeywords: (text: string) =>
+    apiClient.post<{ results: KeywordExpansion[] }>("/skills/agent-skills/resolve-keywords/", { text }),
 };
 
 export interface SearchResult {
@@ -1066,6 +1212,8 @@ export interface MeetingNotesUpdate {
   linked_sources?: MeetingNotesSource[];
   /** True when this meeting existed only as a calendar event until the import ran. */
   created_meeting?: boolean;
+  /** Providers whose email only linked a recording; their tab got a Recording block, not a recap. */
+  recording_only?: string[];
 }
 
 export interface MeetingNotesSkip {
@@ -1123,13 +1271,43 @@ export interface GmailThread {
   calendar_slots?: GmailCalendarSlot[];
 }
 
+export type AccessLevel = "basic" | "pm" | "admin";
+export interface DirectoryUser {
+  profile_id: number;
+  user_id: number;
+  username: string;
+  email: string;
+  display_name: string;
+  access_level: AccessLevel;
+  is_self: boolean;
+}
+
 export const integrationsApi = {
+  /** Slack channels/DMs for context pickers. `enabled: false` until Slack is connected. */
+  listSlackConversations: (q?: string) =>
+    apiClient.get<SlackConversations>("/integrations/slack/conversations/", { params: q ? { q } : undefined, noCache: true }),
   getStatus: () =>
     apiClient.get<{ connected: OAuthCredential[]; sync_states: unknown[] }>(
       "/integrations/status/"
     ),
+  /** Which integrations can be connected here, plus the caller's votes on the rest. */
+  getAvailability: () =>
+    apiClient.get<{ providers: Record<string, { configured: boolean; my_vote: "yes" | "not_now" | null; yes_votes: number }> }>(
+      "/integrations/availability/", { noCache: true },
+    ),
+  voteIntegration: (provider: string, vote: "yes" | "not_now") =>
+    apiClient.post<{ provider: string; vote: string }>("/integrations/votes/", { provider, vote }),
+  /** Sends a real test on each channel; per-channel sent / skipped (with reason) / failed. */
+  sendTestNotifications: (channels: import("./notificationTests").TestChannel[]) =>
+    apiClient.post<{ results: { channel: import("./notificationTests").TestChannel; status: "sent" | "skipped" | "failed"; detail: string }[] }>(
+      "/scheduler/notifications/test/", { channels },
+    ),
   getScraperStatus: () =>
-    apiClient.get<{ confluence: boolean; jira: boolean; zendesk: boolean; gong: boolean; notion: boolean }>(
+    apiClient.get<{
+      confluence: boolean; jira: boolean; zendesk: boolean; gong: boolean; notion: boolean;
+      /** Masked ("••••••••3f9a") — the full value never reaches the browser. */
+      hints?: Partial<Record<"confluence" | "jira" | "zendesk" | "gong" | "notion", string>>;
+    }>(
       "/integrations/scraper-status/"
     ),
   testGmail: () =>
@@ -1145,7 +1323,8 @@ export const integrationsApi = {
   // what the account detail page does; `account_name` is the fallback for accounts with
   // no Airtable link. Omit both to cover every account the user is on — what the profile
   // and role pages do.
-  getMeetingNotesFromEmail: (body?: { days?: number; account?: string; account_name?: string }) =>
+  // `auto: true` is the background poll: recent window only, quiet.
+  getMeetingNotesFromEmail: (body?: { days?: number; account?: string; account_name?: string; auto?: boolean }) =>
     apiClient.post<MeetingNotesEmailReport>("/integrations/gmail/meeting-notes/", body ?? {}),
   // NOTE: no backend route exists yet for this — the caller (ThreadCard, orphaned/unwired)
   // is not reachable from any current page, so this is a type-level stub only.
@@ -1155,8 +1334,11 @@ export const integrationsApi = {
     apiClient.get<{ authorization_url: string; state: string }>(
       "/integrations/google/connect/"
     ),
-  syncGoogleCalendar: () =>
-    apiClient.post<{ detail: string; event_count: number }>("/integrations/google/sync/"),
+  /** `auto: true` for background refreshes — same sync, no activity-log entry. */
+  syncGoogleCalendar: (opts?: { auto?: boolean }) =>
+    apiClient.post<{ detail: string; event_count: number; changed?: number }>(
+      "/integrations/google/sync/", opts?.auto ? { auto: true } : undefined,
+    ),
   pushActionItemsToGoogle: (items: Array<{
     airtableId: string;
     start: string;
@@ -1196,6 +1378,7 @@ export const integrationsApi = {
 };
 
 import type { ActionItemStep, StepStatus } from "../types/action_items";
+import type { LimitInput, MyBudget, RecommendedTool, RoleBudgetRow, SkillEstimateRow, TokenBudgetOverview, TokenPricingView } from "../types/tokenBudget";
 export type { ActionItemStep, StepStatus };
 
 export const stepsApi = {
@@ -1225,4 +1408,44 @@ export const syncReviewApi = {
     apiClient.get<{ count: number; results: SyncDeleteRequest[] }>("/sync-review/delete-requests/", { params }),
   resolveDeleteRequest: (id: number, decision: "approved" | "rejected") =>
     apiClient.patch<SyncDeleteRequest>(`/sync-review/delete-requests/${id}/resolve/`, { decision }),
+};
+
+// ── Profile page: notifications, public section, notes left for a member ───────
+
+export const notificationsApi = {
+  list: (params?: Record<string, string>) =>
+    apiClient.get<PaginatedResponse<import("../types/team").AppNotification>>("/team/notifications/", { params: { page_size: "200", ...params } }),
+  markRead: (ids?: number[]) =>
+    apiClient.post<{ updated: number }>("/team/notifications/mark-read/", ids ? { ids } : {}),
+};
+
+export const publicItemsApi = {
+  listForMember: (memberId: number | "me") =>
+    apiClient.get<import("../types/team").PublicItem[]>("/team/public-items/", { params: { member: String(memberId) } }),
+  create: (data: Partial<import("../types/team").PublicItem> | FormData) =>
+    apiClient.post<import("../types/team").PublicItem>("/team/public-items/", data),
+  update: (id: number, data: Partial<import("../types/team").PublicItem>) =>
+    apiClient.patch<import("../types/team").PublicItem>(`/team/public-items/${id}/`, data),
+  remove: (id: number) => apiClient.delete(`/team/public-items/${id}/`),
+};
+
+export const memberProfileApi = {
+  get: (memberId: number) =>
+    apiClient.get<import("../types/team").MemberPublicProfile>(`/team/members/${memberId}/profile/`),
+  leaveNote: (memberId: number, body: string) =>
+    apiClient.post<import("../types/team").LeftNote>(`/team/members/${memberId}/leave-note/`, { body }),
+  listNotesLeftForMe: (myMemberId: number) =>
+    apiClient.get<import("../types/team").LeftNote[]>(`/team/members/${myMemberId}/leave-note/`),
+};
+
+/** Logged time (Log Time panel entries). Feeds the profile page's Time Allocation panel. */
+export const timeEntriesApi = {
+  list: (params?: Record<string, string>) =>
+    apiClient.get<PaginatedResponse<import("../types/salesforce").SalesforceTimeEntry>>("/salesforce/time-entries/", { params }),
+};
+
+/** Where time went, by day and account: logged time, with calendar events filling unlogged days. */
+export const timeAllocationApi = {
+  get: (params: { start: string; end: string }) =>
+    apiClient.get<import("../types/salesforce").TimeAllocation>("/salesforce/time-allocation/", { params }),
 };

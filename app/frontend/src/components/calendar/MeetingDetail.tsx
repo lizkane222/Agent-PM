@@ -27,7 +27,7 @@ import ActivityLogSection from "../ActivityLogSection";
 import { convertActionItemToEvent, convertEventToActionItem, restoreConversion } from "../../hooks/useConvert";
 import { logActionItemUpdate } from "../../lib/actionItemLog";
 import RichTextMentionEditor, { type RichTextMentionEditorHandle } from "../shared/RichTextMentionEditor";
-import { sanitizeHtml, plainToHtml, htmlToPreviewText } from "../../lib/noteHelpers";
+import { sanitizeHtml, plainToHtml, htmlToPreviewText, renderMeetingNoteText } from "../../lib/noteHelpers";
 import { MeetingSummarySourceToggle, preferredMeetingSource } from "../account/MeetingSummarySourceToggle";
 import type { MeetingNotesSource } from "../../lib/api";
 
@@ -1848,10 +1848,7 @@ function parseBullets(text: string): GongItem[] {
 }
 
 function renderWithMentions(text: string): React.ReactNode {
-  const parts = text.split(/(@\S+)/g);
-  return parts.map((p, i) =>
-    p.startsWith("@") ? <span key={i} style={{ color: "#2563eb", fontWeight: 600 }}>{p}</span> : p
-  );
+  return renderMeetingNoteText(text);
 }
 
 function GongActionTooltip({ kind, noteText, eventId, accountName, airtableAccountId, mentionedMembers, anchorRect, onDone, onCreated, onClose }: {

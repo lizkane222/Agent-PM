@@ -10,12 +10,19 @@ import { accountsApi, airtableApi, teamApi, skillsApi, schedulerApi, integration
 import type { GmailThread, MeetingNotesSource, SearchResult } from "../lib/api";
 import { MeetingSummarySourceToggle, preferredMeetingSource } from "../components/account/MeetingSummarySourceToggle";
 import { GetMeetingNotesButton } from "../components/shared/GetMeetingNotesButton";
+import { meetingHasNotes, MEETING_NOTES_UPDATED_EVENT } from "../lib/meetingNotes";
 import type { Account, AccountArtifact, AccountNote, AccountQuickLink, AccountTeamMember, ActionItemAttachment, AirtableAccount, AirtableActionItem, AirtableMeeting, Attendee, CalendarEvent, CommentReference, CustomerContact, CustomerContactNote, GoalSection, MeetingNote, ProjectMember, Reminder, TeamMember } from "../types";
 import { ProjectGoals } from "../components/account/ProjectGoals";
+import { EventDescription } from "../components/shared/EventDescription";
+import { truncateWords } from "../lib/truncateWords";
+import { ArtifactIcon as SharedArtifactIcon } from "../components/account/ArtifactIcon";
+import { ArtifactImageField } from "../components/account/ArtifactImageField";
+import { groupContactsByTeam, teamSuggestions } from "../lib/contactGroups";
+import { UploadFileDialog, type PendingUpload } from "../components/account/UploadFileDialog";
 import { ROLE_META, getTitleRole } from "../lib/titleRoles";
 import { useLogGlow } from "../hooks/useLogGlow";
 import { addLog } from "../lib/appLog";
-import { logActionItemUpdate } from "../lib/actionItemLog";
+import { logActionItemUpdate, changedActionItemFields } from "../lib/actionItemLog";
 import { assignActionItemToMember, isMemberDrag, readMemberDragData, setMemberDragData } from "../lib/actionItemAssign";
 import { useScheduledOccurrences } from "../hooks/useScheduledOccurrences";
 import { useActionItemFieldOptions } from "../hooks/useActionItemFieldOptions";
@@ -31,16 +38,28 @@ import { ACTION_ITEMS_UPDATED_KEY } from "../lib/actionItemEvents";
 import ArtifactPicker from "../components/action-items/ArtifactPicker";
 import { useFocusPins } from "../hooks/useFocusPins";
 import { useStatusArrivalOrder } from "../hooks/useStatusArrivalOrder";
+import { ArtifactBrowseBar } from "../components/account/ArtifactBrowseBar";
+import { DEFAULT_ARTIFACT_BROWSE, browseArtifacts, type ArtifactBrowseState } from "../lib/artifactBrowse";
 import UrlPillInput from "../components/shared/UrlPillInput";
 import LinkedRecordsList from "../components/shared/LinkedRecordsList";
 import { useSlackLinkAutosave } from "../hooks/useSlackLinkAutosave";
 import InlineCommentThread from "../components/comments/InlineCommentThread";
 import ActivityLogSection from "../components/ActivityLogSection";
+import AccountActivityLog from "../components/account/AccountActivityLog";
+import { EmailMessageBody } from "../components/account/EmailMessageBody";
+import { useEmailThreads } from "../hooks/useEmailThreads";
+import { saveLoadedThreads } from "../lib/emailThreadStore";
 import { convertActionItemToEvent, restoreConversion } from "../hooks/useConvert";
 import RichTextMentionEditor, { type RichTextMentionEditorHandle } from "../components/shared/RichTextMentionEditor";
-import { htmlToPreviewText, sanitizeHtml, plainToHtml } from "../lib/noteHelpers";
+import { htmlToPreviewText, sanitizeHtml, plainToHtml, renderMeetingNoteText } from "../lib/noteHelpers";
 import { useAppError } from "../context/AppErrorContext";
+import { permissionMessage } from "../lib/permissions";
 import CloudCoachPushToast from "../components/shared/CloudCoachPushToast";
+import CollapsibleAccountSection from "../components/account/CollapsibleAccountSection";
+import SlackChannelsField from "../components/account/SlackChannelsField";
+import MaskedArrValue from "../components/account/MaskedArrValue";
+import { useAccountSectionCollapse, ACCOUNT_SECTION_IDS as SECTION_IDS } from "../hooks/useAccountSectionCollapse";
+import { timelineMeetingCount } from "../lib/accountMeetings";
 import { isPushOk, summarizePush, type CloudCoachPushResult } from "../lib/cloudCoachPush";
 
 // ── Edit Modal ────────────────────────────────────────────────────────────────
@@ -560,8 +579,9 @@ function ActionItemModal({
     setSaving(true);
     setSaveError(null);
     try {
-      const { data } = await airtableApi.updateActionItemFields(item.airtable_id, form as Parameters<typeof airtableApi.updateActionItemFields>[1]);
-      logActionItemUpdate(item, form as Partial<AirtableActionItem>);
+      const changes = changedActionItemFields(item, form);
+      const { data } = await airtableApi.updateActionItemFields(item.airtable_id, changes);
+      logActionItemUpdate(item, changes);
       onUpdated?.(data);
       onClose();
     } catch (err: unknown) {
@@ -1791,10 +1811,7 @@ function GongSummaryPanel({ eventId, meetingId: meetingIdProp, existingNotes, ex
 }
 
 function renderWithMentions(text: string): React.ReactNode {
-  const parts = text.split(/(@\S+)/g);
-  return parts.map((p, i) =>
-    p.startsWith("@") ? <span key={i} style={{ color: "#2563eb", fontWeight: 600 }}>{p}</span> : p
-  );
+  return renderMeetingNoteText(text);
 }
 
 function _strHash(s: string): number {
@@ -2171,6 +2188,7 @@ function AttendeeList({
   onAccountUpdated?: (a: Account) => void;
   onContactsChange?: (c: CustomerContact[]) => void;
 }) {
+  const { reportError } = useAppError();
   const [popover, setPopover] = useState<{ index: number; mode: "pick" | "twilio-search" | "customer-form" } | null>(null);
   const [search, setSearch] = useState("");
   const [addingMember, setAddingMember] = useState(false);
@@ -2195,6 +2213,8 @@ function AttendeeList({
     setAddingMember(true);
     try {
       await accountsApi.addTeamMember(account.id, memberId);
+    } catch (err) {
+      reportError(permissionMessage(err, "Could not add them to the account."), "AttendeeList");
     } finally {
       setAddingMember(false);
       setPopover(null);
@@ -2431,8 +2451,9 @@ function ActionItemSidePanelContent({
     if (saving) return;
     setSaving(true);
     try {
-      const { data } = await airtableApi.updateActionItemFields(item.airtable_id, form as Parameters<typeof airtableApi.updateActionItemFields>[1]);
-      logActionItemUpdate(item, form as Partial<AirtableActionItem>);
+      const changes = changedActionItemFields(item, form);
+      const { data } = await airtableApi.updateActionItemFields(item.airtable_id, changes);
+      logActionItemUpdate(item, changes);
       onUpdated?.(data);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
@@ -2661,12 +2682,31 @@ function ContactSidePanelContent({
   contact,
   onUpdated,
   onDeleted,
+  teamOptions = [],
 }: {
   contact: CustomerContact;
   onUpdated: (c: CustomerContact) => void;
   onDeleted: (id: number) => void;
+  teamOptions?: string[];
 }) {
-  const [form, setForm] = useState({ name: contact.name, role: contact.role, description: contact.description, email: contact.email });
+  const { reportError } = useAppError();
+  const [form, setForm] = useState({ name: contact.name, role: contact.role, description: contact.description, email: contact.email, team: contact.team ?? "" });
+  const [starred, setStarred] = useState(!!contact.is_main_poc);
+  useEffect(() => { setStarred(!!contact.is_main_poc); }, [contact.is_main_poc]);
+  // Switching to another profile unmounts this panel (keyed by contact id). Flush unsaved edits so
+  // nothing is lost: a dirty form is saved on unmount unless the contact was deleted.
+  const flushRef = useRef<{ dirty: boolean; form: typeof form; deleted: boolean }>({ dirty: false, form, deleted: false });
+  const onUpdatedRef = useRef(onUpdated);
+  onUpdatedRef.current = onUpdated;
+  useEffect(() => {
+    const id = contact.id;
+    return () => {
+      const f = flushRef.current;
+      if (f.dirty && !f.deleted && f.form.name.trim()) {
+        accountsApi.updateContact(id, f.form).then(({ data }) => onUpdatedRef.current(data)).catch(() => {});
+      }
+    };
+  }, [contact.id]);
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [notes, setNotes] = useState<CustomerContactNote[]>(contact.notes ?? []);
@@ -2676,8 +2716,21 @@ function ContactSidePanelContent({
   const initials = contact.name.split(" ").map((p) => p[0]).join("").toUpperCase().slice(0, 2);
 
   function setField(key: keyof typeof form, value: string) {
-    setForm((f) => ({ ...f, [key]: value }));
+    setForm((f) => { const next = { ...f, [key]: value }; flushRef.current.form = next; return next; });
+    flushRef.current.dirty = true;
     setDirty(true);
+  }
+
+  async function handleToggleStar() {
+    const next = !starred;
+    setStarred(next);
+    try {
+      const { data } = await accountsApi.updateContact(contact.id, { is_main_poc: next });
+      onUpdated({ ...contact, ...data, is_main_poc: data.is_main_poc });
+    } catch {
+      setStarred(!next);
+      reportError("Could not update the main point of contact.", "ContactSidePanelContent");
+    }
   }
 
   async function handleSave() {
@@ -2686,6 +2739,7 @@ function ContactSidePanelContent({
     try {
       const { data } = await accountsApi.updateContact(contact.id, form);
       onUpdated(data);
+      flushRef.current.dirty = false;
       setDirty(false);
     } finally {
       setSaving(false);
@@ -2715,6 +2769,7 @@ function ContactSidePanelContent({
 
   async function handleDelete() {
     await accountsApi.deleteContact(contact.id);
+    flushRef.current.deleted = true;
     onDeleted(contact.id);
   }
 
@@ -2741,6 +2796,33 @@ function ContactSidePanelContent({
             style={{ color: "var(--twilio-gray-60)" }}
           />
         </div>
+        <button
+          type="button"
+          onClick={() => void handleToggleStar()}
+          title={starred ? "Main point of contact (click to unset)" : "Mark as main point of contact"}
+          aria-label={starred ? "Unset main point of contact" : "Set as main point of contact"}
+          aria-pressed={starred}
+          className="text-xl leading-none shrink-0"
+          style={{ color: starred ? "#f59e0b" : "#cbd5e1" }}
+        >{starred ? "★" : "☆"}</button>
+      </div>
+
+      {/* Team */}
+      <div className="flex items-center gap-2">
+        <span className="text-[11px] text-[var(--twilio-gray-60)] w-16 shrink-0">Team</span>
+        <input
+          type="text"
+          list="contact-team-suggestions-panel"
+          value={form.team}
+          maxLength={200}
+          onChange={(e) => setField("team", e.target.value)}
+          placeholder="Their internal team"
+          className="flex-1 text-xs border-b border-transparent hover:border-gray-200 focus:border-indigo-300 focus:outline-none bg-transparent"
+          style={{ color: "var(--twilio-navy)" }}
+        />
+        <datalist id="contact-team-suggestions-panel">
+          {teamOptions.map((t) => <option key={t} value={t} />)}
+        </datalist>
       </div>
 
       {/* Email */}
@@ -2773,7 +2855,7 @@ function ContactSidePanelContent({
       {dirty && (
         <div className="flex justify-end gap-2">
           <button
-            onClick={() => { setForm({ name: contact.name, role: contact.role, description: contact.description, email: contact.email }); setDirty(false); }}
+            onClick={() => { const reset = { name: contact.name, role: contact.role, description: contact.description, email: contact.email, team: contact.team ?? "" }; setForm(reset); flushRef.current = { ...flushRef.current, form: reset, dirty: false }; setDirty(false); }}
             className="text-xs text-[var(--twilio-gray-60)] hover:text-[var(--twilio-navy)] transition-colors"
           >Discard</button>
           <button
@@ -2888,7 +2970,9 @@ function SidePanel({ panel, onClose, onCreatedActionItem, onMeetingUpdated, onUp
         )}
         {panel.kind === "contact" && (
           <ContactSidePanelContent
+            key={panel.item.id}
             contact={panel.item}
+            teamOptions={teamSuggestions(contacts ?? [])}
             onUpdated={(updated) => {
               onContactsChange?.((contacts ?? []).map((c) => c.id === updated.id ? updated : c));
             }}
@@ -2949,17 +3033,16 @@ function SidePanel({ panel, onClose, onCreatedActionItem, onMeetingUpdated, onUp
                 </a>
               )}
 
-              {/* Description — render URLs as links */}
+              {/* Project this block was filed under (carried over from the scheduled item) */}
+              {ev.project_name && (
+                <p data-testid="event-project"><span className="opacity-50">Project </span>{ev.project_name}</p>
+              )}
+
+              {/* Description — HTML-ish text rendered safely (real line breaks, safe links) */}
               {ev.description && (
                 <div>
                   <p className="font-medium mb-1">Description</p>
-                  <div className="opacity-70 leading-relaxed whitespace-pre-wrap break-words" style={{ fontSize: "0.75rem" }}>
-                    {ev.description.split(/(https?:\/\/[^\s<>"]+)/g).map((part, i) =>
-                      /^https?:\/\//i.test(part)
-                        ? <a key={i} href={part} target="_blank" rel="noreferrer" style={{ color: "var(--twilio-red, #e22)", textDecoration: "underline", wordBreak: "break-all" }}>{part}</a>
-                        : part
-                    )}
-                  </div>
+                  <EventDescription text={ev.description} className="opacity-70 [&_a]:underline [&_a]:break-all" style={{ fontSize: "0.75rem" }} />
                 </div>
               )}
 
@@ -3052,9 +3135,20 @@ function AccountTimeline({
   const days = buildDayWindow(today, 3);
 
   // Build lookup maps by date string
+  // A meeting that has a calendar event behind it is shown ON that event's row (with the
+  // notes check) rather than as a second, duplicate row. Matched through the link the event
+  // already carries (`agentpm_airtable_id` -> AirtableMeeting.airtable_id).
+  const meetingByCalLink: Record<string, AirtableMeeting> = {};
+  for (const m of meetings) if (m.airtable_id) meetingByCalLink[m.airtable_id] = m;
+  const mergedMeetingIds = new Set<string>();
+  for (const ev of calendarEvents) {
+    const linked = ev.agentpm_airtable_id ? meetingByCalLink[ev.agentpm_airtable_id] : undefined;
+    if (linked) mergedMeetingIds.add(linked.airtable_id);
+  }
   const meetingsByDate: Record<string, AirtableMeeting[]> = {};
   for (const m of meetings) {
     if (!m.date) continue;
+    if (mergedMeetingIds.has(m.airtable_id)) continue;
     const d = isoDate(new Date(m.date));
     (meetingsByDate[d] ??= []).push(m);
   }
@@ -3229,14 +3323,30 @@ function AccountTimeline({
                       ))}
                     </div>
                   ))}
-                  {dayCalEvs.map((ev) => (
-                    <CalEventTimelineBtn
-                      key={ev.google_event_id || ev.id}
-                      ev={ev}
-                      isPast={isPast}
-                      onSelectCalEvent={onSelectCalEvent}
-                    />
-                  ))}
+                  {dayCalEvs.map((ev) => {
+                    const linked = ev.agentpm_airtable_id ? meetingByCalLink[ev.agentpm_airtable_id] : undefined;
+                    return (
+                      <div key={ev.google_event_id || ev.id} style={{ display: "flex", flexDirection: "column", gap: "2px" }}>
+                        <CalEventTimelineBtn
+                          ev={ev}
+                          isPast={isPast}
+                          onSelectCalEvent={onSelectCalEvent}
+                          linkedMeeting={linked}
+                        />
+                        {linked && (pinnedByMeeting[linked.id] ?? []).map((pinned) => (
+                          <button
+                            key={pinned.airtable_id}
+                            onClick={() => onSelectAction(pinned)}
+                            title={pinned.task}
+                            style={{ display: "flex", alignItems: "flex-start", gap: "4px", width: "100%", textAlign: "left", background: "rgba(21,128,61,0.08)", border: "1px solid rgba(21,128,61,0.22)", borderRadius: "3px", padding: "2px 5px", marginLeft: "6px", cursor: "pointer" }}
+                          >
+                            <span style={{ flexShrink: 0, fontSize: "0.6rem", color: "#15803d", marginTop: "2px" }}>✓</span>
+                            <span style={{ fontSize: "0.6rem", fontWeight: 500, lineHeight: 1.3, color: "#15803d", textDecoration: "line-through", wordBreak: "break-word" }}>{pinned.task}</span>
+                          </button>
+                        ))}
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
 
@@ -3595,7 +3705,6 @@ const ARTIFACT_ICON_CATALOG: ArtifactIconEntry[] = [
   { key: "link",        label: "Link",        emoji: "🔗" },
 ];
 
-const CATALOG_BY_KEY = Object.fromEntries(ARTIFACT_ICON_CATALOG.map((e) => [e.key, e]));
 
 function getAutoIconKey(url: string): string {
   try {
@@ -3667,36 +3776,18 @@ function ArtifactIconImg({
   return <span style={{ fontSize: size, lineHeight: 1 }}>{entry.emoji ?? "🔗"}</span>;
 }
 
-function ArtifactIcon({
-  artifactType, mime, name, url, iconKey, size = 18,
-}: {
+// Delegates to the shared component so this page gets the same icon precedence
+// (uploaded image → chosen icon → site favicon / file type) as the Artifacts panel.
+function ArtifactIcon(props: {
   artifactType: string;
   mime: string;
   name: string;
   url?: string | null;
   iconKey?: string;
+  imageUrl?: string | null;
   size?: number;
 }) {
-  const [imgFailed, setImgFailed] = useState(false);
-
-  if (artifactType === "link") {
-    const resolvedKey = (iconKey && iconKey !== "") ? iconKey : getAutoIconKey(url ?? "");
-    const entry = CATALOG_BY_KEY[resolvedKey] ?? CATALOG_BY_KEY["link"];
-    if (!imgFailed) {
-      return <ArtifactIconImg entry={entry} size={size} onError={() => setImgFailed(true)} />;
-    }
-    return <span style={{ fontSize: size, lineHeight: 1 }}>🔗</span>;
-  }
-
-  // File type — use asset icons
-  const m = mime.toLowerCase();
-  const ext = name.split(".").pop()?.toLowerCase() ?? "";
-  let fileEntry: ArtifactIconEntry;
-  if (m.startsWith("image/")) fileEntry = CATALOG_BY_KEY["file_image"];
-  else if (m.includes("spreadsheet") || ext === "xlsx" || ext === "csv") fileEntry = CATALOG_BY_KEY["file_sheet"];
-  else fileEntry = CATALOG_BY_KEY["file_upload"];
-
-  return <ArtifactIconImg entry={fileEntry} size={size} />;
+  return <SharedArtifactIcon {...props} />;
 }
 
 function formatBytes(b: number): string {
@@ -3707,6 +3798,8 @@ function formatBytes(b: number): string {
 
 function ArtifactsPanel({ accountId, airtableAccountId }: { accountId: number; airtableAccountId?: number }) {
   const [artifacts, setArtifacts] = useState<AccountArtifact[]>([]);
+  const [artifactBrowse, setArtifactBrowse] = useState<ArtifactBrowseState>(DEFAULT_ARTIFACT_BROWSE);
+  const artifactGroups = useMemo(() => browseArtifacts(artifacts, artifactBrowse), [artifacts, artifactBrowse]);
   const [actionItemAttachments, setActionItemAttachments] = useState<ActionItemAttachment[]>([]);
   const [showAddModal, setShowAddModal] = useState(false);
   const [dragOver, setDragOver] = useState(false);
@@ -3743,15 +3836,22 @@ function ArtifactsPanel({ accountId, airtableAccountId }: { accountId: number; a
     return () => window.removeEventListener("artifact-added", handler);
   }, [load]);
 
-  async function handleFiles(files: FileList | File[]) {
+  // Picked/dropped files wait here while the user chooses their icons (UploadFileDialog).
+  const [pendingUploads, setPendingUploads] = useState<File[] | null>(null);
+
+  function handleFiles(files: FileList | File[]) {
     const arr = Array.from(files);
-    if (!arr.length) return;
+    if (arr.length) setPendingUploads(arr);
+  }
+
+  async function uploadFiles(uploads: PendingUpload[]) {
+    setPendingUploads(null);
     setUploading(true);
     const failures: string[] = [];
     try {
-      for (const f of arr) {
+      for (const { file: f, iconKey, image } of uploads) {
         try {
-          await accountsApi.uploadArtifactFile(accountId, f);
+          await accountsApi.uploadArtifactFile(accountId, f, { iconKey, image });
         } catch (e: unknown) {
           // The server rejects blocked file types with {"error": "..."} and a 400. With no
           // catch here that surfaced as an unhandled AxiosError in the console and the file
@@ -3855,15 +3955,32 @@ function ArtifactsPanel({ accountId, airtableAccountId }: { accountId: number; a
           Drop files here, or click to upload
         </button>
       ) : (
+        <>
+        <ArtifactBrowseBar artifacts={artifacts} state={artifactBrowse} onChange={setArtifactBrowse} />
+        {artifactGroups.length === 0 && (
+          <p data-testid="artifact-no-match" style={{ fontSize: "0.75rem", fontStyle: "italic", color: "var(--twilio-gray-60)" }}>No artifacts match your search.</p>
+        )}
         <div style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}>
-          {artifacts.map((a) => (
+          {artifactGroups.flatMap((g) => [
+            ...(g.label ? [{ heading: g.label, count: g.items.length } as const] : []),
+            ...g.items,
+          ]).map((row) => {
+            if ("heading" in row) {
+              return (
+                <p key={`h-${row.heading}`} data-testid="artifact-group-heading" className="text-xs font-semibold text-[var(--twilio-gray-60)]" style={{ flexBasis: "100%", margin: "6px 0 0" }}>
+                  {row.heading} <span style={{ fontWeight: 400 }}>({row.count})</span>
+                </p>
+              );
+            }
+            const a = row;
+            return (
             <div
               key={a.id}
               style={{ position: "relative", display: "flex", alignItems: "center", gap: "7px", padding: "7px 10px", borderRadius: "8px", background: "var(--bg, #f5f5f5)", border: "1px solid var(--border, rgba(0,0,0,0.08))", cursor: "pointer", maxWidth: "260px", userSelect: "none" }}
               onClick={(e) => handleArtifactClick(a, e)}
               title="Click to preview · Cmd+Click to open in new tab"
             >
-              <ArtifactIcon artifactType={a.artifact_type} mime={a.mime_type} name={a.name} url={a.url} iconKey={a.icon_key} />
+              <ArtifactIcon artifactType={a.artifact_type} mime={a.mime_type} name={a.name} url={a.url} iconKey={a.icon_key} imageUrl={a.image_url} />
               <div style={{ minWidth: 0, flex: 1 }}>
                 <p style={{ margin: 0, fontSize: "0.75rem", fontWeight: 600, color: "var(--text-primary, #111)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{resolveEmojiShortcodes(a.name)}</p>
                 {a.file_size != null && (
@@ -3914,10 +4031,15 @@ function ArtifactsPanel({ accountId, airtableAccountId }: { accountId: number; a
                 title="Remove"
               >×</button>
             </div>
-          ))}
+            );
+          })}
         </div>
+        </>
       )}
 
+      {pendingUploads && (
+        <UploadFileDialog files={pendingUploads} onCancel={() => setPendingUploads(null)} onConfirm={(u) => void uploadFiles(u)} />
+      )}
       {uploading && (
         <p style={{ marginTop: "8px", fontSize: "0.75rem", color: "var(--twilio-red, #e22)" }}>Uploading…</p>
       )}
@@ -3998,6 +4120,7 @@ function AddArtifactModal({
   const [iconKey, setIconKey] = useState("link");
   const [description, setDescription] = useState("");
   const [references, setReferences] = useState<CommentReference[]>([]);
+  const [imageFile, setImageFile] = useState<File | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -4043,7 +4166,7 @@ function AddArtifactModal({
     setError(null);
     try {
       const displayName = name.trim() || url.trim();
-      const { data } = await accountsApi.addArtifactLink(accountId, displayName, url.trim(), iconKey, secondaryUrl.trim() || undefined, description, references);
+      const { data } = await accountsApi.addArtifactLink(accountId, displayName, url.trim(), iconKey, secondaryUrl.trim() || undefined, description, references, imageFile);
       onAdded(data);
     } catch {
       setError("Failed to add link — please try again.");
@@ -4170,6 +4293,13 @@ function AddArtifactModal({
         </div>
 
         {/* Icon picker */}
+        <ArtifactImageField
+          file={imageFile}
+          removed={false}
+          onPick={setImageFile}
+          onRemove={() => setImageFile(null)}
+          fallback={<ArtifactIcon artifactType="link" mime="" name={name} url={url} iconKey={iconKey} size={22} />}
+        />
         <div style={{ marginTop: "14px" }}>
           <p style={{ margin: "0 0 8px", fontSize: "0.75rem", fontWeight: 600, color: "var(--text-secondary, #888)" }}>Icon</p>
           <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
@@ -4277,7 +4407,7 @@ function ArtifactViewer({
         ) : (
           <div style={{ textAlign: "center", color: "#fff" }}>
             <div style={{ fontSize: "3rem", marginBottom: "12px", display: "flex", justifyContent: "center" }}>
-              <ArtifactIcon artifactType={artifact.artifact_type} mime={artifact.mime_type} name={artifact.name} url={artifact.url} iconKey={artifact.icon_key} size={48} />
+              <ArtifactIcon artifactType={artifact.artifact_type} mime={artifact.mime_type} name={artifact.name} url={artifact.url} iconKey={artifact.icon_key} imageUrl={artifact.image_url} size={48} />
             </div>
             <p style={{ fontSize: "1rem", fontWeight: 600, marginBottom: "8px" }}>{resolveEmojiShortcodes(artifact.name)}</p>
             <p style={{ fontSize: "0.8125rem", color: "rgba(255,255,255,0.6)", marginBottom: "20px" }}>Preview not available</p>
@@ -5021,11 +5151,21 @@ export default function AccountDetailPage() {
   const [quickLinks, setQuickLinks] = useState<AccountQuickLink[]>([]);
   const [selectedContact, setSelectedContact] = useState<CustomerContact | null>(null);
   const [addingContact, setAddingContact] = useState(false);
-  const [addContactForm, setAddContactForm] = useState({ name: "", role: "", email: "", description: "" });
+  const [addContactForm, setAddContactForm] = useState({ name: "", role: "", email: "", description: "", team: "" });
   const [addContactSaving, setAddContactSaving] = useState(false);
   const [loading, setLoading] = useState(true);
   const [editOpen, setEditOpen] = useState(false);
   const [panel, setPanel] = useState<PanelItem | null>(null);
+  // Section folding is a global preference (hooks/useAccountSectionCollapse). Selecting
+  // something that opens the right-hand detail panel re-opens it if it was folded away,
+  // otherwise the click would appear to do nothing.
+  const sectionCollapse = useAccountSectionCollapse();
+  const leftCollapsed = sectionCollapse.isCollapsed(SECTION_IDS.leftSidebar);
+  const rightCollapsed = sectionCollapse.isCollapsed(SECTION_IDS.rightSidebar);
+  useEffect(() => {
+    if (panel && sectionCollapse.isCollapsed(SECTION_IDS.rightSidebar)) sectionCollapse.toggle(SECTION_IDS.rightSidebar);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [panel]);
   const [goals, setGoals] = useState<GoalSection[]>([]);
   const [goalsLoaded, setGoalsLoaded] = useState(false);
   // Action items already attached to a project/goal are single-owner — they stop showing
@@ -5059,6 +5199,9 @@ export default function AccountDetailPage() {
   const [kanbanDragOverCol, setKanbanDragOverCol] = useState<string | null>(null);
   const [kanbanMemberFilter, setKanbanMemberFilter] = useState<Set<string>>(new Set());
   const [kanbanViewMode, setKanbanViewMode] = useState<"all" | "unassigned" | "before_next">("all");
+  const [kanbanSearch, setKanbanSearch] = useState("");
+  // null = closed; "all" or a status = open on that tab
+  const [kanbanModalTab, setKanbanModalTab] = useState<string | null>(null);
   const pageRef = useRef<HTMLDivElement>(null);
   useLogGlow(pageRef);
 
@@ -5461,6 +5604,14 @@ export default function AccountDetailPage() {
   }
 
   /** Re-read this account's meetings so a just-imported summary shows up. */
+  // A background check added notes somewhere — re-read so the timeline icon flips.
+  useEffect(() => {
+    const onNotes = () => { void refreshMeetings(); };
+    window.addEventListener(MEETING_NOTES_UPDATED_EVENT, onNotes);
+    return () => window.removeEventListener(MEETING_NOTES_UPDATED_EVENT, onNotes);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [account]);
+
   async function refreshMeetings() {
     if (!account) return;
     // Mirrors the initial fetch's scoping: airtable_id when the account is linked,
@@ -5475,6 +5626,23 @@ export default function AccountDetailPage() {
   if (loading) return <div className="flex items-center justify-center h-full text-sm text-[var(--twilio-navy)]">Loading…</div>;
   if (!account) return <div className="flex items-center justify-center h-full text-sm text-[var(--twilio-navy)]">Account not found.</div>;
 
+  // Opens the right-hand Event Details panel for a calendar event. Shared by the Timeline and
+  // by the calendar-event chips in Project Goals so both open exactly the same panel.
+  const openCalEventPanel = (ev: CalendarEvent) => setPanel({
+    kind: "calendar",
+    item: ev,
+    linkedMeeting: ev.agentpm_airtable_id ? meetings.find((m) => m.airtable_id === ev.agentpm_airtable_id) : undefined,
+    reminders: meetingReminders[ev.id] ?? [],
+    onAddReminder: async (due_at, title) => { await (await handleAddMeetingReminder(ev.id, account.id, ev.title))(due_at, title); },
+    onDismissReminder: (id) => handleDismissMeetingReminder(ev.id, id),
+  });
+  // A Project Goals chip is the meeting record; open its calendar event when it has one
+  // (same panel as the Timeline), else the meeting's own panel.
+  const openMeetingChip = (m: AirtableMeeting) => {
+    const ev = calendarEvents.find((e) => e.agentpm_airtable_id === m.airtable_id);
+    if (ev) openCalEventPanel(ev); else setPanel({ kind: "meeting", item: m });
+  };
+
   // Split team members: internal (have a TeamMember record) vs external
   const internalMemberIds = new Set(allMembers.map((m) => m.id));
   const internalMembers = (account.team_members ?? []).filter((m) => internalMemberIds.has(m.id));
@@ -5485,7 +5653,19 @@ export default function AccountDetailPage() {
     <div ref={pageRef} className="relative h-full overflow-hidden flex">
 
       {/* ── Left: Account Details sidebar ──────────────────────────────────── */}
-      <div className="w-56 shrink-0 flex flex-col overflow-y-auto" style={{ background: "var(--surface, #fff)", borderRight: "1px solid var(--border, rgba(0,0,0,0.08))", fontFamily: "var(--font-base)" }}>
+      <div data-testid="left-sidebar" className={`${leftCollapsed ? "w-9" : "w-56"} relative shrink-0 flex flex-col overflow-y-auto transition-[width] duration-150`} style={{ background: "var(--surface, #fff)", borderRight: "1px solid var(--border, rgba(0,0,0,0.08))", fontFamily: "var(--font-base)" }}>
+        <button
+          type="button"
+          onClick={() => sectionCollapse.toggle(SECTION_IDS.leftSidebar)}
+          aria-expanded={!leftCollapsed}
+          aria-label={leftCollapsed ? "Expand account details sidebar" : "Collapse account details sidebar"}
+          title={leftCollapsed ? "Expand account details" : "Collapse account details"}
+          className="absolute rounded hover:bg-gray-100 flex items-center justify-center"
+          style={{ top: 8, right: leftCollapsed ? 9 : 6, width: 18, height: 18, zIndex: 2, color: "var(--twilio-gray-60)" }}
+        >
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ transform: leftCollapsed ? "rotate(180deg)" : "none" }}><path d="M10 3L5 8l5 5" /></svg>
+        </button>
+        <div hidden={leftCollapsed}>
         <div className="px-4 py-4" style={{ borderBottom: "1px solid var(--border, rgba(0,0,0,0.08))" }}>
           <button
             onClick={() => navigate("/accounts")}
@@ -5531,6 +5711,7 @@ export default function AccountDetailPage() {
           />
         </div>
 
+        <CollapsibleAccountSection id={SECTION_IDS.sidebarDetails} title="Details" bare>
         <div className="px-4 py-3 space-y-3 text-sm text-[var(--twilio-navy)]">
           <SidebarField
             label="Industry"
@@ -5548,7 +5729,7 @@ export default function AccountDetailPage() {
               const { data } = await accountsApi.updateAccount(account.id, { arr: v === "" ? null : v } as Partial<Account>);
               setAccount(data);
             }}
-            renderValue={(v) => v ? <span className="text-xs">${Number(v).toLocaleString()}</span> : <span style={{ color: "var(--twilio-gray-60)", fontStyle: "italic", fontSize: "0.75rem" }}>—</span>}
+            renderValue={(v) => <MaskedArrValue key={account.id} value={v} />}
           />
           <SidebarField
             label="Website"
@@ -5562,6 +5743,19 @@ export default function AccountDetailPage() {
               ? <a href={v} target="_blank" rel="noreferrer" className="underline text-xs truncate block" style={{ color: "var(--twilio-red, #e22)" }} onClick={(e) => e.stopPropagation()}>{v.replace(/^https?:\/\//, "")}</a>
               : <span style={{ color: "var(--twilio-gray-60)", fontStyle: "italic", fontSize: "0.75rem" }}>—</span>
             }
+          />
+          <SlackChannelsField
+            key={account.id}
+            channels={account.slack_channels ?? []}
+            onChange={async (next) => {
+              try {
+                const { data } = await accountsApi.updateAccount(account.id, { slack_channels: next } as Partial<Account>);
+                setAccount(data);
+              } catch (err) {
+                reportError(permissionMessage(err, "Could not save the Slack channels."), "AccountDetailPage");
+                throw err;
+              }
+            }}
           />
           <SidebarField
             label="Primary Contact"
@@ -5584,8 +5778,12 @@ export default function AccountDetailPage() {
                       {m.full_name.split(" ")[0]}
                       <button
                         onClick={async () => {
-                          const { data } = await accountsApi.removeTeamMember(account.id, m.id);
-                          setAccount(data);
+                          try {
+                            const { data } = await accountsApi.removeTeamMember(account.id, m.id);
+                            setAccount(data);
+                          } catch (err) {
+                            reportError(permissionMessage(err, `Could not remove ${m.full_name}.`), "AccountDetailPage");
+                          }
                         }}
                         className="ml-0.5 leading-none hover:opacity-60"
                         aria-label={`Remove ${m.full_name}`}
@@ -5628,9 +5826,12 @@ export default function AccountDetailPage() {
           </div>
           <div>
             <p className="text-[11px] text-[var(--twilio-gray-60)] uppercase tracking-wide mb-0.5">Meetings</p>
-            <p className="text-xs">{meetings.length} recorded</p>
+            <p className="text-xs" data-testid="sidebar-meeting-count">{timelineMeetingCount(meetings, calendarEvents).total} recorded</p>
           </div>
         </div>
+
+        </CollapsibleAccountSection>
+        <CollapsibleAccountSection id={SECTION_IDS.sidebarQuickLinks} title="Quick Links" bare>
 
         {/* ── Quick Links ─────────────────────────────────────────────────── */}
         <QuickLinksPanel
@@ -5638,11 +5839,14 @@ export default function AccountDetailPage() {
           links={quickLinks}
           onLinksChange={setQuickLinks}
         />
+        </CollapsibleAccountSection>
+        </div>
       </div>
 
       {/* ── Main content ───────────────────────────────────────────────────── */}
       <div className="flex-1 overflow-y-auto px-6 py-6 space-y-5">
 
+        <CollapsibleAccountSection id={SECTION_IDS.team} title="Teams">
         {/* Team row */}
         <div className="rounded-lg px-5 py-4" style={{ background: "var(--surface, #fff)", border: "1px solid var(--border, rgba(0,0,0,0.08))", boxShadow: "0 1px 4px rgba(0,0,0,0.04)" }}>
           <div className="flex gap-8 flex-wrap">
@@ -5684,37 +5888,66 @@ export default function AccountDetailPage() {
                   {account.company_name} Team
                 </p>
                 <button
-                  onClick={() => { setAddContactForm({ name: "", role: "", email: "", description: "" }); setAddingContact(true); }}
+                  onClick={() => { setAddContactForm({ name: "", role: "", email: "", description: "", team: "" }); setAddingContact(true); }}
                   className="text-[11px] font-semibold text-indigo-600 hover:text-indigo-800 transition-colors"
                 >+ Add</button>
               </div>
-              <div className="flex flex-wrap gap-2">
-                {contacts.map((c) => {
-                  const initials = c.name.split(" ").map((p) => p[0]).join("").toUpperCase().slice(0, 2);
-                  const nameParts = c.name.trim().split(" ");
-                  const firstName = nameParts[0] ?? "";
-                  const lastName = nameParts.slice(1).join(" ");
-                  return (
-                    <button
-                      key={c.id}
-                      title={`${c.name}${c.role ? ` · ${c.role}` : ""}`}
-                      onClick={() => setPanel({ kind: "contact", item: c })}
-                      className="flex flex-col items-center gap-0.5 hover:opacity-80 transition-opacity"
-                    >
-                      <div className="h-9 w-9 rounded-full flex items-center justify-center text-[11px] font-semibold ring-2 ring-white"
-                        style={{ background: "rgba(99,102,241,0.13)", color: "#4f46e5" }}>
-                        {initials}
-                      </div>
-                      <span className="text-[10px] font-medium text-[var(--twilio-navy)] max-w-[56px] truncate leading-tight">{firstName}</span>
-                      {lastName && <span className="text-[10px] text-[var(--twilio-navy)] opacity-60 max-w-[56px] truncate leading-tight">{lastName}</span>}
-                    </button>
-                  );
-                })}
+              <div className="flex flex-col gap-3">
+                {groupContactsByTeam(contacts).map((group) => (
+                  <div key={group.team || "__no_team__"} data-testid="contact-team-group">
+                    <p className="text-[10px] font-semibold uppercase tracking-wide text-[var(--twilio-gray-60)] mb-1">{group.label}</p>
+                    <div className="flex flex-wrap gap-2">
+                      {group.contacts.map((c) => {
+                        const initials = c.name.split(" ").map((p) => p[0]).join("").toUpperCase().slice(0, 2);
+                        const nameParts = c.name.trim().split(" ");
+                        const firstName = nameParts[0] ?? "";
+                        const lastName = nameParts.slice(1).join(" ");
+                        const isSelected = panel?.kind === "contact" && panel.item.id === c.id;
+                        return (
+                          <div key={c.id} className="relative">
+                            <button
+                              title={`${c.name}${c.role ? ` · ${c.role}` : ""}`}
+                              aria-pressed={isSelected}
+                              data-selected={isSelected ? "true" : undefined}
+                              onClick={() => setPanel({ kind: "contact", item: c })}
+                              className={`flex flex-col items-center gap-0.5 rounded-lg px-1 py-0.5 transition-colors ${isSelected ? "bg-indigo-50 ring-2 ring-indigo-400" : "hover:opacity-80"}`}
+                            >
+                              <div className="h-9 w-9 rounded-full flex items-center justify-center text-[11px] font-semibold ring-2 ring-white"
+                                style={{ background: "rgba(99,102,241,0.13)", color: "#4f46e5" }}>
+                                {initials}
+                              </div>
+                              <span className="text-[10px] font-medium text-[var(--twilio-navy)] max-w-[56px] truncate leading-tight">{firstName}</span>
+                              {lastName && <span className="text-[10px] text-[var(--twilio-navy)] opacity-60 max-w-[56px] truncate leading-tight">{lastName}</span>}
+                            </button>
+                            <button
+                              type="button"
+                              title={c.is_main_poc ? "Main point of contact (click to unset)" : "Mark as main point of contact"}
+                              aria-label={`${c.is_main_poc ? "Unstar" : "Star"} ${c.name}`}
+                              aria-pressed={!!c.is_main_poc}
+                              onClick={() => {
+                                accountsApi.updateContact(c.id, { is_main_poc: !c.is_main_poc })
+                                  .then(({ data }) => {
+                                    setContacts((prev) => prev.map((x) => x.id === data.id ? { ...x, is_main_poc: data.is_main_poc } : x));
+                                    setPanel((p) => p?.kind === "contact" && p.item.id === data.id ? { kind: "contact", item: { ...p.item, is_main_poc: data.is_main_poc } } : p);
+                                  })
+                                  .catch(() => reportError("Could not update the main point of contact.", "AccountDetailPage"));
+                              }}
+                              className="absolute -top-1 -right-1 text-[13px] leading-none"
+                              style={{ color: c.is_main_poc ? "#f59e0b" : "#cbd5e1" }}
+                            >{c.is_main_poc ? "★" : "☆"}</button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ))}
                 {contacts.length === 0 && <p className="text-xs text-[var(--twilio-gray-60)] italic">No contacts yet.</p>}
               </div>
             </div>
           </div>
         </div>
+
+        </CollapsibleAccountSection>
 
         {/* Add customer contact modal */}
         {addingContact && createPortal(
@@ -5750,6 +5983,21 @@ export default function AccountDetailPage() {
                   )}
                 </div>
               ))}
+              <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                <label style={{ fontSize: "0.75rem", fontWeight: 600, color: "var(--twilio-gray-60)" }}>Team</label>
+                <input
+                  type="text"
+                  list="contact-team-suggestions"
+                  value={addContactForm.team}
+                  maxLength={200}
+                  placeholder="Their internal team, e.g. Platform"
+                  onChange={(e) => setAddContactForm((f) => ({ ...f, team: e.target.value }))}
+                  style={{ fontSize: "0.8125rem", border: "1px solid #e5e7eb", borderRadius: "7px", padding: "7px 10px", outline: "none", color: "var(--twilio-navy)" }}
+                />
+                <datalist id="contact-team-suggestions">
+                  {teamSuggestions(contacts).map((t) => <option key={t} value={t} />)}
+                </datalist>
+              </div>
               <div style={{ display: "flex", gap: "8px", justifyContent: "flex-end", marginTop: "4px" }}>
                 <button onClick={() => setAddingContact(false)} style={{ padding: "7px 16px", fontSize: "0.8125rem", borderRadius: "7px", border: "1px solid #e5e7eb", background: "#fff", cursor: "pointer", color: "var(--twilio-gray-60)" }}>
                   Cancel
@@ -5765,6 +6013,7 @@ export default function AccountDetailPage() {
                         role: addContactForm.role.trim(),
                         email: addContactForm.email.trim(),
                         description: addContactForm.description.trim(),
+                        team: addContactForm.team.trim(),
                       });
                       setContacts((prev) => [...prev, data]);
                       setAddingContact(false);
@@ -5798,6 +6047,7 @@ export default function AccountDetailPage() {
           />
         )}
 
+        <CollapsibleAccountSection id={SECTION_IDS.timeline} title="Timeline">
         {/* Combined calendar + action-item timeline */}
         <div className="rounded-lg px-5 py-4" style={{ background: "var(--surface, #fff)", border: "1px solid var(--border, rgba(0,0,0,0.08))", boxShadow: "0 1px 4px rgba(0,0,0,0.04)" }}>
           <div className="flex items-center justify-between gap-2 mb-3 flex-wrap">
@@ -5817,18 +6067,14 @@ export default function AccountDetailPage() {
             calendarEvents={calendarEvents}
             onSelectMeeting={(m) => setPanel({ kind: "meeting", item: m })}
             onSelectAction={(i) => setPanel({ kind: "action", item: i })}
-            onSelectCalEvent={(ev) => setPanel({
-              kind: "calendar",
-              item: ev,
-              linkedMeeting: ev.agentpm_airtable_id ? meetings.find((m) => m.airtable_id === ev.agentpm_airtable_id) : undefined,
-              reminders: meetingReminders[ev.id] ?? [],
-              onAddReminder: async (due_at, title) => { await (await handleAddMeetingReminder(ev.id, account.id, ev.title))(due_at, title); },
-              onDismissReminder: (id) => handleDismissMeetingReminder(ev.id, id),
-            })}
+            onSelectCalEvent={openCalEventPanel}
             onDropActionOnDay={handleDropActionOnDay}
           />
         </div>
 
+        </CollapsibleAccountSection>
+
+        <CollapsibleAccountSection id={SECTION_IDS.actionItems} title="Action Items">
         {/* Action Items — status columns */}
         <div
           data-testid="action-items-section"
@@ -5842,6 +6088,11 @@ export default function AccountDetailPage() {
           onDragOver={(e) => { if (e.dataTransfer.types.includes("notetext")) { e.preventDefault(); setNoteDragOverSection("actions"); } }}
           onDragLeave={() => setNoteDragOverSection(null)}
           onDrop={(e) => { void handleNoteDropOnActions(e); }}
+          onDoubleClick={(e) => {
+            // Only the section's own chrome opens the full-screen view — not a control or a card.
+            if ((e.target as HTMLElement).closest("button, input, textarea, a, select, [draggable='true'], [contenteditable]")) return;
+            setKanbanModalTab("all");
+          }}
         >
           <p className="text-xs font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide mb-1">
             Action Items
@@ -5891,6 +6142,19 @@ export default function AccountDetailPage() {
                     }}
                   >{m.full_name}</button>
                 ))}
+                <input
+                  type="search"
+                  value={kanbanSearch}
+                  onChange={(e) => setKanbanSearch(e.target.value)}
+                  placeholder="Search action items…"
+                  aria-label="Search action items"
+                  data-testid="kanban-search"
+                  className="ml-auto text-xs rounded px-2 py-0.5 focus:outline-none"
+                  data-filtered={kanbanSearch.trim() ? "true" : "false"}
+                  style={kanbanSearch.trim()
+                    ? { border: "1px solid #f59e0b", boxShadow: "0 0 0 2px rgba(245,158,11,0.45)", background: "#fffbeb", minWidth: 160 }
+                    : { border: "1px solid rgba(0,0,0,0.12)", background: "#fff", minWidth: 160 }}
+                />
               </div>
             );
           })()}
@@ -5900,14 +6164,19 @@ export default function AccountDetailPage() {
             const nextFutureMeeting = meetings
               .filter((m): m is typeof m & { date: string } => m.date !== null && m.date >= today)
               .sort((a, b) => a.date.localeCompare(b.date))[0];
+            const searchTerm = kanbanSearch.trim().toLowerCase();
+            const searchedItems = searchTerm
+              ? actionItems.filter((i) => [i.task, i.task_details?.replace(/<[^>]*>/g, " "), i.assignee_name, i.status, i.priority, i.linked_meeting_name]
+                  .some((v) => (v ?? "").toLowerCase().includes(searchTerm)))
+              : actionItems;
             const kanbanItems = (() => {
-              if (kanbanMemberFilter.size > 0) return actionItems.filter(i => kanbanMemberFilter.has(i.assignee_name ?? ""));
-              if (kanbanViewMode === "unassigned") return actionItems.filter(i => !i.assignee_name);
-              return actionItems;
+              if (kanbanMemberFilter.size > 0) return searchedItems.filter(i => kanbanMemberFilter.has(i.assignee_name ?? ""));
+              if (kanbanViewMode === "unassigned") return searchedItems.filter(i => !i.assignee_name);
+              return searchedItems;
             })();
             if (kanbanViewMode === "before_next" && kanbanMemberFilter.size === 0 && nextFutureMeeting) {
-              const beforeItems = actionItems.filter(i => i.due_date && i.due_date <= nextFutureMeeting.date);
-              const otherItems = actionItems.filter(i => !i.due_date || i.due_date > nextFutureMeeting.date);
+              const beforeItems = searchedItems.filter(i => i.due_date && i.due_date <= nextFutureMeeting.date);
+              const otherItems = searchedItems.filter(i => !i.due_date || i.due_date > nextFutureMeeting.date);
               return (
                 <div className="space-y-4">
                   <div>
@@ -5945,8 +6214,94 @@ export default function AccountDetailPage() {
               }
             }
 
+            const renderKanbanCard = (item: AirtableActionItem) => (
+              <ActionItemCard
+                key={item.airtable_id}
+                item={item}
+                teamMembers={allMembers}
+                meetings={meetings}
+                onUpdated={(updated) => setActionItems((prev) => prev.map((i) => i.airtable_id === updated.airtable_id ? updated : i))}
+                onDeleted={(id) => setActionItems((prev) => prev.filter((i) => i.id !== id))}
+                onDragStart={(e) => {
+                  e.dataTransfer.setData("kanbanItemId", item.airtable_id);
+                  e.dataTransfer.setData("goalActionId", item.airtable_id);
+                  e.dataTransfer.setData("timelineActionId", item.airtable_id);
+                }}
+              />
+            );
+            // Double-clicking a column's own chrome (header / empty space), never a card or control.
+            const openColumnModal = (status: string) => (e: React.MouseEvent) => {
+              if ((e.target as HTMLElement).closest("button, input, textarea, a, select, [draggable='true'], [contenteditable]")) return;
+              e.stopPropagation();
+              setKanbanModalTab(status);
+            };
+            const KANBAN_COL_MAX_HEIGHT = 480;
+            const MODAL_TABS = ["all", "Open", "In Progress", "Done", "Blocked", "Backlogged"] as const;
+            const modalItems = kanbanModalTab === null ? [] : kanbanModalTab === "all"
+              ? MODAL_TABS.slice(1).flatMap((st) => orderForStatus(kanbanItems.filter((i) => i.status === st), st))
+              : orderForStatus(kanbanItems.filter((i) => i.status === kanbanModalTab), kanbanModalTab as AirtableActionItem["status"]);
+
             return (
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(200px, 1fr)) minmax(200px, 1fr) minmax(252px, auto)", gap: "10px", alignItems: "start" }}>
+              <>
+              {kanbanModalTab !== null && createPortal(
+                <div
+                  className="fixed inset-0 z-40 flex items-center justify-center bg-black/40"
+                  onClick={() => setKanbanModalTab(null)}
+                  onKeyDown={(e) => { if (e.key === "Escape") setKanbanModalTab(null); }}
+                >
+                  <div
+                    data-testid="kanban-fullscreen-modal"
+                    role="dialog"
+                    aria-label="Action items"
+                    className="rounded-2xl shadow-2xl flex flex-col overflow-hidden"
+                    style={{ background: "#fff", width: "calc(100vw - 48px)", height: "calc(100vh - 48px)" }}
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <div className="flex items-center gap-3 px-5 py-3 shrink-0" style={{ borderBottom: "1px solid rgba(0,0,0,0.08)" }}>
+                      <p className="text-sm font-semibold" style={{ color: "var(--text-primary,#111)" }}>Action Items</p>
+                      <div className="flex items-center gap-1 flex-wrap">
+                        {MODAL_TABS.map((tab) => {
+                          const count = tab === "all" ? kanbanItems.length : kanbanItems.filter((i) => i.status === tab).length;
+                          return (
+                            <button
+                              key={tab}
+                              data-testid={`kanban-modal-tab-${tab}`}
+                              onClick={() => setKanbanModalTab(tab)}
+                              className={`px-2 py-0.5 rounded-full text-xs font-medium ${kanbanModalTab === tab ? "bg-indigo-600 text-white" : "bg-gray-100 text-gray-600 hover:bg-gray-200"}`}
+                            >{tab === "all" ? "All" : tab} <span className="opacity-60">{count}</span></button>
+                          );
+                        })}
+                      </div>
+                      <input
+                        type="search"
+                        autoFocus
+                        value={kanbanSearch}
+                        onChange={(e) => setKanbanSearch(e.target.value)}
+                        placeholder="Search action items…"
+                        aria-label="Search action items in full view"
+                        data-testid="kanban-modal-search"
+                        className="ml-auto text-xs rounded px-2 py-1 focus:outline-none"
+                        data-filtered={kanbanSearch.trim() ? "true" : "false"}
+                        style={kanbanSearch.trim()
+                          ? { border: "1px solid #f59e0b", boxShadow: "0 0 0 2px rgba(245,158,11,0.45)", background: "#fffbeb", minWidth: 220 }
+                          : { border: "1px solid rgba(0,0,0,0.12)", minWidth: 220 }}
+                      />
+                      <button onClick={() => setKanbanModalTab(null)} aria-label="Close" className="text-gray-400 hover:text-gray-700 text-lg leading-none">✕</button>
+                    </div>
+                    <div className="flex-1 overflow-y-auto p-5">
+                      {modalItems.length === 0 ? (
+                        <p className="text-sm italic text-[var(--twilio-gray-60)]">{searchTerm ? "No action items match your search." : "None"}</p>
+                      ) : (
+                        <div data-testid="kanban-modal-grid" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 12, alignItems: "start" }}>
+                          {modalItems.map(renderKanbanCard)}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>,
+                document.body,
+              )}
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(200px, 1fr)) minmax(252px, 1fr)", gap: "10px", alignItems: "start" }}>
                 {(["Open", "In Progress", "Done"] as const).map((status) => {
                   const colItems = orderForStatus(kanbanItems.filter((i) => i.status === status), status);
                   const { header, dot, bg, dropBg } = KANBAN_COL_STYLE[status];
@@ -5963,6 +6318,7 @@ export default function AccountDetailPage() {
                         if (!e.currentTarget.contains(e.relatedTarget as Node)) setKanbanDragOverCol(null);
                       }}
                       onDrop={(e) => { void handleKanbanDrop(e, status); }}
+                      onDoubleClick={openColumnModal(status)}
                     >
                       <div className={`flex items-center gap-1.5 text-xs font-semibold ${header}`}>
                         <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dot}`} />
@@ -5971,29 +6327,29 @@ export default function AccountDetailPage() {
                           <span className="ml-auto text-[10px] font-normal opacity-60">{colItems.length}</span>
                         )}
                       </div>
-                      {colItems.map((item) => (
-                        <ActionItemCard
-                          key={item.airtable_id}
-                          item={item}
-                          teamMembers={allMembers}
-                          meetings={meetings}
-                          onUpdated={(updated) => setActionItems((prev) => prev.map((i) => i.airtable_id === updated.airtable_id ? updated : i))}
-                          onDeleted={(id) => setActionItems((prev) => prev.filter((i) => i.id !== id))}
-                          onDragStart={(e) => {
-                            e.dataTransfer.setData("kanbanItemId", item.airtable_id);
-                            e.dataTransfer.setData("goalActionId", item.airtable_id);
-                            e.dataTransfer.setData("timelineActionId", item.airtable_id);
-                          }}
-                        />
-                      ))}
+                      {colItems.length > 0 && (
+                        <div data-testid={`kanban-col-scroll-${status}`} className="flex flex-col gap-2 overflow-y-auto" style={{ maxHeight: KANBAN_COL_MAX_HEIGHT, scrollbarWidth: "thin" }}>
+                          {colItems.map(renderKanbanCard)}
+                        </div>
+                      )}
                       {colItems.length === 0 && (
                         <p className="text-[11px] text-[var(--twilio-gray-60)] italic px-1">None</p>
                       )}
                     </div>
                   );
                 })}
-                {/* Blocked + Backlogged share one column, stacked */}
+                {/* New card sits at the top of the Blocked + Backlogged column; the three share one column, stacked */}
                 <div className="flex flex-col gap-0" style={{ minHeight: 80 }}>
+                  <div data-testid="kanban-new-slot" className="rounded-xl flex flex-col gap-2 p-3 bg-gray-50 mb-2" style={{ minHeight: 80 }}>
+                    <div className="flex items-center gap-1.5 text-xs font-semibold text-[var(--twilio-gray-60)] italic">
+                      New
+                    </div>
+                    <NewActionItemCard
+                      accountName={account.company_name}
+                      teamMembers={allMembers}
+                      onSave={(newItem) => setActionItems((prev) => [newItem, ...prev])}
+                    />
+                  </div>
                   {(["Blocked", "Backlogged"] as const).map((status, i) => {
                     const colItems = orderForStatus(kanbanItems.filter((item) => item.status === status), status);
                     const { header, dot, bg, dropBg } = KANBAN_COL_STYLE[status];
@@ -6016,6 +6372,7 @@ export default function AccountDetailPage() {
                           if (!e.currentTarget.contains(e.relatedTarget as Node)) setKanbanDragOverCol(null);
                         }}
                         onDrop={(e) => { void handleKanbanDrop(e, status); }}
+                        onDoubleClick={openColumnModal(status)}
                       >
                         <div className={`flex items-center gap-1.5 text-xs font-semibold ${header}`}>
                           <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dot}`} />
@@ -6024,21 +6381,11 @@ export default function AccountDetailPage() {
                             <span className="ml-auto text-[10px] font-normal opacity-60">{colItems.length}</span>
                           )}
                         </div>
-                        {colItems.map((item) => (
-                          <ActionItemCard
-                            key={item.airtable_id}
-                            item={item}
-                            teamMembers={allMembers}
-                            meetings={meetings}
-                            onUpdated={(updated) => setActionItems((prev) => prev.map((i) => i.airtable_id === updated.airtable_id ? updated : i))}
-                            onDeleted={(id) => setActionItems((prev) => prev.filter((i) => i.id !== id))}
-                            onDragStart={(e) => {
-                              e.dataTransfer.setData("kanbanItemId", item.airtable_id);
-                              e.dataTransfer.setData("goalActionId", item.airtable_id);
-                              e.dataTransfer.setData("timelineActionId", item.airtable_id);
-                            }}
-                          />
-                        ))}
+                        {colItems.length > 0 && (
+                          <div data-testid={`kanban-col-scroll-${status}`} className="flex flex-col gap-2 overflow-y-auto" style={{ maxHeight: KANBAN_COL_MAX_HEIGHT, scrollbarWidth: "thin" }}>
+                            {colItems.map(renderKanbanCard)}
+                          </div>
+                        )}
                         {colItems.length === 0 && (
                           <p className="text-[11px] text-[var(--twilio-gray-60)] italic px-1">None</p>
                         )}
@@ -6046,22 +6393,15 @@ export default function AccountDetailPage() {
                     );
                   })}
                 </div>
-                {/* New column — min-width sized to fit the card */}
-                <div className="rounded-xl flex flex-col gap-2 p-3 bg-gray-50" style={{ minHeight: 80 }}>
-                  <div className="flex items-center gap-1.5 text-xs font-semibold text-[var(--twilio-gray-60)] italic">
-                    New
-                  </div>
-                  <NewActionItemCard
-                    accountName={account.company_name}
-                    teamMembers={allMembers}
-                    onSave={(newItem) => setActionItems((prev) => [newItem, ...prev])}
-                  />
-                </div>
               </div>
+              </>
             );
           })()}
         </div>
 
+        </CollapsibleAccountSection>
+
+        <CollapsibleAccountSection id={SECTION_IDS.goals} title="Project Goals">
         {/* Project Goals */}
         <div className="rounded-lg px-5 py-4" style={{ background: "var(--surface, #fff)", border: "1px solid var(--border, rgba(0,0,0,0.08))", boxShadow: "0 1px 4px rgba(0,0,0,0.04)" }}>
           <div className="flex items-center justify-between mb-3">
@@ -6184,11 +6524,13 @@ export default function AccountDetailPage() {
                       key={m.airtable_id}
                       draggable
                       onDragStart={(e) => e.dataTransfer.setData("goalMeetingId", m.airtable_id)}
-                      className="flex items-center gap-1 rounded px-2 py-1 text-[11px] cursor-grab active:cursor-grabbing select-none"
+                      onClick={() => openMeetingChip(m)}
+                      title={m.name || "Meeting"}
+                      className="flex items-start gap-1 rounded px-2 py-1 text-[11px] cursor-grab active:cursor-grabbing select-none"
                       style={{ background: "rgba(226,34,34,0.06)", border: "1px solid rgba(226,34,34,0.2)", color: "var(--twilio-red, #e22)" }}
                     >
                       <svg viewBox="0 0 16 16" fill="currentColor" className="w-2.5 h-2.5 shrink-0"><path d="M2 3a2 2 0 012-2h8a2 2 0 012 2v10a2 2 0 01-2 2H4a2 2 0 01-2-2V3zm8 1H6v1h4V4z"/></svg>
-                      <span className="truncate max-w-[120px]">{m.name || "Meeting"}</span>
+                      <span data-testid="meeting-chip-name" className="max-w-[260px] break-words whitespace-normal leading-snug">{truncateWords(m.name || "Meeting", 10)}</span>
                     </div>
                   ))}
                 </div>
@@ -6217,6 +6559,7 @@ export default function AccountDetailPage() {
             meetings={meetings}
             onChange={handleGoalsChange}
             onSelectAction={(i) => setPanel({ kind: "action", item: i })}
+            onSelectMeeting={openMeetingChip}
             onNoteDropped={handleNoteDropOnGoal}
             accountTeamMembers={account?.team_members ?? []}
             projectMembers={projectMembers}
@@ -6231,6 +6574,9 @@ export default function AccountDetailPage() {
           />
         </div>
 
+        </CollapsibleAccountSection>
+
+        <CollapsibleAccountSection id={SECTION_IDS.meetingNotes} title="Meeting Notes">
         {/* Meeting Notes */}
         <AccountMeetingNotes
           accountId={account.id}
@@ -6244,6 +6590,9 @@ export default function AccountDetailPage() {
           onCreatedActionItem={(item) => setActionItems((prev) => [item, ...prev])}
         />
 
+        </CollapsibleAccountSection>
+
+        <CollapsibleAccountSection id={SECTION_IDS.reminders} title="Reminders">
         {/* Account Reminders */}
         <div
           className="rounded-lg px-5 py-4"
@@ -6284,6 +6633,9 @@ export default function AccountDetailPage() {
           )}
         </div>
 
+        </CollapsibleAccountSection>
+
+        <CollapsibleAccountSection id={SECTION_IDS.comments} title="Comments">
         {/* Account Comments */}
         <div className="rounded-lg px-5 py-4" style={{ background: "var(--surface, #fff)", border: "1px solid var(--border, rgba(0,0,0,0.08))", boxShadow: "0 1px 4px rgba(0,0,0,0.04)" }}>
           <InlineCommentThread
@@ -6293,20 +6645,43 @@ export default function AccountDetailPage() {
           />
         </div>
 
+        </CollapsibleAccountSection>
+
+        <CollapsibleAccountSection id={SECTION_IDS.artifacts} title="Artifacts">
         {/* Artifacts */}
         <ArtifactsPanel accountId={account.id} airtableAccountId={airtableAccount?.id} />
 
-        {/* Activity Log */}
-        <ActivityLogSection resourceType="account" resourceId={account.id} />
+        </CollapsibleAccountSection>
 
+        <CollapsibleAccountSection id={SECTION_IDS.activityLog} title="Activity Log">
+        {/* Activity Log */}
+        <AccountActivityLog accountId={account.id} />
+
+        </CollapsibleAccountSection>
+
+        <CollapsibleAccountSection id={SECTION_IDS.email} title="Email Chain Summary">
         {/* Email Chain Summary & Status */}
         <EmailChainSection account={account} />
+        </CollapsibleAccountSection>
 
       </div>
 
       {/* ── Right: detail panel — space always reserved, content appears on selection ── */}
-      <div className="w-80 shrink-0" style={{ borderLeft: "1px solid var(--border, rgba(0,0,0,0.08))", background: "var(--surface, #fff)" }}>
+      <div data-testid="right-sidebar" className={`${rightCollapsed ? "w-9" : "w-80"} relative shrink-0 transition-[width] duration-150`} style={{ borderLeft: "1px solid var(--border, rgba(0,0,0,0.08))", background: "var(--surface, #fff)" }}>
+        <button
+          type="button"
+          onClick={() => sectionCollapse.toggle(SECTION_IDS.rightSidebar)}
+          aria-expanded={!rightCollapsed}
+          aria-label={rightCollapsed ? "Expand detail panel" : "Collapse detail panel"}
+          title={rightCollapsed ? "Expand detail panel" : "Collapse detail panel"}
+          className="absolute rounded hover:bg-gray-100 flex items-center justify-center"
+          style={{ top: 8, left: rightCollapsed ? 9 : 6, width: 18, height: 18, zIndex: 2, color: "var(--twilio-gray-60)" }}
+        >
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ transform: rightCollapsed ? "none" : "rotate(180deg)" }}><path d="M10 3L5 8l5 5" /></svg>
+        </button>
+        <div hidden={rightCollapsed} className="h-full">
         {panel && <SidePanel panel={panel} onClose={() => setPanel(null)} onCreatedActionItem={(item) => setActionItems((prev) => [item, ...prev])} onMeetingUpdated={(updated) => { setMeetings((prev) => prev.map((m) => m.id === updated.id ? updated : m)); setPanel((p) => { if (!p) return p; if (p.kind === "meeting" && p.item.id === updated.id) return { kind: "meeting", item: updated }; if (p.kind === "calendar" && p.linkedMeeting?.id === updated.id) return { ...p, linkedMeeting: updated }; return p; }); }} onUpdatedActionItem={(updated) => { setActionItems((prev) => prev.map((a) => a.id === updated.id ? updated : a)); setPanel((p) => p?.kind === "action" && p.item.id === updated.id ? { kind: "action", item: updated } : p); }} teamMembers={allMembers} airtableAccountId={airtableAccount?.id} account={account} contacts={contacts} onContactsChange={setContacts} />}
+        </div>
       </div>
 
       {/* ── Edit Account modal ───────────────────────────────────────────────── */}
@@ -6631,12 +7006,6 @@ function ThreadCard({ thread, isExpanded, onToggle, onChat }: {
 }
 
 function ThreadExpanded({ thread, searchTerm }: { thread: GmailThread; searchTerm: string }) {
-  const highlight = (text: string) => {
-    if (!searchTerm.trim()) return text;
-    const re = new RegExp(`(${searchTerm.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`, "gi");
-    return text.replace(re, "**$1**");
-  };
-
   return (
     <div style={{
       borderRadius: 10, border: "1px solid var(--border, rgba(0,0,0,0.1))",
@@ -6659,36 +7028,20 @@ function ThreadExpanded({ thread, searchTerm }: { thread: GmailThread; searchTer
           <strong>Summary:</strong> {thread.summary}
         </p>
       )}
-      {thread.messages.map((m, i) => {
-        const body = highlight(m.body);
-        const parts = body.split(/(\*\*[^*]+\*\*)/g);
-        return (
-          <div key={i} style={{
-            padding: "12px 14px", borderRadius: 8, background: "var(--surface, #fff)",
-            border: "1px solid var(--border, rgba(0,0,0,0.07))",
-          }}>
-            <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 4, marginBottom: 6 }}>
-              <span style={{ fontSize: "0.75rem", fontWeight: 700, color: "var(--twilio-navy, #121c2d)" }}>{m.from}</span>
-              <span style={{ fontSize: "0.6875rem", color: "var(--text-secondary, #aaa)" }}>{m.date}</span>
-            </div>
-            <p style={{ margin: 0, fontSize: "0.8125rem", lineHeight: 1.55, color: "var(--text-primary, #111)", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
-              {parts.map((part, j) =>
-                part.startsWith("**") && part.endsWith("**")
-                  ? <mark key={j} style={{ background: "rgba(245,158,11,0.25)", borderRadius: 2, padding: "0 1px" }}>{part.slice(2,-2)}</mark>
-                  : <React.Fragment key={j}>{part}</React.Fragment>
-              )}
-            </p>
-          </div>
-        );
-      })}
+      {thread.messages.map((m, i) => (
+        <EmailMessageBody key={i} from={m.from} date={m.date} subject={m.subject}
+          body={m.body} threadSubject={thread.subject} searchTerm={searchTerm} />
+      ))}
     </div>
   );
 }
 
 function EmailChainSection({ account }: { account: Account }) {
-  const [threads, setThreads] = useState<GmailThread[]>([]);
+  // Loaded threads live in a module-level store so they survive navigation and reloads.
+  const cached = useEmailThreads(account.id);
+  const threads = cached?.threads ?? [];
+  const loaded = !!cached;
   const [loading, setLoading] = useState(false);
-  const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [chatThread, setChatThread] = useState<GmailThread | null>(null);
@@ -6708,8 +7061,7 @@ function EmailChainSection({ account }: { account: Account }) {
         account_name: account.company_name,
         q: q || undefined,
       });
-      setThreads(data.threads);
-      setLoaded(true);
+      saveLoadedThreads(account.id, data.threads);
     } catch (e: unknown) {
       const msg = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
         ?? "Failed to load Gmail threads.";
@@ -6780,6 +7132,11 @@ function EmailChainSection({ account }: { account: Account }) {
           </p>
         </div>
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          {cached && (
+            <span data-testid="gmail-last-loaded" style={{ fontSize: "0.6875rem", color: "var(--text-secondary, #888)" }}>
+              Last loaded {new Date(cached.loadedAt).toLocaleString(undefined, { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" })}
+            </span>
+          )}
           {loaded && (
             <div style={{ position: "relative" }}>
               <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6"
@@ -6940,6 +7297,17 @@ function MeetingTimelineBtn({
         maxWidth: "100%",
       }}
     >
+      {/* Notes status: a check once a Gong or Zoom recap is stored, a hollow clock while
+          none has arrived yet. */}
+      <span
+        data-testid="meeting-notes-status"
+        data-has-notes={meetingHasNotes(m) ? "true" : "false"}
+        title={meetingHasNotes(m) ? "Meeting notes added" : "No meeting notes yet"}
+        aria-hidden="true"
+        style={{ marginRight: 3, fontWeight: 700, color: meetingHasNotes(m) ? "#16a34a" : "#9ca3af" }}
+      >
+        {meetingHasNotes(m) ? "✓" : "◷"}
+      </span>
       {m.name || "Meeting"}
       {/* A badge, not a button — the chip itself is the button, and right-click on it
           opens the thread. */}
@@ -6952,10 +7320,13 @@ function CalEventTimelineBtn({
   ev,
   isPast,
   onSelectCalEvent,
+  linkedMeeting,
 }: {
   ev: CalendarEvent;
   isPast: boolean;
   onSelectCalEvent: (ev: CalendarEvent) => void;
+  /** The meeting record behind this event; its notes status is shown here instead of on a duplicate row. */
+  linkedMeeting?: AirtableMeeting;
 }) {
   const { onContextMenu } = useRightClickComment("calendar_event", ev.id, ev.title);
   return (
@@ -6981,6 +7352,17 @@ function CalEventTimelineBtn({
         maxWidth: "100%",
       }}
     >
+      {linkedMeeting && (
+        <span
+          data-testid="meeting-notes-status"
+          data-has-notes={meetingHasNotes(linkedMeeting) ? "true" : "false"}
+          title={meetingHasNotes(linkedMeeting) ? "Meeting notes added" : "No meeting notes yet"}
+          aria-hidden="true"
+          style={{ marginRight: 3, fontWeight: 700, color: meetingHasNotes(linkedMeeting) ? "#16a34a" : "#9ca3af" }}
+        >
+          {meetingHasNotes(linkedMeeting) ? "✓" : "◷"}
+        </span>
+      )}
       {ev.title}
       <CommentCountBadge resourceType="calendar_event" resourceId={ev.id} className="ml-1 align-middle" />
     </button>

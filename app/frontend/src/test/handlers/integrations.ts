@@ -33,6 +33,10 @@ export const mockGmailCredential = {
 };
 
 export const integrationsHandlers = [
+  // The calendar page syncs with Google on open and every 5 minutes. Default: nothing changed.
+  http.post("/api/v1/integrations/google/sync/", () =>
+    HttpResponse.json({ detail: "Sync complete.", event_count: 0, changed: 0 }),
+  ),
   http.get("/api/v1/integrations/status/", () =>
     HttpResponse.json({ connected: [mockGmailCredential], sync_states: [] })
   ),

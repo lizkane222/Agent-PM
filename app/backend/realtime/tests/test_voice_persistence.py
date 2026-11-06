@@ -6,6 +6,7 @@ status callback and the relay setup frame both update_or_create the same VoiceSe
 row and race in both directions, so each side must write only its own fields.
 """
 
+from channels.db import database_sync_to_async
 from django.contrib.auth import get_user_model
 from django.test import TestCase, override_settings
 from django.utils import timezone
@@ -20,6 +21,7 @@ from realtime.voice_persistence import (
     attach_user_to_voice_session,
     close_agent_session,
     load_skill_inventory,
+    load_user_timezone,
     open_agent_session,
     record_message,
     record_tool_calls,
@@ -302,3 +304,36 @@ class LoadSkillInventoryTests(TestCase):
         for line in inventory.splitlines():
             description = line.split("—", 1)[1].strip()
             self.assertLessEqual(len(description), 10, line)
+
+
+class LoadUserTimezoneTests(TestCase):
+    """The caller's timezone is read once at call start, in sync context. Reading
+    `user.profile` lazily inside the async voice loop raises SynchronousOnlyOperation,
+    which crashed every call."""
+
+    def setUp(self):
+        from team.models import UserProfile
+        self.user = User.objects.create_user("tz-user", password="x")
+        UserProfile.objects.create(user=self.user, timezone="America/Los_Angeles")
+
+    async def test_returns_the_profile_timezone(self):
+        self.assertEqual(await load_user_timezone(self.user), "America/Los_Angeles")
+
+    async def test_the_value_is_returned_as_stored_and_normalised_by_the_agent(self):
+        from team.models import UserProfile
+        await database_sync_to_async(UserProfile.objects.filter(user=self.user).update)(timezone="PST")
+        fresh = await database_sync_to_async(User.objects.get)(pk=self.user.pk)
+        self.assertEqual(await load_user_timezone(fresh), "PST")
+
+    async def test_a_user_with_no_profile_gets_utc(self):
+        bare = await database_sync_to_async(User.objects.create_user)("no-profile", password="x")
+        self.assertEqual(await load_user_timezone(bare), "UTC")
+
+    async def test_no_user_gets_utc(self):
+        self.assertEqual(await load_user_timezone(None), "UTC")
+
+    async def test_a_blank_timezone_gets_utc(self):
+        from team.models import UserProfile
+        await database_sync_to_async(UserProfile.objects.filter(user=self.user).update)(timezone="")
+        fresh = await database_sync_to_async(User.objects.get)(pk=self.user.pk)
+        self.assertEqual(await load_user_timezone(fresh), "UTC")

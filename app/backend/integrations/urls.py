@@ -3,6 +3,9 @@
 from django.urls import path
 
 from .views import (
+    GoogleCalendarWebhookView,
+    IntegrationAvailabilityView,
+    IntegrationVoteView,
     AirtableConnectView,
     ConfluenceAPITokenConnectView,
     ConfluenceOAuthCallbackView,
@@ -32,6 +35,7 @@ from .views import (
     SalesforceOAuthCallbackView,
     SalesforceOAuthInitView,
     ScraperStatusView,
+    SlackConversationsView,
     SlackNotifyMentionView,
     SlackOAuthCallbackView,
     SlackOAuthInitView,
@@ -46,6 +50,8 @@ from .views import (
 urlpatterns = [
     path("status/", IntegrationStatusView.as_view(), name="integration-status"),
     path("scraper-status/", ScraperStatusView.as_view(), name="scraper-status"),
+    path("availability/", IntegrationAvailabilityView.as_view(), name="integration-availability"),
+    path("votes/", IntegrationVoteView.as_view(), name="integration-votes"),
     # Confluence
     path("confluence/connect/", ConfluenceOAuthInitView.as_view(), name="confluence-oauth-init"),
     path("confluence/callback/", ConfluenceOAuthCallbackView.as_view(), name="confluence-oauth-callback"),
@@ -68,8 +74,10 @@ urlpatterns = [
     path("gmail/meeting-notes/", MeetingNotesFromEmailView.as_view(), name="gmail-meeting-notes"),
     path("google/connect/", GoogleOAuthInitView.as_view(), name="google-oauth-init"),
     path("google/sync/", GoogleCalendarSyncView.as_view(), name="google-calendar-sync"),
+    path("google/calendar-webhook/", GoogleCalendarWebhookView.as_view(), name="google-calendar-webhook"),
     path("google/push-action-items/", GoogleActionItemsPushView.as_view(), name="google-push-action-items"),
     path("google/callback/", GoogleOAuthCallbackView.as_view(), name="google-oauth-callback"),
+    path("slack/conversations/", SlackConversationsView.as_view(), name="slack-conversations"),
     path("slack/connect/", SlackOAuthInitView.as_view(), name="slack-oauth-init"),
     path("slack/callback/", SlackOAuthCallbackView.as_view(), name="slack-oauth-callback"),
     path("slack/notify-mention/", SlackNotifyMentionView.as_view(), name="slack-notify-mention"),

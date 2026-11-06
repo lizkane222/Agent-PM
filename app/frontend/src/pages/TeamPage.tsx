@@ -1,5 +1,8 @@
 import { useEffect, useRef, useState } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import axios from "axios";
+import { permissionMessage } from "../lib/permissions";
+import { useAppError } from "../context/AppErrorContext";
 import CorporateIcon from "../assets/icons/Corporate.svg?react";
 import TeamIcon from "../assets/icons/Team.svg?react";
 import { accountsApi } from "../lib/api";
@@ -747,6 +750,10 @@ function MemberDetailSidebar({
 }
 
 export default function TeamPage() {
+  const navigate = useNavigate();
+  const openProfile = (m: TeamMember) => navigate(`/profile/${m.id}`);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const { reportError } = useAppError();
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [search, setSearch] = useState("");
   const [modal, setModal] = useState<Partial<TeamMember> | null | "new">(null);
@@ -768,6 +775,18 @@ export default function TeamPage() {
     updateMember,
     deleteMember,
   } = useTeam({ search });
+
+  // /team?member=<id> is the profile page's "Manage" link: open the staff drawer (edit,
+  // linked accounts, linked docs) for that member, then clear the param so a refresh
+  // doesn't reopen it.
+  const manageId = searchParams.get("member");
+  useEffect(() => {
+    if (!manageId) return;
+    const target = members.find((m) => String(m.id) === manageId);
+    if (!target) return;
+    setSelectedMember(target);
+    setSearchParams({}, { replace: true });
+  }, [manageId, members, setSearchParams]);
 
   // Role overrides (staff admin only) — persisted to localStorage
   const [roleOverrides, setRoleOverrides] = useState<Record<number, string>>(() => {
@@ -893,10 +912,14 @@ export default function TeamPage() {
     if (!accountId) return;
     const existingIds: number[] = JSON.parse(e.dataTransfer.getData("accountTeamMemberIds") || "[]");
     if (existingIds.includes(member.id)) return;
-    const { data } = await accountsApi.updateAccount(accountId, {
-      team_member_ids: [...existingIds, member.id],
-    } as Partial<Account>);
-    setAccounts((prev) => prev.map((a) => (a.id === data.id ? data : a)));
+    try {
+      const { data } = await accountsApi.updateAccount(accountId, {
+        team_member_ids: [...existingIds, member.id],
+      } as Partial<Account>);
+      setAccounts((prev) => prev.map((a) => (a.id === data.id ? data : a)));
+    } catch (err) {
+      reportError(permissionMessage(err, "Could not add that team member to the account."), "TeamPage");
+    }
   }
 
   async function handleMemberDropOnAccount(e: React.DragEvent, account: Account) {
@@ -906,10 +929,14 @@ export default function TeamPage() {
     if (!memberId) return;
     const existing = (account.team_members ?? []).map((m) => m.id);
     if (existing.includes(memberId)) return;
-    const { data } = await accountsApi.updateAccount(account.id, {
-      team_member_ids: [...existing, memberId],
-    } as Partial<Account>);
-    setAccounts((prev) => prev.map((a) => (a.id === data.id ? data : a)));
+    try {
+      const { data } = await accountsApi.updateAccount(account.id, {
+        team_member_ids: [...existing, memberId],
+      } as Partial<Account>);
+      setAccounts((prev) => prev.map((a) => (a.id === data.id ? data : a)));
+    } catch (err) {
+      reportError(permissionMessage(err, "Could not add that team member to the account."), "TeamPage");
+    }
   }
 
   return (
@@ -1133,7 +1160,7 @@ export default function TeamPage() {
                               <MemberCard
                                 key={member.id}
                                 member={member}
-                                onSelect={(m) => setSelectedMember(m)}
+                                onSelect={openProfile}
                                 dropTarget={dropTargetMemberId === member.id}
                                 onDragOver={(e) => { e.stopPropagation(); e.preventDefault(); setDropTargetMemberId(member.id); }}
                                 onDragLeave={() => setDropTargetMemberId(null)}
@@ -1162,7 +1189,7 @@ export default function TeamPage() {
                     return (
                       <button
                         key={member.id}
-                        onClick={() => setSelectedMember(member)}
+                        onClick={() => openProfile(member)}
                         onDragOver={(e) => { e.preventDefault(); setDropTargetMemberId(member.id); }}
                         onDragLeave={() => setDropTargetMemberId(null)}
                         onDrop={(e) => void handleAccountDrop(e, member)}
@@ -1211,7 +1238,7 @@ export default function TeamPage() {
                       return (
                         <tr
                           key={member.id}
-                          onClick={() => setSelectedMember(member)}
+                          onClick={() => openProfile(member)}
                           onDragOver={(e) => { e.preventDefault(); setDropTargetMemberId(member.id); }}
                           onDragLeave={() => setDropTargetMemberId(null)}
                           onDrop={(e) => void handleAccountDrop(e, member)}
@@ -1259,8 +1286,12 @@ export default function TeamPage() {
           onClose={() => setSelectedMember(null)}
           onEdit={() => { setModal(selectedMember); setSelectedMember(null); }}
           onRemoveFromAccount={async (accountId) => {
-            const { data } = await accountsApi.removeTeamMember(accountId, selectedMember.id);
-            setAccounts((prev) => prev.map((a) => (a.id === data.id ? data : a)));
+            try {
+              const { data } = await accountsApi.removeTeamMember(accountId, selectedMember.id);
+              setAccounts((prev) => prev.map((a) => (a.id === data.id ? data : a)));
+            } catch (err) {
+              reportError(permissionMessage(err, "Could not remove them from the account."), "TeamPage");
+            }
           }}
         />
       )}

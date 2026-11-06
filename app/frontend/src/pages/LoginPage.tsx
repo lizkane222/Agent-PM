@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { login } from "../lib/auth";
 
 export default function LoginPage() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -16,6 +17,10 @@ export default function LoginPage() {
       .then((d: { okta_enabled?: boolean }) => { if (d.okta_enabled) setOktaEnabled(true); })
       .catch(() => {});
   }, []);
+
+  // With SSO configured, the company sign-in is the only door. `?local=1` is the break-glass
+  // path for an SSO outage, so a provider problem cannot lock everyone out of the app.
+  const ssoOnly = oktaEnabled && searchParams.get("local") !== "1";
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -35,6 +40,19 @@ export default function LoginPage() {
     <div className="min-h-screen flex items-center justify-center bg-gray-50">
       <div className="w-full max-w-sm bg-white rounded-lg border border-gray-200 shadow-sm p-8">
         <h1 className="text-3xl font-semibold text-[var(--twilio-navy)] mb-6">Sign in to Agent PM</h1>
+        {ssoOnly ? (
+          <div className="space-y-4">
+            <a
+              href="/oidc/authenticate/"
+              className="block w-full rounded-md bg-indigo-600 px-4 py-2 text-center text-sm font-medium text-white hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            >
+              Sign in with Okta SSO
+            </a>
+            <p className="text-center text-xs text-gray-500">
+              Use your company account. <a href="?local=1" className="underline">Having trouble?</a>
+            </p>
+          </div>
+        ) : (
         <form onSubmit={(e) => void handleSubmit(e)} className="space-y-4">
           <div>
             <label htmlFor="login-username" className="block text-sm font-medium text-[var(--twilio-navy)] mb-1">Username or Email</label>
@@ -69,7 +87,8 @@ export default function LoginPage() {
             {loading ? "Signing in…" : "Sign in"}
           </button>
         </form>
-        {oktaEnabled && (
+        )}
+        {oktaEnabled && !ssoOnly && (
           <div className="mt-4 text-center">
             <a
               href="/oidc/authenticate/"

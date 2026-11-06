@@ -116,3 +116,28 @@ export function logActionItemUpdate(
     resource: { type: "action_item", id: airtableId },
   });
 }
+
+/**
+ * The subset of `form` that differs from `before` — what a Save should actually send.
+ *
+ * Edit forms are seeded once from the item (`useState({ ...item })`) and used to PATCH the
+ * whole thing back. `/fields/` writes absolutely, so an untouched `time_spent` overwrote
+ * every increment Live Tracking (`/time-logs/`, an atomic `F()` add) had made since the form
+ * opened — including teammates'. Sending only edited fields makes a stale form harmless.
+ * Same blank-equivalence as the log diff, so `null` vs `""` is not a change.
+ */
+export function changedActionItemFields(
+  before: Partial<AirtableActionItem>,
+  form: Partial<AirtableActionItem>,
+): Partial<AirtableActionItem> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(form)) {
+    if (!sameFieldValue((before as Record<string, unknown>)[key], value)) out[key] = value;
+  }
+  // The backend resolves the account from the pk *and* the name together.
+  if ("account" in out || "account_name" in out) {
+    if ("account" in form) out.account = form.account;
+    if ("account_name" in form) out.account_name = form.account_name;
+  }
+  return out as Partial<AirtableActionItem>;
+}

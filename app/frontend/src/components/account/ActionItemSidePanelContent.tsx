@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import { airtableApi } from "../../lib/api";
-import { logActionItemUpdate } from "../../lib/actionItemLog";
+import { logActionItemUpdate, changedActionItemFields } from "../../lib/actionItemLog";
 import type { AirtableActionItem, ActionItemAttachment, TeamMember } from "../../types";
 import { useActionItemFieldOptions } from "../../hooks/useActionItemFieldOptions";
 import { useSlackLinkAutosave } from "../../hooks/useSlackLinkAutosave";
@@ -117,8 +117,9 @@ export function ActionItemSidePanelContent({
     if (saving) return;
     setSaving(true);
     try {
-      const { data } = await airtableApi.updateActionItemFields(item.airtable_id, form as Parameters<typeof airtableApi.updateActionItemFields>[1]);
-      logActionItemUpdate(item, form as Partial<AirtableActionItem>);
+      const changes = changedActionItemFields(item, form);
+      const { data } = await airtableApi.updateActionItemFields(item.airtable_id, changes);
+      logActionItemUpdate(item, changes);
       onUpdated?.(data);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);

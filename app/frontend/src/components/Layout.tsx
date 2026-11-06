@@ -1,16 +1,18 @@
 import { useEffect, useState } from "react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
+import { bottomNavItems } from "../lib/navItems";
 import { DndContext } from "@dnd-kit/core";
 import GlobalSearch from "./GlobalSearch";
 import { accountsApi, teamApi, agentApi, skillsApi } from "../lib/api";
-import SyncRunner from "./SyncRunner";
+// import SyncRunner from "./SyncRunner"; // stick-figure sync animation — hidden from the sidebar
+import { initialsFor, sidebarTitle } from "../lib/initials";
 import type { Account, UserProfile } from "../types";
 import TranscriptFooter from "./TranscriptFooter";
 import ExportBar from "./ExportBar";
+import BudgetBanner from "./BudgetBanner";
 import { useFeedback } from "../context/FeedbackContext";
 import FeedbackModal from "./feedback/FeedbackModal";
 import { useExport } from "../context/ExportContext";
-import HomeIcon from "../assets/icons/Home.svg?react";
 import CalendarIcon from "../assets/icons/Calendar.svg?react";
 import ConversationIcon from "../assets/icons/Conversation.svg?react";
 import TeamIcon from "../assets/icons/Team.svg?react";
@@ -23,12 +25,75 @@ import ScheduleIcon from "../assets/icons/Schedule.svg?react";
 import InnovationIcon from "../assets/icons/Innovation.svg?react";
 import StructureIcon from "../assets/icons/Structure.svg?react";
 import type { FC, SVGProps } from "react";
-import { getTitleRole, ROLE_META, ROLED_PAGES } from "../lib/titleRoles";
+import MeetingNotesToast from "./MeetingNotesToast";
+import { useMeetingNotesAutoCheck } from "../hooks/useMeetingNotesAutoCheck";
 
 type SvgIcon = FC<SVGProps<SVGSVGElement>>;
 
+/** Nested links shown (collapsibly) under a top-level item. */
+const AGENT_CHILDREN = [{ to: "/skills", label: "Claude Skills", Icon: CodeIcon }];
+const BUILD_CHILDREN = [
+  { to: "/edit-preview", label: "Layouts", Icon: InnovationIcon },
+  { to: "/discover", label: "Discovery", Icon: InnovationIcon },
+];
+
+/** Disclosure arrow — deliberately larger than the old 0.75rem glyph so it is easy to hit. */
+function Chevron({ open, label, onClick }: { open: boolean; label: string; onClick: (e: React.MouseEvent) => void }) {
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      aria-expanded={open}
+      onClick={onClick}
+      style={{
+        display: "flex", alignItems: "center", justifyContent: "center",
+        width: 24, height: 24, borderRadius: 4, flexShrink: 0,
+        background: "transparent", border: "none", cursor: "pointer",
+        color: "rgba(255,255,255,0.75)", fontSize: "1.125rem", lineHeight: 1,
+      }}
+    >
+      {open ? "▾" : "▸"}
+    </button>
+  );
+}
+
+function NestedLinks({ items }: { items: { to: string; label: string; Icon: SvgIcon }[] }) {
+  const location = useLocation();
+  return (
+    <div className="mt-0.5 space-y-0.5 pl-2">
+      {items.map(({ to, label, Icon }) => (
+        <NavLink
+          key={to}
+          to={to}
+          style={({ isActive }) => ({
+            display: "flex", alignItems: "center", gap: "6px",
+            padding: "5px 10px", borderRadius: "4px",
+            fontSize: "0.8125rem", fontFamily: "var(--font-base)",
+            textDecoration: "none", transition: "background 0.15s, color 0.15s",
+            background: isActive ? "rgba(255,255,255,0.12)" : "transparent",
+            color: isActive ? "rgba(255,255,255,0.95)" : "rgba(255,255,255,0.45)",
+            fontWeight: isActive ? 500 : 400,
+          })}
+          onMouseEnter={(e) => {
+            (e.currentTarget as HTMLAnchorElement).style.background = "var(--twilio-navy-light)";
+            (e.currentTarget as HTMLAnchorElement).style.color = "rgba(255,255,255,0.85)";
+          }}
+          onMouseLeave={(e) => {
+            const el = e.currentTarget as HTMLAnchorElement;
+            const isSelected = location.pathname === to || location.pathname.startsWith(to + "/");
+            el.style.background = isSelected ? "rgba(255,255,255,0.12)" : "transparent";
+            el.style.color = isSelected ? "rgba(255,255,255,0.95)" : "rgba(255,255,255,0.45)";
+          }}
+        >
+          <Icon width={14} height={14} style={{ flexShrink: 0 }} />
+          <span className="truncate">{label}</span>
+        </NavLink>
+      ))}
+    </div>
+  );
+}
+
 const BASE_NAV_ITEMS: { to: string; label: string; Icon: SvgIcon }[] = [
-  { to: "/", label: "Dashboard", Icon: HomeIcon },
   { to: "/calendar", label: "Calendar", Icon: CalendarIcon },
   { to: "/action-items", label: "Action Items", Icon: ChecklistIcon },
   { to: "/reminders", label: "Reminders", Icon: ScheduleIcon },
@@ -74,7 +139,7 @@ function useNavAccounts() {
     ]);
 
     const regular: Account[] = listResult.status === "fulfilled"
-      ? listResult.value.data.results.filter((a) => !a.is_admin_account)
+      ? listResult.value.data.results.filter((a) => !a.is_admin_account && a.status !== "inactive")
       : [];
 
     const adminAccount: Account | null = adminResult.status === "fulfilled"
@@ -105,26 +170,6 @@ function useNavAccounts() {
   return accounts;
 }
 
-/**
- * When staff_view_override is on (or user is not staff), show all role pages.
- * When a staff user disables staff view, only show the role page matching their title.
- */
-function useRolePages(profile: UserProfile | null): Array<{ slug: string; label: string }> {
-  if (!profile) return ROLED_PAGES.map(r => ({ slug: ROLE_META[r].slug, label: ROLE_META[r].label }));
-
-  const staffViewActive = !profile.is_staff || profile.staff_view_override;
-  if (staffViewActive) {
-    return ROLED_PAGES.map(r => ({ slug: ROLE_META[r].slug, label: ROLE_META[r].label }));
-  }
-
-  // Staff with override disabled — only show the role page matching this user's title
-  const myRole = getTitleRole(profile.title);
-  if (ROLED_PAGES.includes(myRole)) {
-    return [{ slug: ROLE_META[myRole].slug, label: ROLE_META[myRole].label }];
-  }
-  return [];
-}
-
 function useTheme() {
   const [dark, setDark] = useState<boolean>(() => {
     const stored = localStorage.getItem("agentpm-theme");
@@ -141,10 +186,11 @@ function useTheme() {
 }
 
 export default function Layout() {
+  // Every 10 minutes: pull fresh Gong / Zoom recaps into meetings and announce them.
+  const notesCheck = useMeetingNotesAutoCheck();
   const { dark, toggle } = useTheme();
   const profile = useUserProfile();
   const navAccounts = useNavAccounts();
-  const rolePages = useRolePages(profile);
   const location = useLocation();
   const { pickMode } = useFeedback();
   const { exportMode, toggleMode, count: exportCount } = useExport();
@@ -174,8 +220,10 @@ export default function Layout() {
 
   // "Send to chat" lives in the tray itself (ExportBar), not on this button —
   // overloading the toggle with send is what stopped it closing the tray.
-  const buildPaths = ["/skills", "/edit-preview", "/discover"];
-  const [buildOpen, setBuildOpen] = useState(() => buildPaths.some(p => location.pathname.startsWith(p)));
+  const buildPaths = ["/edit-preview", "/discover"];
+  const [buildOpen, setBuildOpen] = useState(true);
+  const [agentOpen, setAgentOpen] = useState(true);
+  const [settingsOpen, setSettingsOpen] = useState(false); // Admin Data hidden by default
   const [accountsOpen, setAccountsOpen] = useState(true);
 
   // Sidebar expansion state for time allocation panel
@@ -210,7 +258,7 @@ export default function Layout() {
           className="px-5 py-5 border-b"
           style={{ borderColor: "rgba(255,255,255,0.08)" }}
         >
-          <div className="flex items-center gap-2">
+          <NavLink to="/" aria-label="Go to dashboard" className="flex items-center gap-2" style={{ textDecoration: "none" }}>
             <img
               src="/logo.svg"
               alt="Agent PM"
@@ -223,7 +271,7 @@ export default function Layout() {
             >
               Agent PM
             </span>
-          </div>
+          </NavLink>
         </div>
 
         {/* Search */}
@@ -261,47 +309,16 @@ export default function Layout() {
                 })}
               >
                 <Icon width={16} height={16} style={{ flexShrink: 0 }} />
-                <span style={{ color: "#ffffff" }}>{label}</span>
+                <span style={{ color: "#ffffff", flex: 1 }}>{label}</span>
+                {to === "/agent" && (
+                  <Chevron
+                    open={agentOpen}
+                    label={agentOpen ? "Collapse Agent" : "Expand Agent"}
+                    onClick={(e) => { e.preventDefault(); e.stopPropagation(); setAgentOpen(v => !v); }}
+                  />
+                )}
               </NavLink>
-
-              {/* Nested role pages under Team */}
-              {to === "/team" && rolePages.length > 0 && (
-                <div className="mt-0.5 space-y-0.5 pl-2">
-                  {rolePages.map(({ slug, label }) => (
-                    <NavLink
-                      key={slug}
-                      to={`/role/${slug}`}
-                      style={({ isActive }) => ({
-                        display: "flex",
-                        alignItems: "center",
-                        gap: "6px",
-                        padding: "5px 10px",
-                        borderRadius: "4px",
-                        fontSize: "0.8125rem",
-                        fontFamily: "var(--font-base)",
-                        textDecoration: "none",
-                        transition: "background 0.15s, color 0.15s",
-                        background: isActive ? "rgba(255,255,255,0.12)" : "transparent",
-                        color: isActive ? "rgba(255,255,255,0.95)" : "rgba(255,255,255,0.45)",
-                        fontWeight: isActive ? 500 : 400,
-                      })}
-                      onMouseEnter={(e) => {
-                        (e.currentTarget as HTMLAnchorElement).style.background = "var(--twilio-navy-light)";
-                        (e.currentTarget as HTMLAnchorElement).style.color = "rgba(255,255,255,0.85)";
-                      }}
-                      onMouseLeave={(e) => {
-                        const el = e.currentTarget as HTMLAnchorElement;
-                        const isSelected = location.pathname === `/role/${slug}`;
-                        el.style.background = isSelected ? "rgba(255,255,255,0.12)" : "transparent";
-                        el.style.color = isSelected ? "rgba(255,255,255,0.95)" : "rgba(255,255,255,0.45)";
-                      }}
-                    >
-                      <span style={{ color: "rgba(255,255,255,0.25)", fontFamily: "monospace" }}>↳</span>
-                      <span className="truncate">{label}</span>
-                    </NavLink>
-                  ))}
-                </div>
-              )}
+              {to === "/agent" && agentOpen && <NestedLinks items={AGENT_CHILDREN} />}
 
               {/* Nested account sub-items under Accounts */}
               {to === "/accounts" && navAccounts.length > 0 && (
@@ -363,98 +380,88 @@ export default function Layout() {
               )}
             </div>
           ))}
-
-          {/* Build section */}
-          <div>
-            <button
-              onClick={() => setBuildOpen(v => !v)}
-              style={{
-                display: "flex", alignItems: "center", gap: "10px",
-                width: "100%", padding: "7px 12px", borderRadius: "4px",
-                fontSize: "0.9375rem", fontWeight: buildPaths.some(p => location.pathname.startsWith(p)) ? 600 : 400,
-                fontFamily: "var(--font-base)",
-                background: buildPaths.some(p => location.pathname.startsWith(p)) ? "var(--twilio-red)" : "transparent",
-                color: "var(--twilio-red)", border: "none", cursor: "pointer", textAlign: "left",
-              }}
-            >
-              <StructureIcon width={16} height={16} style={{ flexShrink: 0, color: buildPaths.some(p => location.pathname.startsWith(p)) ? "#ffffff" : "var(--twilio-red)" }} />
-              <span style={{ color: "#ffffff", flex: 1 }}>Build</span>
-              <span style={{ color: "rgba(255,255,255,0.45)", fontSize: "0.75rem", marginLeft: "auto" }}>
-                {buildOpen ? "▾" : "▸"}
-              </span>
-            </button>
-            {buildOpen && (
-              <div className="mt-0.5 space-y-0.5 pl-2">
-                {[
-                  { to: "/skills", label: "Claude Skills", Icon: CodeIcon },
-                  { to: "/edit-preview", label: "Layouts", Icon: InnovationIcon },
-                  { to: "/discover", label: "Discovery", Icon: InnovationIcon },
-                ].map(({ to, label, Icon }) => (
-                  <NavLink
-                    key={to}
-                    to={to}
-                    style={({ isActive }) => ({
-                      display: "flex", alignItems: "center", gap: "6px",
-                      padding: "5px 10px", borderRadius: "4px",
-                      fontSize: "0.8125rem", fontFamily: "var(--font-base)",
-                      textDecoration: "none", transition: "background 0.15s, color 0.15s",
-                      background: isActive ? "rgba(255,255,255,0.12)" : "transparent",
-                      color: isActive ? "rgba(255,255,255,0.95)" : "rgba(255,255,255,0.45)",
-                      fontWeight: isActive ? 500 : 400,
-                    })}
-                    onMouseEnter={(e) => {
-                      (e.currentTarget as HTMLAnchorElement).style.background = "var(--twilio-navy-light)";
-                      (e.currentTarget as HTMLAnchorElement).style.color = "rgba(255,255,255,0.85)";
-                    }}
-                    onMouseLeave={(e) => {
-                      const el = e.currentTarget as HTMLAnchorElement;
-                      const isSelected = location.pathname === to || location.pathname.startsWith(to + "/");
-                      el.style.background = isSelected ? "rgba(255,255,255,0.12)" : "transparent";
-                      el.style.color = isSelected ? "rgba(255,255,255,0.95)" : "rgba(255,255,255,0.45)";
-                    }}
-                  >
-                    <Icon width={14} height={14} style={{ flexShrink: 0 }} />
-                    <span className="truncate">{label}</span>
-                  </NavLink>
-                ))}
-              </div>
-            )}
-          </div>
         </nav>
 
         {/* Activity Log + Settings + Profile — sit above the animation */}
         <div className="px-3 space-y-1.5 pb-2">
-          {[
-            { to: "/logs", label: "Activity Log", Icon: NotificationIcon },
-            ...(profile?.is_staff ? [{ to: "/admin-data", label: "Admin Data", Icon: SettingsIcon }] : []),
-            { to: "/settings", label: "Settings", Icon: SettingsIcon },
-          ].map(({ to, label, Icon }) => (
-            <NavLink
-              key={to}
-              to={to}
-              className="nav-bottom-link"
-              style={({ isActive }) => ({
-                display: "flex",
-                alignItems: "center",
-                gap: "10px",
-                padding: "7px 12px",
-                borderRadius: "4px",
-                fontSize: "0.9375rem",
-                fontWeight: isActive ? 600 : 400,
-                fontFamily: "var(--font-base)",
-                textDecoration: "none",
-                background: isActive ? "var(--twilio-red)" : "transparent",
-                color: isActive ? "#ffffff" : "var(--twilio-red)",
-              })}
+          {/* Build — pinned above Activity Log so it is always visible */}
+          <div>
+            <div
+              style={{
+                display: "flex", alignItems: "center", paddingRight: 4, borderRadius: "4px",
+                background: buildPaths.some(p => location.pathname.startsWith(p)) ? "var(--twilio-red)" : "transparent",
+              }}
             >
-              <Icon width={16} height={16} style={{ flexShrink: 0 }} />
-              <span style={{ color: "#ffffff" }}>{label}</span>
-            </NavLink>
-          ))}
+              <button
+                onClick={() => setBuildOpen(v => !v)}
+                style={{
+                  display: "flex", alignItems: "center", gap: "10px", flex: 1, minWidth: 0,
+                  padding: "7px 12px", fontSize: "0.9375rem",
+                  fontWeight: buildPaths.some(p => location.pathname.startsWith(p)) ? 600 : 400,
+                  fontFamily: "var(--font-base)", background: "transparent",
+                  color: "var(--twilio-red)", border: "none", cursor: "pointer", textAlign: "left",
+                }}
+              >
+                <StructureIcon width={16} height={16} style={{ flexShrink: 0, color: buildPaths.some(p => location.pathname.startsWith(p)) ? "#ffffff" : "var(--twilio-red)" }} />
+                <span style={{ color: "#ffffff" }}>Build</span>
+              </button>
+              <Chevron open={buildOpen} label={buildOpen ? "Collapse Build" : "Expand Build"} onClick={() => setBuildOpen(v => !v)} />
+            </div>
+            {buildOpen && <NestedLinks items={BUILD_CHILDREN} />}
+          </div>
+          {(() => {
+            const items = bottomNavItems(profile);
+            const link = ({ to, label }: { to: string; label: string }) => {
+              const Icon = to === "/logs" ? NotificationIcon : SettingsIcon;
+              return (
+                <NavLink
+                  key={to}
+                  to={to}
+                  // `end` so Settings isn't also highlighted while on its Admin Data child.
+                  end={to === "/settings"}
+                  className="nav-bottom-link"
+                  style={({ isActive }) => ({
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "10px",
+                    padding: "7px 12px",
+                    borderRadius: "4px",
+                    fontSize: "0.9375rem",
+                    fontWeight: isActive ? 600 : 400,
+                    fontFamily: "var(--font-base)",
+                    textDecoration: "none",
+                    background: isActive ? "var(--twilio-red)" : "transparent",
+                    color: isActive ? "#ffffff" : "var(--twilio-red)",
+                  })}
+                >
+                  <Icon width={16} height={16} style={{ flexShrink: 0 }} />
+                  <span style={{ color: "#ffffff", flex: 1 }}>{label}</span>
+                  {to === "/settings" && items.some((i) => i.child) && (
+                    <Chevron
+                      open={settingsOpen}
+                      label={settingsOpen ? "Collapse Settings" : "Expand Settings"}
+                      onClick={(e) => { e.preventDefault(); e.stopPropagation(); setSettingsOpen(v => !v); }}
+                    />
+                  )}
+                </NavLink>
+              );
+            };
+            const children = items.filter((i) => i.child).map((i) => ({ ...i, Icon: SettingsIcon }));
+            return (
+              <>
+                {items.filter((i) => !i.child).map((i) => (
+                  <div key={i.to}>
+                    {link(i)}
+                    {i.to === "/settings" && settingsOpen && children.length > 0 && <NestedLinks items={children} />}
+                  </div>
+                ))}
+              </>
+            );
+          })()}
         </div>
 
         {/* Sync runner — outside padded section so it spans full sidebar width */}
-        <SyncRunner />
+        {/* <SyncRunner /> — stick-figure sync animation, hidden from the sidebar */}
 
         {/* Dark / light toggle + version */}
         <div
@@ -482,7 +489,7 @@ export default function Layout() {
                   display: "flex", alignItems: "center", justifyContent: "center",
                   fontSize: "0.9375rem", fontWeight: 700, color: "#fff",
                 }}>
-                  {(profile.display_name || profile.username || profile.email || "?")[0].toUpperCase()}
+                  {initialsFor(profile.display_name || profile.username || profile.email || "?")}
                 </div>
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <p style={{
@@ -491,12 +498,12 @@ export default function Layout() {
                   }}>
                     {profile.display_name || profile.username || profile.email}
                   </p>
-                  {(profile.title || profile.role) && (
+                  {(sidebarTitle(profile.title) || profile.role) && (
                     <p style={{
                       fontSize: "0.8125rem", fontFamily: "var(--font-base)", color: "rgba(255,255,255,0.55)",
-                      marginTop: "1px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", margin: 0,
+                      marginTop: "1px", whiteSpace: "normal", overflowWrap: "break-word", margin: 0,
                     }}>
-                      {profile.title || profile.role}
+                      {sidebarTitle(profile.title) || profile.role}
                     </p>
                   )}
                 </div>
@@ -651,10 +658,12 @@ export default function Layout() {
 
       {/* Main */}
       <div className="flex-1 flex flex-col min-w-0">
+        <BudgetBanner />
         <ExportBar />
         <main className="flex-1 overflow-y-auto">
           <Outlet />
         </main>
+        <MeetingNotesToast notifications={notesCheck.pending} onDismiss={notesCheck.dismiss} />
         <TranscriptFooter />
       </div>
     </div>
