@@ -1,5 +1,8 @@
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
+import { accountsApi } from "../../lib/api";
 import type { AirtableActionItem } from "../../types";
+import type { AccountProject } from "../../types/accounts";
 
 /**
  * The records a calendar item belongs to, shown in its detail panel: the account (a link to
@@ -37,5 +40,36 @@ export function ActionItemRecordButton({ item, onOpen }: { item: AirtableActionI
         <span className="block text-sm font-medium text-[var(--twilio-navy)] truncate">{item.task || "Untitled"}</span>
       </span>
     </button>
+  );
+}
+
+/**
+ * The account-page projects and goals this meeting is filed under (an `AccountProject`
+ * lists meetings by their Airtable id). Renders nothing when there are none, so an
+ * unlinked meeting's panel is unchanged.
+ */
+export function ProjectRecordLinks({ meetingAirtableId }: { meetingAirtableId?: string | null }) {
+  const [linked, setLinked] = useState<AccountProject[]>([]);
+  useEffect(() => {
+    setLinked([]);
+    if (!meetingAirtableId) return;
+    let cancelled = false;
+    accountsApi.listAllProjects()
+      .then((r) => {
+        if (!cancelled) setLinked(r.data.results.filter((p) => (p.meeting_ids ?? []).includes(meetingAirtableId)));
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [meetingAirtableId]);
+  if (linked.length === 0) return null;
+  return (
+    <div data-testid="panel-project-links" className="rounded-lg px-3 py-2 border border-gray-200 text-sm flex flex-col gap-1">
+      {linked.map((p) => (
+        <div key={p.id} className="flex items-center gap-2 min-w-0">
+          <span className="text-[10px] uppercase tracking-wide text-[var(--twilio-gray-60)] font-semibold shrink-0">{p.kind === "goal" ? "Goal" : "Project"}</span>
+          <Link to={`/accounts/${p.account}`} className="font-medium text-indigo-600 hover:underline truncate" title={`Open ${p.name}`}>{p.name || "Untitled"}</Link>
+        </div>
+      ))}
+    </div>
   );
 }

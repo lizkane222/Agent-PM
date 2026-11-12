@@ -88,7 +88,7 @@ export default function TemplateTabs({
       {intro && !readOnly && (
         <details style={{ marginBottom: "8px", fontSize: "0.8125rem", color: "var(--text-secondary, #666)" }}>
           <summary style={{ cursor: "pointer" }}>Document intro (not a template)</summary>
-          <div dangerouslySetInnerHTML={{ __html: markdownToHtml(intro) }} />
+          <div className="rich-text" dangerouslySetInnerHTML={{ __html: markdownToHtml(intro) }} />
         </details>
       )}
 
@@ -113,7 +113,7 @@ export default function TemplateTabs({
           {current && (
             <div role="tabpanel" style={{ paddingTop: "10px" }}>
               {readOnly ? (
-                <div className="prose prose-sm max-w-none" style={{ fontSize: "0.875rem", lineHeight: 1.6 }}
+                <div className="prose prose-sm max-w-none rich-text" style={{ fontSize: "0.875rem", lineHeight: 1.6 }}
                   dangerouslySetInnerHTML={{ __html: sanitizeHtml(current.body_html) }} />
               ) : (
                 <>

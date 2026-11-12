@@ -45,8 +45,9 @@ logger = logging.getLogger(__name__)
 # Cloud Coach bills in quarter hours; a 50-minute meeting is 0.75h, not 0.83h.
 QUARTER_HOUR_MINUTES = 15
 
-# Event kinds that are never timesheet activity.
-EXCLUDED_CALENDAR_IDS = frozenset({"work_tracking"})
+# Event kinds that are never timesheet activity. A scheduled reminder is a 15-minute marker
+# on the grid, not time spent — and every reminder created from the calendar now gets one.
+EXCLUDED_CALENDAR_IDS = frozenset({"work_tracking", "reminders"})
 
 
 def round_up_to_quarter_hour(minutes: float) -> int:

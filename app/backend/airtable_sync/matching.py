@@ -110,6 +110,12 @@ def match_event_to_account(
     if existing:
         return existing
 
+    # 0. A recurring instance whose earlier week was linked with "update subsequent recurring".
+    from .series import inherit_series_link
+    inherited = inherit_series_link(event_uid)
+    if inherited:
+        return inherited
+
     # 1. Domain match
     account, domain = _match_by_domain(attendee_emails)
     if account:
@@ -149,6 +155,7 @@ def set_manual_categorization(
     account_id: int | None,
     categorization: str,
     account_name: str = "",
+    apply_to_future: bool = False,
 ) -> CalendarEventAccountLink:
     """Called when the user manually selects an account or a category (Internal/Admin)."""
     account = None
@@ -171,6 +178,7 @@ def set_manual_categorization(
             "account": account,
             "categorization": categorization,
             "match_method": "manual",
+            "apply_to_future": bool(apply_to_future and account),
         },
     )
     return link

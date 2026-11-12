@@ -60,8 +60,8 @@ def _shared_account_ids(viewer, other) -> set[int]:
     )
 
 
-def _app_user_busy(viewer, other, start, end) -> list[dict]:
-    shared = _shared_account_ids(viewer, other)
+def _app_user_busy(viewer, other, start, end, reveal_all: bool = False) -> list[dict]:
+    shared = set() if reveal_all else _shared_account_ids(viewer, other)
     rows = (
         CalendarEvent.objects
         .filter(owner=other, start_datetime__lt=end, end_datetime__gt=start)
@@ -73,7 +73,7 @@ def _app_user_busy(viewer, other, start, end) -> list[dict]:
     )
     out = []
     for r in rows:
-        visible = r["account_id"] is not None and r["account_id"] in shared
+        visible = reveal_all or (r["account_id"] is not None and r["account_id"] in shared)
         out.append({
             "start": r["start_datetime"].isoformat(),
             "end": r["end_datetime"].isoformat(),
@@ -82,6 +82,19 @@ def _app_user_busy(viewer, other, start, end) -> list[dict]:
             "title_visible": visible,
         })
     return out
+
+
+def _viewer_addresses(viewer) -> set[str]:
+    """Every address the viewer is known by: login, team-member record, linked Google account."""
+    found = {(getattr(viewer, "email", "") or "").strip().lower()}
+    member = getattr(viewer, "team_member", None) if hasattr(viewer, "team_member") else None
+    if member is not None:
+        found.add((member.email or "").strip().lower())
+    profile = getattr(viewer, "profile", None) if hasattr(viewer, "profile") else None
+    if profile is not None:
+        found.add((profile.google_account_email or "").strip().lower())
+    found.discard("")
+    return found
 
 
 def _google_service_for(viewer):
@@ -139,13 +152,14 @@ def _google_freebusy(viewer, emails: list[str], start: datetime, end: datetime) 
     return out
 
 
-def compute_availability(viewer, emails: list[str], start: datetime, end: datetime) -> list[dict]:
+def compute_availability(viewer, emails: list[str], start: datetime, end: datetime, include_self: bool = False) -> list[dict]:
     """
     Privacy-masked busy time for each address, as the compare-calendars view returns it.
 
     One implementation for the REST view and the voice agent's tool, so the masking rules
     (titles only on shared accounts, nothing else ever returned) cannot drift between them.
-    The viewer's own address is skipped; their calendar is already on screen.
+    The viewer's own address is skipped (their calendar is already on screen) unless
+    ``include_self`` is set, in which case it returns their own calendar with full titles.
     """
     from team.models import TeamMember
 
@@ -157,7 +171,15 @@ def compute_availability(viewer, emails: list[str], start: datetime, end: dateti
     users_by_email = {u.email.lower(): u for u in User.objects.filter(email__in=emails, is_active=True)}
 
     people, google_emails = [], []
+    mine = _viewer_addresses(viewer) if include_self else set()
     for email in emails:
+        if email in mine:
+            own = getattr(viewer, "team_member", None) if hasattr(viewer, "team_member") else None
+            people.append({
+                "email": email, "name": (own.full_name if own else "") or viewer.get_full_name() or email,
+                "source": "app", "busy": _app_user_busy(viewer, viewer, start, end, reveal_all=True), "error": None,
+            })
+            continue
         member = members.get(email)
         user = (member.user if member and member.user_id else None) or users_by_email.get(email)
         name = (member.full_name if member else "") or (user.get_full_name() if user else "") or email
@@ -196,5 +218,6 @@ def availability(request):
     if len(emails) > MAX_PEOPLE:
         return Response({"detail": f"At most {MAX_PEOPLE} people at a time."}, status=400)
 
-    people = compute_availability(request.user, emails, start, end)
+    include_self = (request.query_params.get("include_self") or "").lower() in ("1", "true", "yes")
+    people = compute_availability(request.user, emails, start, end, include_self=include_self)
     return Response({"start": start.isoformat(), "end": end.isoformat(), "people": people})

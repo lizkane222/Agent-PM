@@ -7,13 +7,14 @@
  * - VoiceButton is embedded in the right side of the input row.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
-import { skillsApi } from "../lib/api";
+import SlashSkillMenu from "./chat/SlashSkillMenu";
+import { useSlashSkills } from "../hooks/useSlashSkills";
 import { fmtBytes } from "twilio-agent-pm-shared";
-import type { ClaudeSkill } from "../types";
 import VoiceButton, { type VoiceTurn } from "./VoiceButton";
 import { budgetBlockedMessage } from "../lib/tokenBudget";
+import { CHAT_COUNT_SHOW_AT, CHAT_MESSAGE_MAX, sendFailureMessage, tooLongMessage } from "../lib/chatSend";
 
 interface AttachedFile {
   name: string;
@@ -66,6 +67,12 @@ function extractSkillKeywords(msg: string): string {
     .trim();
 }
 
+const INPUT_MIN_PX = 38;
+const AUTO_MAX_PX = 160;
+const INPUT_VIEWPORT_FRACTION = 0.7;
+const DRAG_THRESHOLD_PX = 4;
+const KEY_STEP_PX = 24;
+
 export default function TranscriptFooter() {
   const navigate = useNavigate();
   const location = useLocation();
@@ -76,6 +83,11 @@ export default function TranscriptFooter() {
   const [isExpanded, setIsExpanded] = useState(false);
   const [activeSessionId, setActiveSessionId] = useState<number | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  // Input sizing: auto-grows to content up to AUTO_MAX_PX; "show all" lifts that cap to the viewport;
+  // a manual height (from dragging the resize handle) overrides both.
+  const [showAll, setShowAll] = useState(false);
+  const [manualHeight, setManualHeight] = useState<number | null>(null);
+  const dragRef = useRef<{ startY: number; startH: number; moved: boolean } | null>(null);
   const activeSessionIdRef = useRef<number | null>(null);
   const transcriptBottomRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -114,28 +126,8 @@ export default function TranscriptFooter() {
     }
   }, []);
 
-  // Slash-command autocomplete
-  const [allSkills, setAllSkills] = useState<ClaudeSkill[]>([]);
-  const [cmdSuggestions, setCmdSuggestions] = useState<ClaudeSkill[]>([]);
-  const [cmdHighlight, setCmdHighlight] = useState(0);
-
-  useEffect(() => {
-    skillsApi.list().then(({ data }) => setAllSkills(data.results)).catch(() => {});
-  }, []);
-
-  // Recompute suggestions whenever input changes
-  useEffect(() => {
-    if (input.startsWith("/")) {
-      const query = input.toLowerCase();
-      const matches = allSkills.filter(
-        s => s.command && s.command.toLowerCase().startsWith(query)
-      );
-      setCmdSuggestions(matches);
-      setCmdHighlight(0);
-    } else {
-      setCmdSuggestions([]);
-    }
-  }, [input, allSkills]);
+  // "/" skill lookup (lazy; shared with the Agent page composer)
+  const slash = useSlashSkills({ value: input, onChange: setInput, inputRef });
 
   const addLine = useCallback(
     (role: "user" | "assistant", content: string) => {
@@ -147,11 +139,21 @@ export default function TranscriptFooter() {
     []
   );
 
+  // The Console run of a skill whose prompt is waiting in the input box (see handleChatInject).
+  const pendingSkillRunRef = useRef<{ id: string; prefix: string } | null>(null);
+  // A pinned skill's Run button: send the injected prompt as soon as it lands in the input.
+  const autoSendRef = useRef(false);
+
   // Listen for any page injecting text into the chat input (e.g. meeting note → agent).
   useEffect(() => {
     function handleChatInject(e: Event) {
-      const text = (e as CustomEvent<{ text: string }>).detail?.text;
+      const detail = (e as CustomEvent<{ text: string; run_id?: string; send?: boolean }>).detail;
+      const text = detail?.text;
       if (!text) return;
+      // A saved skill launched this prompt: remember its Console run, tied to the prompt's first
+      // line (`/skill-name`) so it can only attach to that skill's own message.
+      pendingSkillRunRef.current = detail.run_id ? { id: detail.run_id, prefix: text.split("\n", 1)[0] } : null;
+      autoSendRef.current = !!detail.send;
       setInput(text);
       setIsExpanded(true);
       setTimeout(() => inputRef.current?.focus(), 80);
@@ -184,6 +186,13 @@ export default function TranscriptFooter() {
     if (isExpanded) transcriptBottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [lines, isExpanded]);
 
+  /** The pending skill run's id if this message is that skill's own prompt; consumed either way. */
+  const takeSkillRunId = (message: string): string | undefined => {
+    const pending = pendingSkillRunRef.current;
+    pendingSkillRunRef.current = null;
+    return pending && message.trimStart().startsWith(pending.prefix) ? pending.id : undefined;
+  };
+
   const handleSend = useCallback(async () => {
     const message = input.trim();
     if (!message && attachments.length === 0) return;
@@ -208,6 +217,16 @@ export default function TranscriptFooter() {
         : fileContext;
     }
 
+    // Over the cap the server would refuse it and the text would be gone. Say so and keep it to edit.
+    if (fullMessage.length > CHAT_MESSAGE_MAX) {
+      addLine("assistant", `Error: ${tooLongMessage(fullMessage.length)}`);
+      setIsExpanded(true);
+      return;
+    }
+
+    const sentAttachments = attachments;
+    const pendingRun = pendingSkillRunRef.current;
+    let rejected = false;
     setInput("");
     setAttachments([]);
     setIsSending(true);
@@ -226,12 +245,17 @@ export default function TranscriptFooter() {
         body: JSON.stringify({
           message: fullMessage,
           session_id: activeSessionIdRef.current ?? undefined,
+          skill_run_id: takeSkillRunId(fullMessage),
         }),
       });
 
       if (response.status === 403) {
         const blocked = budgetBlockedMessage(403, await response.clone().text());
         if (blocked) throw new Error(blocked);
+      }
+      if (!response.ok) {
+        rejected = true;
+        throw new Error(sendFailureMessage(response.status, await response.text()));
       }
       // Read the session ID from the response header.
       const sessionId = response.headers.get("X-Session-Id");
@@ -258,93 +282,34 @@ export default function TranscriptFooter() {
       addLine("assistant", accumulated);
     } catch (err) {
       addLine("assistant", `Error: ${err instanceof Error ? err.message : "Unknown error"}`);
+      if (rejected) {
+        // Nothing reached the agent, so give the text back: it can be reviewed, trimmed and sent again.
+        setInput(message);
+        setAttachments(sentAttachments);
+        pendingSkillRunRef.current = pendingRun;
+        setIsExpanded(true);
+      }
     } finally {
       setIsSending(false);
     }
-  }, [input, isSending, addLine, isSkillsPage]);
+  }, [input, isSending, addLine, isSkillsPage, attachments]);
 
-  const selectSuggestion = useCallback((skill: ClaudeSkill) => {
-    const msg = `Run the skill "${skill.name}": ${skill.description}`;
-    setInput("");
-    setCmdSuggestions([]);
-    // send immediately
-    void (async () => {
-      setIsSending(true);
-      addLine("user", skill.command || skill.name);
-      try {
-        const token = localStorage.getItem("agentpm_access");
-        const baseUrl = import.meta.env["VITE_API_BASE_URL"] ?? "/api/v1";
-        const response = await fetch(`${baseUrl}/agents/sessions/send/`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            ...(token ? { Authorization: `Bearer ${token}` } : {}),
-          },
-          body: JSON.stringify({
-            message: msg,
-            session_id: activeSessionIdRef.current ?? undefined,
-          }),
-        });
-        if (response.status === 403) {
-          const blocked = budgetBlockedMessage(403, await response.clone().text());
-          if (blocked) throw new Error(blocked);
-        }
-        const sessionId = response.headers.get("X-Session-Id");
-        if (sessionId) {
-          const sid = parseInt(sessionId, 10);
-          activeSessionIdRef.current = sid;
-          setActiveSessionId(sid);
-          window.dispatchEvent(new StorageEvent("storage", { key: "agentSessionUpdated", newValue: sessionId }));
-        }
-        const reader = response.body?.getReader();
-        if (!reader) throw new Error("No response body.");
-        const decoder = new TextDecoder();
-        let accumulated = "";
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          accumulated += decoder.decode(value, { stream: true });
-        }
-        addLine("assistant", accumulated);
-        setIsExpanded(true);
-      } catch (err) {
-        addLine("assistant", `Error: ${err instanceof Error ? err.message : "Unknown error"}`);
-      } finally {
-        setIsSending(false);
-      }
-    })();
-  }, [addLine]);
+  // Runs once per injected prompt: handleSend is rebuilt with the new input, then fires here.
+  useEffect(() => {
+    if (!autoSendRef.current || !input.trim()) return;
+    autoSendRef.current = false;
+    void handleSend();
+  }, [input, handleSend]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-      if (cmdSuggestions.length > 0) {
-        if (e.key === "ArrowDown") {
-          e.preventDefault();
-          setCmdHighlight(h => Math.min(h + 1, cmdSuggestions.length - 1));
-          return;
-        }
-        if (e.key === "ArrowUp") {
-          e.preventDefault();
-          setCmdHighlight(h => Math.max(h - 1, 0));
-          return;
-        }
-        if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
-          e.preventDefault();
-          const s = cmdSuggestions[cmdHighlight];
-          if (s) selectSuggestion(s);
-          return;
-        }
-        if (e.key === "Escape") {
-          setCmdSuggestions([]);
-          return;
-        }
-      }
+      if (slash.handleKeyDown(e)) return;
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
         void handleSend();
       }
     },
-    [handleSend, cmdSuggestions, cmdHighlight, selectSuggestion]
+    [handleSend, slash]
   );
 
   const handleVoiceTurn = useCallback(
@@ -361,6 +326,57 @@ export default function TranscriptFooter() {
     },
     []
   );
+
+  const maxInputHeight = () => Math.max(INPUT_MIN_PX, Math.floor((typeof window !== "undefined" ? window.innerHeight : 800) * INPUT_VIEWPORT_FRACTION));
+  const clampHeight = (h: number) => Math.min(maxInputHeight(), Math.max(INPUT_MIN_PX, h));
+
+  // Size the textarea to its content (shrinks again when text is removed or sent).
+  useLayoutEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    if (manualHeight !== null) {
+      el.style.height = `${clampHeight(manualHeight)}px`;
+      el.style.overflowY = "auto";
+      return;
+    }
+    el.style.height = "auto";
+    const cap = showAll ? maxInputHeight() : AUTO_MAX_PX;
+    const wanted = Math.max(INPUT_MIN_PX, el.scrollHeight);
+    el.style.height = `${Math.min(cap, wanted)}px`;
+    el.style.overflowY = wanted > cap ? "auto" : "hidden";
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [input, showAll, manualHeight]);
+
+  const onHandlePointerDown = (e: React.PointerEvent<HTMLButtonElement>) => {
+    const h = inputRef.current?.getBoundingClientRect().height || INPUT_MIN_PX;
+    dragRef.current = { startY: e.clientY, startH: h, moved: false };
+    try { e.currentTarget.setPointerCapture?.(e.pointerId); } catch { /* not supported */ }
+  };
+  const onHandlePointerMove = (e: React.PointerEvent<HTMLButtonElement>) => {
+    const d = dragRef.current;
+    if (!d) return;
+    const dy = d.startY - e.clientY; // dragging up grows the box
+    if (!d.moved && Math.abs(dy) < DRAG_THRESHOLD_PX) return;
+    d.moved = true;
+    setManualHeight(clampHeight(d.startH + dy));
+  };
+  const onHandlePointerUp = () => {
+    const d = dragRef.current;
+    dragRef.current = null;
+    if (d && !d.moved) {
+      // A plain click toggles show-all and hands sizing back to the content.
+      setManualHeight(null);
+      setShowAll((v) => !v);
+    }
+  };
+  const onHandleKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>) => {
+    if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+      e.preventDefault();
+      const cur = manualHeight ?? (inputRef.current?.getBoundingClientRect().height || INPUT_MIN_PX);
+      setManualHeight(clampHeight(cur + (e.key === "ArrowUp" ? KEY_STEP_PX : -KEY_STEP_PX)));
+    }
+    // Enter / Space fire a click on a <button>; that path is handled in onClick below.
+  };
 
   return (
     <footer
@@ -470,38 +486,12 @@ export default function TranscriptFooter() {
         )}
 
         <div className="flex-1 relative">
-          {cmdSuggestions.length > 0 && (
-            <div style={{
-              position: "absolute", bottom: "calc(100% + 6px)", left: 0, right: 0,
-              background: "#fff", border: "1px solid rgba(0,0,0,0.12)", borderRadius: "10px",
-              boxShadow: "0 4px 16px rgba(0,0,0,0.12)", zIndex: 50, overflow: "hidden",
-            }}>
-              {cmdSuggestions.map((s, i) => (
-                <button
-                  key={s.id}
-                  onMouseDown={(e) => { e.preventDefault(); selectSuggestion(s); }}
-                  style={{
-                    display: "flex", flexDirection: "column", width: "100%", textAlign: "left",
-                    padding: "8px 12px", border: "none", cursor: "pointer",
-                    background: i === cmdHighlight ? "rgba(226,35,26,0.06)" : "transparent",
-                    borderLeft: i === cmdHighlight ? "3px solid var(--twilio-red, #e22)" : "3px solid transparent",
-                  }}
-                  onMouseEnter={() => setCmdHighlight(i)}
-                >
-                  <span style={{ fontSize: "0.8125rem", fontWeight: 700, fontFamily: "var(--font-mono, monospace)", color: "var(--twilio-red, #e22)" }}>
-                    {s.command}
-                  </span>
-                  <span style={{ fontSize: "0.75rem", color: "var(--text-secondary, #888)", marginTop: "1px", lineHeight: 1.4 }}>
-                    {s.name} — {s.description}
-                  </span>
-                </button>
-              ))}
-            </div>
-          )}
-            <textarea
+          <SlashSkillMenu menu={slash} />
+          <textarea
             ref={inputRef}
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={slash.handleChange}
+            onSelect={slash.handleSelect}
             onKeyDown={handleKeyDown}
             rows={1}
             placeholder={isSkillsPage
@@ -509,8 +499,39 @@ export default function TranscriptFooter() {
               : "Ask Agent PM something… (Enter to send, / for skills, drag files to attach)"
             }
             disabled={isSending}
-            className="w-full resize-none rounded-md border border-gray-300 px-3 py-2 text-sm placeholder-gray-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 disabled:bg-gray-50"
+            className="w-full text-sm rounded-xl border border-gray-200 pl-3 pr-9 py-2 resize-none outline-none focus:border-indigo-300 focus:ring-1 focus:ring-indigo-200 bg-white transition-all placeholder-gray-400 disabled:opacity-60"
+            style={{ color: "var(--text-ink)", maxHeight: "80vh" }}
           />
+          {input.length >= CHAT_COUNT_SHOW_AT && (
+            <span
+              data-testid="footer-char-count"
+              role="status"
+              className={`pointer-events-none absolute right-9 bottom-2.5 text-[11px] tabular-nums ${input.length > CHAT_MESSAGE_MAX ? "font-semibold text-red-600" : "text-gray-400"}`}
+            >
+              {input.length.toLocaleString("en-US")} / {CHAT_MESSAGE_MAX.toLocaleString("en-US")}
+            </span>
+          )}
+          <button
+            type="button"
+            data-testid="footer-size-handle"
+            aria-label={showAll ? "Stop expanding input to show all content" : "Expand input to show all content"}
+            aria-pressed={showAll}
+            title="Click to show all text. Drag up or down to resize."
+            onPointerDown={onHandlePointerDown}
+            onPointerMove={onHandlePointerMove}
+            onPointerUp={onHandlePointerUp}
+            onPointerCancel={() => { dragRef.current = null; }}
+            onKeyDown={onHandleKeyDown}
+            onClick={(e) => {
+              // Pointer clicks are handled on pointerup; a keyboard activation has detail === 0.
+              if (e.detail === 0) { setManualHeight(null); setShowAll((v) => !v); }
+            }}
+            className="absolute right-2 bottom-2 flex h-5 w-5 items-center justify-center rounded text-gray-400 hover:text-indigo-600 hover:bg-indigo-50 cursor-ns-resize touch-none focus:outline-none focus:ring-1 focus:ring-indigo-300"
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <polyline points="7 9 12 4 17 9" /><polyline points="7 15 12 20 17 15" />
+            </svg>
+          </button>
         </div>
 
         {/* Paperclip / attach button */}

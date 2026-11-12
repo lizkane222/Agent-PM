@@ -1,13 +1,22 @@
 import { useState, useRef, useEffect } from "react";
-import { accountsApi } from "../../lib/api";
+import { accountsApi, teamApi } from "../../lib/api";
+import { addLog } from "../../lib/appLog";
+import { allEmails } from "../../lib/teamEmails";
 import { useAppError } from "../../context/AppErrorContext";
 import { permissionMessage } from "../../lib/permissions";
-import type { Attendee, Account, TeamMember, CustomerContact } from "../../types";
+import { AttendeeActionButton } from "./AttendeeActionButton";
+import { guestName, knownFullName, matchAttendee } from "../../lib/attendeeMatch";
+import { fullNameFromEmail } from "../../lib/nameFromEmail";
+import type { Attendee, Account, AccountTeamMember, TeamMember, CustomerContact } from "../../types";
+
+export const ATTENDEE_RESPONSE_COLOR: Record<string, string> = {
+  accepted: "#15803d", declined: "#dc2626", tentative: "#a16207", needsAction: "#888",
+};
 
 function CustomerContactQuickForm({
-  defaultName, defaultEmail, saving, onSave, onBack,
+  defaultName, defaultEmail, saving, onSave, onBack, nameGuessed = false,
 }: {
-  defaultName: string; defaultEmail: string; saving: boolean;
+  defaultName: string; defaultEmail: string; saving: boolean; nameGuessed?: boolean;
   onSave: (name: string, email: string, role: string) => void;
   onBack: () => void;
 }) {
@@ -19,6 +28,7 @@ function CustomerContactQuickForm({
       <p className="text-[11px] font-semibold text-[var(--twilio-navy)]">Add as customer contact</p>
       <input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="Full name *"
         className="w-full rounded-lg border border-gray-200 px-2.5 py-1.5 text-xs text-[var(--twilio-navy)] focus:border-indigo-400 focus:outline-none" />
+      {nameGuessed && name === defaultName && <p className="text-[10px] text-amber-600 -mt-1">Name guessed from the email address. Please check it.</p>}
       <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Email"
         className="w-full rounded-lg border border-gray-200 px-2.5 py-1.5 text-xs text-[var(--twilio-navy)] focus:border-indigo-400 focus:outline-none" />
       <input value={role} onChange={(e) => setRole(e.target.value)} placeholder="Role / title"
@@ -41,6 +51,7 @@ export function AttendeeList({
   account,
   teamMembers,
   contacts,
+  onAccountUpdated,
   onContactsChange,
 }: {
   attendees: Attendee[];
@@ -70,14 +81,33 @@ export function AttendeeList({
   }, [popover]);
 
   const currentAttendee = popover != null ? attendees[popover.index] : null;
+  // The account's team as last returned by the server, so a guest turns into a check mark at once
+  // (the parent's copy of the account is not refreshed from here).
+  const [teamOverride, setTeamOverride] = useState<AccountTeamMember[] | null>(null);
+  useEffect(() => { setTeamOverride(null); }, [account]);
+  const accountTeam = teamOverride ?? account?.team_members ?? [];
 
   async function handleAddToTwilio(memberId: number) {
     if (!account || addingMember) return;
     setAddingMember(true);
     try {
-      await accountsApi.addTeamMember(account.id, memberId);
+      // Record the address this guest was invited under on the team member (once), then make
+      // sure they are on the account's team. Both are idempotent.
+      const member = teamMembers.find((m) => m.id === memberId);
+      const guestEmail = (currentAttendee?.email ?? "").trim();
+      if (member && guestEmail && !allEmails(member).some((e) => e.toLowerCase() === guestEmail.toLowerCase())) {
+        await teamApi.addMemberEmail(memberId, guestEmail);
+      }
+      const { data } = await accountsApi.addTeamMember(account.id, memberId);
+      setTeamOverride(data.team_members ?? []);
+      onAccountUpdated?.(data);
+      addLog({
+        category: "account",
+        message: `Linked ${guestEmail || "a guest"} to Twilio team member "${member?.full_name ?? memberId}"`,
+        resource: { type: "account", id: account.id },
+      });
     } catch (err) {
-      // Adding someone else to an account is PM/Admin only (accounts/access.py).
+      // Adding someone else to an account, or an address to someone else, is PM/Admin only.
       reportError(permissionMessage(err, "Could not add them to the account."), "AttendeeList");
     } finally {
       setAddingMember(false);
@@ -112,18 +142,28 @@ export function AttendeeList({
         {attendees.map((a, i) => (
           <div key={i} className="group relative" style={{ display: "flex", alignItems: "center", gap: "8px" }}>
             <span style={{ width: "7px", height: "7px", borderRadius: "50%", flexShrink: 0, background: responseColor[a.responseStatus] ?? "#888", display: "inline-block" }} title={a.responseStatus} />
-            <span style={{ fontSize: "0.75rem", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              {a.displayName
-                ? <><span style={{ fontWeight: 500 }}>{a.displayName}</span> <span className="opacity-50">{a.email}</span></>
-                : a.email}
-            </span>
+            {(() => {
+              // A guest with a check mark and a full name shows the name alone; the address is the tooltip.
+              const known = account ? knownFullName(a, matchAttendee(a, contacts ?? [], accountTeam)) : "";
+              return (
+                <span title={known ? a.email : undefined} style={{ fontSize: "0.75rem", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {known
+                    ? <span style={{ fontWeight: 500 }}>{known}</span>
+                    : a.displayName
+                      ? <><span style={{ fontWeight: 500 }}>{a.displayName}</span> <span className="opacity-50">{a.email}</span></>
+                      : a.email}
+                </span>
+              );
+            })()}
             {account && (
-              <button
-                onClick={() => { setPopover({ index: i, mode: "pick" }); setSearch(""); }}
-                className="opacity-0 group-hover:opacity-100 transition-opacity shrink-0 w-5 h-5 rounded-full flex items-center justify-center text-indigo-600 hover:bg-indigo-50"
-                style={{ fontSize: "14px", lineHeight: 1 }}
-                title="Add to team or contacts"
-              >+</button>
+              <AttendeeActionButton
+                attendee={a}
+                account={account}
+                contacts={contacts ?? []}
+                accountTeamMembers={accountTeam}
+                onContactsChange={onContactsChange}
+                onAdd={() => { setPopover({ index: i, mode: "pick" }); setSearch(""); }}
+              />
             )}
 
             {/* Popover */}
@@ -181,7 +221,8 @@ export function AttendeeList({
 
                 {popover.mode === "customer-form" && currentAttendee && (
                   <CustomerContactQuickForm
-                    defaultName={currentAttendee.displayName ?? ""}
+                    defaultName={guestName(currentAttendee) || fullNameFromEmail(currentAttendee.email).name}
+                    nameGuessed={!guestName(currentAttendee) && !!fullNameFromEmail(currentAttendee.email).name}
                     defaultEmail={currentAttendee.email}
                     saving={addingContact}
                     onSave={(name, email, role) => void handleAddAsContact(name, email, role)}

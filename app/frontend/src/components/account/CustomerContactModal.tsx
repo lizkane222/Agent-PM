@@ -62,10 +62,10 @@ export function CustomerContactModal({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onClose}>
+    <div className="fixed inset-0 z-[9000] flex items-center justify-center bg-black/40" onClick={onClose}>
       <div
         className="rounded-2xl shadow-2xl flex flex-col overflow-hidden"
-        style={{ background: "#fff", width: "440px", maxWidth: "calc(100vw - 32px)", maxHeight: "calc(100vh - 48px)" }}
+        style={{ background: "var(--surface-card)", width: "440px", maxWidth: "calc(100vw - 32px)", maxHeight: "calc(100vh - 48px)" }}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}

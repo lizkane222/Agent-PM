@@ -51,7 +51,7 @@ export default function ReminderCard_Cal({ reminder, onDragStart, onDelete, onUp
       <div
         ref={cardRef}
         className="rounded-lg select-none"
-        style={{ background: "#FFFBEB", borderLeft: "3px solid #f59e0b", padding: "8px 10px", display: "flex", flexDirection: "column", gap: 6, boxShadow: "0 2px 8px rgba(0,0,0,0.10)" }}
+        style={{ background: "var(--tint-amber-50)", borderLeft: "3px solid #f59e0b", padding: "8px 10px", display: "flex", flexDirection: "column", gap: 6, boxShadow: "0 2px 8px rgba(0,0,0,0.10)" }}
       >
         <input
           autoFocus
@@ -97,7 +97,7 @@ export default function ReminderCard_Cal({ reminder, onDragStart, onDelete, onUp
       onDragStart={onDragStart}
       onClick={() => setExpanded(true)}
       className="rounded-lg select-none cursor-pointer group"
-      style={{ background: "#FFFBEB", borderLeft: "3px solid #f59e0b", padding: "8px 10px", display: "flex", flexDirection: "column", gap: 4, boxShadow: "0 1px 3px rgba(0,0,0,0.08)" }}
+      style={{ background: "var(--tint-amber-50)", borderLeft: "3px solid #f59e0b", padding: "8px 10px", display: "flex", flexDirection: "column", gap: 4, boxShadow: "0 1px 3px rgba(0,0,0,0.08)" }}
     >
       <div className="flex items-center gap-1.5 flex-wrap">
         <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded whitespace-nowrap bg-amber-50 text-amber-700">{statusLabel}</span>

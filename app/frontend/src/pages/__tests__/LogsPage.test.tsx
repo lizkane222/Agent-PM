@@ -1,4 +1,4 @@
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { http, HttpResponse } from "msw";
@@ -7,6 +7,7 @@ import { mockCalendarEvents } from "../../test/handlers/scheduler";
 import { mockReminders } from "../../test/handlers/scheduler";
 import { mockFeedbackItems } from "../../test/handlers/feedback";
 import { mockNotification } from "../../test/handlers/profile";
+import { mockAgentSkill, mockPagePin, mockSkillRun, pagePinsFor } from "../../test/handlers/skills";
 import { mockEventUpdate } from "../../test/handlers/realtime";
 
 // ── Mock cross-cutting deps ──────────────────────────────────────────────────
@@ -49,6 +50,24 @@ async function renderPage() {
 describe("LogsPage", () => {
   beforeEach(() => {
     vi.resetModules();
+  });
+
+  it("keeps every tab title on one line in a container wide enough for them", async () => {
+    await renderPage();
+    const bar = screen.getByTestId("activity-log-tabs");
+    const buttons = within(bar).getAllByRole("button");
+    expect(buttons.map(b => b.textContent)).toEqual(
+      ["Activity", "Console", "Events", "Comments", "Notifications", "Reminders", "Feedback", "Tokens"]
+    );
+    for (const b of buttons) {
+      expect(b.className).toContain("whitespace-nowrap");
+      expect(b.className).toContain("shrink-0");
+    }
+    expect(bar.className).toContain("overflow-x-auto");
+    // not capped at the old max-w-3xl (768px), which forced titles to wrap
+    const content = screen.getByTestId("activity-log-content");
+    expect(content.className).not.toContain("max-w-3xl");
+    expect(content.className).toMatch(/max-w-(5xl|6xl|7xl)/);
   });
 
   it("renders the tab bar", async () => {
@@ -152,5 +171,31 @@ describe("LogsPage", () => {
       await waitFor(() => expect(screen.queryByText("Loading…")).not.toBeInTheDocument());
       expect(screen.queryAllByTestId("recorded-notification")).toHaveLength(0);
     });
+  });
+});
+
+describe("LogsPage — Claude skills and the Console", () => {
+  it("lists pinned skills in a column to the right of the log", async () => {
+    server.use(pagePinsFor("activity-log", [mockPagePin({ page: "activity-log", skill: mockAgentSkill({ id: 1, name: "weekly-update" }) })]));
+    await renderPage();
+    const aside = await screen.findByTestId("activity-log-skills-column");
+    expect(await within(aside).findByRole("button", { name: /^Weekly Update/ })).toBeInTheDocument();
+    expect(aside.previousElementSibling).toHaveTextContent("Activity Log");       // beside the log column, after it
+    expect(aside.parentElement).toHaveClass("flex");
+  });
+
+  it("has a Console tab that shows skill runs from the server", async () => {
+    server.use(http.get("/api/v1/skills/runs/", () => HttpResponse.json({ count: 1, next: null, previous: null, results: [mockSkillRun({ id: "r1", skill_name: "weekly-update", records_created: 2 })] })));
+    await renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Console" }));
+    const row = await screen.findByTestId("run-r1");
+    expect(row).toHaveTextContent("Weekly Update");
+    expect(row).toHaveTextContent("2 created");
+  });
+
+  it("puts Console right after Activity", async () => {
+    await renderPage();
+    const tabs = (await screen.findAllByRole("button")).map((b) => b.textContent);
+    expect(tabs.indexOf("Console")).toBe(tabs.indexOf("Activity") + 1);
   });
 });

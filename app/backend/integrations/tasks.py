@@ -376,3 +376,21 @@ def check_meeting_notes_all_users():
             continue
         except Exception:
             logger.exception("Scheduled meeting-notes check failed for user %s", user.pk)
+
+
+@shared_task(name="integrations.tasks.scan_tickets_all_users", ignore_result=True)
+def scan_tickets_all_users():
+    """Every 10 minutes: file JIRA / Zendesk / Product Gap emails as account tickets (read-only Gmail)."""
+    from integrations.models import OAuthCredential
+    from integrations.ticket_scan import scan_user_tickets
+
+    done: set = set()
+
+    for cred in OAuthCredential.objects.filter(provider__in=["google", "gmail"], is_active=True).select_related("user").order_by("user_id"):
+        if cred.user_id in done:
+            continue
+        done.add(cred.user_id)
+        try:
+            scan_user_tickets(cred.user)
+        except Exception:
+            logger.warning("Scheduled ticket scan failed for user %s", cred.user_id)

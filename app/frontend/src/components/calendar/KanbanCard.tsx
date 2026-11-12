@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useStatusLabels } from "../../hooks/useStatusLabels";
 import type { AirtableActionItem } from "../../types";
 import { airtableApi } from "../../lib/api";
 import { logActionItemUpdate } from "../../lib/actionItemLog";
@@ -10,6 +11,7 @@ import CommentPreviewList from "../comments/CommentPreviewList";
 import { useCommentMenuItem } from "../comments/commentMenuItem";
 import { useFocusPins } from "../../hooks/useFocusPins";
 import { sanitizeHtml, plainToHtml } from "../../lib/noteHelpers";
+import { CALENDAR_DRAG_KEY } from "./calendarHelpers";
 
 interface Props {
   item: AirtableActionItem;
@@ -34,6 +36,7 @@ function formatDuration(seconds: number): string {
 
 export default function KanbanCard({ item, onStatusChange, onDoubleClick }: Props) {
   const { status: statusOptions } = useActionItemFieldOptions();
+  const { label: statusLabel } = useStatusLabels();
   const { addToTray } = useExportTray();
   const { isPinned, toggle: toggleFocusPin } = useFocusPins();
   const [expanded, setExpanded] = useState(false);
@@ -76,10 +79,27 @@ export default function KanbanCard({ item, onStatusChange, onDoubleClick }: Prop
       draggable
       onDragStart={(e) => {
         e.dataTransfer.setData("kanbanCardId", item.airtable_id);
+        // Same payload the calendar sidebar's cards carry, so this card can also be dropped
+        // straight onto the calendar grid (which reads these globals) — see CalendarPage's
+        // native drop handler.
+        e.dataTransfer.setData("text/plain", item.airtable_id);
         e.dataTransfer.effectAllowed = "move";
+        const w = window as unknown as Record<string, string>;
+        w[CALENDAR_DRAG_KEY] = item.airtable_id;
+        w[`${CALENDAR_DRAG_KEY}_task`] = item.task;
+        w[`${CALENDAR_DRAG_KEY}_account`] = item.account_name ?? "";
+        w[`${CALENDAR_DRAG_KEY}_est`] = String(item.estimated_time ?? 0);
         setDragging(true);
       }}
-      onDragEnd={() => setDragging(false)}
+      onDragEnd={() => {
+        setDragging(false);
+        // A cancelled drag must not leave the calendar believing a card is still in the air.
+        const w = window as unknown as Record<string, string>;
+        delete w[CALENDAR_DRAG_KEY];
+        delete w[`${CALENDAR_DRAG_KEY}_task`];
+        delete w[`${CALENDAR_DRAG_KEY}_account`];
+        delete w[`${CALENDAR_DRAG_KEY}_est`];
+      }}
       className={["relative bg-white border border-gray-200 rounded-lg shadow-sm overflow-hidden cursor-grab active:cursor-grabbing select-none transition-opacity", dragging ? "opacity-40" : ""].join(" ")}
       onClick={() => setExpanded((v) => !v)}
       onDoubleClick={(e) => { e.stopPropagation(); onDoubleClick?.(item); }}
@@ -133,7 +153,7 @@ export default function KanbanCard({ item, onStatusChange, onDoubleClick }: Prop
         >
           {item.task_details && (
             <div
-              className="text-[13px] text-[var(--twilio-navy)] opacity-70 leading-relaxed prose prose-sm max-w-none"
+              className="text-[13px] text-[var(--twilio-navy)] opacity-70 leading-relaxed prose prose-sm max-w-none rich-text"
               dangerouslySetInnerHTML={{ __html: sanitizeHtml(plainToHtml(item.task_details)) }}
             />
           )}
@@ -204,11 +224,11 @@ export default function KanbanCard({ item, onStatusChange, onDoubleClick }: Prop
                 className="px-2 py-0.5 rounded-full border text-sm font-medium transition-colors disabled:opacity-40"
                 style={{
                   background: item.status === s ? "#0263E0" : "transparent",
-                  borderColor: item.status === s ? "#0263E0" : "#d1d5db",
-                  color: item.status === s ? "#fff" : "#6b7280",
+                  borderColor: item.status === s ? "#0263E0" : "var(--border-subtle-2)",
+                  color: item.status === s ? "#fff" : "var(--text-gray-500)",
                 }}
               >
-                {s}
+                {statusLabel(s)}
               </button>
             ))}
           </div>

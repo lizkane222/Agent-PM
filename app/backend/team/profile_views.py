@@ -44,7 +44,9 @@ class NotificationViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
             qs = qs.filter(channel=channel)
         if kind:
             qs = qs.filter(kind=kind)
-        return qs
+        if self.request.query_params.get("unread") in ("1", "true"):
+            qs = qs.filter(read_at__isnull=True)
+        return qs.select_related("reminder")
 
     @action(detail=False, methods=["post"], url_path="mark-read")
     def mark_read(self, request):

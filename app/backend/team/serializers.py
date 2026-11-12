@@ -104,6 +104,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
             "notify_default_slack",
             "notify_default_push",
             "notify_default_sms",
+            "allow_reminders_from_others",
             # Web Push — only expose whether a subscription exists, not the raw secret
             "push_subscription_active",
             # Staff view mode
@@ -112,6 +113,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
             "access_level",
             # Calendar appearance
             "calendar_colors",
+            "status_labels",
             # Gmail watch configuration
             "gmail_watch_config",
             "teams",
@@ -142,6 +144,30 @@ class UserProfileSerializer(serializers.ModelSerializer):
                 "Enter the number with its country code, e.g. +1 415 555 0123."
             )
         return cleaned
+
+    # Allowed display names per canonical action-item status (display only).
+    STATUS_LABEL_CHOICES = {
+        "Open": ("Open", "Not Started"),
+        "In Progress": ("In Progress", "Pending"),
+        "Blocked": ("Blocked",),
+        "Done": ("Done", "Completed"),
+        "Backlogged": ("Backlogged", "Not Going To Do"),
+    }
+
+    def validate_status_labels(self, value):
+        if not isinstance(value, dict):
+            raise serializers.ValidationError("Must be an object.")
+        for status, label in value.items():
+            allowed = self.STATUS_LABEL_CHOICES.get(status)
+            if allowed is None:
+                raise serializers.ValidationError(
+                    f"Unknown status '{status}'. Expected one of: {', '.join(self.STATUS_LABEL_CHOICES)}."
+                )
+            if label not in allowed:
+                raise serializers.ValidationError(
+                    f"'{label}' is not a valid name for {status}. Expected one of: {', '.join(allowed)}."
+                )
+        return value
 
     def validate_calendar_colors(self, value):
         """Validate the calendar_colors blob.
@@ -254,6 +280,44 @@ class TeamMemberSerializer(serializers.ModelSerializer):
     manager_name = serializers.CharField(
         source="manager.full_name", read_only=True, allow_null=True
     )
+    # Effective zone: the person's own setting wins, else the one someone assigned, else "".
+    timezone = serializers.SerializerMethodField()
+    timezone_source = serializers.SerializerMethodField()
+    assigned_by_username = serializers.SerializerMethodField()
+
+    def get_timezone(self, obj):
+        return obj.timezone_with_source()[0]
+
+    def validate_additional_emails(self, value):
+        if not isinstance(value, list):
+            raise serializers.ValidationError("Expected a list of email addresses.")
+        if len(value) > 10:
+            raise serializers.ValidationError("At most 10 additional addresses.")
+        field = serializers.EmailField()
+        cleaned: list[str] = []
+        for raw in value:
+            if not isinstance(raw, str):
+                raise serializers.ValidationError("Each address must be text.")
+            addr = field.run_validation(raw.strip()).lower()
+            if addr not in cleaned:
+                cleaned.append(addr)
+        primary = (self.initial_data.get("email") or (self.instance.email if self.instance else "")).strip().lower()
+        cleaned = [a for a in cleaned if a != primary]
+        taken = TeamMember.objects.filter(email__in=cleaned)
+        if self.instance:
+            taken = taken.exclude(pk=self.instance.pk)
+        if taken.exists():
+            raise serializers.ValidationError("Another team member already uses one of these addresses.")
+        return cleaned
+
+    def get_timezone_source(self, obj):
+        return obj.timezone_with_source()[1]
+
+    def get_assigned_by_username(self, obj):
+        # Only named while the assignment is the value in force.
+        if obj.timezone_with_source()[1] != "assigned" or not obj.assigned_timezone_by_id:
+            return None
+        return obj.assigned_timezone_by.username
 
     class Meta:
         model = TeamMember
@@ -262,6 +326,7 @@ class TeamMemberSerializer(serializers.ModelSerializer):
             "user",
             "full_name",
             "email",
+            "additional_emails",
             "title",
             "department",
             "status",
@@ -272,6 +337,9 @@ class TeamMemberSerializer(serializers.ModelSerializer):
             "slack_handle",
             "avatar_url",
             "joined_at",
+            "timezone",
+            "timezone_source",
+            "assigned_by_username",
             "created_at",
             "updated_at",
         ]
@@ -279,9 +347,17 @@ class TeamMemberSerializer(serializers.ModelSerializer):
 
 
 class NotificationSerializer(serializers.ModelSerializer):
+    # Only the reminder's owner can reschedule it. Someone who was notified through a teammate's
+    # reminder can acknowledge it, not snooze it.
+    can_snooze = serializers.SerializerMethodField()
+
+    def get_can_snooze(self, obj) -> bool:
+        return bool(obj.reminder_id and obj.reminder.created_by_id == obj.user_id)
+
     class Meta:
         model = Notification
-        fields = ["id", "channel", "kind", "title", "body", "link", "status", "read_at", "created_at"]
+        fields = ["id", "channel", "kind", "title", "body", "link", "status", "read_at", "created_at",
+                  "reminder", "fired_for", "can_snooze"]
         read_only_fields = fields
 
 
@@ -291,6 +367,27 @@ def _safe_url(value: str) -> str:
     if value and not re.match(r"^https?://", value, re.IGNORECASE):
         raise serializers.ValidationError("Links must start with http:// or https://.")
     return value
+
+
+_TASK_ITEM_RE = re.compile(
+    r'<li[^>]*data-checked="(true|false)"[^>]*>\s*<label>.*?</label>\s*<div>\s*(<p>)?(.*?)</div>\s*</li>',
+    re.S,
+)
+
+
+def flatten_task_lists(markup: str) -> str:
+    """Turn the editor's checklist (``Steps``) into plain list items marked ☐ / ☑.
+
+    The sanitizer strips ``input``, ``label`` and ``data-*`` (it also guards uploaded HTML files),
+    so a checklist saved as-is would come back as bullets with no checkboxes. The state is kept as
+    text rather than loosening that allowlist.
+    """
+    def one(m: "re.Match[str]") -> str:
+        mark = "\u2611" if m.group(1) == "true" else "\u2610"
+        return f"<li>{m.group(2) or ''}{mark} {m.group(3)}</li>"
+
+    out = _TASK_ITEM_RE.sub(one, markup)
+    return re.sub(r'<ul[^>]*data-type="taskList"[^>]*>', "<ul>", out)
 
 
 class PublicItemSerializer(serializers.ModelSerializer):
@@ -323,7 +420,7 @@ class PublicItemSerializer(serializers.ModelSerializer):
     def validate_body(self, value):
         from core.html_sanitize import sanitize_html
 
-        return sanitize_html(value or "")
+        return sanitize_html(flatten_task_lists(value or ""))
 
     def validate(self, attrs):
         item_type = attrs.get("item_type") or getattr(self.instance, "item_type", "")

@@ -1,5 +1,5 @@
 import React from "react";
-import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent, within, act } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { http, HttpResponse } from "msw";
@@ -136,6 +136,27 @@ describe("AccountDetailPage action items — layout and search highlight", () =>
   });
 });
 
+describe("AccountDetailPage action items — status display names", () => {
+  beforeEach(() => { vi.resetModules(); localStorage.clear(); register(); });
+
+  it("renders the preferred names on column headers and status pills, keeping stored statuses", async () => {
+    await renderPage();
+    const section = await screen.findByTestId("action-items-section");
+    await waitFor(() => within(section).getByText("Alpha task"));
+    // Defaults first.
+    expect(within(section).getAllByText("Open").length).toBeGreaterThan(0);
+    const { seedStatusLabels } = await import("../../hooks/useStatusLabels");
+    act(() => seedStatusLabels({ Open: "Not Started", "In Progress": "Pending", Done: "Completed" }));
+    await waitFor(() => expect(within(section).getAllByText("Not Started").length).toBeGreaterThan(1)); // header + card pill
+    expect(within(section).getByText("Pending")).toBeInTheDocument();
+    expect(within(section).getByText("Completed")).toBeInTheDocument();
+    expect(within(section).queryByText("Open")).toBeNull();
+    // Column data hooks and sort aria-labels use the shown name; the column key is canonical.
+    expect(within(section).getByTestId("kanban-col-scroll-Open")).toBeInTheDocument();
+    expect(within(section).getByLabelText(/Sort Not Started/)).toBeInTheDocument();
+  });
+});
+
 describe("AccountDetailPage artifacts — search / sort / group", () => {
   beforeEach(() => {
     vi.resetModules(); localStorage.clear(); register();
@@ -155,8 +176,9 @@ describe("AccountDetailPage artifacts — search / sort / group", () => {
     fireEvent.change(search, { target: { value: "nothing-matches" } });
     expect(screen.getByTestId("artifact-no-match")).toBeInTheDocument();
     fireEvent.change(search, { target: { value: "" } });
-    fireEvent.change(screen.getByLabelText("Group artifacts"), { target: { value: "creator" } });
-    const headings = screen.getAllByTestId("artifact-group-heading").map((h) => h.textContent);
-    expect(headings).toEqual(["alice (1)", "bob (1)"]);
+    fireEvent.click(screen.getByRole("button", { name: /^Creator/ }));
+    fireEvent.click(await screen.findByTestId("artifact-creator-chip-alice"));
+    expect(screen.getByText("Roadmap deck")).toBeInTheDocument();
+    expect(screen.queryByText("Zeta spec")).not.toBeInTheDocument();
   });
 });

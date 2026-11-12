@@ -1,0 +1,71 @@
+/*
+ * Rich text: lists and checklists, for the editor AND everywhere its HTML is displayed.
+ *
+ * Why this file exists. Tailwind v4's Preflight resets every list (`ol, ul { list-style: none }`)
+ * and strips their padding, and the `prose` class many components carry belongs to the
+ * `@tailwindcss/typography` plugin, which is not installed — so `prose` did nothing. The editor's
+ * bullet / numbered / "Steps" buttons toggled correctly, but the result was drawn as plain,
+ * unindented lines with no markers, and a checklist item's checkbox sat on its own line above its
+ * text. Notes, action items, comments, the page builder and the profile canvas all share this
+ * editor, so they shared the bug; they get the fix here, once.
+ *
+ * Scope. Lists are restored only inside:
+ *   .ProseMirror   the editors themselves (TipTap)
+ *   .rich-text     anything that DISPLAYS saved rich-text HTML (add the class to the wrapper)
+ *   .prose         the existing wrappers, which were meant to do this
+ * They are NOT restored globally: the app's own menus and nav lists rely on Preflight's reset.
+ *
+ * In `@layer base` so a utility class on a specific element (e.g. `list-none`) still wins.
+ */
+@layer base {
+  :is(.ProseMirror, .rich-text, .prose) :is(ul, ol) {
+    margin: 0.25em 0;
+    padding-left: 1.5em;
+  }
+  :is(.ProseMirror, .rich-text, .prose) ul { list-style: disc outside; }
+  :is(.ProseMirror, .rich-text, .prose) ol { list-style: decimal outside; }
+  :is(.ProseMirror, .rich-text, .prose) ul ul { list-style: circle outside; }
+  :is(.ProseMirror, .rich-text, .prose) ul ul ul { list-style: square outside; }
+  :is(.ProseMirror, .rich-text, .prose) ol ol { list-style: lower-alpha outside; }
+  :is(.ProseMirror, .rich-text, .prose) ol ol ol { list-style: lower-roman outside; }
+  :is(.ProseMirror, .rich-text, .prose) li { margin: 0.125em 0; }
+  /* TipTap wraps each item's text in a <p>; without this every item gets a paragraph gap. */
+  :is(.ProseMirror, .rich-text, .prose) li > p { margin: 0; }
+
+  /* Checklists ("Steps"): a checkbox then the text on one line, no bullet. */
+  :is(.ProseMirror, .rich-text, .prose) ul[data-type="taskList"] {
+    list-style: none;
+    padding-left: 0;
+  }
+  :is(.ProseMirror, .rich-text, .prose) ul[data-type="taskList"] > li {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5em;
+  }
+  :is(.ProseMirror, .rich-text, .prose) ul[data-type="taskList"] > li > label {
+    flex: 0 0 auto;
+    margin-top: 0.2em;
+    user-select: none;
+  }
+  :is(.ProseMirror, .rich-text, .prose) ul[data-type="taskList"] > li > div {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  :is(.ProseMirror, .rich-text, .prose) ul[data-type="taskList"] input[type="checkbox"] {
+    cursor: pointer;
+    accent-color: #0263e0;
+  }
+  /* A finished step reads as finished. */
+  :is(.ProseMirror, .rich-text, .prose) ul[data-type="taskList"] > li[data-checked="true"] > div {
+    text-decoration: line-through;
+    opacity: 0.6;
+  }
+
+  /* Displayed (not editable) checklists: the box shows the saved state but must not look
+     clickable — a click would flip it on screen and save nothing. The editor never carries
+     .rich-text, so its checkboxes stay live. */
+  .rich-text ul[data-type="taskList"] input[type="checkbox"] {
+    pointer-events: none;
+    cursor: default;
+  }
+}

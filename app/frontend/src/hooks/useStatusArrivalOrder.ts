@@ -44,6 +44,73 @@ export interface StatusOrderableItem {
   status: string;
   created_at: string;
   marked_done_at?: string | null;
+  status_changed_at?: string | null;
+  updated_at?: string;
+}
+
+/** Explicit per-column sort chosen with the header toggle. Absent = the default rules above. */
+export type ColumnSortDirection = "newest" | "oldest";
+export const COLUMN_SORT_KEY = "actionItemColumnSort-v1";
+
+const sortStore = createLocalStore<Record<string, ColumnSortDirection>>(
+  COLUMN_SORT_KEY,
+  (raw) => {
+    if (!raw) return {};
+    try {
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+      const out: Record<string, ColumnSortDirection> = {};
+      for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+        if (v === "newest" || v === "oldest") out[k] = v;
+      }
+      return out;
+    } catch {
+      return {};
+    }
+  },
+  (value) => JSON.stringify(value),
+);
+
+export function reloadColumnSort(): void {
+  sortStore.reload();
+}
+
+/** When the item entered its current status. `status_changed_at` is stamped by the server only
+ *  on a real transition; `updated_at` moves on any save (incl. every Airtable pull), so it is
+ *  only a fallback for rows predating the field. */
+function movedTime(item: StatusOrderableItem): number {
+  const raw = item.status_changed_at || item.updated_at || item.created_at;
+  const t = new Date(raw ?? "").getTime();
+  return Number.isNaN(t) ? 0 : t;
+}
+
+/** The one comparator for an explicit column sort, shared by every surface that shows status
+ *  columns. "newest" = most recently moved into the status first. Does not mutate. */
+export function sortByMoved<T extends StatusOrderableItem>(list: T[], direction: ColumnSortDirection): T[] {
+  const sign = direction === "newest" ? -1 : 1;
+  return [...list].sort((a, b) => sign * (movedTime(a) - movedTime(b)));
+}
+
+/**
+ * The shared per-status sort direction. Backed by one module-level store, so a direction chosen
+ * on any surface (Account Detail, Action Items status board, meeting detail kanban, Project
+ * Goals tabs, calendar sidebar) applies on all of them. With no direction chosen, `apply`
+ * returns the list untouched, so each surface keeps its own default order.
+ */
+export function useColumnSort() {
+  const sorts = useSyncExternalStore(sortStore.subscribe, sortStore.get, sortStore.get);
+  const sortDirection = useCallback((status: string) => sorts[status] ?? null, [sorts]);
+  const toggleSort = useCallback((status: string) => {
+    sortStore.update((prev) => ({ ...prev, [status]: prev[status] === "newest" ? "oldest" : "newest" }));
+  }, []);
+  const applySort = useCallback(
+    <T extends StatusOrderableItem>(list: T[], status: string): T[] => {
+      const d = sorts[status];
+      return d ? sortByMoved(list, d) : list;
+    },
+    [sorts],
+  );
+  return { sortDirection, toggleSort, applySort };
 }
 
 const store = createLocalStore<ArrivalMap>(
@@ -101,6 +168,10 @@ function fallbackTime(item: StatusOrderableItem, status: string): number {
 export interface StatusArrivalOrder {
   /** Sort a single status column. Does not mutate the input. */
   orderForStatus: <T extends StatusOrderableItem>(items: T[], status: string) => T[];
+  /** The explicit sort chosen for a column, or null when it follows the default rules. */
+  sortDirection: (status: string) => ColumnSortDirection | null;
+  /** Flip a column: default or oldest -> newest first, newest -> oldest first. */
+  toggleSort: (status: string) => void;
 }
 
 /**
@@ -118,6 +189,8 @@ export interface StatusArrivalOrder {
  */
 export function useStatusArrivalOrder(items: StatusOrderableItem[]): StatusArrivalOrder {
   const map = useSyncExternalStore(store.subscribe, store.get, store.get);
+  const { sortDirection, toggleSort } = useColumnSort();
+  const sorts = useSyncExternalStore(sortStore.subscribe, sortStore.get, sortStore.get);
   const seenRef = useRef<Map<string, string>>(new Map());
 
   useEffect(() => {
@@ -139,6 +212,8 @@ export function useStatusArrivalOrder(items: StatusOrderableItem[]): StatusArriv
 
   const orderForStatus = useCallback(
     <T extends StatusOrderableItem>(list: T[], status: string): T[] => {
+      const explicit = sorts[status];
+      if (explicit) return sortByMoved(list, explicit);
       // Open is the inbox: always chronological, arrival records ignored.
       if (status === "Open") {
         return [...list].sort((a, b) => fallbackTime(a, status) - fallbackTime(b, status));
@@ -154,8 +229,8 @@ export function useStatusArrivalOrder(items: StatusOrderableItem[]): StatusArriv
         return fallbackTime(a, status) - fallbackTime(b, status);
       });
     },
-    [map],
+    [map, sorts],
   );
 
-  return { orderForStatus };
+  return { orderForStatus, sortDirection, toggleSort };
 }

@@ -36,9 +36,9 @@ export default function DayBar({ events, selectedEvent, onSelect }: Props) {
               onClick={() => onSelect(e)}
               className="shrink-0 flex flex-col items-center px-3 py-1 rounded-lg border text-center transition-colors"
               style={{
-                background: active ? "#0263E0" : "#f9fafb",
-                borderColor: active ? "#0263E0" : "#e5e7eb",
-                color: active ? "#fff" : "#374151",
+                background: active ? "#0263E0" : "var(--surface-subtle)",
+                borderColor: active ? "#0263E0" : "var(--border-subtle)",
+                color: active ? "#fff" : "var(--text-gray-700)",
                 minWidth: "200px",
                 maxWidth: "280px",
               }}

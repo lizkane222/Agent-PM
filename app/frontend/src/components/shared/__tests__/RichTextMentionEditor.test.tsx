@@ -150,3 +150,109 @@ describe("RichTextMentionEditor — Enter submits", () => {
     expect(screen.getByTitle("Bullet list")).toBeInTheDocument();
   });
 });
+
+describe("RichTextMentionEditor — Underline button (opt-in)", () => {
+  it("is not shown by default, so notes and action items keep their existing toolbar", async () => {
+    renderEditor();
+    await waitFor(() => pm());
+    expect(screen.getByTitle("Bold")).toBeInTheDocument();
+    expect(screen.queryByTitle("Underline")).toBeNull();
+  });
+
+  it("is shown when asked for", async () => {
+    renderEditor({ showUnderline: true });
+    await waitFor(() => pm());
+    expect(screen.getByTitle("Underline")).toBeInTheDocument();
+  });
+
+  it("underlines the selected text", async () => {
+    const { onChange } = renderEditor({ showUnderline: true, value: "<p>hello</p>" });
+    await waitFor(() => pm());
+    fireEvent.keyDown(pm(), { key: "a", ctrlKey: true });         // select all
+    fireEvent.mouseDown(screen.getByTitle("Underline"));
+    await waitFor(() => expect(onChange).toHaveBeenCalled());
+    expect(onChange.mock.calls.at(-1)?.[0]).toContain("<u>hello</u>");
+  });
+
+  it("bold and italic still work alongside it", async () => {
+    const { onChange } = renderEditor({ showUnderline: true, value: "<p>hello</p>" });
+    await waitFor(() => pm());
+    fireEvent.keyDown(pm(), { key: "a", ctrlKey: true });
+    fireEvent.mouseDown(screen.getByTitle("Bold"));
+    fireEvent.mouseDown(screen.getByTitle("Italic"));
+    await waitFor(() => expect(onChange.mock.calls.length).toBeGreaterThan(1));
+    const html = onChange.mock.calls.at(-1)?.[0] as string;
+    expect(html).toContain("<strong>");
+    expect(html).toContain("<em>");
+  });
+});
+
+describe("RichTextMentionEditor — list buttons", () => {
+  const last = (onChange: ReturnType<typeof vi.fn>) => onChange.mock.calls.at(-1)?.[0] as string;
+
+  it("Bullet list wraps the line in <ul><li>", async () => {
+    const { onChange } = renderEditor({ value: "<p>apples</p>" });
+    await waitFor(() => pm());
+    fireEvent.mouseDown(screen.getByTitle("Bullet list"));
+    await waitFor(() => expect(onChange).toHaveBeenCalled());
+    expect(last(onChange)).toMatch(/<ul><li><p>apples<\/p><\/li><\/ul>/);
+    expect(pm().querySelector("ul > li")).toBeTruthy();
+  });
+
+  it("Numbered list wraps the line in <ol><li>", async () => {
+    const { onChange } = renderEditor({ value: "<p>apples</p>" });
+    await waitFor(() => pm());
+    fireEvent.mouseDown(screen.getByTitle("Numbered list"));
+    await waitFor(() => expect(onChange).toHaveBeenCalled());
+    expect(last(onChange)).toMatch(/<ol><li><p>apples<\/p><\/li><\/ol>/);
+    expect(pm().querySelector("ol > li")).toBeTruthy();
+  });
+
+  it("Steps (checklist) makes a task list with a checkbox beside the text", async () => {
+    const { onChange } = renderEditor({ value: "<p>apples</p>" });
+    await waitFor(() => pm());
+    fireEvent.mouseDown(screen.getByTitle("Checklist"));
+    await waitFor(() => expect(onChange).toHaveBeenCalled());
+    const html = last(onChange);
+    expect(html).toContain('data-type="taskList"');
+    expect(html).toContain('data-type="taskItem"');
+    expect(html).toContain('type="checkbox"');
+    // The structure the stylesheet lays out: <li> > <label> (checkbox) + <div> (text).
+    const li = pm().querySelector('ul[data-type="taskList"] > li') as HTMLElement;
+    expect(li.querySelector(":scope > label input[type=checkbox]")).toBeTruthy();
+    expect(li.querySelector(":scope > div")?.textContent).toBe("apples");
+  });
+
+  it("Steps: ticking the checkbox marks the step done and is saved", async () => {
+    const { onChange } = renderEditor({ value: "<p>apples</p>" });
+    await waitFor(() => pm());
+    fireEvent.mouseDown(screen.getByTitle("Checklist"));
+    await waitFor(() => expect(pm().querySelector('input[type="checkbox"]')).toBeTruthy());
+    const box = pm().querySelector('input[type="checkbox"]') as HTMLInputElement;
+    fireEvent.click(box);
+    await waitFor(() => expect(last(onChange)).toContain('data-checked="true"'));
+  });
+
+  it("pressing the same list button again turns the list back into a paragraph", async () => {
+    const { onChange } = renderEditor({ value: "<p>apples</p>" });
+    await waitFor(() => pm());
+    fireEvent.mouseDown(screen.getByTitle("Bullet list"));
+    await waitFor(() => expect(last(onChange)).toContain("<ul>"));
+    fireEvent.mouseDown(screen.getByTitle("Bullet list"));
+    await waitFor(() => expect(last(onChange)).not.toContain("<ul>"));
+  });
+
+  it("the active list button is highlighted so you can see which list you are in", async () => {
+    renderEditor({ value: "<p>apples</p>" });
+    await waitFor(() => pm());
+    const bullet = screen.getByTitle("Bullet list");
+    const before = bullet.className;
+    fireEvent.mouseDown(bullet);
+    await waitFor(() => expect(screen.getByTitle("Bullet list").className).not.toBe(before));
+  });
+
+  it("an existing saved list loads as a list", async () => {
+    renderEditor({ value: "<ul><li><p>a</p></li><li><p>b</p></li></ul>" });
+    await waitFor(() => expect(pm().querySelectorAll("ul > li")).toHaveLength(2));
+  });
+});

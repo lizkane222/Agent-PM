@@ -105,4 +105,6 @@ export interface TimeAllocation {
   inferred_minutes: number;
   /** Calendar time with no account at all; not in `rows`. */
   unlinked_calendar_minutes: number;
+  /** Label of the user's own Admin workspace; the panel always lists it. */
+  admin_account?: string;
 }

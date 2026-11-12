@@ -41,7 +41,7 @@ def catalog_lines() -> list[tuple[str, str]]:
     return [(n, mcp_server._description(n)) for n in mcp_server.skill_safe_tools()]
 
 
-def recommend_tools(description: str, instructions: str = "", *, client, model: str) -> dict:
+def recommend_tools(description: str, instructions: str = "", *, client, model: str, user=None) -> dict:
     catalog = catalog_lines()
     allowed = {n for n, _ in catalog}
     prompt = (
@@ -54,6 +54,8 @@ def recommend_tools(description: str, instructions: str = "", *, client, model: 
         model=model, max_tokens=1500, system=_SYSTEM,
         messages=[{"role": "user", "content": prompt}],
     )
+    from agents.usage import record_llm_usage
+    record_llm_usage(user, "Skill recommendations", resp)
     data = loads_object(resp.content[0].text)
 
     picked, seen = [], set()

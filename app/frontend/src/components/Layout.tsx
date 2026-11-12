@@ -27,6 +27,8 @@ import StructureIcon from "../assets/icons/Structure.svg?react";
 import type { FC, SVGProps } from "react";
 import MeetingNotesToast from "./MeetingNotesToast";
 import { useMeetingNotesAutoCheck } from "../hooks/useMeetingNotesAutoCheck";
+import { useReminderAlerts } from "../hooks/useReminderAlerts";
+import ReminderAlertToast from "./ReminderAlertToast";
 
 type SvgIcon = FC<SVGProps<SVGSVGElement>>;
 
@@ -102,6 +104,12 @@ const BASE_NAV_ITEMS: { to: string; label: string; Icon: SvgIcon }[] = [
   { to: "/team", label: "Team", Icon: TeamIcon },
 ];
 
+/** localStorage key for the Accounts list collapsed state ("0" = collapsed). */
+const ACCOUNTS_OPEN_KEY = "agentpm-nav-accounts-open";
+
+/** Wait before the one retry of a failed profile fetch. */
+const PROFILE_RETRY_MS = 3000;
+
 function useUserProfile() {
   const [profile, setProfile] = useState<UserProfile | null>(null);
   // `fresh` bypasses the short GET cache (lib/requestCache.ts). The mount fetch is
@@ -110,7 +118,15 @@ function useUserProfile() {
   // below must see the toggled value, so it opts out.
   const doFetch = (fresh = false) =>
     teamApi.getMyProfile({ fresh }).then(({ data }) => setProfile(data)).catch(() => {});
-  useEffect(() => { void doFetch(); }, []);
+  useEffect(() => {
+    // One quiet retry: the sidebar link to /profile must not depend on a single request landing
+    // (a throttled or dropped request used to leave it off the page until a reload).
+    let retry: number | undefined;
+    teamApi.getMyProfile({ fresh: false })
+      .then(({ data }) => setProfile(data))
+      .catch(() => { retry = window.setTimeout(() => void doFetch(true), PROFILE_RETRY_MS); });
+    return () => { if (retry) window.clearTimeout(retry); };
+  }, []);
   // Re-fetch when staff_view_override is toggled.
   // StorageEvent fires only in other tabs; the window "accountsUpdated" event fires in the same tab.
   useEffect(() => {
@@ -188,6 +204,7 @@ function useTheme() {
 export default function Layout() {
   // Every 10 minutes: pull fresh Gong / Zoom recaps into meetings and announce them.
   const notesCheck = useMeetingNotesAutoCheck();
+  const reminderAlerts = useReminderAlerts();
   const { dark, toggle } = useTheme();
   const profile = useUserProfile();
   const navAccounts = useNavAccounts();
@@ -224,7 +241,13 @@ export default function Layout() {
   const [buildOpen, setBuildOpen] = useState(true);
   const [agentOpen, setAgentOpen] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false); // Admin Data hidden by default
-  const [accountsOpen, setAccountsOpen] = useState(true);
+  const [accountsOpen, setAccountsOpen] = useState<boolean>(() => {
+    try { return localStorage.getItem(ACCOUNTS_OPEN_KEY) !== "0"; } catch { return true; }
+  });
+  const toggleAccounts = () => setAccountsOpen((v) => {
+    try { localStorage.setItem(ACCOUNTS_OPEN_KEY, v ? "0" : "1"); } catch { /* storage unavailable */ }
+    return !v;
+  });
 
   // Sidebar expansion state for time allocation panel
   const [sidebarWide] = useState(false);
@@ -238,6 +261,94 @@ export default function Layout() {
   // 192px on laptop screens (≤1440px), 224px on larger desktop monitors
   const baseWidth = windowWidth <= 1440 ? 192 : 224;
   const sidebarWidth = sidebarWide ? 520 : baseWidth;
+
+  const renderNavItem = ({ to, label, Icon }: { to: string; label: string; Icon: SvgIcon }) => (
+            <div key={to}>
+
+              <NavLink
+                to={to}
+                end={to === "/"}
+                className="nav-main-link"
+                style={({ isActive }) => ({
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "10px",
+                  padding: "7px 12px",
+                  borderRadius: "4px",
+                  fontSize: "0.9375rem",
+                  fontWeight: isActive ? 600 : 400,
+                  fontFamily: "var(--font-base)",
+                  textDecoration: "none",
+                  background: isActive ? "var(--twilio-red)" : "transparent",
+                  color: isActive ? "#ffffff" : "var(--twilio-red)",
+                })}
+              >
+                <Icon width={16} height={16} style={{ flexShrink: 0 }} />
+                <span style={{ color: "#ffffff", flex: 1 }}>{label}</span>
+                {to === "/agent" && (
+                  <Chevron
+                    open={agentOpen}
+                    label={agentOpen ? "Collapse Agent" : "Expand Agent"}
+                    onClick={(e) => { e.preventDefault(); e.stopPropagation(); setAgentOpen(v => !v); }}
+                  />
+                )}
+                {to === "/accounts" && navAccounts.length > 0 && !accountsOpen && (
+                  <span data-testid="accounts-count" style={{ color: "rgba(255,255,255,0.6)", fontSize: "0.75rem" }}>({navAccounts.length})</span>
+                )}
+                {to === "/accounts" && navAccounts.length > 0 && (
+                  <Chevron
+                    open={accountsOpen}
+                    label={accountsOpen ? "Collapse accounts" : "Expand accounts"}
+                    onClick={(e) => { e.preventDefault(); e.stopPropagation(); toggleAccounts(); }}
+                  />
+                )}
+              </NavLink>
+              {to === "/agent" && agentOpen && <NestedLinks items={AGENT_CHILDREN} />}
+
+              {/* Nested account sub-items under Accounts */}
+              {to === "/accounts" && navAccounts.length > 0 && (
+                <div className="mt-0.5 pl-2">
+                  {accountsOpen && <div className="space-y-0.5" style={{ maxHeight: "40vh", overflowY: "auto" }}>
+                  {navAccounts.map((acct) => (
+                    <NavLink
+                      key={acct.id}
+                      to={`/accounts/${acct.id}`}
+                      style={({ isActive }) => ({
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "6px",
+                        padding: "5px 10px",
+                        borderRadius: "4px",
+                        fontSize: "0.8125rem",
+                        fontFamily: "var(--font-base)",
+                        textDecoration: "none",
+                        transition: "background 0.15s, color 0.15s",
+                        background: isActive ? "rgba(255,255,255,0.12)" : "transparent",
+                        color: isActive ? "rgba(255,255,255,0.95)" : acct.is_admin_account ? "rgba(255,255,255,0.65)" : "rgba(255,255,255,0.45)",
+                        fontWeight: isActive ? 500 : acct.is_admin_account ? 500 : 400,
+                      })}
+                      onMouseEnter={(e) => {
+                        (e.currentTarget as HTMLAnchorElement).style.background = "var(--twilio-navy-light)";
+                        (e.currentTarget as HTMLAnchorElement).style.color = "rgba(255,255,255,0.85)";
+                      }}
+                      onMouseLeave={(e) => {
+                        const el = e.currentTarget as HTMLAnchorElement;
+                        const isSelected = location.pathname === `/accounts/${acct.id}`;
+                        el.style.background = isSelected ? "rgba(255,255,255,0.12)" : "transparent";
+                        el.style.color = isSelected ? "rgba(255,255,255,0.95)" : acct.is_admin_account ? "rgba(255,255,255,0.65)" : "rgba(255,255,255,0.45)";
+                      }}
+                    >
+                      <span style={{ color: acct.is_admin_account ? "rgba(255,255,255,0.4)" : "rgba(255,255,255,0.25)", fontFamily: "monospace" }}>
+                        {acct.is_admin_account ? "⚙" : "↳"}
+                      </span>
+                      <span className="truncate">{acct.company_name}</span>
+                    </NavLink>
+                  ))}
+                  </div>}
+                </div>
+              )}
+            </div>
+  );
 
   return (
     <DndContext>
@@ -288,101 +399,13 @@ export default function Layout() {
 
         {/* Nav */}
         <nav className="flex-1 min-h-0 px-3 py-4 space-y-1.5 overflow-y-auto">
-          {BASE_NAV_ITEMS.map(({ to, label, Icon }) => (
-            <div key={to}>
-              <NavLink
-                to={to}
-                end={to === "/"}
-                className="nav-main-link"
-                style={({ isActive }) => ({
-                  display: "flex",
-                  alignItems: "center",
-                  gap: "10px",
-                  padding: "7px 12px",
-                  borderRadius: "4px",
-                  fontSize: "0.9375rem",
-                  fontWeight: isActive ? 600 : 400,
-                  fontFamily: "var(--font-base)",
-                  textDecoration: "none",
-                  background: isActive ? "var(--twilio-red)" : "transparent",
-                  color: isActive ? "#ffffff" : "var(--twilio-red)",
-                })}
-              >
-                <Icon width={16} height={16} style={{ flexShrink: 0 }} />
-                <span style={{ color: "#ffffff", flex: 1 }}>{label}</span>
-                {to === "/agent" && (
-                  <Chevron
-                    open={agentOpen}
-                    label={agentOpen ? "Collapse Agent" : "Expand Agent"}
-                    onClick={(e) => { e.preventDefault(); e.stopPropagation(); setAgentOpen(v => !v); }}
-                  />
-                )}
-              </NavLink>
-              {to === "/agent" && agentOpen && <NestedLinks items={AGENT_CHILDREN} />}
-
-              {/* Nested account sub-items under Accounts */}
-              {to === "/accounts" && navAccounts.length > 0 && (
-                <div className="mt-0.5 pl-2">
-                  {/* Collapsible header — only shown when there are many accounts (staff view) */}
-                  {navAccounts.length > 5 && (
-                    <button
-                      onClick={() => setAccountsOpen(v => !v)}
-                      style={{
-                        display: "flex", alignItems: "center", gap: 4,
-                        width: "100%", padding: "3px 10px", borderRadius: 4,
-                        fontSize: "0.75rem", fontFamily: "var(--font-base)",
-                        color: "rgba(255,255,255,0.35)", background: "transparent",
-                        border: "none", cursor: "pointer", textAlign: "left",
-                      }}
-                    >
-                      <span style={{ fontFamily: "monospace", fontSize: "0.7rem" }}>{accountsOpen ? "▾" : "▸"}</span>
-                      <span>{accountsOpen ? "Hide accounts" : `${navAccounts.length} accounts`}</span>
-                    </button>
-                  )}
-                  {(accountsOpen || navAccounts.length <= 5) && <div className="space-y-0.5">
-                  {navAccounts.map((acct) => (
-                    <NavLink
-                      key={acct.id}
-                      to={`/accounts/${acct.id}`}
-                      style={({ isActive }) => ({
-                        display: "flex",
-                        alignItems: "center",
-                        gap: "6px",
-                        padding: "5px 10px",
-                        borderRadius: "4px",
-                        fontSize: "0.8125rem",
-                        fontFamily: "var(--font-base)",
-                        textDecoration: "none",
-                        transition: "background 0.15s, color 0.15s",
-                        background: isActive ? "rgba(255,255,255,0.12)" : "transparent",
-                        color: isActive ? "rgba(255,255,255,0.95)" : acct.is_admin_account ? "rgba(255,255,255,0.65)" : "rgba(255,255,255,0.45)",
-                        fontWeight: isActive ? 500 : acct.is_admin_account ? 500 : 400,
-                      })}
-                      onMouseEnter={(e) => {
-                        (e.currentTarget as HTMLAnchorElement).style.background = "var(--twilio-navy-light)";
-                        (e.currentTarget as HTMLAnchorElement).style.color = "rgba(255,255,255,0.85)";
-                      }}
-                      onMouseLeave={(e) => {
-                        const el = e.currentTarget as HTMLAnchorElement;
-                        const isSelected = location.pathname === `/accounts/${acct.id}`;
-                        el.style.background = isSelected ? "rgba(255,255,255,0.12)" : "transparent";
-                        el.style.color = isSelected ? "rgba(255,255,255,0.95)" : acct.is_admin_account ? "rgba(255,255,255,0.65)" : "rgba(255,255,255,0.45)";
-                      }}
-                    >
-                      <span style={{ color: acct.is_admin_account ? "rgba(255,255,255,0.4)" : "rgba(255,255,255,0.25)", fontFamily: "monospace" }}>
-                        {acct.is_admin_account ? "⚙" : "↳"}
-                      </span>
-                      <span className="truncate">{acct.company_name}</span>
-                    </NavLink>
-                  ))}
-                  </div>}
-                </div>
-              )}
-            </div>
-          ))}
+          {BASE_NAV_ITEMS.filter((i) => i.to !== "/team").map(renderNavItem)}
         </nav>
 
-        {/* Activity Log + Settings + Profile — sit above the animation */}
+        {/* Team is pinned below the scrolling nav (like Build) so a long accounts list can never hide it. */}
+        <div className="px-3 pb-1.5">
+          {BASE_NAV_ITEMS.filter((i) => i.to === "/team").map(renderNavItem)}
+        </div>
         <div className="px-3 space-y-1.5 pb-2">
           {/* Build — pinned above Activity Log so it is always visible */}
           <div>
@@ -468,8 +491,9 @@ export default function Layout() {
           className="px-3 py-4 border-t space-y-2"
           style={{ borderColor: "rgba(255,255,255,0.08)" }}
         >
-          {/* User profile card */}
-          {profile && (
+          {/* User profile card. Always rendered: until (or unless) the profile loads it shows a
+              generic "Profile" entry, so the link to /profile is never missing from the sidebar. */}
+          {(
             <NavLink
               to="/profile"
               style={{ textDecoration: "none" }}
@@ -489,16 +513,16 @@ export default function Layout() {
                   display: "flex", alignItems: "center", justifyContent: "center",
                   fontSize: "0.9375rem", fontWeight: 700, color: "#fff",
                 }}>
-                  {initialsFor(profile.display_name || profile.username || profile.email || "?")}
+                  {profile ? initialsFor(profile.display_name || profile.username || profile.email || "?") : "•"}
                 </div>
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <p style={{
                     fontSize: "0.9375rem", fontWeight: 700, fontFamily: "var(--font-base)",
                     color: "#ffffff", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", margin: 0,
                   }}>
-                    {profile.display_name || profile.username || profile.email}
+                    {profile ? (profile.display_name || profile.username || profile.email) : "Profile"}
                   </p>
-                  {(sidebarTitle(profile.title) || profile.role) && (
+                  {profile && (sidebarTitle(profile.title) || profile.role) && (
                     <p style={{
                       fontSize: "0.8125rem", fontFamily: "var(--font-base)", color: "rgba(255,255,255,0.55)",
                       marginTop: "1px", whiteSpace: "normal", overflowWrap: "break-word", margin: 0,
@@ -664,6 +688,7 @@ export default function Layout() {
           <Outlet />
         </main>
         <MeetingNotesToast notifications={notesCheck.pending} onDismiss={notesCheck.dismiss} />
+        <ReminderAlertToast alerts={reminderAlerts.alerts} onAcknowledge={reminderAlerts.acknowledge} onSnooze={reminderAlerts.snooze} />
         <TranscriptFooter />
       </div>
     </div>

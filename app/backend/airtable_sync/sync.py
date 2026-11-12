@@ -6,6 +6,7 @@ import logging
 import time
 from datetime import datetime
 
+from django.utils import timezone as django_tz
 from django.utils.dateparse import parse_datetime
 
 from django.conf import settings
@@ -302,19 +303,22 @@ def sync_action_items() -> int:
         keep_local_status = bool(existing and existing.status_locally_modified)
         if keep_local_status:
             # The user changed the status here and Airtable has not (or cannot) hold it
-            # ("Done" push rejected, or "Backlogged", which Airtable has no option for).
+            # (a push that was rejected or failed).
             # Taking Airtable's value would silently revert their change.
             from .write_back import airtable_status_for
-            if airtable_status_for(existing.status) == _str(f.get("Status", "")) and existing.status != "Backlogged":
+            if airtable_status_for(existing.status) == _str(f.get("Status", "")):
                 keep_local_status = False  # Airtable caught up
                 defaults["status_locally_modified"] = False
             else:
                 defaults.pop("status")
+        # Stamp status_changed_at only when the pulled status really differs (or the row is new).
+        if "status" in defaults and (existing is None or existing.status != defaults["status"]):
+            defaults["status_changed_at"] = django_tz.now()
         air_item, _ = AirtableActionItem.objects.update_or_create(
             airtable_id=record["id"],
             defaults=defaults,
         )
-        if keep_local_status and air_item.status != "Backlogged":
+        if keep_local_status:
             from .write_back import push_action_item_status
             if push_action_item_status(air_item):
                 AirtableActionItem.objects.filter(pk=air_item.pk).update(status_locally_modified=False)

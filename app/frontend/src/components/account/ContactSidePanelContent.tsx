@@ -74,7 +74,7 @@ export function ContactSidePanelContent({
             value={form.name}
             onChange={(e) => setField("name", e.target.value)}
             className="w-full text-sm font-semibold border-b border-transparent hover:border-gray-200 focus:border-indigo-300 focus:outline-none bg-transparent"
-            style={{ color: "var(--twilio-navy)" }}
+            style={{ color: "var(--text-ink)" }}
           />
           <input
             value={form.role}
@@ -95,7 +95,7 @@ export function ContactSidePanelContent({
           onChange={(e) => setField("email", e.target.value)}
           placeholder="email@company.com"
           className="flex-1 text-xs border-b border-transparent hover:border-gray-200 focus:border-indigo-300 focus:outline-none bg-transparent"
-          style={{ color: "var(--twilio-navy)" }}
+          style={{ color: "var(--text-ink)" }}
         />
       </div>
 
@@ -108,7 +108,7 @@ export function ContactSidePanelContent({
           rows={3}
           placeholder="Context, background…"
           className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-xs placeholder:text-gray-400 focus:bg-white focus:border-indigo-400 focus:outline-none resize-none"
-          style={{ color: "var(--twilio-navy)" }}
+          style={{ color: "var(--text-ink)" }}
         />
       </div>
 
@@ -137,7 +137,7 @@ export function ContactSidePanelContent({
             onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void handleAddNote(); } }}
             placeholder="Add a note…"
             className="flex-1 rounded-lg border border-gray-200 bg-gray-50 px-3 py-1.5 text-xs placeholder:text-gray-400 focus:bg-white focus:border-indigo-300 focus:outline-none"
-            style={{ color: "var(--twilio-navy)" }}
+            style={{ color: "var(--text-ink)" }}
           />
           {noteDraft.trim() && (
             <button onClick={() => void handleAddNote()}

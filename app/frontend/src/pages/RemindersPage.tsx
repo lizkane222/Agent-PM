@@ -1,7 +1,11 @@
 import { useRef, useState } from "react";
 import ScheduleIcon from "../assets/icons/Schedule.svg?react";
 import { useNotificationDefaults } from "../context/NotificationDefaultsContext";
-import type { ReminderResourceType } from "../types";
+import ReminderLinksField from "../components/shared/ReminderLinksField";
+import ReminderRecipientsPicker from "../components/calendar/ReminderRecipientsPicker";
+import ReminderChannelsField from "../components/shared/ReminderChannelsField";
+import { buildReminderPayload, channelsOf, reminderSaveError } from "../lib/reminderDraft";
+import type { ReminderLink } from "../types";
 import { useExport, type ExportItem } from "../context/ExportContext";
 import { useRightClickComment } from "../components/comments/CommentContext";
 import CommentTrigger from "../components/comments/CommentTrigger";
@@ -10,21 +14,8 @@ import { addLog } from "../lib/appLog";
 import ActivityLogSection from "../components/ActivityLogSection";
 import { useReminders } from "../hooks/useReminders";
 import type { Reminder } from "../types/scheduler";
-
-const CHANNEL_LABELS: { key: keyof Pick<Reminder, "notify_in_app" | "notify_slack" | "notify_push" | "notify_sms">; label: string }[] = [
-  { key: "notify_in_app", label: "In-App" },
-  { key: "notify_slack", label: "Slack" },
-  { key: "notify_push", label: "Laptop" },
-  { key: "notify_sms", label: "Phone" },
-];
-
-const RESOURCE_TYPES: { value: ReminderResourceType; label: string }[] = [
-  { value: "general", label: "General" },
-  { value: "account", label: "Account" },
-  { value: "calendar_event", label: "Calendar Event" },
-  { value: "action_item", label: "Action Item" },
-  { value: "task", label: "Task" },
-];
+import { toLocalDatetimeValue } from "../lib/datetimeLocal";
+import PinnedSkillsSection from "../components/skills/PinnedSkillsSection";
 
 function statusColor(status: Reminder["status"]): string {
   if (status === "dismissed") return "rgba(0,0,0,0.25)";
@@ -48,9 +39,7 @@ function formatDue(iso: string): string {
 const BLANK: Omit<Partial<Reminder>, "id" | "created_by" | "created_by_username" | "created_at" | "updated_at"> = {
   title: "",
   body: "",
-  resource_type: "general",
-  resource_id: null,
-  resource_label: "",
+  links: [],
   due_at: "",
   notify_in_app: true,
   notify_slack: false,
@@ -58,26 +47,20 @@ const BLANK: Omit<Partial<Reminder>, "id" | "created_by" | "created_by_username"
   notify_sms: false,
 };
 
-function toLocalDatetimeValue(iso: string): string {
-  if (!iso) return "";
-  const d = new Date(iso);
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
-}
-
-function fromLocalDatetimeValue(val: string): string {
-  if (!val) return "";
-  return new Date(val).toISOString();
-}
-
 type FilterTab = "pending" | "all" | "dismissed";
 
 export default function RemindersPage() {
-  const [tab, setTab] = useState<FilterTab>("pending");
+  const [tab, setTab] = useState<FilterTab>("all");
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ ...BLANK });
   const [saving, setSaving] = useState(false);
   const [editId, setEditId] = useState<number | null>(null);
+  // Teammates to notify as well as me. Notifying anyone new takes an explicit yes (below).
+  const [recipients, setRecipients] = useState<number[]>([]);
+  const [recipientNames, setRecipientNames] = useState<string[]>([]);
+  const [originalRecipients, setOriginalRecipients] = useState<number[]>([]);
+  const [confirmingNotify, setConfirmingNotify] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [voiceText, setVoiceText] = useState("");
   const titleRef = useRef<HTMLInputElement>(null);
   const { exportMode, toggleItem, isSelected } = useExport();
@@ -99,18 +82,26 @@ export default function RemindersPage() {
       notify_push: notifDefaults.notify_default_push,
       notify_sms: notifDefaults.notify_default_sms,
     });
+    setRecipients([]); setRecipientNames([]); setOriginalRecipients([]);
+    setConfirmingNotify(false); setSaveError(null);
     setShowForm(true);
     setTimeout(() => titleRef.current?.focus(), 50);
   }
 
   function openEdit(r: Reminder) {
     setEditId(r.id);
+    setRecipients(r.recipients ?? []);
+    setRecipientNames((r.recipient_details ?? []).map((d) => d.name));
+    setOriginalRecipients(r.recipients ?? []);
+    setConfirmingNotify(false); setSaveError(null);
     setForm({
       title: r.title,
       body: r.body,
-      resource_type: r.resource_type,
-      resource_id: r.resource_id,
-      resource_label: r.resource_label,
+      // Rows from before multiple links have only the single link; show it as one.
+      links: r.links?.length ? r.links
+        : r.resource_type !== "general" && r.resource_id
+          ? [{ resource_type: r.resource_type as ReminderLink["resource_type"], resource_id: r.resource_id, resource_label: r.resource_label }]
+          : [],
       due_at: toLocalDatetimeValue(r.due_at),
       notify_in_app: r.notify_in_app,
       notify_slack: r.notify_slack,
@@ -121,10 +112,25 @@ export default function RemindersPage() {
     setTimeout(() => titleRef.current?.focus(), 50);
   }
 
-  async function save() {
+  async function save(confirmed = false) {
     if (!form.title?.trim() || !form.due_at) return;
+    const added = recipients.filter((id) => !originalRecipients.includes(id));
+    if (added.length > 0 && !confirmed) {
+      setConfirmingNotify(true); // nobody is notified until the user says yes
+      return;
+    }
     setSaving(true);
-    const payload = { ...form, due_at: fromLocalDatetimeValue(form.due_at as string) };
+    setSaveError(null);
+    // The same request every reminder form sends (lib/reminderDraft): fields, channels, and the
+    // approval flag only when somebody new is being added.
+    const payload = buildReminderPayload({
+      title: String(form.title ?? ""),
+      body: String(form.body ?? ""),
+      dueLocal: String(form.due_at ?? ""),
+      links: (form.links ?? []) as ReminderLink[],
+      channels: channelsOf(form as Pick<Reminder, "notify_in_app" | "notify_push" | "notify_sms" | "notify_slack">),
+      recipients,
+    }, originalRecipients);
     try {
       if (editId !== null) {
         await updateReminder(editId, payload);
@@ -143,6 +149,9 @@ export default function RemindersPage() {
       }
       setShowForm(false);
       setEditId(null);
+    } catch (err) {
+      setConfirmingNotify(false);
+      setSaveError(reminderSaveError(err));
     } finally {
       setSaving(false);
     }
@@ -212,7 +221,8 @@ export default function RemindersPage() {
       : reminders.filter(r => r.status === "dismissed");
 
   return (
-    <div style={{ maxWidth: 800, margin: "0 auto", padding: "32px 24px" }}>
+    <div style={{ display: "flex", justifyContent: "center", alignItems: "flex-start", gap: 24, padding: "32px 24px" }}>
+    <div style={{ flex: "1 1 800px", maxWidth: 800, minWidth: 0 }}>
       {/* Header */}
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 24 }}>
         <div>
@@ -352,42 +362,44 @@ export default function RemindersPage() {
                   style={inputStyle}
                 />
               </div>
-              <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 4 }}>
-                <label style={labelStyle}>Link to resource</label>
-                <select
-                  value={form.resource_type as string}
-                  onChange={e => setForm(f => ({ ...f, resource_type: e.target.value as ReminderResourceType }))}
-                  style={inputStyle}
-                >
-                  {RESOURCE_TYPES.map(rt => (
-                    <option key={rt.value} value={rt.value}>{rt.label}</option>
-                  ))}
-                </select>
-              </div>
             </div>
-            {form.resource_type !== "general" && (
-              <input
-                value={form.resource_label as string}
-                onChange={e => setForm(f => ({ ...f, resource_label: e.target.value }))}
-                placeholder="Resource name (e.g. account or meeting name)"
-                style={inputStyle}
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              <label style={labelStyle}>Link to resource</label>
+              <ReminderLinksField
+                value={(form.links ?? []) as ReminderLink[]}
+                onChange={(links) => setForm((f) => ({ ...f, links }))}
               />
-            )}
-            <div>
-              <label style={{ ...labelStyle, display: "block", marginBottom: 8 }}>Notify via</label>
-              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                {CHANNEL_LABELS.map(ch => (
-                  <label key={ch.key} style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: "0.875rem" }}>
-                    <input
-                      type="checkbox"
-                      checked={form[ch.key] as boolean}
-                      onChange={e => setForm(f => ({ ...f, [ch.key]: e.target.checked }))}
-                    />
-                    {ch.label}
-                  </label>
-                ))}
-              </div>
             </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              <label style={labelStyle}>Also notify</label>
+              <ReminderRecipientsPicker
+                links={(form.links ?? []) as ReminderLink[]}
+                selected={recipients}
+                accent="#d1d5db"
+                onChange={(ids, names) => { setRecipients(ids); setRecipientNames(names); setConfirmingNotify(false); }}
+              />
+            </div>
+            <ReminderChannelsField
+              value={channelsOf(form as Pick<Reminder, "notify_in_app" | "notify_push" | "notify_sms" | "notify_slack">)}
+              onChange={(c) => setForm((f) => ({ ...f, ...c }))}
+            />
+            {saveError && <p role="alert" style={{ color: "#dc2626", fontSize: "0.8125rem", margin: 0 }}>{saveError}</p>}
+            {confirmingNotify && (
+              <div role="alertdialog" aria-label="Confirm notifying other users"
+                   style={{ border: "1px solid #fcd34d", background: "var(--tint-amber-50)", borderRadius: 6, padding: "8px 10px", display: "flex", flexDirection: "column", gap: 6 }}>
+                <strong style={{ fontSize: "0.8125rem" }}>Are you sure you want to notify these users?</strong>
+                <span style={{ fontSize: "0.8125rem" }}>
+                  {recipientNames.join(", ")} will be notified when this reminder is due, in addition to you.
+                </span>
+                <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                  <button type="button" className="card-btn" onClick={() => setConfirmingNotify(false)} style={{ ...ghostBtn }}>Go back</button>
+                  <button
+                    type="button" className="card-btn" disabled={saving} onClick={() => void save(true)}
+                    style={{ padding: "5px 12px", background: "var(--twilio-red, #e22)", color: "#fff", border: "none", borderRadius: 6, fontWeight: 600, fontSize: "0.8125rem", cursor: "pointer" }}
+                  >Yes, notify them</button>
+                </div>
+              </div>
+            )}
             <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 4 }}>
               <button
                 className="card-btn"
@@ -398,8 +410,8 @@ export default function RemindersPage() {
               </button>
               <button
                 className="card-btn"
-                onClick={save}
-                disabled={saving || !form.title?.toString().trim() || !form.due_at}
+                onClick={() => void save()}
+                disabled={saving || confirmingNotify || !form.title?.toString().trim() || !form.due_at}
                 style={{
                   padding: "7px 18px", background: "var(--twilio-red, #e22)", color: "#fff",
                   border: "none", borderRadius: 6, fontWeight: 600, fontSize: "0.875rem",
@@ -438,6 +450,11 @@ export default function RemindersPage() {
         </div>
       )}
     </div>
+    {/* Pinned Claude skills: a vertical list to the right of the page's column */}
+    <aside data-testid="reminders-skills-column" style={{ width: 260, flexShrink: 0, position: "sticky", top: 32 }}>
+      <PinnedSkillsSection page="reminders" variant="column" />
+    </aside>
+    </div>
   );
 }
 
@@ -469,7 +486,7 @@ function ReminderRow({
                 type: "reminder",
                 label: r.title,
                 summary: `${r.status} · Due: ${r.due_at}`,
-                content: `Reminder: ${r.title}\nStatus: ${r.status}\nDue: ${r.due_at}\nBody: ${r.body ?? ""}\nLinked to: ${r.resource_label ?? "N/A"}`,
+                content: `Reminder: ${r.title}\nStatus: ${r.status}\nDue: ${r.due_at}\nBody: ${r.body ?? ""}\nLinked to: ${r.links?.length ? r.links.map((l) => l.resource_label).join(", ") : (r.resource_label || "N/A")}`,
               }) : undefined}
               onContextMenu={onContextMenu}
               style={{
@@ -498,9 +515,9 @@ function ReminderRow({
                     <span style={{ fontSize: "0.75rem", color: "var(--text-secondary, #888)" }}>
                       🕐 {formatDue(r.due_at)}
                     </span>
-                    {r.resource_label && (
+                    {(r.links?.length ? r.links.map((l) => l.resource_label) : r.resource_label ? [r.resource_label] : []).length > 0 && (
                       <span style={{ fontSize: "0.75rem", color: "var(--text-secondary, #888)" }}>
-                        🔗 {r.resource_label}
+                        🔗 {(r.links?.length ? r.links.map((l) => l.resource_label) : [r.resource_label]).join(" · ")}
                       </span>
                     )}
                     <span style={{ fontSize: "0.75rem", color: "var(--text-secondary, #888)" }}>

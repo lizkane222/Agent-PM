@@ -6,6 +6,7 @@
  *           · notification · repeat
  */
 
+import { useStatusLabels } from "../../hooks/useStatusLabels";
 import { useEffect, useRef, useState } from "react";
 import type { MutableRefObject } from "react";
 import { airtableApi, accountsApi, teamApi } from "../../lib/api";
@@ -89,6 +90,7 @@ function fromDatetimeLocal(val: string): string {
 // ── Component ────────────────────────────────────────────────────────────────
 
 export default function CreateEventModal({ draft, onChange, onSave, onCancel, saving, zoomConnected, allAccountsRef, categoryColors = DEFAULT_CATEGORY_COLORS }: Props) {
+  const { label: statusLabel } = useStatusLabels();
   const titleRef = useRef<HTMLInputElement>(null);
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
@@ -688,7 +690,7 @@ export default function CreateEventModal({ draft, onChange, onSave, onCancel, sa
                           <span className={[
                             "text-[10px] px-1.5 rounded-full shrink-0",
                             item.status === "In Progress" ? "bg-blue-100 text-blue-700" : "bg-gray-100 text-gray-500",
-                          ].join(" ")}>{item.status}</span>
+                          ].join(" ")}>{statusLabel(item.status)}</span>
                         </label>
                       </li>
                     ))}

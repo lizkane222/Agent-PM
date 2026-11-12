@@ -581,7 +581,7 @@ class SyncMeetingNotesTests(TestCase):
         """Run the scan with a deterministic summariser so assertions are on matching."""
         with patch(
             "integrations.meeting_notes.summarize_email",
-            side_effect=lambda body, name, source: f"Recap\n- {source} summary",
+            side_effect=lambda body, name, source, **kw: f"Recap\n- {source} summary",
         ):
             return meeting_notes.sync_meeting_notes_from_email(
                 self.user, gmail=FakeGmail(messages), **kwargs
@@ -789,7 +789,7 @@ class SyncMeetingNotesTests(TestCase):
     def test_closest_email_wins_when_a_provider_sent_two(self):
         with patch(
             "integrations.meeting_notes.summarize_email",
-            side_effect=lambda body, name, source: body,
+            side_effect=lambda body, name, source, **kw: body,
         ):
             meeting_notes.sync_meeting_notes_from_email(self.user, gmail=FakeGmail([
                 gmail_message("m1", "Gong Call Recap: Acme Q3 Planning", GONG_FROM,
@@ -807,7 +807,7 @@ class SyncMeetingNotesTests(TestCase):
     def test_recording_url_is_captured_when_blank(self):
         with patch(
             "integrations.meeting_notes.summarize_email",
-            side_effect=lambda body, name, source: "Recap\n- x",
+            side_effect=lambda body, name, source, **kw: "Recap\n- x",
         ):
             meeting_notes.sync_meeting_notes_from_email(self.user, gmail=FakeGmail([
                 gmail_message(
@@ -949,7 +949,7 @@ class UnlinkedCalendarEventTests(TestCase):
     def _sync(self, messages, **kwargs):
         with patch(
             "integrations.meeting_notes.summarize_email",
-            side_effect=lambda body, name, source: f"Recap\n- {source} summary",
+            side_effect=lambda body, name, source, **kw: f"Recap\n- {source} summary",
         ):
             return meeting_notes.sync_meeting_notes_from_email(
                 self.user, gmail=FakeGmail(messages), **kwargs
@@ -1124,7 +1124,7 @@ class MeetingNotesNotificationTests(TestCase):
     def _run(self):
         with patch(
             "integrations.meeting_notes.summarize_email",
-            side_effect=lambda body, name, source: f"Recap\n- {source} summary",
+            side_effect=lambda body, name, source, **kw: f"Recap\n- {source} summary",
         ):
             report = meeting_notes.sync_meeting_notes_from_email(
                 self.user, days=meeting_notes.AUTO_LOOKBACK_DAYS,

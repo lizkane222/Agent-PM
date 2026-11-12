@@ -2,9 +2,15 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { truncateWords } from "../../lib/truncateWords";
 import type { AccountTeamMember, AirtableActionItem, AirtableMeeting, GoalResource, GoalSection, ProjectMember, SalesforceProjectData } from "../../types";
 import { accountsApi } from "../../lib/api";
+import { readNoteDragData, linkNoteToGoal, noteRefKey } from "../../lib/noteLinks";
+import type { NoteRef } from "../../types/accounts";
 import { summarizeSyncReport, type CloudCoachPushResult, type CloudCoachSyncReport } from "../../lib/cloudCoachPush";
 import { ArtifactIconImg, CATALOG_BY_KEY, getAutoIconKey } from "./ArtifactIcon";
 import { ActionItemCard } from "./ActionItemCard";
+import { useColumnSort, sortByMoved } from "../../hooks/useStatusArrivalOrder";
+import ColumnSortButton from "./ColumnSortButton";
+import { useStatusLabels } from "../../hooks/useStatusLabels";
+import type { StatusLabelPrefs } from "../../lib/statusLabels";
 
 function uid() { return Math.random().toString(36).slice(2, 9); }
 
@@ -243,6 +249,21 @@ const CLUSTER_VIEW_TABS: { key: ClusterView; label: string }[] = [
   { key: "blocked", label: "Blocked/Backlogged" },
 ];
 
+/**
+ * Tab text under the user's status-name preferences. A tab only follows a preference the
+ * user actually set, so default prefs keep today's text ("Pending", "Closed", ...).
+ */
+function clusterTabLabel(key: ClusterView, base: string, prefs: StatusLabelPrefs): string {
+  switch (key) {
+    case "open": return prefs.Open ?? base;
+    case "pending": return prefs["In Progress"] ?? base;
+    case "closed": return prefs.Done ?? base;
+    case "blocked":
+      return prefs.Blocked || prefs.Backlogged ? `${prefs.Blocked ?? "Blocked"}/${prefs.Backlogged ?? "Backlogged"}` : base;
+    default: return base;
+  }
+}
+
 // Open → Open, In Progress → Pending, Done → Closed, Blocked/Backlogged → their own
 // bucket (they don't read as "pending" or "closed"). Any other/unknown status has no
 // bucket, so it simply doesn't appear in a status tab — still visible in the tree view.
@@ -256,6 +277,13 @@ function statusBucket(status: string): ClusterView | null {
     default: return null;
   }
 }
+
+type StatusTab = "open" | "pending" | "closed" | "blocked";
+// The status whose shared sort direction each status tab follows. "Blocked/Backlogged" is one
+// merged tab, so it follows Blocked's direction.
+const BUCKET_SORT_STATUS: Record<StatusTab, string> = {
+  open: "Open", pending: "In Progress", closed: "Done", blocked: "Blocked",
+};
 
 type ClusterActionEntry = { kind: "action"; ownerId: string; ownerName: string; item: AirtableActionItem };
 type ClusterResourceEntry = { kind: "resource"; ownerId: string; ownerName: string; resource: GoalResource };
@@ -414,9 +442,9 @@ function ProjectDetailsModal({
       border: "1px solid rgba(0,0,0,0.1)",
       borderRadius: 5,
       padding: "3px 8px",
-      color: "var(--twilio-navy)",
+      color: "var(--text-ink)",
       outline: "none",
-      background: "#fafafa",
+      background: "var(--surface-subtle-3)",
       width: "100%",
       boxSizing: "border-box",
     };
@@ -466,7 +494,7 @@ function ProjectDetailsModal({
       case "currency":
         return (
           <div style={{ display: "flex", alignItems: "center", gap: 0 }}>
-            <span style={{ fontSize: "0.8125rem", color: "#6b7280", padding: "3px 6px 3px 8px", background: "#f3f4f6", border: "1px solid rgba(0,0,0,0.1)", borderRight: "none", borderRadius: "5px 0 0 5px", lineHeight: "1.6", flexShrink: 0 }}>$</span>
+            <span style={{ fontSize: "0.8125rem", color: "var(--text-gray-500)", padding: "3px 6px 3px 8px", background: "var(--surface-subtle-2)", border: "1px solid rgba(0,0,0,0.1)", borderRight: "none", borderRadius: "5px 0 0 5px", lineHeight: "1.6", flexShrink: 0 }}>$</span>
             <input
               type="number"
               value={val}
@@ -486,7 +514,7 @@ function ProjectDetailsModal({
               onChange={(e) => set(e.target.value)}
               style={{ ...inputStyle, borderRadius: "5px 0 0 5px" }}
             />
-            <span style={{ fontSize: "0.8125rem", color: "#6b7280", padding: "3px 8px 3px 6px", background: "#f3f4f6", border: "1px solid rgba(0,0,0,0.1)", borderLeft: "none", borderRadius: "0 5px 5px 0", lineHeight: "1.6", flexShrink: 0 }}>%</span>
+            <span style={{ fontSize: "0.8125rem", color: "var(--text-gray-500)", padding: "3px 8px 3px 6px", background: "var(--surface-subtle-2)", border: "1px solid rgba(0,0,0,0.1)", borderLeft: "none", borderRadius: "0 5px 5px 0", lineHeight: "1.6", flexShrink: 0 }}>%</span>
           </div>
         );
       case "url":
@@ -544,7 +572,7 @@ function ProjectDetailsModal({
           background: highlighted ? "rgba(99,102,241,0.03)" : "transparent",
         }}
       >
-        <label style={{ fontSize: "0.6875rem", color: "#6b7280", fontWeight: 500, paddingTop: isTopAligned ? 3 : 0, cursor: isCheckbox ? "pointer" : undefined }}>
+        <label style={{ fontSize: "0.6875rem", color: "var(--text-gray-500)", fontWeight: 500, paddingTop: isTopAligned ? 3 : 0, cursor: isCheckbox ? "pointer" : undefined }}>
           {f.label}
         </label>
         {renderFieldInput(f)}
@@ -558,23 +586,23 @@ function ProjectDetailsModal({
       style={{ position: "fixed", inset: 0, zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.35)" }}
       onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
     >
-      <div style={{ background: "#fff", borderRadius: 12, width: "min(700px,94vw)", maxHeight: "90vh", display: "flex", flexDirection: "column", boxShadow: "0 20px 60px rgba(0,0,0,0.18)" }}>
+      <div style={{ background: "var(--surface-card)", borderRadius: 12, width: "min(700px,94vw)", maxHeight: "90vh", display: "flex", flexDirection: "column", boxShadow: "0 20px 60px rgba(0,0,0,0.18)" }}>
         {/* Modal header */}
         <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "14px 16px 10px", borderBottom: "1px solid rgba(0,0,0,0.07)", flexShrink: 0 }}>
           <div style={{ flex: 1, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
             <div style={{ display: "flex", flexDirection: "column", gap: 4, flex: "1 1 200px", minWidth: 0 }}>
-              <label style={{ fontSize: "0.625rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em", color: "#6b7280" }}>
+              <label style={{ fontSize: "0.625rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em", color: "var(--text-gray-500)" }}>
                 Project Name <span style={{ color: "#e22" }}>*</span>
               </label>
               <input
                 autoFocus
                 value={name}
                 onChange={(e) => setName(e.target.value)}
-                style={{ fontSize: "0.9375rem", fontWeight: 700, color: "var(--twilio-navy)", border: "none", borderBottom: "2px solid var(--twilio-red,#e22)", outline: "none", background: "transparent", padding: "2px 0" }}
+                style={{ fontSize: "0.9375rem", fontWeight: 700, color: "var(--text-ink)", border: "none", borderBottom: "2px solid var(--twilio-red,#e22)", outline: "none", background: "transparent", padding: "2px 0" }}
               />
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: 4, flex: "1 1 160px", minWidth: 0 }}>
-              <label style={{ fontSize: "0.625rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em", color: "#6b7280" }}>
+              <label style={{ fontSize: "0.625rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em", color: "var(--text-gray-500)" }}>
                 Project URL <span style={{ color: "#e22" }}>*</span>
               </label>
               <input
@@ -582,24 +610,24 @@ function ProjectDetailsModal({
                 value={url}
                 onChange={(e) => setUrl(e.target.value)}
                 placeholder="https://…"
-                style={{ fontSize: "0.8125rem", color: "var(--twilio-navy)", border: "none", borderBottom: "2px solid #c7d2fe", outline: "none", background: "transparent", padding: "2px 0" }}
+                style={{ fontSize: "0.8125rem", color: "var(--text-ink)", border: "none", borderBottom: "2px solid #c7d2fe", outline: "none", background: "transparent", padding: "2px 0" }}
               />
             </div>
           </div>
-          <button onClick={onClose} style={{ fontSize: 18, color: "#9ca3af", background: "none", border: "none", cursor: "pointer", padding: "0 4px", lineHeight: 1 }}>✕</button>
+          <button onClick={onClose} style={{ fontSize: 18, color: "var(--text-gray-400)", background: "none", border: "none", cursor: "pointer", padding: "0 4px", lineHeight: 1 }}>✕</button>
         </div>
 
         {/* Salesforce fetch row */}
         <div style={{ display: "flex", alignItems: "flex-end", gap: 8, padding: "0 16px 10px", flexShrink: 0 }}>
           <div style={{ display: "flex", flexDirection: "column", gap: 4, flex: "1 1 200px", minWidth: 0 }}>
-            <label style={{ fontSize: "0.625rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em", color: "#6b7280" }}>
+            <label style={{ fontSize: "0.625rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em", color: "var(--text-gray-500)" }}>
               Salesforce Project ID
             </label>
             <input
               value={sfProjectId}
               onChange={(e) => setSfProjectId(e.target.value)}
               placeholder="a0B…"
-              style={{ fontSize: "0.8125rem", color: "var(--twilio-navy)", border: "1px solid rgba(0,0,0,0.1)", borderRadius: 5, outline: "none", background: "#fafafa", padding: "4px 8px" }}
+              style={{ fontSize: "0.8125rem", color: "var(--text-ink)", border: "1px solid rgba(0,0,0,0.1)", borderRadius: 5, outline: "none", background: "var(--surface-subtle-3)", padding: "4px 8px" }}
             />
           </div>
           <button
@@ -622,7 +650,7 @@ function ProjectDetailsModal({
           </div>
         )}
         {sfFieldsSkipped && sfFieldsSkipped.length > 0 && (
-          <div style={{ padding: "0 16px 8px", fontSize: "0.75rem", color: "#9ca3af", flexShrink: 0 }}>
+          <div style={{ padding: "0 16px 8px", fontSize: "0.75rem", color: "var(--text-gray-400)", flexShrink: 0 }}>
             {sfFieldsSkipped.length} field{sfFieldsSkipped.length === 1 ? "" : "s"} not found on the connected org and left as-is.
           </div>
         )}
@@ -633,31 +661,31 @@ function ProjectDetailsModal({
             onClick={() => toggleSection("__members__")}
             style={{ width: "100%", display: "flex", alignItems: "center", gap: 8, padding: "7px 12px", background: "#f8f8fb", border: "none", cursor: "pointer", borderRadius: 7 }}
           >
-            <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" style={{ width: 10, height: 10, color: "#9ca3af", flexShrink: 0, transition: "transform 0.15s", transform: expandedSections.has("__members__") ? "rotate(90deg)" : "rotate(0deg)" }}>
+            <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" style={{ width: 10, height: 10, color: "var(--text-gray-400)", flexShrink: 0, transition: "transform 0.15s", transform: expandedSections.has("__members__") ? "rotate(90deg)" : "rotate(0deg)" }}>
               <path d="M4 2l4 4-4 4"/>
             </svg>
-            <span style={{ fontSize: "0.6875rem", fontWeight: 600, color: "var(--twilio-navy)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+            <span style={{ fontSize: "0.6875rem", fontWeight: 600, color: "var(--text-ink)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
               Team Members {members.length > 0 ? `(${members.length})` : ""}
             </span>
           </button>
           {expandedSections.has("__members__") && (
             <div style={{ padding: "8px 12px 4px", display: "flex", flexDirection: "column", gap: 6 }}>
               {!isSaved ? (
-                <p style={{ fontSize: "0.75rem", color: "#9ca3af" }}>Save the project first to add team members.</p>
+                <p style={{ fontSize: "0.75rem", color: "var(--text-gray-400)" }}>Save the project first to add team members.</p>
               ) : (
                 <>
                   {members.map((m) => (
                     <div key={m.id} className="group" style={{ display: "flex", alignItems: "center", gap: 8, fontSize: "0.8125rem" }}>
-                      <span style={{ width: 20, height: 20, borderRadius: "50%", background: "#ede9fe", color: "#6366f1", fontSize: "0.625rem", fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                      <span style={{ width: 20, height: 20, borderRadius: "50%", background: "var(--tint-violet-100)", color: "#6366f1", fontSize: "0.625rem", fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
                         {m.team_member_name.slice(0, 1).toUpperCase()}
                       </span>
-                      <span style={{ color: "var(--twilio-navy)", flex: 1 }}>{m.team_member_name}{m.role ? ` — ${m.role}` : ""}</span>
+                      <span style={{ color: "var(--text-ink)", flex: 1 }}>{m.team_member_name}{m.role ? ` — ${m.role}` : ""}</span>
                       {onRemoveMember && (
-                        <button onClick={() => onRemoveMember(m.id)} style={{ color: "#9ca3af", background: "none", border: "none", cursor: "pointer", fontSize: 12 }}>✕</button>
+                        <button onClick={() => onRemoveMember(m.id)} style={{ color: "var(--text-gray-400)", background: "none", border: "none", cursor: "pointer", fontSize: 12 }}>✕</button>
                       )}
                     </div>
                   ))}
-                  {members.length === 0 && <p style={{ fontSize: "0.75rem", color: "#9ca3af" }}>No team members yet.</p>}
+                  {members.length === 0 && <p style={{ fontSize: "0.75rem", color: "var(--text-gray-400)" }}>No team members yet.</p>}
                   {addingMember ? (
                     <select
                       autoFocus
@@ -701,7 +729,7 @@ function ProjectDetailsModal({
                             : "Sync members to Cloud Coach"}
                       </button>
                       {memberSyncMessage && (
-                        <span data-testid="sync-members-message" style={{ fontSize: "0.6875rem", color: "#6b7280" }}>
+                        <span data-testid="sync-members-message" style={{ fontSize: "0.6875rem", color: "var(--text-gray-500)" }}>
                           {memberSyncMessage}
                         </span>
                       )}
@@ -724,10 +752,10 @@ function ProjectDetailsModal({
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder="Search fields…"
-              style={{ width: "100%", paddingLeft: 28, paddingRight: 10, paddingTop: 6, paddingBottom: 6, fontSize: "0.8125rem", border: "1px solid rgba(0,0,0,0.1)", borderRadius: 7, outline: "none", boxSizing: "border-box", background: "#f9fafb", color: "var(--twilio-navy)" }}
+              style={{ width: "100%", paddingLeft: 28, paddingRight: 10, paddingTop: 6, paddingBottom: 6, fontSize: "0.8125rem", border: "1px solid rgba(0,0,0,0.1)", borderRadius: 7, outline: "none", boxSizing: "border-box", background: "var(--surface-subtle)", color: "var(--text-ink)" }}
             />
             {search && (
-              <button onClick={() => setSearch("")} style={{ position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", cursor: "pointer", color: "#9ca3af", fontSize: 14, lineHeight: 1 }}>✕</button>
+              <button onClick={() => setSearch("")} style={{ position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", cursor: "pointer", color: "var(--text-gray-400)", fontSize: 14, lineHeight: 1 }}>✕</button>
             )}
           </div>
         </div>
@@ -740,7 +768,7 @@ function ProjectDetailsModal({
             <div style={{ marginBottom: 4 }}>
               <button
                 onClick={() => toggleSection("__populated__")}
-                style={{ width: "100%", display: "flex", alignItems: "center", gap: 8, padding: "7px 12px", background: "#f0fdf4", border: "none", cursor: "pointer", borderRadius: 7, marginBottom: 2 }}
+                style={{ width: "100%", display: "flex", alignItems: "center", gap: 8, padding: "7px 12px", background: "var(--tint-green-50)", border: "none", cursor: "pointer", borderRadius: 7, marginBottom: 2 }}
               >
                 <svg viewBox="0 0 12 12" fill="currentColor" style={{ width: 10, height: 10, color: "#16a34a", transition: "transform 0.15s", transform: expandedSections.has("__populated__") ? "rotate(90deg)" : "rotate(0deg)" }}>
                   <path d="M4 2l4 4-4 4"/>
@@ -770,10 +798,10 @@ function ProjectDetailsModal({
                   onClick={() => toggleSection(section.label)}
                   style={{ width: "100%", display: "flex", alignItems: "center", gap: 8, padding: "7px 12px", background: isOpen ? "#f8f8fb" : "transparent", border: "none", cursor: "pointer", borderRadius: 7, marginBottom: 1 }}
                 >
-                  <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" style={{ width: 10, height: 10, color: "#9ca3af", flexShrink: 0, transition: "transform 0.15s", transform: isOpen ? "rotate(90deg)" : "rotate(0deg)" }}>
+                  <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" style={{ width: 10, height: 10, color: "var(--text-gray-400)", flexShrink: 0, transition: "transform 0.15s", transform: isOpen ? "rotate(90deg)" : "rotate(0deg)" }}>
                     <path d="M4 2l4 4-4 4"/>
                   </svg>
-                  <span style={{ fontSize: "0.6875rem", fontWeight: 600, color: "var(--twilio-navy)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                  <span style={{ fontSize: "0.6875rem", fontWeight: 600, color: "var(--text-ink)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
                     {section.label}
                   </span>
                   {!isOpen && section.fields.some((f) => sfData[f.key]) && (
@@ -794,7 +822,7 @@ function ProjectDetailsModal({
 
         {/* Footer */}
         <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, padding: "10px 16px", borderTop: "1px solid rgba(0,0,0,0.07)", flexShrink: 0 }}>
-          <button onClick={onClose} style={{ fontSize: "0.8125rem", padding: "6px 16px", border: "1px solid rgba(0,0,0,0.1)", borderRadius: 7, cursor: "pointer", background: "transparent", color: "#6b7280" }}>
+          <button onClick={onClose} style={{ fontSize: "0.8125rem", padding: "6px 16px", border: "1px solid rgba(0,0,0,0.1)", borderRadius: 7, cursor: "pointer", background: "transparent", color: "var(--text-gray-500)" }}>
             Cancel
           </button>
           <button
@@ -820,6 +848,7 @@ export function ProjectGoals({
   onSelectAction,
   onSelectMeeting,
   onNoteDropped,
+  onSelectNote,
   accountTeamMembers = [],
   projectMembers = [],
   onAddProjectMember,
@@ -834,6 +863,8 @@ export function ProjectGoals({
   /** Click on a meeting / calendar event listed under a project or goal. */
   onSelectMeeting?: (m: AirtableMeeting) => void;
   onNoteDropped?: (noteText: string, goalId: string) => void;
+  /** Click on a linked note listed under a project or goal. */
+  onSelectNote?: (ref: NoteRef) => void;
   /** The account's own roster — the pool a project's Team Members are picked from. */
   accountTeamMembers?: AccountTeamMember[];
   /** Every ProjectMember for every project on this account (filtered per-card by project id). */
@@ -843,6 +874,8 @@ export function ProjectGoals({
   /** Per-member outcomes of a real (non-dry-run) Cloud Coach member sync, for the toast. */
   onCloudCoachSyncResult?: (results: CloudCoachPushResult[]) => void;
 }) {
+  const { prefs: statusPrefs } = useStatusLabels();
+  const { sortDirection: colSortDirection, toggleSort: toggleColSort } = useColumnSort();
   const [itemDropTarget, setItemDropTarget] = useState<string | null>(null);
   const [goalDropTarget, setGoalDropTarget] = useState<string | null>(null); // project accepting a dragged goal
   const [newGoalDraft, setNewGoalDraft] = useState<GoalSection | null>(null);
@@ -863,6 +896,25 @@ export function ProjectGoals({
 
   const actionMap = Object.fromEntries(actionItems.map((a) => [a.airtable_id, a]));
   const meetingMap = Object.fromEntries(meetings.map((m) => [m.airtable_id, m]));
+  // Recurring meetings repeat under one exact name. They are listed once per name, and a
+  // drop files every same-named meeting together so the calendar (which knows meetings by
+  // id) sees each occurrence as linked.
+  const dedupeByName = (ids: string[]) => {
+    const seen = new Set<string>();
+    return ids.filter((id) => {
+      const m = meetingMap[id];
+      if (!m) return true;
+      const key = m.name ?? "";
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  };
+  const sameNameIds = (id: string) => {
+    const m = meetingMap[id];
+    if (!m) return [id];
+    return meetings.filter((x) => x.name === m.name).map((x) => x.airtable_id);
+  };
 
   const modalGoal = newGoalDraft ?? (modalGoalId ? goals.find((g) => g.id === modalGoalId) ?? null : null);
 
@@ -902,7 +954,11 @@ export function ProjectGoals({
     onChange(goals.map((g) => g.id === goalId ? { ...g, actionIds: g.actionIds.filter((x) => x !== aid) } : g));
   }
   function removeMeeting(goalId: string, mid: string) {
-    onChange(goals.map((g) => g.id === goalId ? { ...g, meetingIds: g.meetingIds.filter((x) => x !== mid) } : g));
+    onChange(goals.map((g) => g.id === goalId ? { ...g, meetingIds: g.meetingIds.filter((x) => !sameNameIds(mid).includes(x)) } : g));
+  }
+  // Unlinks only — the note itself stays in its source section.
+  function removeNoteRef(goalId: string, key: string) {
+    onChange(goals.map((g) => g.id === goalId ? { ...g, noteRefs: (g.noteRefs ?? []).filter((r) => noteRefKey(r) !== key) } : g));
   }
   function removeResource(goalId: string, rid: string) {
     onChange(goals.map((g) => g.id === goalId ? { ...g, resources: g.resources.filter((r) => r.id !== rid) } : g));
@@ -927,8 +983,13 @@ export function ProjectGoals({
     setItemDropTarget(null);
     const actionId = e.dataTransfer.getData("goalActionId");
     const meetingId = e.dataTransfer.getData("goalMeetingId");
+    const meetingGroup = meetingId ? sameNameIds(meetingId) : [];
     const resourceId = e.dataTransfer.getData("goalResourceId");
     const noteText = e.dataTransfer.getData("noteText");
+    // A dragged Account Note / timeline note LINKS (reference only, single parent): the note
+    // itself is never touched, and dropping it on another project/goal moves the link.
+    const linkedNote = readNoteDragData(e);
+    if (linkedNote) { onChange(linkNoteToGoal(goals, targetId, linkedNote)); return; }
     const artifactRaw = e.dataTransfer.getData("artifactDrop");
     if (noteText && onNoteDropped) { onNoteDropped(noteText, targetId); return; }
     if (artifactRaw) {
@@ -958,13 +1019,13 @@ export function ProjectGoals({
       if (g.id === targetId) {
         let next = g;
         if (actionId && !next.actionIds.includes(actionId)) next = { ...next, actionIds: [...next.actionIds, actionId] };
-        if (meetingId && !next.meetingIds.includes(meetingId)) next = { ...next, meetingIds: [...next.meetingIds, meetingId] };
+        if (meetingId) next = { ...next, meetingIds: [...next.meetingIds, ...meetingGroup.filter((x) => !next.meetingIds.includes(x))] };
         if (movedResource && !next.resources.some((r) => r.id === resourceId)) next = { ...next, resources: [...next.resources, movedResource] };
         return next;
       }
       let next = g;
       if (actionId && next.actionIds.includes(actionId)) next = { ...next, actionIds: next.actionIds.filter((x) => x !== actionId) };
-      if (meetingId && next.meetingIds.includes(meetingId)) next = { ...next, meetingIds: next.meetingIds.filter((x) => x !== meetingId) };
+      if (meetingId && next.meetingIds.some((x) => meetingGroup.includes(x))) next = { ...next, meetingIds: next.meetingIds.filter((x) => !meetingGroup.includes(x)) };
       if (resourceId && next.resources.some((r) => r.id === resourceId)) next = { ...next, resources: next.resources.filter((r) => r.id !== resourceId) };
       return next;
     }));
@@ -1001,7 +1062,7 @@ export function ProjectGoals({
           key={aid}
           draggable
           onDragStart={onDragStart}
-          onClick={() => setExpandedActionItemIds((prev) => new Set(prev).add(aid))}
+          onClick={() => (onSelectAction ? onSelectAction(item) : setExpandedActionItemIds((prev) => new Set(prev).add(aid)))}
           className="group flex items-center gap-1.5 bg-white rounded px-2 py-1 border border-gray-200 text-[11px] cursor-pointer hover:bg-gray-50 transition-colors"
         >
           <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" className="w-2.5 h-2.5 shrink-0 text-gray-400"><path d="M4 2l4 4-4 4"/></svg>
@@ -1038,7 +1099,7 @@ export function ProjectGoals({
   // ── Shared goal body renderer (items inside a goal) ────────────────────────
 
   function renderGoalItems(goal: GoalSection) {
-    const hasItems = goal.actionIds.length > 0 || goal.meetingIds.length > 0 || goal.resources.length > 0;
+    const hasItems = goal.actionIds.length > 0 || goal.meetingIds.length > 0 || goal.resources.length > 0 || (goal.noteRefs?.length ?? 0) > 0;
     if (!hasItems && itemDropTarget !== goal.id) return null;
     return (
       <div className="flex flex-col gap-2 pt-1.5">
@@ -1065,7 +1126,7 @@ export function ProjectGoals({
         {goal.meetingIds.length > 0 && (
           <div className="flex flex-col gap-1">
             <p className="text-[9px] font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide">Meetings</p>
-            {goal.meetingIds.map((mid) => {
+            {dedupeByName(goal.meetingIds).map((mid) => {
               const m = meetingMap[mid];
               if (!m) return null;
               return (
@@ -1077,6 +1138,23 @@ export function ProjectGoals({
                 </div>
               );
             })}
+          </div>
+        )}
+        {(goal.noteRefs?.length ?? 0) > 0 && (
+          <div className="flex flex-col gap-1" data-testid="goal-notes">
+            <p className="text-[9px] font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide">Notes</p>
+            {(goal.noteRefs ?? []).map((n) => (
+              <div
+                key={noteRefKey(n)}
+                data-testid="goal-note-row"
+                onClick={() => onSelectNote?.(n)}
+                className={`group flex items-start gap-1.5 bg-white rounded px-2 py-1 border border-gray-200 text-[11px] text-[var(--twilio-navy)] ${onSelectNote ? "cursor-pointer" : ""}`}
+              >
+                <span className="shrink-0 text-[9px] uppercase text-[var(--twilio-gray-60)] mt-0.5">{n.kind === "account_note" ? "Note" : n.kind === "summary" ? "Summary" : "Meeting"}</span>
+                <span className="flex-1 break-words whitespace-normal leading-snug" title={n.label}>{truncateWords(n.label || "Note", 14)}</span>
+                <button aria-label="Unlink note" title="Unlink (the note is not deleted)" onClick={(e) => { e.stopPropagation(); removeNoteRef(goal.id, noteRefKey(n)); }} className="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-red-400 transition-all shrink-0">✕</button>
+              </div>
+            ))}
           </div>
         )}
         {goal.actionIds.length > 0 && (
@@ -1101,8 +1179,8 @@ export function ProjectGoals({
     if (newResourceTarget !== targetId) return null;
     return (
       <div className="flex flex-col gap-1.5 mt-1">
-        <input autoFocus placeholder="Label" value={resourceForm.label} onChange={(e) => setResourceForm((f) => ({ ...f, label: e.target.value }))} className="w-full text-[11px] rounded px-2 py-1 focus:outline-none" style={{ border: "1px solid rgba(0,0,0,0.08)", background: "#fff" }} />
-        <input placeholder="URL (optional)" value={resourceForm.url} onChange={(e) => setResourceForm((f) => ({ ...f, url: e.target.value }))} onKeyDown={(e) => { if (e.key === "Enter") addResource(targetId); }} className="w-full text-[11px] rounded px-2 py-1 focus:outline-none" style={{ border: "1px solid rgba(0,0,0,0.08)", background: "#fff" }} />
+        <input autoFocus placeholder="Label" value={resourceForm.label} onChange={(e) => setResourceForm((f) => ({ ...f, label: e.target.value }))} className="w-full text-[11px] rounded px-2 py-1 focus:outline-none" style={{ border: "1px solid rgba(0,0,0,0.08)", background: "var(--surface-card)" }} />
+        <input placeholder="URL (optional)" value={resourceForm.url} onChange={(e) => setResourceForm((f) => ({ ...f, url: e.target.value }))} onKeyDown={(e) => { if (e.key === "Enter") addResource(targetId); }} className="w-full text-[11px] rounded px-2 py-1 focus:outline-none" style={{ border: "1px solid rgba(0,0,0,0.08)", background: "var(--surface-card)" }} />
         <div className="flex gap-1">
           <button onClick={() => addResource(targetId)} className="flex-1 text-[11px] px-2 py-1 rounded" style={{ background: "var(--twilio-red,#e22)", color: "#fff" }}>Add</button>
           <button onClick={() => setNewResourceTarget(null)} className="text-[11px] px-2 py-1 border border-gray-300 rounded text-[var(--twilio-navy)] hover:bg-gray-50">✕</button>
@@ -1115,7 +1193,7 @@ export function ProjectGoals({
 
   function renderGoalCard(goal: GoalSection) {
     const isItemDrop = itemDropTarget === goal.id;
-    const hasItems = goal.actionIds.length > 0 || goal.meetingIds.length > 0 || goal.resources.length > 0;
+    const hasItems = goal.actionIds.length > 0 || goal.meetingIds.length > 0 || goal.resources.length > 0 || (goal.noteRefs?.length ?? 0) > 0;
     return (
       <div
         key={goal.id}
@@ -1140,11 +1218,11 @@ export function ProjectGoals({
           width: 220, minHeight: 80, cursor: "grab",
           ...(isItemDrop
             ? { border: "1px solid var(--twilio-red,#e22)", background: "rgba(226,34,34,0.04)", boxShadow: "0 4px 12px rgba(0,0,0,0.1)" }
-            : { border: "1px solid rgba(99,102,241,0.3)", background: "#f5f3ff" }),
+            : { border: "1px solid rgba(99,102,241,0.3)", background: "var(--tint-violet-50)" }),
         }}
       >
         {/* Header */}
-        <div className="flex flex-col rounded-t-lg shrink-0" style={{ background: "#ede9fe", padding: "9px 10px 7px", borderBottom: (hasItems || isItemDrop) ? "1px solid rgba(99,102,241,0.15)" : "none" }}>
+        <div className="flex flex-col rounded-t-lg shrink-0" style={{ background: "var(--tint-violet-100)", padding: "9px 10px 7px", borderBottom: (hasItems || isItemDrop) ? "1px solid rgba(99,102,241,0.15)" : "none" }}>
           <div className="flex items-center gap-1.5">
             {/* drag handle */}
             <svg viewBox="0 0 16 16" fill="currentColor" className="w-2.5 h-2.5 shrink-0 text-indigo-300"><title>Drag to assign to a project</title><path d="M4 4a1 1 0 100 2 1 1 0 000-2zm4 0a1 1 0 100 2 1 1 0 000-2zm4 0a1 1 0 100 2 1 1 0 000-2zM4 8a1 1 0 100 2 1 1 0 000-2zm4 0a1 1 0 100 2 1 1 0 000-2zm4 0a1 1 0 100 2 1 1 0 000-2zM4 12a1 1 0 100 2 1 1 0 000-2zm4 0a1 1 0 100 2 1 1 0 000-2zm4 0a1 1 0 100 2 1 1 0 000-2z"/></svg>
@@ -1156,10 +1234,10 @@ export function ProjectGoals({
                 onBlur={() => setEditingGoalId(null)}
                 onKeyDown={(e) => { if (e.key === "Enter" || e.key === "Escape") setEditingGoalId(null); }}
                 className="flex-1 text-xs font-semibold rounded px-1 py-0 focus:outline-none min-w-0"
-                style={{ background: "#fff", border: "1px solid #a5b4fc", color: "var(--text-primary,#111)" }}
+                style={{ background: "var(--surface-card)", border: "1px solid #a5b4fc", color: "var(--text-primary,#111)" }}
               />
             ) : (
-              <button onClick={() => setEditingGoalId(goal.id)} className="flex-1 text-left text-xs font-semibold leading-tight hover:opacity-70 truncate" style={{ color: "#4338ca" }}>
+              <button onClick={() => setEditingGoalId(goal.id)} className="flex-1 text-left text-xs font-semibold leading-tight hover:opacity-70 truncate" style={{ color: "var(--ink-indigo)" }}>
                 {goal.name || <span className="italic opacity-40">Untitled Goal</span>}
               </button>
             )}
@@ -1241,6 +1319,13 @@ export function ProjectGoals({
       entries = all;
     } else {
       entries = all.filter((e) => e.kind === "action" && statusBucket(e.item.status) === view);
+      // Same shared direction + comparator as the kanban columns. Unset = collection order.
+      const dir = colSortDirection(BUCKET_SORT_STATUS[view as StatusTab]);
+      if (dir) {
+        const sorted = sortByMoved((entries as ClusterActionEntry[]).map((e) => e.item), dir);
+        const byId = new Map((entries as ClusterActionEntry[]).map((e) => [e.item, e]));
+        entries = sorted.map((it) => byId.get(it)!);
+      }
     }
     const q = search.trim().toLowerCase();
     if (q) {
@@ -1249,7 +1334,7 @@ export function ProjectGoals({
     return (
       <div className="flex flex-col gap-1.5">
         {entries.length === 0 && (
-          <p className="text-[10px] text-center py-3" style={{ color: "#9ca3af" }}>
+          <p className="text-[10px] text-center py-3" style={{ color: "var(--text-gray-400)" }}>
             {q ? "No matches." : "Nothing here yet."}
           </p>
         )}
@@ -1271,6 +1356,7 @@ export function ProjectGoals({
     // An action item / meeting / artifact belongs to exactly one place. handleItemDrop
     // already enforces that on every move, but this is a display-time backstop against
     // stale data ever rendering the same item under both the project and one of its goals.
+    const claimedNoteKeys = new Set(nestedGoals.flatMap((g) => (g.noteRefs ?? []).map(noteRefKey)));
     const claimedByGoals = {
       actionIds: new Set(nestedGoals.flatMap((g) => g.actionIds)),
       meetingIds: new Set(nestedGoals.flatMap((g) => g.meetingIds)),
@@ -1281,6 +1367,7 @@ export function ProjectGoals({
       actionIds: project.actionIds.filter((id) => !claimedByGoals.actionIds.has(id)),
       meetingIds: project.meetingIds.filter((id) => !claimedByGoals.meetingIds.has(id)),
       resources: project.resources.filter((r) => !claimedByGoals.resourceIds.has(r.id)),
+      noteRefs: (project.noteRefs ?? []).filter((r) => !claimedNoteKeys.has(noteRefKey(r))),
     };
     const clusterView = clusterViewByProject[project.id] ?? "tree";
     const clusterSearch = clusterSearchByProject[project.id] ?? "";
@@ -1347,18 +1434,18 @@ export function ProjectGoals({
                   {members.slice(0, 5).map((m) => (
                     <span
                       key={m.id}
-                      style={{ width: 16, height: 16, borderRadius: "50%", background: "#ede9fe", color: "#6366f1", fontSize: "0.5625rem", fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", border: "1.5px solid var(--surface,#fff)" }}
+                      style={{ width: 16, height: 16, borderRadius: "50%", background: "var(--tint-violet-100)", color: "#6366f1", fontSize: "0.5625rem", fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", border: "1.5px solid var(--surface,#fff)" }}
                     >
                       {m.team_member_name.slice(0, 1).toUpperCase()}
                     </span>
                   ))}
                   {members.length > 5 && (
-                    <span style={{ fontSize: "0.5625rem", color: "#9ca3af", marginLeft: 4 }}>+{members.length - 5}</span>
+                    <span style={{ fontSize: "0.5625rem", color: "var(--text-gray-400)", marginLeft: 4 }}>+{members.length - 5}</span>
                   )}
                 </div>
               )}
             </div>
-            <button onClick={() => setModalGoalId(project.id)} title="Project details" className="shrink-0 hover:opacity-70 transition-opacity" style={{ color: "#9ca3af" }}>
+            <button onClick={() => setModalGoalId(project.id)} title="Project details" className="shrink-0 hover:opacity-70 transition-opacity" style={{ color: "var(--text-gray-400)" }}>
               <svg viewBox="0 0 16 16" fill="currentColor" className="w-3 h-3"><path d="M8 1a7 7 0 100 14A7 7 0 008 1zm0 1a6 6 0 110 12A6 6 0 018 2zm0 4a.75.75 0 100 1.5A.75.75 0 008 6zm-.75 2.25a.75.75 0 011.5 0v3.5a.75.75 0 01-1.5 0v-3.5z"/></svg>
             </button>
             {project.url && (
@@ -1382,16 +1469,24 @@ export function ProjectGoals({
                   ? { background: "#6366f1", color: "#fff" }
                   : { background: "rgba(99,102,241,0.08)", color: "#6366f1" }}
               >
-                {tab.label}
+                {clusterTabLabel(tab.key, tab.label, statusPrefs)}
               </button>
             ))}
+            {clusterView in BUCKET_SORT_STATUS && (
+              <ColumnSortButton
+                status={BUCKET_SORT_STATUS[clusterView as StatusTab]}
+                direction={colSortDirection(BUCKET_SORT_STATUS[clusterView as StatusTab])}
+                onToggle={toggleColSort}
+                className="ml-auto"
+              />
+            )}
           </div>
           <input
             value={clusterSearch}
             onChange={(e) => setClusterSearchByProject((prev) => ({ ...prev, [project.id]: e.target.value }))}
             placeholder="Search this project's goals…"
             className="w-full text-[10px] rounded px-2 py-1 mb-1.5 focus:outline-none"
-            style={{ border: "1px solid rgba(0,0,0,0.08)", background: "#fff" }}
+            style={{ border: "1px solid rgba(0,0,0,0.08)", background: "var(--surface-card)" }}
           />
         </div>
 
@@ -1407,7 +1502,7 @@ export function ProjectGoals({
               <div className="flex flex-row flex-wrap items-start gap-2">
               {nestedGoals.map((goal) => {
                 const isExpanded = expandedGoals.has(goal.id);
-                const itemCount = goal.actionIds.length + goal.meetingIds.length + goal.resources.length;
+                const itemCount = goal.actionIds.length + dedupeByName(goal.meetingIds).length + goal.resources.length + (goal.noteRefs?.length ?? 0);
                 const isGoalItemDrop = itemDropTarget === goal.id;
                 return (
                   <div
@@ -1455,11 +1550,11 @@ export function ProjectGoals({
                           onBlur={() => setEditingGoalId(null)}
                           onKeyDown={(e) => { if (e.key === "Enter" || e.key === "Escape") setEditingGoalId(null); }}
                           className="flex-1 text-[11px] font-semibold rounded px-1 focus:outline-none"
-                          style={{ background: "#fff", border: "1px solid #a5b4fc", color: "#4338ca" }}
+                          style={{ background: "var(--surface-card)", border: "1px solid #a5b4fc", color: "var(--ink-indigo)" }}
                           onClick={(e) => e.stopPropagation()}
                         />
                       ) : (
-                        <button onDoubleClick={() => setEditingGoalId(goal.id)} className="flex-1 text-left text-[11px] font-semibold truncate hover:opacity-70" style={{ color: "#4338ca" }}>
+                        <button onDoubleClick={() => setEditingGoalId(goal.id)} className="flex-1 text-left text-[11px] font-semibold truncate hover:opacity-70" style={{ color: "var(--ink-indigo)" }}>
                           {goal.name || <span className="italic opacity-40">Untitled</span>}
                         </button>
                       )}
@@ -1501,14 +1596,14 @@ export function ProjectGoals({
               Drop to add goal
             </div>
           ) : nestedGoals.length === 0 && !isItemDrop ? (
-            <div className="rounded-md py-2.5 text-center text-[10px]" style={{ border: "1px dashed rgba(99,102,241,0.3)", color: "#9ca3af" }}>
+            <div className="rounded-md py-2.5 text-center text-[10px]" style={{ border: "1px dashed rgba(99,102,241,0.3)", color: "var(--text-gray-400)" }}>
               Drag a goal here
             </div>
           ) : null}
 
           {/* Project-level items (legacy / direct drops) — excludes anything already
               owned by a nested goal, so a moved item never renders in both places. */}
-          {(projectOwnItems.actionIds.length > 0 || projectOwnItems.resources.length > 0 || projectOwnItems.meetingIds.length > 0 || isItemDrop) && (
+          {(projectOwnItems.actionIds.length > 0 || projectOwnItems.resources.length > 0 || projectOwnItems.meetingIds.length > 0 || (projectOwnItems.noteRefs?.length ?? 0) > 0 || isItemDrop) && (
             <div className="mt-2">
               <p className="text-[9px] font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide mb-1">Project Items</p>
               {renderGoalItems(projectOwnItems)}
@@ -1576,7 +1671,7 @@ export function ProjectGoals({
             setEditingGoalId(g.id);
           }}
           className="rounded-lg flex items-center gap-1.5 px-3 py-2 text-xs font-medium transition-colors hover:opacity-80"
-          style={{ color: "#6366f1", border: "1px dashed rgba(99,102,241,0.4)", background: "#f5f3ff" }}
+          style={{ color: "#6366f1", border: "1px dashed rgba(99,102,241,0.4)", background: "var(--tint-violet-50)" }}
         >
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" className="w-3 h-3"><path d="M8 3v10M3 8h10"/></svg>
           New Goal

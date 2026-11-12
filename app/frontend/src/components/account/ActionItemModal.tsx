@@ -1,4 +1,5 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useId, useRef, useState } from "react";
+import { useStatusLabels } from "../../hooks/useStatusLabels";
 import { createPortal } from "react-dom";
 import CorporateIcon from "../../assets/icons/Corporate.svg?react";
 import { airtableApi } from "../../lib/api";
@@ -16,6 +17,25 @@ import ActivityLogSection from "../ActivityLogSection";
 import ActionItemCalendarNotes from "./ActionItemCalendarNotes";
 import { ArtifactIconImg, CATALOG_BY_KEY, getAutoIconKey } from "./ArtifactIcon";
 import ArtifactPicker from "../action-items/ArtifactPicker";
+import RichTextMentionEditor from "../shared/RichTextMentionEditor";
+
+/** A visible field label. `htmlFor` ties it to a control; `id` lets a group be named by it. */
+function FieldLabel({ htmlFor, id, children }: { htmlFor?: string; id?: string; children: React.ReactNode }) {
+  return (
+    <label
+      htmlFor={htmlFor}
+      id={id}
+      className="block text-[11px] font-semibold uppercase tracking-wide text-[var(--twilio-gray-60)] mb-1"
+    >
+      {children}
+    </label>
+  );
+}
+
+const fmtStamp = (iso?: string | null) =>
+  iso
+    ? new Date(iso).toLocaleString(undefined, { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" })
+    : "—";
 
 // ── Pill helpers for new action item form ─────────────────────────────────────
 
@@ -67,7 +87,16 @@ export function ActionItemModal({
   onConverted?: () => void;
   onDeleted?: (id: number) => void;
 }) {
+  const uid = useId();
+  const ids = {
+    task: `${uid}-task`, priority: `${uid}-priority`, status: `${uid}-status`, due: `${uid}-due`,
+    prep: `${uid}-prep`, assignee: `${uid}-assignee`, account: `${uid}-account`, meeting: `${uid}-meeting`,
+    est: `${uid}-est`, spent: `${uid}-spent`, detailsLabel: `${uid}-details`, activityLabel: `${uid}-activity`,
+    created: `${uid}-created`, updated: `${uid}-updated`,
+  };
+  const isLocal = item.airtable_id.startsWith("local-");
   const { status: statusOptions } = useActionItemFieldOptions();
+  const { label: statusLabel } = useStatusLabels();
   const [form, setForm] = useState<Partial<AirtableActionItem>>({ ...item });
   const [saving, setSaving] = useState(false);
   const [converting, setConverting] = useState(false);
@@ -217,13 +246,13 @@ export function ActionItemModal({
   // squeezed the modal into the sidebar's width instead of centring it on the page.
   return createPortal(
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
+      className="fixed inset-0 z-[9000] flex items-center justify-center bg-black/40"
       onClick={onClose}
     >
       <div
         data-testid="action-item-modal-panel"
         className="relative rounded-2xl shadow-2xl flex flex-col overflow-hidden"
-        style={{ background: "#fff", width: "480px", maxWidth: "calc(100vw - 32px)", maxHeight: "calc(100vh - 48px)", borderLeft: `4px solid ${accent}` }}
+        style={{ background: "var(--surface-card)", width: "760px", maxWidth: "calc(100vw - 32px)", maxHeight: "calc(100vh - 48px)", borderLeft: `4px solid ${accent}` }}
         onClick={(e) => e.stopPropagation()}
         // The modal isn't a portal, so a drag/drop over it would otherwise bubble to the
         // kanban board's own drop zones underneath (handleKanbanDrop, handleNoteDropOnActions
@@ -262,158 +291,209 @@ export function ActionItemModal({
         )}
 
         {/* Header */}
-        <div className="flex items-center justify-between px-5 py-4" style={{ borderBottom: "1px solid rgba(0,0,0,0.07)" }}>
-          <textarea
-            autoFocus
-            value={form.task ?? ""}
-            onChange={(e) => set({ task: e.target.value })}
-            placeholder="Task name…"
-            rows={2}
-            className="flex-1 text-sm font-semibold text-[var(--twilio-navy)] bg-transparent border-b border-transparent focus:border-indigo-400 focus:outline-none pb-0.5 mr-3 resize-none leading-snug"
-            style={{ overflow: "hidden", fieldSizing: "content" } as React.CSSProperties}
-          />
+        <div className="flex items-center justify-between px-5 py-3" style={{ borderBottom: "1px solid rgba(0,0,0,0.07)" }}>
+          <h2 className="text-sm font-semibold text-[var(--twilio-navy)]">Action item</h2>
           <div className="flex items-center gap-1.5 shrink-0">
             <CommentTrigger
               resourceType="action_item"
               resourceId={item.id}
               resourceLabel={item.task ?? ""}
-              disabled={item.airtable_id.startsWith("local-")}
+              disabled={isLocal}
             />
-            <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-xl leading-none transition-colors">×</button>
+            <button onClick={onClose} aria-label="Close" className="text-gray-400 hover:text-gray-600 text-xl leading-none transition-colors">×</button>
           </div>
         </div>
 
         {/* Scrollable body */}
         <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
-          {/* Priority + Status pills */}
-          <div className="flex items-center gap-2 flex-wrap">
-            <AccPillSelect
-              value={form.priority}
-              options={["Critical", "High", "Medium", "Low"] as const}
-              colorMap={NEW_AI_PRIORITY_COLORS}
-              placeholder="Priority"
-              onChange={(v) => set({ priority: v })}
-            />
-            <AccPillSelect
-              value={form.status}
-              options={statusOptions as AirtableActionItem["status"][]}
-              colorMap={NEW_AI_STATUS_COLORS}
-              placeholder="Status"
-              onChange={(v) => set({ status: v })}
-            />
-            <AccPillDate value={form.due_date} onChange={(v) => set({ due_date: v })} />
-          </div>
-
-          {/* Description. Steps have their own Checklist section below, so the placeholder
-              no longer invites writing them here as prose. */}
-          <div>
-            <p className="text-xs font-semibold uppercase tracking-wide text-[var(--twilio-gray-60)] mb-1.5">
-              Description
-            </p>
+          {/* Row 1 — Task */}
+          <div data-row="task">
+            <FieldLabel htmlFor={ids.task}>Task</FieldLabel>
             <textarea
-              value={form.task_details ?? ""}
-              onChange={(e) => set({ task_details: e.target.value })}
-              rows={3}
-              placeholder="Additional context or notes…"
-              className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-[var(--twilio-navy)] placeholder:text-[var(--twilio-gray-60)] focus:bg-white focus:border-indigo-400 focus:outline-none focus:ring-1 focus:ring-indigo-100 transition-colors resize-none"
+              id={ids.task}
+              autoFocus
+              value={form.task ?? ""}
+              onChange={(e) => set({ task: e.target.value })}
+              placeholder="Task name…"
+              rows={2}
+              className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm font-semibold text-[var(--twilio-navy)] placeholder:text-[var(--twilio-gray-60)] focus:bg-white focus:border-indigo-400 focus:outline-none focus:ring-1 focus:ring-indigo-100 resize-none leading-snug"
+              style={{ overflow: "hidden", fieldSizing: "content" } as React.CSSProperties}
             />
           </div>
 
-          {/* Checklist — its own field, directly below the description. Real Airtable items
-              only: steps key off the numeric PK, which a local-* draft lacks until promoted. */}
-          {!item.airtable_id.startsWith("local-") && (
-            <div className="pt-3 border-t border-gray-100">
+          {/* Rows 2-4 — one 3 x 3 grid:
+              Priority | Status | Due Date
+              Prep     | Assignee | Account
+              Est. Time (min) | Time Spent | Slack */}
+          <div data-row="fields" className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div>
+              <FieldLabel htmlFor={ids.priority}>Priority</FieldLabel>
+              <AccPillSelect
+                id={ids.priority}
+                value={form.priority}
+                options={["Critical", "High", "Medium", "Low"] as const}
+                colorMap={NEW_AI_PRIORITY_COLORS}
+                placeholder="Priority"
+                onChange={(v) => set({ priority: v })}
+              />
+            </div>
+            <div>
+              <FieldLabel htmlFor={ids.status}>Status</FieldLabel>
+              <AccPillSelect
+                id={ids.status}
+                value={form.status}
+                options={statusOptions as AirtableActionItem["status"][]}
+                format={statusLabel}
+                colorMap={NEW_AI_STATUS_COLORS}
+                placeholder="Status"
+                onChange={(v) => set({ status: v })}
+              />
+            </div>
+            <div>
+              <FieldLabel htmlFor={ids.due}>Due Date</FieldLabel>
+              <AccPillDate id={ids.due} value={form.due_date} onChange={(v) => set({ due_date: v })} />
+            </div>
+            <div>
+              <FieldLabel htmlFor={ids.prep}>Prep</FieldLabel>
+              <AccPillNumber id={ids.prep} value={form.prep_time} label="Set" onChange={(v) => set({ prep_time: v ?? 0 })} />
+            </div>
+            <div>
+              <FieldLabel htmlFor={ids.assignee}>Assignee</FieldLabel>
+              {teamMembers.length > 0 ? (
+                <AccPillSelect
+                  id={ids.assignee}
+                  value={(form.assignee_name || "Unassigned") as string}
+                  options={memberNames as string[]}
+                  colorMap={{}}
+                  placeholder="Unassigned"
+                  onChange={(v) => {
+                    const member = teamMembers.find((m) => m.full_name === v);
+                    set({ assignee_airtable_id: member ? String(member.id) : "", assignee_name: member?.full_name ?? "" });
+                  }}
+                />
+              ) : (
+                <output id={ids.assignee} className="text-xs text-[var(--twilio-navy)]">{item.assignee_name || "Unassigned"}</output>
+              )}
+            </div>
+            <div>
+              <FieldLabel htmlFor={ids.account}>Account</FieldLabel>
+              <output id={ids.account} className="inline-flex items-center gap-1 text-xs font-medium text-[var(--twilio-navy)] bg-gray-100 px-2 py-0.5 rounded-full">
+                {item.account_name && <CorporateIcon width={10} height={10} className="shrink-0 opacity-60" />}
+                {item.account_name || "—"}
+              </output>
+            </div>
+
+            <div>
+              <FieldLabel htmlFor={ids.est}>Est. Time (min)</FieldLabel>
+              <AccPillNumber id={ids.est} value={form.estimated_time} label="Set" onChange={(v) => set({ estimated_time: v ?? 0 })} />
+            </div>
+            <div>
+              <FieldLabel htmlFor={ids.spent}>Time Spent</FieldLabel>
+              <AccPillNumber id={ids.spent} value={form.time_spent} label="Set" onChange={(v) => set({ time_spent: v ?? 0 })} />
+            </div>
+            <div>
+              <FieldLabel>Slack</FieldLabel>
+              {/* A pasted link saves on its own (hooks/useSlackLinkAutosave.ts), not with Save. */}
+              <AccPillUrl
+                value={form.slack_thread_url}
+                onChange={(v) => { set({ slack_thread_url: v }); autosaveSlackLink(item, v, onAutosaved); }}
+              />
+            </div>
+          </div>
+
+          {/* Pin to meeting — an extra for Done items, kept with the people/time fields */}
+          {(form.status === "Done" || item.status === "Done") && meetings.length > 0 && (
+              <div>
+                <FieldLabel htmlFor={ids.meeting}>Pin to meeting</FieldLabel>
+                <select
+                  id={ids.meeting}
+                  value={form.linked_meeting ?? ""}
+                  onChange={(e) => set({ linked_meeting: e.target.value ? Number(e.target.value) : null })}
+                  className="w-full rounded-lg border border-gray-200 bg-gray-50 px-2.5 py-1 text-xs text-[var(--twilio-navy)] focus:bg-white focus:border-indigo-400 focus:outline-none"
+                >
+                  <option value="">— No meeting —</option>
+                  {meetings.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.name}{m.date ? ` (${new Date(m.date).toLocaleDateString(undefined, { month: "short", day: "numeric" })})` : ""}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+
+          {/* Row 5 — Details (rich text). Steps have their own Checklist section below. */}
+          <div data-row="details">
+            <FieldLabel id={ids.detailsLabel}>Details</FieldLabel>
+            <div role="group" aria-labelledby={ids.detailsLabel}>
+              <RichTextMentionEditor
+                value={form.task_details ?? ""}
+                onChange={(html) => set({ task_details: html })}
+                placeholder="Additional context or notes…"
+                minHeightClassName="min-h-[72px]"
+              />
+            </div>
+          </div>
+
+          {/* Row 6 — Checklist. Real Airtable items only: steps key off the numeric PK,
+              which a local-* draft lacks until promoted. */}
+          {!isLocal && (
+            <div data-row="checklist" className="pt-3 border-t border-gray-100">
               <StepsPanel actionItemId={item.id} />
             </div>
           )}
 
-          {/* Time + Slack */}
-          <div className="flex flex-wrap gap-2 items-center">
-            <AccPillNumber value={form.estimated_time} label="Est." onChange={(v) => set({ estimated_time: v ?? 0 })} />
-            <AccPillNumber value={form.time_spent} label="Spent" onChange={(v) => set({ time_spent: v ?? 0 })} />
-            <AccPillNumber value={form.prep_time} label="Prep" onChange={(v) => set({ prep_time: v ?? 0 })} />
-            <AccPillUrl
-              value={form.slack_thread_url}
-              onChange={(v) => { set({ slack_thread_url: v }); autosaveSlackLink(item, v, onAutosaved); }}
+          {/* Extras that have no slot in the row layout: calendar blocks, notes added under
+              them, and the latest comments. */}
+          <ActionItemCardOccurrences airtableId={item.airtable_id} />
+          <ActionItemCalendarNotes airtableId={item.airtable_id} />
+          {!isLocal && (
+            <CommentPreviewList
+              resourceType="action_item"
+              resourceId={item.id}
+              resourceLabel={item.task ?? ""}
+              variant="panel"
             />
-          </div>
-
-          {/* Assignee */}
-          {teamMembers.length > 0 && (
-            <div className="flex items-center gap-2">
-              <span className="text-xs text-[var(--twilio-gray-60)]">Assignee</span>
-              <AccPillSelect
-                value={(form.assignee_name || "Unassigned") as string}
-                options={memberNames as string[]}
-                colorMap={{}}
-                placeholder="Unassigned"
-                onChange={(v) => {
-                  const member = teamMembers.find((m) => m.full_name === v);
-                  set({ assignee_airtable_id: member ? String(member.id) : "", assignee_name: member?.full_name ?? "" });
-                }}
-              />
-            </div>
           )}
 
-          {/* Account */}
-          {item.account_name && (
-            <div className="flex items-center gap-2">
-              <span className="text-xs text-[var(--twilio-gray-60)]">Account</span>
-              <span className="inline-flex items-center gap-1 text-xs font-medium text-[var(--twilio-navy)] bg-gray-100 px-2 py-0.5 rounded-full">
-                <CorporateIcon width={10} height={10} className="shrink-0 opacity-60" />
-                {item.account_name}
-              </span>
-            </div>
-          )}
-
-          {/* Link to meeting — only shown for Done items */}
-          {(form.status === "Done" || item.status === "Done") && meetings.length > 0 && (
-            <div className="flex items-center gap-2">
-              <span className="text-xs text-[var(--twilio-gray-60)] shrink-0">Pin to meeting</span>
-              <select
-                value={form.linked_meeting ?? ""}
-                onChange={(e) => set({ linked_meeting: e.target.value ? Number(e.target.value) : null })}
-                className="flex-1 rounded-lg border border-gray-200 bg-gray-50 px-2.5 py-1 text-xs text-[var(--twilio-navy)] focus:bg-white focus:border-indigo-400 focus:outline-none"
-              >
-                <option value="">— No meeting —</option>
-                {meetings.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.name}{m.date ? ` (${new Date(m.date).toLocaleDateString(undefined, { month: "short", day: "numeric" })})` : ""}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
-
-          {/* Attachments */}
-          {!item.airtable_id.startsWith("local-") && (
+          {/* Row 7 — Attachments, with Activity stacked below it */}
+          <div data-row="attachments-activity" className="grid grid-cols-1 gap-4">
             <div>
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-xs font-semibold uppercase tracking-wide text-[var(--twilio-gray-60)]">
-                  Attachments{attachments.length > 0 && ` (${attachments.length})`}
-                </span>
-                <div className="flex items-center gap-1">
-                  {uploadingAttachment && <span className="text-[11px] text-gray-400 animate-pulse">Uploading…</span>}
-                  <button
-                    onClick={() => attachFileRef.current?.click()}
-                    title="Click to pick a file, or drag a file from your computer anywhere onto this window"
-                    className="text-[11px] px-2 py-0.5 rounded border border-gray-200 text-[var(--twilio-navy)] hover:bg-gray-50 transition-colors"
-                  >+ File</button>
-                  <button
-                    onClick={() => { setLinkFormOpen((v) => !v); }}
-                    className="text-[11px] px-2 py-0.5 rounded border border-gray-200 text-[var(--twilio-navy)] hover:bg-gray-50 transition-colors"
-                  >+ Link</button>
-                  <ArtifactPicker
-                    actionItemId={item.id}
-                    accountName={item.account_name}
-                    accountId={accountId}
-                    onAttached={(a) => { setAttachments((prev) => [a, ...prev]); setLinkFormOpen(false); }}
-                    onError={setAttachError}
-                  />
-                  <input ref={attachFileRef} type="file" multiple className="hidden" onChange={(e) => e.target.files && void handleAttachFiles(e.target.files)} />
-                </div>
-              </div>
-
+              {!isLocal ? (
+                <>
+                  <div className="flex items-center justify-between mb-2 gap-2 flex-wrap">
+                    <span className="text-xs font-semibold uppercase tracking-wide text-[var(--twilio-gray-60)]">
+                      Attachments{attachments.length > 0 && ` (${attachments.length})`}
+                    </span>
+                    {uploadingAttachment && <span className="text-[11px] text-gray-400 animate-pulse">Uploading…</span>}
+                  </div>
+                  <div className="flex items-center gap-1.5 flex-wrap mb-2">
+                    <button
+                      type="button"
+                      onClick={() => attachFileRef.current?.click()}
+                      title="Click to pick a file, or drag a file from your computer anywhere onto this window"
+                      className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded border border-gray-200 text-[var(--twilio-navy)] hover:bg-gray-50 transition-colors"
+                    >
+                      <svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-3.5 h-3.5 shrink-0"><path d="M8 2v8M5 5l3-3 3 3" strokeLinecap="round" strokeLinejoin="round"/><path d="M2 12h12" strokeLinecap="round"/></svg>
+                      Upload
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => { setLinkFormOpen((v) => !v); }}
+                      className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded border border-gray-200 text-[var(--twilio-navy)] hover:bg-gray-50 transition-colors"
+                    >
+                      <svg aria-hidden="true" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-3.5 h-3.5 shrink-0"><path d="M6 9a3 3 0 0 0 4.5.4l1.5-1.5a3 3 0 0 0-4.2-4.2L6.5 5" strokeLinecap="round"/><path d="M10 7a3 3 0 0 0-4.5-.4L4 8.1a3 3 0 0 0 4.2 4.2l1.3-1.3" strokeLinecap="round"/></svg>
+                      Add Link
+                    </button>
+                    <ArtifactPicker
+                      actionItemId={item.id}
+                      accountName={item.account_name}
+                      accountId={accountId}
+                      onAttached={(a) => { setAttachments((prev) => [a, ...prev]); setLinkFormOpen(false); }}
+                      onError={setAttachError}
+                    />
+                    <input ref={attachFileRef} type="file" multiple className="hidden" onChange={(e) => e.target.files && void handleAttachFiles(e.target.files)} />
+                  </div>
               {/* Inline link form */}
               {linkFormOpen && (
                 <div className="mb-2 flex flex-col gap-1.5">
@@ -485,49 +565,44 @@ export function ActionItemModal({
                   })}
                 </div>
               )}
+                </>
+              ) : (
+                <>
+                  <FieldLabel>Attachments</FieldLabel>
+                  <p className="text-xs text-gray-400 italic">Save the item to add attachments.</p>
+                </>
+              )}
             </div>
-          )}
 
-          <ActionItemCardOccurrences airtableId={item.airtable_id} />
-
-          {/* Notes added under this item's calendar blocks ("Meeting notes" on the calendar). */}
-          <ActionItemCalendarNotes airtableId={item.airtable_id} />
-
-          {/* Comments — the latest few, in place. The panel behind the header icon is
-              still where you read the full thread and reply; this exists so an item
-              with a conversation on it doesn't look identical to one without. */}
-          {!item.airtable_id.startsWith("local-") && (
-            <CommentPreviewList
-              resourceType="action_item"
-              resourceId={item.id}
-              resourceLabel={item.task ?? ""}
-              variant="panel"
-            />
-          )}
-
-          {/* Activity log */}
-          <div>
-            <span className="text-xs font-semibold uppercase tracking-wide text-[var(--twilio-gray-60)] mb-2 block">Activity</span>
-            <ActivityLogSection
-              resourceType="action_item"
-              resourceId={item.airtable_id}
-              variant="inline"
-              onRestore={async (rd) => { await restoreConversion(rd); onConverted?.(); onClose(); }}
-            />
+            {/* Activity */}
+            <div>
+              <FieldLabel id={ids.activityLabel}>Activity</FieldLabel>
+              <div role="group" aria-labelledby={ids.activityLabel}>
+                <ActivityLogSection
+                  resourceType="action_item"
+                  resourceId={item.airtable_id}
+                  variant="inline"
+                  onRestore={async (rd) => { await restoreConversion(rd); onConverted?.(); onClose(); }}
+                />
+              </div>
+            </div>
           </div>
 
-          {/* Timestamps */}
-          {!item.airtable_id.startsWith("local-") && (
-            <div className="pt-3 border-t border-gray-100 flex flex-wrap gap-x-5 gap-y-1">
-              <span className="text-[11px] text-[var(--twilio-gray-60)]">
-                <span className="font-semibold uppercase tracking-wide">Created</span>{" "}
-                {item.created_at ? new Date(item.created_at).toLocaleString(undefined, { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" }) : "—"}
-              </span>
+          {/* Row 8 — Created, Updated (read-only) */}
+          {!isLocal && (
+            <div data-row="timestamps" className="pt-3 border-t border-gray-100 grid grid-cols-2 gap-3">
+              <div>
+                <FieldLabel htmlFor={ids.created}>Created</FieldLabel>
+                <output id={ids.created} className="text-[11px] text-[var(--twilio-gray-60)]">{fmtStamp(item.created_at)}</output>
+              </div>
+              <div>
+                <FieldLabel htmlFor={ids.updated}>Updated</FieldLabel>
+                <output id={ids.updated} className="text-[11px] text-[var(--twilio-gray-60)]">{fmtStamp(item.updated_at)}</output>
+              </div>
               {item.marked_done_at && (
-                <span className="text-[11px] text-emerald-600">
-                  <span className="font-semibold uppercase tracking-wide">Completed</span>{" "}
-                  {new Date(item.marked_done_at).toLocaleString(undefined, { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" })}
-                </span>
+                <div className="col-span-2 text-[11px] text-emerald-600">
+                  <span className="font-semibold uppercase tracking-wide">Completed</span> {fmtStamp(item.marked_done_at)}
+                </div>
               )}
             </div>
           )}

@@ -38,6 +38,9 @@ class Account(models.Model):
         blank=True,
         related_name="accounts",
     )
+    # Free-text primary contact (the starred customer contact). Distinct from the FK above,
+    # which points at an internal TeamMember. Not pushed to Airtable.
+    primary_contact_text = models.CharField(max_length=255, blank=True, default="")
     team_members = models.ManyToManyField(
         "team.TeamMember",
         blank=True,
@@ -140,6 +143,8 @@ class CustomerContact(models.Model):
     team = models.CharField(max_length=200, blank=True, default="")
     # Main point of contact. Several per account are allowed (one flag per contact).
     is_main_poc = models.BooleanField(default=False)
+    # IANA zone name, e.g. "America/Chicago". Display-only (planning meeting times).
+    timezone = models.CharField(max_length=64, blank=True, default="")
     airtable_id = models.CharField(max_length=64, blank=True, default="", db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -213,6 +218,10 @@ class AccountArtifact(models.Model):
     description = models.TextField(blank=True, default="")  # rich text (HTML)
     # Records referenced via @# picker inside the description: [{resource_type, resource_id, label, url}]
     references = models.JSONField(default=list, blank=True)
+    # Who last edited the artifact (set by the viewset on update; null until edited).
+    updated_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True, related_name="updated_account_artifacts"
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -244,6 +253,8 @@ class AccountProject(models.Model):
     meeting_ids = models.JSONField(default=list)
     goal_ids = models.JSONField(default=list)
     resources = models.JSONField(default=list)
+    # Linked (not copied) notes: [{kind, id, meetingId?, label}]. See AccountProjectSerializer.
+    note_refs = models.JSONField(blank=True, default=list)
     sf_data = models.JSONField(blank=True, default=dict)
     # Salesforce Cloud Coach project Id (e.g. "a0B..."). Required key for the
     # "fetch remaining fields from Salesforce" action — kept as a real column
@@ -314,3 +325,52 @@ class AccountRole(models.Model):
 
     def __str__(self):
         return f"{self.user} — {self.role} on {self.account}"
+
+
+class AccountTicket(models.Model):
+    """A JIRA / Zendesk ticket or product gap tied to an account.
+
+    Created by hand, by pasting a link, or by the Gmail ticket scanner
+    (``integrations/ticket_scan.py``). The scanner files an unmatched email as
+    ``review_state="needs_review"`` with ``account=None``, visible only to ``found_by``.
+    """
+
+    KIND_CHOICES = [("jira", "JIRA"), ("zendesk", "Zendesk"), ("product_gap", "Product Gap")]
+    STATUS_CHOICES = [
+        ("open", "Open"), ("in_progress", "In Progress"), ("waiting", "Waiting"),
+        ("resolved", "Resolved"), ("closed", "Closed"),
+    ]
+    REVIEW_CHOICES = [("confirmed", "Confirmed"), ("needs_review", "Needs review")]
+
+    account = models.ForeignKey(Account, on_delete=models.CASCADE, null=True, blank=True, related_name="tickets")
+    kind = models.CharField(max_length=20, choices=KIND_CHOICES, db_index=True)
+    url = models.URLField(max_length=1000, blank=True, default="")
+    external_key = models.CharField(max_length=100, blank=True, default="")
+    title = models.CharField(max_length=500, blank=True, default="")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="open")
+    notes = models.TextField(blank=True, default="")
+    source_created_at = models.DateTimeField(null=True, blank=True)
+    source_updated_at = models.DateTimeField(null=True, blank=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="created_account_tickets")
+    review_state = models.CharField(max_length=20, choices=REVIEW_CHOICES, default="confirmed", db_index=True)
+    found_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="found_account_tickets")
+    source_message_id = models.CharField(max_length=200, blank=True, default="")
+    source_subject = models.CharField(max_length=500, blank=True, default="")
+    source_sender = models.CharField(max_length=300, blank=True, default="")
+    source_snippet = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["-source_updated_at", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["found_by", "source_message_id"],
+                condition=~models.Q(source_message_id=""),
+                name="uniq_ticket_found_by_message",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.kind} {self.external_key or self.title}"

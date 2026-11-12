@@ -48,7 +48,7 @@ export default function CanvasContextMenu({
     background: "transparent",
     cursor: "pointer",
     display: "block",
-    color: "#374151",
+    color: "var(--text-gray-700)",
   };
 
   const dividerStyle: React.CSSProperties = {
@@ -64,9 +64,9 @@ export default function CanvasContextMenu({
         position: "fixed",
         left: x,
         top: y,
-        background: "#fff",
+        background: "var(--surface-card)",
         borderRadius: 8,
-        border: "1px solid #E5E7EB",
+        border: "1px solid var(--border-subtle)",
         boxShadow: "0 4px 16px rgba(0,0,0,0.12)",
         minWidth: 180,
         overflow: "hidden",

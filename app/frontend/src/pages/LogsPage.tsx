@@ -14,13 +14,16 @@ import { useEventUpdates } from "../hooks/useEventUpdates";
 import { useReminders } from "../hooks/useReminders";
 import { useNotifications } from "../hooks/useNotifications";
 import { useFeedbackItems } from "../hooks/useFeedbackItems";
+import PinnedSkillsSection from "../components/skills/PinnedSkillsSection";
+import ConsolePanel from "../components/logs/ConsolePanel";
 
 // ── Tab definition ────────────────────────────────────────────────────────────
 
-type Tab = "activity" | "events" | "comments" | "notifications" | "reminders" | "feedback" | "tokens";
+type Tab = "activity" | "events" | "comments" | "notifications" | "reminders" | "feedback" | "tokens" | "console";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "activity", label: "Activity" },
+  { id: "console", label: "Console" },
   { id: "events", label: "Events" },
   { id: "comments", label: "Comments" },
   { id: "notifications", label: "Notifications" },
@@ -105,7 +108,7 @@ function EventsTab() {
               {badge.label}
             </span>
             <div className="flex-1 min-w-0">
-              <p className="text-sm font-medium" style={{ color: "var(--twilio-navy)" }}>{ev.title}</p>
+              <p className="text-sm font-medium" style={{ color: "var(--text-ink)" }}>{ev.title}</p>
               <div className="flex flex-wrap gap-x-3 mt-0.5">
                 {meta.event_start && (
                   <span className="text-xs" style={{ color: "var(--twilio-gray-60)" }}>
@@ -185,7 +188,7 @@ function CommentsTab() {
                 {c.resource_label}
               </p>
             )}
-            <p className="text-sm leading-snug" style={{ color: "var(--twilio-navy)" }}>{c.content}</p>
+            <p className="text-sm leading-snug" style={{ color: "var(--text-ink)" }}>{c.content}</p>
             {c.replies?.length > 0 && (
               <p className="text-xs mt-1" style={{ color: "var(--twilio-gray-60)" }}>
                 {c.replies.length} repl{c.replies.length !== 1 ? "ies" : "y"}
@@ -245,7 +248,7 @@ function RecordedNotificationRow({ n }: { n: AppNotification }) {
         {NOTIF_KIND_LABEL[n.kind] ?? n.kind}
       </span>
       <div className="flex-1 min-w-0">
-        <p className="text-sm font-medium" style={{ color: "var(--twilio-navy)" }}>{n.title}</p>
+        <p className="text-sm font-medium" style={{ color: "var(--text-ink)" }}>{n.title}</p>
         {n.body && <p className="text-xs mt-0.5 leading-snug" style={{ color: "var(--twilio-gray-60)" }}>{n.body}</p>}
         {n.link && (
           <Link to={n.link} className="text-xs mt-0.5 inline-block text-indigo-600 underline underline-offset-2">Open</Link>
@@ -265,7 +268,7 @@ function ReminderNotificationRow({ rem }: { rem: Reminder }) {
         {rem.status}
       </span>
       <div className="flex-1 min-w-0">
-        <p className="text-sm font-medium" style={{ color: "var(--twilio-navy)" }}>{rem.title}</p>
+        <p className="text-sm font-medium" style={{ color: "var(--text-ink)" }}>{rem.title}</p>
         {rem.body && (
           <p className="text-xs mt-0.5 leading-snug" style={{ color: "var(--twilio-gray-60)" }}>{rem.body}</p>
         )}
@@ -320,7 +323,7 @@ function RemindersTab() {
             {rem.status}
           </span>
           <div className="flex-1 min-w-0">
-            <p className="text-sm font-medium" style={{ color: "var(--twilio-navy)" }}>{rem.title}</p>
+            <p className="text-sm font-medium" style={{ color: "var(--text-ink)" }}>{rem.title}</p>
             {rem.body && (
               <p className="text-xs mt-0.5 leading-snug" style={{ color: "var(--twilio-gray-60)" }}>{rem.body}</p>
             )}
@@ -385,7 +388,7 @@ function FeedbackTab() {
               {FB_STATUS_LABEL[fb.status] ?? fb.status}
             </span>
             <div style={{ flex: 1, minWidth: 0 }}>
-              <p style={{ fontSize: "0.875rem", color: "var(--twilio-navy)", margin: 0, lineHeight: 1.5 }}>
+              <p style={{ fontSize: "0.875rem", color: "var(--text-ink)", margin: 0, lineHeight: 1.5 }}>
                 {fb.description.length > 120 ? fb.description.slice(0, 120) + "…" : fb.description}
               </p>
               <div style={{ display: "flex", gap: 12, marginTop: 4, flexWrap: "wrap" }}>
@@ -471,7 +474,7 @@ function ActivityTab() {
             {CATEGORY_LABEL[entry.category]}
           </span>
           <div className="flex-1 min-w-0">
-            <p className="text-sm" style={{ color: "var(--twilio-navy)" }}>{entry.message}</p>
+            <p className="text-sm" style={{ color: "var(--text-ink)" }}>{entry.message}</p>
             {entry.links && entry.links.length > 0 && (
               <div className="flex flex-wrap gap-3 mt-1.5">
                 {entry.links.map((link) => (
@@ -547,7 +550,7 @@ function TokensTab() {
         ].map(({ label, value, sub }) => (
           <div key={label} className="rounded-xl border border-gray-100 bg-white px-5 py-4 shadow-sm">
             <p className="text-xs font-medium mb-1" style={{ color: "var(--twilio-gray-60)" }}>{label}</p>
-            <p className="text-2xl font-bold tabular-nums" style={{ color: "var(--twilio-navy)" }}>{fmtTokens(value)}</p>
+            <p className="text-2xl font-bold tabular-nums" style={{ color: "var(--text-ink)" }}>{fmtTokens(value)}</p>
             <p className="text-xs mt-0.5" style={{ color: "var(--twilio-gray-40)" }}>{sub}</p>
           </div>
         ))}
@@ -556,18 +559,18 @@ function TokensTab() {
       {/* Agent sessions breakdown */}
       {(agentStats?.by_session.length ?? 0) > 0 && (
         <div>
-          <h2 className="text-sm font-semibold mb-3" style={{ color: "var(--twilio-navy)" }}>Agent sessions</h2>
+          <h2 className="text-sm font-semibold mb-3" style={{ color: "var(--text-ink)" }}>Agent sessions</h2>
           <div className="space-y-2">
             {agentStats!.by_session.map(row => (
               <div key={row.session_id} className="flex items-center gap-3 rounded-xl border border-gray-100 bg-white px-4 py-3 shadow-sm">
                 <div className="flex-1 min-w-0">
-                  <p className="text-sm font-medium truncate" style={{ color: "var(--twilio-navy)" }}>{row.title}</p>
+                  <p className="text-sm font-medium truncate" style={{ color: "var(--text-ink)" }}>{row.title}</p>
                   <div className="flex items-center gap-2 mt-1">
                     <TokenBar value={row.total_tokens} max={agentStats!.all_time.total_tokens} />
                   </div>
                 </div>
                 <div className="text-right shrink-0">
-                  <p className="text-sm font-semibold tabular-nums" style={{ color: "var(--twilio-navy)" }}>{fmtTokens(row.total_tokens)}</p>
+                  <p className="text-sm font-semibold tabular-nums" style={{ color: "var(--text-ink)" }}>{fmtTokens(row.total_tokens)}</p>
                   <p className="text-[11px] tabular-nums" style={{ color: "var(--twilio-gray-40)" }}>
                     {fmtTokens(row.input_tokens)} in · {fmtTokens(row.output_tokens)} out
                   </p>
@@ -581,12 +584,12 @@ function TokensTab() {
       {/* Skill invocations breakdown */}
       {(skillStats?.by_skill.length ?? 0) > 0 && (
         <div>
-          <h2 className="text-sm font-semibold mb-3" style={{ color: "var(--twilio-navy)" }}>Skill invocations</h2>
+          <h2 className="text-sm font-semibold mb-3" style={{ color: "var(--text-ink)" }}>Skill invocations</h2>
           <div className="space-y-2">
             {skillStats!.by_skill.map(row => (
               <div key={row.skill_id} className="flex items-center gap-3 rounded-xl border border-gray-100 bg-white px-4 py-3 shadow-sm">
                 <div className="flex-1 min-w-0">
-                  <p className="text-sm font-medium truncate" style={{ color: "var(--twilio-navy)" }}>{row.skill_name}</p>
+                  <p className="text-sm font-medium truncate" style={{ color: "var(--text-ink)" }}>{row.skill_name}</p>
                   <div className="flex items-center gap-2 mt-1">
                     <TokenBar value={row.total_tokens} max={skillStats!.all_time.total_tokens} />
                     <span className="shrink-0 text-[11px]" style={{ color: "var(--twilio-gray-40)" }}>
@@ -595,7 +598,7 @@ function TokensTab() {
                   </div>
                 </div>
                 <div className="text-right shrink-0">
-                  <p className="text-sm font-semibold tabular-nums" style={{ color: "var(--twilio-navy)" }}>{fmtTokens(row.total_tokens)}</p>
+                  <p className="text-sm font-semibold tabular-nums" style={{ color: "var(--text-ink)" }}>{fmtTokens(row.total_tokens)}</p>
                   <p className="text-[11px] tabular-nums" style={{ color: "var(--twilio-gray-40)" }}>
                     {fmtTokens(row.input_tokens)} in · {fmtTokens(row.output_tokens)} out
                   </p>
@@ -619,22 +622,23 @@ export default function LogsPage() {
   const [activeTab, setActiveTab] = useState<Tab>("activity");
 
   return (
-    <div className="px-6 py-8 max-w-3xl mx-auto">
+    <div className="px-6 py-8 mx-auto flex gap-6 items-start justify-center">
+    <div data-testid="activity-log-content" className="max-w-5xl flex-1 min-w-0">
       {/* Header */}
       <div className="mb-6">
-        <h1 className="text-3xl font-semibold flex items-center gap-2" style={{ color: "var(--twilio-navy)" }}><NotificationIcon width={24} height={24} style={{ flexShrink: 0 }} />Activity Log</h1>
+        <h1 className="text-3xl font-semibold flex items-center gap-2" style={{ color: "var(--text-ink)" }}><NotificationIcon width={24} height={24} style={{ flexShrink: 0 }} />Activity Log</h1>
         <p className="text-sm mt-1" style={{ color: "var(--twilio-gray-60)" }}>
           Historical record of events, comments, notifications, and reminders.
         </p>
       </div>
 
       {/* Tabs */}
-      <div className="flex gap-1 mb-5 border-b border-gray-200">
+      <div data-testid="activity-log-tabs" className="flex gap-1 mb-5 border-b border-gray-200 overflow-x-auto">
         {TABS.map(tab => (
           <button
             key={tab.id}
             onClick={() => setActiveTab(tab.id)}
-            className="px-4 py-2 text-sm font-medium transition-colors relative"
+            className="px-4 py-2 text-sm font-medium transition-colors relative whitespace-nowrap shrink-0"
             style={{
               color: activeTab === tab.id ? "var(--twilio-red, #e22)" : "var(--twilio-gray-60)",
               background: "transparent",
@@ -656,12 +660,18 @@ export default function LogsPage() {
 
       {/* Tab content */}
       {activeTab === "activity" && <ActivityTab />}
+      {activeTab === "console" && <ConsolePanel />}
       {activeTab === "events" && <EventsTab />}
       {activeTab === "comments" && <CommentsTab />}
       {activeTab === "notifications" && <NotificationsTab />}
       {activeTab === "reminders" && <RemindersTab />}
       {activeTab === "feedback" && <FeedbackTab />}
       {activeTab === "tokens" && <TokensTab />}
+    </div>
+    {/* Pinned Claude skills: a vertical list to the right of the log */}
+    <aside data-testid="activity-log-skills-column" className="w-64 shrink-0 sticky top-8">
+      <PinnedSkillsSection page="activity-log" variant="column" />
+    </aside>
     </div>
   );
 }

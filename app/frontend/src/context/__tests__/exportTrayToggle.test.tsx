@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
-import { render, screen, fireEvent, act } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { render, screen, fireEvent, act, waitFor } from "@testing-library/react";
+import { http, HttpResponse } from "msw";
+import { server } from "../../test/msw-server";
+import { MemoryRouter, Link, Route, Routes } from "react-router-dom";
 import { ExportProvider, useExport, type ExportItem } from "../ExportContext";
 import { useExportTray } from "../../hooks/useExportTray";
 import ExportBar from "../../components/ExportBar";
@@ -154,9 +156,99 @@ describe("export tray toggle", () => {
     });
   });
 
+  describe("open/closed state persists", () => {
+    it("a tray the user closed stays closed after a remount, items kept", () => {
+      const first = render(<ExportProvider><Harness /></ExportProvider>);
+      fireEvent.click(screen.getByText("add"));
+      fireEvent.click(screen.getByText("toggle")); // close
+      first.unmount();
+
+      render(<ExportProvider><Harness /></ExportProvider>);
+      expect(screen.getByTestId("mode").textContent).toBe("false");
+      expect(screen.getByTestId("count").textContent).toBe("1");
+    });
+
+    it("a tray the user opened (even empty) stays open after a remount", () => {
+      const first = render(<ExportProvider><Harness /></ExportProvider>);
+      fireEvent.click(screen.getByText("toggle"));
+      first.unmount();
+
+      render(<ExportProvider><Harness /></ExportProvider>);
+      expect(screen.getByTestId("mode").textContent).toBe("true");
+    });
+
+    it("survives a route change inside the router", () => {
+      render(
+        <MemoryRouter initialEntries={["/a"]}>
+          <ExportProvider>
+            <Harness />
+            <Routes>
+              <Route path="/a" element={<Link to="/b">go</Link>} />
+              <Route path="/b" element={<span>page b</span>} />
+            </Routes>
+          </ExportProvider>
+        </MemoryRouter>
+      );
+      fireEvent.click(screen.getByText("toggle"));
+      fireEvent.click(screen.getByText("go"));
+      expect(screen.getByText("page b")).toBeInTheDocument();
+      expect(screen.getByTestId("mode").textContent).toBe("true");
+    });
+
+    it("with nothing stored, defaults to open only when items exist", () => {
+      localStorage.setItem("agentpm_export_tray", JSON.stringify([item]));
+      render(<ExportProvider><Harness /></ExportProvider>);
+      expect(screen.getByTestId("mode").textContent).toBe("true");
+    });
+
+    it("an explicitly closed state wins over stored items", () => {
+      localStorage.setItem("agentpm_export_tray", JSON.stringify([item]));
+      localStorage.setItem("agentpm_export_tray_open", "0");
+      render(<ExportProvider><Harness /></ExportProvider>);
+      expect(screen.getByTestId("mode").textContent).toBe("false");
+    });
+  });
+
+  describe("Send to Voice Session", () => {
+    beforeEach(() => {
+      server.use(http.post("*/api/v1/skills/voice-launch/", async ({ request }) => {
+        const b = (await request.json()) as { text: string };
+        return HttpResponse.json({ key: "k1", script: b.text });
+      }));
+    });
+    it("announces a voice-launch built from the tray items", async () => {
+      localStorage.setItem("agentpm_export_tray", JSON.stringify([item]));
+      const got: Event[] = [];
+      const on = (e: Event) => { got.push(e); e.preventDefault(); };
+      window.addEventListener("voice-launch", on);
+      try {
+        render(<MemoryRouter><ExportProvider><ExportBar /></ExportProvider></MemoryRouter>);
+        fireEvent.click(screen.getByText("Send to Voice Session"));
+        await waitFor(() => expect(got).toHaveLength(1));
+        const detail = (got[0] as CustomEvent).detail;
+        expect(detail.script).toContain("Acme");
+      } finally { window.removeEventListener("voice-launch", on); }
+    });
+
+    it("says so when no voice session picked it up", async () => {
+      localStorage.setItem("agentpm_export_tray", JSON.stringify([item]));
+      render(<MemoryRouter><ExportProvider><ExportBar /></ExportProvider></MemoryRouter>);
+      fireEvent.click(screen.getByText("Send to Voice Session"));
+      expect(await screen.findByRole("status")).toHaveTextContent(/Voice isn't available/i);
+    });
+  });
+
   describe("useExportTray auto-close", () => {
     beforeEach(() => vi.useFakeTimers());
     afterEach(() => vi.useRealTimers());
+
+    it("does not auto-close a tray the user opened themselves", () => {
+      render(<ExportProvider><Harness /><TrayHarness /></ExportProvider>);
+      fireEvent.click(screen.getByText("toggle")); // user opens
+      fireEvent.click(screen.getByText("addViaHook"));
+      act(() => { vi.advanceTimersByTime(6000); });
+      expect(screen.getAllByTestId("mode")[0].textContent).toBe("true");
+    });
 
     it("does not discard the tray when it auto-closes", () => {
       render(<ExportProvider><TrayHarness /></ExportProvider>);

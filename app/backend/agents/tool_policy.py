@@ -460,6 +460,11 @@ def revoke_confirmation(token: str, user_id: int) -> bool:
 # only the skill's declared tools may be dispatched in this context.
 active_skill: ContextVar["SkillScope | None"] = ContextVar("active_skill", default=None)
 
+# The id of the skills.SkillRun this dispatch belongs to, when a saved skill launched the turn.
+# Set around a dispatch (like `active_skill`) by the chat orchestrator and the voice agent;
+# MCPServer.dispatch reads it to write the run's Console line. None for ordinary chat.
+active_skill_run: ContextVar["str | None"] = ContextVar("active_skill_run", default=None)
+
 
 @dataclass(frozen=True)
 class SkillScope:
@@ -468,7 +473,8 @@ class SkillScope:
 
 
 # Tools that stay callable inside a skill so it can still find records and report back.
-SKILL_ALWAYS_ALLOWED = frozenset({"list_skills", "load_skill", "search_records", "resolve_skill_keywords"})
+SKILL_ALWAYS_ALLOWED = frozenset({"list_skills", "load_skill", "search_records", "resolve_skill_keywords",
+                                  "get_skill_run_data"})
 
 
 def check_skill_scope(tool_name: str, meta: dict) -> None:

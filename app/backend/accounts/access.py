@@ -29,6 +29,7 @@ AUDITED_FIELDS = {
     "arr": "ARR",
     "owner": "Owner",
     "primary_contact": "Primary contact",
+    "primary_contact_text": "Primary contact",
     "slack_channels": "Slack channels",
 }
 

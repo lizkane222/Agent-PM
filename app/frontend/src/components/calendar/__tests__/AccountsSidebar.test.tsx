@@ -1,9 +1,9 @@
-import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { render, screen, fireEvent, waitFor, within, act } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { http, HttpResponse } from "msw";
 import { server } from "../../../test/msw-server";
 import { mockAirtableAccount } from "../../../test/handlers/accounts";
-import AccountsSidebar from "../AccountsSidebar";
+import AccountsSidebar, { OPTION_GLOW_MS } from "../AccountsSidebar";
 
 vi.mock("../../../assets/icons/Corporate.svg?react", () => ({ default: () => null }));
 
@@ -104,5 +104,77 @@ describe("AccountsSidebar", () => {
     await waitFor(() => screen.getByText("Acme Corp"));
     const panel = container.querySelector(".absolute.top-0.left-0.h-full");
     expect(panel).not.toBeNull();
+  });
+
+  describe("recurring-meeting options", () => {
+    const histBtn = () => screen.getByRole("checkbox", { name: "update historical" });
+    const subseqBtn = () => screen.getByRole("checkbox", { name: "update subsequent recurring" });
+
+    it("both buttons are off by default", () => {
+      render(<AccountsSidebar {...baseProps} />);
+      expect(histBtn()).toHaveAttribute("aria-checked", "false");
+      expect(subseqBtn()).toHaveAttribute("aria-checked", "false");
+    });
+
+    it("reads as one line, ( ) historical ← recurring → future ( ), and the words toggle too", () => {
+      const onHist = vi.fn();
+      const onSub = vi.fn();
+      render(<AccountsSidebar {...baseProps} onUpdateHistoricalChange={onHist} onUpdateSubsequentChange={onSub} />);
+      const group = screen.getByRole("group", { name: "Recurring meetings" });
+      expect(group.textContent).toBe("historical← recurring →future");
+      fireEvent.click(within(group).getByText("historical"));
+      fireEvent.click(within(group).getByText("future"));
+      expect(onHist).toHaveBeenCalledWith(true);
+      expect(onSub).toHaveBeenCalledWith(true);
+    });
+
+    it("each button reports the opposite of its current state when clicked", () => {
+      const onHist = vi.fn();
+      const onSub = vi.fn();
+      const { rerender } = render(
+        <AccountsSidebar {...baseProps} onUpdateHistoricalChange={onHist} onUpdateSubsequentChange={onSub} />,
+      );
+      fireEvent.click(histBtn());
+      fireEvent.click(subseqBtn());
+      expect(onHist).toHaveBeenCalledWith(true);
+      expect(onSub).toHaveBeenCalledWith(true);
+
+      rerender(
+        <AccountsSidebar {...baseProps} updateHistorical updateSubsequent
+          onUpdateHistoricalChange={onHist} onUpdateSubsequentChange={onSub} />,
+      );
+      expect(histBtn()).toHaveAttribute("aria-checked", "true");
+      fireEvent.click(histBtn());
+      expect(onHist).toHaveBeenLastCalledWith(false);
+    });
+
+    describe("glow", () => {
+      beforeEach(() => { vi.useFakeTimers(); });
+      afterEach(() => { vi.useRealTimers(); });
+
+      it("both buttons glow when the sidebar opens, then stop after 2 seconds", () => {
+        expect(OPTION_GLOW_MS).toBe(2000);
+        render(<AccountsSidebar {...baseProps} />);
+        expect(histBtn()).toHaveAttribute("data-glow", "true");
+        expect(subseqBtn()).toHaveAttribute("data-glow", "true");
+        act(() => { vi.advanceTimersByTime(OPTION_GLOW_MS - 1); });
+        expect(histBtn()).toHaveAttribute("data-glow", "true");
+        act(() => { vi.advanceTimersByTime(1); });
+        expect(histBtn()).toHaveAttribute("data-glow", "false");
+        expect(subseqBtn()).toHaveAttribute("data-glow", "false");
+      });
+
+      it("does not glow while the sidebar is closed, and glows again on the next open", () => {
+        const { rerender } = render(<AccountsSidebar {...baseProps} open={false} />);
+        expect(histBtn()).toHaveAttribute("data-glow", "false");
+        rerender(<AccountsSidebar {...baseProps} open />);
+        expect(histBtn()).toHaveAttribute("data-glow", "true");
+        act(() => { vi.advanceTimersByTime(OPTION_GLOW_MS); });
+        expect(histBtn()).toHaveAttribute("data-glow", "false");
+        rerender(<AccountsSidebar {...baseProps} open={false} />);
+        rerender(<AccountsSidebar {...baseProps} open />);
+        expect(histBtn()).toHaveAttribute("data-glow", "true");
+      });
+    });
   });
 });

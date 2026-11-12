@@ -68,7 +68,7 @@ function ReviewModal({ items, accounts, onAccepted, onRejected, onClose }: Modal
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+    <div className="fixed inset-0 z-[9000] flex items-center justify-center bg-black/40">
       <div className="bg-white rounded-xl shadow-xl w-full max-w-lg max-h-[85vh] flex flex-col">
         <div className="flex items-center justify-between px-5 py-4 border-b border-gray-200">
           <h2 className="text-base font-semibold text-gray-900">Pending Review Items</h2>
@@ -170,7 +170,7 @@ export function PendingReviewBadge({ accountId }: Props) {
       <button
         onClick={handleOpen}
         className="relative flex items-center gap-1.5 w-full text-left px-2 py-1.5 rounded-md text-xs font-medium transition-colors hover:bg-orange-50"
-        style={{ color: "var(--twilio-navy)" }}
+        style={{ color: "var(--text-ink)" }}
         title="Pending review items for this account"
       >
         <svg className="w-3.5 h-3.5 text-orange-500 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">

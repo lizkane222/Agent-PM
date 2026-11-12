@@ -28,3 +28,10 @@ TWILIO_WIRING.md
 
 # ── Incident runbooks (local-only operational checklists) ─────────────────────
 INCIDENT_*_RUNBOOK.md
+
+# ── Generated test / tooling output (never committed) ────────────────────────
+coverage/
+test-results/
+playwright-report/
+.vite/
+*.tsbuildinfo

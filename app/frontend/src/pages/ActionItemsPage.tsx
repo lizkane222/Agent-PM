@@ -1,10 +1,15 @@
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useStatusLabels } from "../hooks/useStatusLabels";
+import { useColumnSort } from "../hooks/useStatusArrivalOrder";
+import ColumnSortButton from "../components/account/ColumnSortButton";
+import { ActionItemModal } from "../components/account/ActionItemModal";
 import { fileIcon, fmtBytes, dueDateGroup } from "twilio-agent-pm-shared";
 import { airtableApi, accountsApi, schedulerApi, teamApi, searchApi } from "../lib/api";
 import type { SearchResult } from "../lib/api";
 import CommentTrigger from "../components/comments/CommentTrigger";
 import CommentPreviewList from "../components/comments/CommentPreviewList";
 import { useCommentMenuItem } from "../components/comments/commentMenuItem";
+import type { AccountProject } from "../types/accounts";
 import type { ActionItemAttachment, ActionItemDependency, AirtableActionItem, AirtableAccount, TeamMember, UserProfile } from "../types";
 import { addLog } from "../lib/appLog";
 import { logActionItemUpdate, changedActionItemFields } from "../lib/actionItemLog";
@@ -57,9 +62,13 @@ import {
 } from "../hooks/useAccountGroupCollapse";
 import { useCardCollapse } from "../hooks/useCardCollapse";
 import ActivityLogSection from "../components/ActivityLogSection";
+import { useAccountProjects } from "../hooks/useAccountProjects";
+import { moveActionItem } from "../lib/projectTree";
+import ProjectsTreeView, { type DropTarget } from "../components/action-items/ProjectsTreeView";
 import RichTextMentionEditor from "../components/shared/RichTextMentionEditor";
 import UrlPillInput from "../components/shared/UrlPillInput";
 import { useSlackLinkAutosave } from "../hooks/useSlackLinkAutosave";
+import PinnedSkillsSection from "../components/skills/PinnedSkillsSection";
 
 // Unified account shape used in the kanban accounts zone.
 // Airtable accounts get prefix "at-", app accounts get prefix "app-".
@@ -118,18 +127,6 @@ function sameFieldValue(a: unknown, b: unknown): boolean {
   return norm(a) === norm(b);
 }
 
-/**
- * Clear a row's drag highlight only when the pointer has really left it.
- *
- * `dragleave` bubbles from every child, so a bare handler fires as the cursor crosses from
- * the account label into the card strip and back — flipping the shared `dragOverZone` to
- * null and re-rendering the whole page on each crossing. That reads as an unresponsive drop
- * target and, with a tree this size, can cost the `drop` event itself.
- */
-function leftElement(e: React.DragEvent): boolean {
-  return !e.currentTarget.contains(e.relatedTarget as Node | null);
-}
-
 function fmtTime(seconds: number): string {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
@@ -186,13 +183,15 @@ const FIELD_INPUT = "w-full rounded-md border border-gray-200 bg-gray-50 px-2.5 
 // ── Inline interactive pill components ────────────────────────────────────────
 
 function PillSelect<T extends string>({
-  value, options, colorMap, placeholder, onChange,
+  value, options, colorMap, placeholder, onChange, format,
 }: {
   value: T | undefined;
   options: readonly T[];
   colorMap: Record<string, string>;
   placeholder: string;
   onChange: (v: T) => void;
+  /** Display-only text for a value (e.g. status names); the option VALUE stays canonical. */
+  format?: (v: string) => string;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLSelectElement>(null);
@@ -208,7 +207,7 @@ function PillSelect<T extends string>({
         onClick={(e) => e.stopPropagation()}
         className="rounded-full border border-indigo-400 bg-white px-2.5 py-0.5 text-[12px] font-semibold focus:outline-none cursor-pointer"
       >
-        {options.map((o) => <option key={o} value={o}>{o}</option>)}
+        {options.map((o) => <option key={o} value={o}>{format ? format(o) : o}</option>)}
       </select>
     );
   }
@@ -218,7 +217,7 @@ function PillSelect<T extends string>({
       onClick={(e) => { e.stopPropagation(); setOpen(true); }}
       className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[12px] font-semibold cursor-pointer hover:opacity-75 transition-opacity ${cls}`}
     >
-      {value ?? placeholder}
+      {value != null ? (format ? format(value) : value) : placeholder}
       <svg viewBox="0 0 8 5" fill="currentColor" className="w-1.5 h-1.5 opacity-50"><path d="M0 0l4 5 4-5z"/></svg>
     </button>
   );
@@ -360,6 +359,7 @@ function ActionItemFields({
   onAutosaved?: (updated: AirtableActionItem) => void;
 }) {
   const { status: statusOptions } = useActionItemFieldOptions();
+  const { label: statusLabel } = useStatusLabels();
   const autosaveSlackLink = useSlackLinkAutosave();
   const assigneeName = form.assignee_name || (form.assignee_airtable_id ? form.assignee_airtable_id : "");
   const memberNames = ["Unassigned", ...teamMembers.map((m) => m.full_name)] as string[];
@@ -384,7 +384,8 @@ function ActionItemFields({
           value={form.task_details ?? ""}
           onChange={(html) => onChange({ task_details: html })}
           placeholder="Additional context or notes…"
-          minHeightClassName={compact ? "min-h-[48px]" : "min-h-[72px]"}
+          // Cards (compact) cap long notes and scroll inside; the full editor is uncapped.
+          minHeightClassName={compact ? "min-h-[48px] max-h-40 overflow-y-auto" : "min-h-[72px]"}
         />
       </div>
 
@@ -396,6 +397,7 @@ function ActionItemFields({
         <PillSelect
           value={form.status}
           options={statusOptions as AirtableActionItem["status"][]}
+          format={statusLabel}
           colorMap={STATUS_COLORS}
           placeholder="Status"
           onChange={(v) => onChange({ status: v })}
@@ -874,6 +876,7 @@ function WaitingOnSection({
   allItems: AirtableActionItem[];
   onUpdated: (updated: AirtableActionItem) => void;
 }) {
+  const { label: statusLabel } = useStatusLabels();
   const deps: ActionItemDependency[] = item.waiting_on ?? [];
   const [query, setQuery] = useState("");
   const [adding, setAdding] = useState(false);
@@ -930,7 +933,7 @@ function WaitingOnSection({
           {deps.map((dep) => (
             <div key={dep.id} className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-gray-50 border border-gray-100">
               <span className={`text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded shrink-0 ${WAITING_STATUS_COLORS[dep.status] ?? WAITING_STATUS_COLORS["Open"]}`}>
-                {dep.status}
+                {statusLabel(dep.status)}
               </span>
               {dep.status === "Done" && (
                 <span className="text-emerald-500 shrink-0 text-xs">✓</span>
@@ -966,7 +969,7 @@ function WaitingOnSection({
                 className="w-full text-left px-3 py-2 flex items-center gap-2 hover:bg-indigo-50 transition-colors"
               >
                 <span className={`text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded shrink-0 ${WAITING_STATUS_COLORS[c.status] ?? WAITING_STATUS_COLORS["Open"]}`}>
-                  {c.status}
+                  {statusLabel(c.status)}
                 </span>
                 <span className="text-xs text-[var(--twilio-navy)] truncate">{c.task}</span>
                 {c.account_name && (
@@ -1316,8 +1319,8 @@ function ReminderButton({
             top: panelPos.top,
             right: panelPos.right,
             zIndex: 9999,
-            background: "#fff",
-            border: "1px solid #e5e7eb",
+            background: "var(--surface-card)",
+            border: "1px solid var(--border-subtle)",
             borderRadius: 10,
             padding: "12px 14px",
             width: 236,
@@ -1339,9 +1342,9 @@ function ReminderButton({
                 style={{
                   flex: 1, padding: "3px 0", fontSize: "0.6875rem", fontWeight: 600,
                   borderRadius: 5, border: "1px solid",
-                  borderColor: mode === id ? "#6366f1" : "#e5e7eb",
-                  background: mode === id ? "#eef2ff" : "#f9fafb",
-                  color: mode === id ? "#4338ca" : "#6b7280",
+                  borderColor: mode === id ? "#6366f1" : "var(--border-subtle)",
+                  background: mode === id ? "var(--tint-indigo-50)" : "var(--surface-subtle)",
+                  color: mode === id ? "var(--ink-indigo)" : "var(--text-gray-500)",
                   cursor: "pointer",
                 }}
               >
@@ -1353,25 +1356,25 @@ function ReminderButton({
           {mode === "datetime" && (
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
               <input type="date" value={dateVal} onChange={(e) => setDateVal(e.target.value)}
-                style={{ width: "100%", padding: "4px 8px", fontSize: "0.75rem", border: "1px solid #e5e7eb", borderRadius: 5 }} />
+                style={{ width: "100%", padding: "4px 8px", fontSize: "0.75rem", border: "1px solid var(--border-subtle)", borderRadius: 5 }} />
               <input type="time" value={timeVal} onChange={(e) => setTimeVal(e.target.value)}
-                style={{ width: "100%", padding: "4px 8px", fontSize: "0.75rem", border: "1px solid #e5e7eb", borderRadius: 5 }} />
+                style={{ width: "100%", padding: "4px 8px", fontSize: "0.75rem", border: "1px solid var(--border-subtle)", borderRadius: 5 }} />
             </div>
           )}
 
           {mode === "before_meeting" && (
             <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
               <input type="number" min={1} max={480} value={beforeMins} onChange={(e) => setBeforeMins(Number(e.target.value))}
-                style={{ width: 60, padding: "4px 8px", fontSize: "0.75rem", border: "1px solid #e5e7eb", borderRadius: 5 }} />
-              <span style={{ fontSize: "0.75rem", color: "#374151" }}>min before next meeting</span>
+                style={{ width: 60, padding: "4px 8px", fontSize: "0.75rem", border: "1px solid var(--border-subtle)", borderRadius: 5 }} />
+              <span style={{ fontSize: "0.75rem", color: "var(--text-gray-700)" }}>min before next meeting</span>
             </div>
           )}
 
           {mode === "tomorrow" && (
             <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-              <span style={{ fontSize: "0.75rem", color: "#374151" }}>Tomorrow at</span>
+              <span style={{ fontSize: "0.75rem", color: "var(--text-gray-700)" }}>Tomorrow at</span>
               <input type="time" value={tomorrowTime} onChange={(e) => setTomorrowTime(e.target.value)}
-                style={{ flex: 1, padding: "4px 8px", fontSize: "0.75rem", border: "1px solid #e5e7eb", borderRadius: 5 }} />
+                style={{ flex: 1, padding: "4px 8px", fontSize: "0.75rem", border: "1px solid var(--border-subtle)", borderRadius: 5 }} />
             </div>
           )}
 
@@ -1405,8 +1408,8 @@ function ReminderButton({
               onClick={() => setOpen(false)}
               style={{
                 padding: "5px 8px", fontSize: "0.75rem", fontWeight: 600,
-                background: "transparent", color: "#6b7280",
-                border: "1px solid #e5e7eb", borderRadius: 5, cursor: "pointer",
+                background: "transparent", color: "var(--text-gray-500)",
+                border: "1px solid var(--border-subtle)", borderRadius: 5, cursor: "pointer",
               }}
             >
               ✕
@@ -1473,7 +1476,7 @@ function DeleteButton({ onDelete }: { onDelete: () => void }) {
             top: tooltipPos.top - 88,
             right: tooltipPos.right,
             zIndex: 9999,
-            background: "#fff", border: "1px solid rgba(239,68,68,0.3)",
+            background: "var(--surface-card)", border: "1px solid rgba(239,68,68,0.3)",
             borderRadius: 8, padding: "10px 12px", width: 200,
             boxShadow: "0 4px 16px rgba(0,0,0,0.12)",
           }}
@@ -1496,8 +1499,8 @@ function DeleteButton({ onDelete }: { onDelete: () => void }) {
               onClick={() => setConfirm(false)}
               style={{
                 flex: 1, padding: "4px 0", fontSize: "0.75rem", fontWeight: 600,
-                background: "transparent", color: "#6b7280",
-                border: "1px solid #e5e7eb", borderRadius: 5, cursor: "pointer",
+                background: "transparent", color: "var(--text-gray-500)",
+                border: "1px solid var(--border-subtle)", borderRadius: 5, cursor: "pointer",
               }}
             >
               Cancel
@@ -1622,6 +1625,7 @@ function KanbanCard({
     : 0;
 
   const { status: statusOptions } = useActionItemFieldOptions();
+  const { label: statusLabel } = useStatusLabels();
   const isUnstaged = zone === "unstaged";
   const isFullForm = zone === "unstaged" || zone === "today" || zone === "active";
   const accentColor = form.priority ? PRIORITY_ACCENT[form.priority] : "#e5e7eb";
@@ -1705,7 +1709,7 @@ function KanbanCard({
         onDragStart={handleDragStartWithGhost}
         onContextMenu={handleCardContextMenu}
         className="rounded-lg shadow-blue-md cursor-grab active:cursor-grabbing select-none hover:shadow-blue-lg transition-all flex items-center gap-2 px-2.5 py-2 overflow-hidden"
-        style={{ position: "relative", background: "#F4F4F6" }}
+        style={{ position: "relative", background: "var(--surface-subtle-4)" }}
       >
         {isPinnedToFocus && <FocusPinBadge />}
         <button
@@ -1719,7 +1723,7 @@ function KanbanCard({
           {item.task || <span className="italic opacity-50">Untitled</span>}
         </p>
         <span className={`shrink-0 text-[10px] font-semibold uppercase px-1 py-0.5 rounded whitespace-nowrap ${STATUS_COLORS[statusKey] ?? STATUS_COLORS["Open"]}`}>
-          {statusKey}
+          {statusLabel(statusKey)}
         </span>
         {(item.account_name || form.account_name) && (
           <span className="shrink-0 inline-flex items-center gap-1 text-[11px] font-semibold text-indigo-700 bg-indigo-50 px-1.5 py-0.5 rounded-full max-w-[110px] truncate">
@@ -1764,7 +1768,7 @@ function KanbanCard({
         onDragStart={handleDragStartWithGhost}
         onContextMenu={handleCardContextMenu}
         className="rounded-lg shadow-blue-md cursor-grab active:cursor-grabbing select-none hover:shadow-blue-lg transition-all overflow-hidden"
-        style={{ position: "relative", background: "#F4F4F6", display: "grid", gridTemplateColumns: gridCols, gridTemplateRows: "auto auto auto", padding: "10px 12px", gap: "4px 10px", width: "100%", alignItems: "center" }}
+        style={{ position: "relative", background: "var(--surface-subtle-4)", display: "grid", gridTemplateColumns: gridCols, gridTemplateRows: "auto auto auto", padding: "10px 12px", gap: "4px 10px", width: "100%", alignItems: "center" }}
       >
         {isPinnedToFocus && <FocusPinBadge />}
         {/* Row 1 col 1: task name + account badge */}
@@ -1812,6 +1816,7 @@ function KanbanCard({
           <PillSelect
             value={form.status}
             options={statusOptions as AirtableActionItem["status"][]}
+            format={statusLabel}
             colorMap={STATUS_COLORS}
             placeholder="Status"
             onChange={(v) => setForm((f) => ({ ...f, status: v }))}
@@ -1859,7 +1864,8 @@ function KanbanCard({
             value={form.task_details ?? ""}
             onChange={(html) => setForm((f) => ({ ...f, task_details: html }))}
             placeholder="Task details…"
-            minHeightClassName="min-h-[60px]"
+            // Long notes scroll inside the card instead of stretching it.
+            minHeightClassName="min-h-[60px] max-h-40 overflow-y-auto"
           />
         </div>
 
@@ -1941,7 +1947,7 @@ function KanbanCard({
         onDragStart={handleUnstagedDragStart}
         onContextMenu={handleCardContextMenu}
         className="rounded-xl shadow-blue-md cursor-grab active:cursor-grabbing select-none hover:shadow-blue-lg transition-all flex flex-col overflow-hidden"
-        style={{ position: "relative", background: "#F4F4F6" }}
+        style={{ position: "relative", background: "var(--surface-subtle-4)" }}
       >
         {isPinnedToFocus && <FocusPinBadge />}
         {/* Task title — above badges */}
@@ -1964,7 +1970,7 @@ function KanbanCard({
               </span>
             )}
             <span className={`text-[10px] font-semibold uppercase px-1 py-0.5 rounded whitespace-nowrap shrink ${STATUS_COLORS[statusKey] ?? STATUS_COLORS["Open"]}`}>
-              {statusKey}
+              {statusLabel(statusKey)}
             </span>
             {form.account_name && (
               <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-indigo-700 bg-indigo-50 px-1.5 py-0.5 rounded-full min-w-0 max-w-[120px] truncate">
@@ -2061,7 +2067,7 @@ function KanbanCard({
       onClick={(e) => { e.stopPropagation(); onExpandClick(); }}
       onContextMenu={(e) => { e.preventDefault(); setCtxPos({ x: e.clientX, y: e.clientY }); }}
       className="rounded-lg shadow-blue-md cursor-grab active:cursor-grabbing select-none hover:shadow-blue-lg transition-all flex flex-col overflow-hidden"
-      style={{ position: "relative", background: "#F4F4F6" }}
+      style={{ position: "relative", background: "var(--surface-subtle-4)" }}
     >
       {isPinnedToFocus && <FocusPinBadge />}
       <div className="px-3 pt-3 pb-2 flex-1 flex flex-col gap-1.5">
@@ -2082,7 +2088,7 @@ function KanbanCard({
               </span>
             )}
             <span className={`text-[10px] font-semibold uppercase px-1 py-0.5 rounded whitespace-nowrap min-w-0 shrink ${STATUS_COLORS[statusKey] ?? STATUS_COLORS["Open"]}`}>
-              {statusKey}
+              {statusLabel(statusKey)}
             </span>
           </div>
           <div className="flex items-center gap-1 shrink-0">
@@ -2139,100 +2145,6 @@ function KanbanCard({
   );
 }
 
-// ── Completed-stack deck per account ─────────────────────────────────────────
-
-function CompletedDeckTrigger({
-  items,
-  open,
-  onToggle,
-}: {
-  items: AirtableActionItem[];
-  open: boolean;
-  onToggle: () => void;
-}) {
-  if (items.length === 0) return null;
-  const top = items[0];
-  const ghostCount = Math.min(items.length - 1, 2);
-  const accent = PRIORITY_ACCENT[top.priority] ?? "#9ca3af";
-  // card is 160px wide × 80px tall; ghosts offset 8px right + 4px down each
-  const cardW = 160;
-  const cardH = 80;
-  const offsetX = 8;
-  const offsetY = 4;
-  const totalW = cardW + ghostCount * offsetX;
-  const totalH = cardH + ghostCount * offsetY;
-
-  return (
-    <button
-      onClick={onToggle}
-      title={open ? "Collapse" : `${items.length} completed`}
-      style={{ position: "relative", width: totalW, height: totalH + 8, cursor: "pointer", background: "none", border: "none", padding: 0, flexShrink: 0, alignSelf: "center" }}
-    >
-      {/* Ghost cards behind — rendered first (lowest z) */}
-      {Array.from({ length: ghostCount }).map((_, gi) => (
-        <div
-          key={gi}
-          style={{
-            position: "absolute",
-            top: (ghostCount - gi) * offsetY,
-            left: (ghostCount - gi) * offsetX,
-            width: cardW,
-            height: cardH,
-            background: "#d1fae5",
-            borderRadius: 6,
-            border: "1px solid #6ee7b7",
-            boxShadow: "0 1px 3px rgba(0,0,0,0.07)",
-            zIndex: gi + 1,
-          }}
-        />
-      ))}
-      {/* Front card with real content */}
-      <div
-        style={{
-          position: "absolute",
-          top: 0,
-          left: 0,
-          width: cardW,
-          height: cardH,
-          background: "#fff",
-          borderRadius: 6,
-          border: "1px solid #e5e7eb",
-          borderLeft: `3px solid ${accent}`,
-          boxShadow: "0 1px 4px rgba(0,0,0,0.10)",
-          zIndex: ghostCount + 2,
-          padding: "6px 8px",
-          display: "flex",
-          flexDirection: "column",
-          gap: 4,
-          overflow: "hidden",
-        }}
-      >
-        <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-          <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded whitespace-nowrap ${PRIORITY_COLORS[top.priority]}`}>{top.priority}</span>
-          <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded whitespace-nowrap ${STATUS_COLORS[top.status] ?? "bg-gray-100 text-gray-700"}`}>{top.status}</span>
-        </div>
-        <p style={{ fontSize: "0.6875rem", fontWeight: 600, color: "var(--twilio-navy)", overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" as const, lineHeight: 1.3 }}>
-          {top.task || "Untitled"}
-        </p>
-        {top.account_name && (
-          <p style={{ fontSize: "0.625rem", color: "var(--twilio-navy)", fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{top.account_name}</p>
-        )}
-        {top.assignee_name && (
-          <p style={{ fontSize: "0.625rem", color: "#9ca3af", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{top.assignee_name}</p>
-        )}
-      </div>
-      {/* Count badge */}
-      <span style={{
-        position: "absolute", bottom: 0, right: 0,
-        fontSize: 10, fontWeight: 700, background: "#059669", color: "#fff",
-        borderRadius: "50%", width: 16, height: 16,
-        display: "flex", alignItems: "center", justifyContent: "center",
-        zIndex: ghostCount + 3,
-      }}>{items.length}</span>
-    </button>
-  );
-}
-
 // Chevron for an account group header. Points down when expanded, right when collapsed.
 function CollapseChevron({ collapsed }: { collapsed: boolean }) {
   return (
@@ -2245,46 +2157,6 @@ function CollapseChevron({ collapsed }: { collapsed: boolean }) {
     >
       <path d="M2 4l4 4 4-4" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
-  );
-}
-
-// Open/Done counts shown on an account row header, so a collapsed row still says how much
-// it is hiding.
-function GroupCounts({ items }: { items: AirtableActionItem[] }) {
-  const done = items.filter((i) => i.status === "Done").length;
-  const open = items.length - done;
-  if (items.length === 0) return null;
-  return (
-    <span className="flex items-center gap-1 shrink-0">
-      {open > 0 && (
-        <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-gray-100 text-[var(--twilio-navy)]">{open} open</span>
-      )}
-      {done > 0 && (
-        <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700">{done} done</span>
-      )}
-    </span>
-  );
-}
-
-/**
- * "Drop here" affordance filling the body of a collapsed account row.
- *
- * A collapsed row has always accepted drops — it just gave no sign of it, so filing a card
- * under an account you had folded away meant aiming at a 40px strip on faith. Rendered only
- * while a card is actually in the air, so the resting grid is unchanged.
- */
-function CollapsedRowDropHint({ active, dragInFlight, name }: { active: boolean; dragInFlight: boolean; name: string }) {
-  if (!dragInFlight) return <div className="flex-1" />;
-  return (
-    <div data-testid="collapsed-drop-hint" className="flex-1 flex items-center px-3 py-2 min-w-0">
-      <span
-        className={`text-[11px] font-semibold rounded-md border border-dashed px-2 py-1 truncate transition-colors ${
-          active ? "border-indigo-400 text-indigo-600 bg-indigo-50" : "border-gray-300 text-[var(--twilio-gray-60)]"
-        }`}
-      >
-        {active ? `Drop to file under ${name}` : "Drop here"}
-      </span>
-    </div>
   );
 }
 
@@ -2320,10 +2192,10 @@ function DropZone({
   onAutoTrackToggle,
   starredAccountKey,
   onStarAccount,
-  completedItems,
-  pinnedIds,
-  onPin,
-  myCollabId,
+  projects,
+  accountIdByName,
+  dragAccountName,
+  onAssignToProject,
   className,
   style,
   pageView,
@@ -2332,12 +2204,9 @@ function DropZone({
   onSearchChange,
   allRealItems,
   onSaveFieldsOnly,
-  itemZones,
-  onRestoreToViews,
   externalDragId,
   onExternalDropWithStatus,
   onAccountDrop,
-  focusMode,
   reorderable,
   dragId,
   dropHint,
@@ -2367,10 +2236,13 @@ function DropZone({
   onAutoTrackToggle?: () => void;
   starredAccountKey?: string | null;
   onStarAccount?: (key: string | null) => void;
-  completedItems?: AirtableActionItem[];
-  pinnedIds?: Set<string>;
-  onPin?: (item: AirtableActionItem) => void;
-  myCollabId?: string | null;
+  /** Every project and goal the caller can see (Projects view). */
+  projects?: AccountProject[];
+  /** Lowercased account name -> Django Account.id (projects are keyed by that id). */
+  accountIdByName?: Map<string, number>;
+  /** Lowercased account name of the card being dragged, if any. */
+  dragAccountName?: string | null;
+  onAssignToProject?: (target: DropTarget) => void;
   className?: string;
   style?: React.CSSProperties;
   // accounts-zone view controls
@@ -2380,17 +2252,12 @@ function DropZone({
   onSearchChange?: (v: string) => void;
   allRealItems?: AirtableActionItem[];
   onSaveFieldsOnly?: (item: AirtableActionItem, fields: Partial<AirtableActionItem>) => Promise<void>;
-  itemZones?: Record<string, Zone>;
-  onRestoreToViews?: (item: AirtableActionItem) => void;
   // The airtable_id being dragged from outside this zone (so status columns can accept external drops)
   externalDragId?: string | null;
   onExternalDropWithStatus?: (airtableId: string, status: AirtableActionItem["status"]) => void;
   /** File the dragged card under an account without touching its zone. Used by the Projects
    *  view's per-group drop targets; `"none"` clears the account. */
   onAccountDrop?: (e: React.DragEvent, accountKey: string) => void;
-  /** Focus mode is on. Pinned items are hoisted into the Pinned In Progress section, so
-   *  the accounts grid shows them as ghosts instead of full cards. */
-  focusMode?: boolean;
   // ── Hand-ordering (today / active only) ──────────────────────────────────────
   /** Cards in this zone can be reordered by dragging. */
   reorderable?: boolean;
@@ -2405,11 +2272,16 @@ function DropZone({
   collapsible?: boolean;
 }) {
   const isOver = dragOverZone === zone;
-  const [accountView, setAccountView] = useState<"mine" | "team">("mine");
-  const [openDeckKey, setOpenDeckKey] = useState<string | null>(null);
-  const { pinnedIds: focusPinnedIds } = useFocusPins();
-  const { isCollapsed, toggle: toggleCollapse, setAll: setAllCollapsed, allCollapsed } = useAccountGroupCollapse();
+  const { setAll: setAllCollapsed, allCollapsed } = useAccountGroupCollapse();
   const { exportMode, toggleItem, isSelected } = useExport();
+  const toggleActionItemForExport = (item: AirtableActionItem) => toggleItem({
+    id: `action_item:${item.airtable_id}`,
+    type: "action_item",
+    label: item.task || "Untitled",
+    summary: `${item.status} · ${item.priority} · ${item.account_name ?? "No account"}`,
+    content: `Action Item: ${item.task || "Untitled"}\nStatus: ${item.status}\nPriority: ${item.priority}\nAccount: ${item.account_name ?? "N/A"}\nAssignee: ${item.assignee_name ?? "Unassigned"}\nDue: ${item.due_date ?? "No date"}\nDetails: ${item.task_details ?? ""}`,
+    accountName: item.account_name ?? undefined,
+  });
 
   // Panel-level fallback for the "accounts" (Views) DropZone: a drop that lands anywhere
   // other than a specific row/deck/group (header, padding, between rows, an unmatched or
@@ -2451,13 +2323,6 @@ function DropZone({
   }, []);
 
   if (zone === "accounts") {
-    // Exclude Done items from the active list — they live in the completed deck
-    const activeItems = items.filter((i) => i.status !== "Done");
-    // Filter active items by mine/team
-    const filteredItems = accountView === "mine" && myCollabId
-      ? activeItems.filter((i) => !i.assignee_airtable_id || i.assignee_airtable_id === myCollabId)
-      : activeItems;
-
     // Build filtered items for Status/Due views
     const q = (search ?? "").trim().toLowerCase();
     const matchesSearch = (i: AirtableActionItem) => {
@@ -2475,14 +2340,14 @@ function DropZone({
     };
     const viewItems = (allRealItems ?? []).filter(matchesSearch);
 
-    const currentView = pageView ?? "kanban";
+    const currentView = pageView ?? "accounts";
 
     // Every group key the Collapse all button should act on. The Views grid and the
     // Projects view share one canonical key space (lowercased account name), so the union
     // of both lists is correct and lets one button cover whichever view is on screen.
     const hasUnmatched = (() => {
       const known = new Set((accounts ?? []).map((a) => a.name.toLowerCase()));
-      return filteredItems.some((i) => i.account_name && !known.has(i.account_name.toLowerCase()));
+      return viewItems.some((i) => i.account_name && !known.has(i.account_name.toLowerCase()));
     })();
     const visibleGroupKeys = [...new Set([
       NO_ACCOUNT_GROUP_KEY,
@@ -2502,9 +2367,9 @@ function DropZone({
         <div className="px-5 py-3 shrink-0 flex items-center gap-3 flex-wrap border-b border-gray-100">
           <p className="text-sm font-semibold text-[var(--twilio-navy)] shrink-0">{label}</p>
           {/* View switcher */}
-          <div style={{ display: "flex", background: "#f3f4f6", borderRadius: 8, padding: 2, gap: 2, flexShrink: 0 }}>
+          <div style={{ display: "flex", background: "var(--surface-subtle-2)", borderRadius: 8, padding: 2, gap: 2, flexShrink: 0 }}>
             {([
-              { id: "kanban",   label: "Accounts" },
+              { id: "accounts", label: "Accounts" },
               { id: "status",   label: "By Status" },
               { id: "due",      label: "By Due Date" },
               { id: "projects", label: "Projects" },
@@ -2515,8 +2380,8 @@ function DropZone({
                 style={{
                   padding: "3px 10px", fontSize: "0.6875rem", fontWeight: 600,
                   borderRadius: 6, border: "none", cursor: "pointer",
-                  background: currentView === id ? "#fff" : "transparent",
-                  color: currentView === id ? "var(--twilio-navy)" : "#9ca3af",
+                  background: currentView === id ? "var(--surface-card)" : "transparent",
+                  color: currentView === id ? "var(--twilio-navy)" : "var(--text-gray-400)",
                   boxShadow: currentView === id ? "0 1px 3px rgba(0,0,0,0.1)" : "none",
                   whiteSpace: "nowrap",
                 }}
@@ -2525,31 +2390,10 @@ function DropZone({
               </button>
             ))}
           </div>
-          {/* Mine / Team toggle — only in accounts view */}
-          {(currentView === "kanban") && (
-            <div style={{ display: "flex", background: "#f3f4f6", borderRadius: 8, padding: 2, gap: 2, flexShrink: 0 }}>
-              {(["mine", "team"] as const).map((v) => (
-                <button
-                  key={v}
-                  onClick={() => setAccountView(v)}
-                  style={{
-                    padding: "3px 10px", fontSize: "0.6875rem", fontWeight: 600,
-                    borderRadius: 6, border: "none", cursor: "pointer",
-                    background: accountView === v ? "#fff" : "transparent",
-                    color: accountView === v ? "var(--twilio-navy)" : "#9ca3af",
-                    boxShadow: accountView === v ? "0 1px 3px rgba(0,0,0,0.1)" : "none",
-                    textTransform: "uppercase", letterSpacing: "0.04em",
-                  }}
-                >
-                  {v}
-                </button>
-              ))}
-            </div>
-          )}
           {/* Collapse all / Expand all — one button covering both grouped views. The label
               is derived from the store, so it flips to "Expand all" as soon as the last
               expanded group is collapsed by hand. */}
-          {(currentView === "kanban" || currentView === "projects") && (
+          {(currentView === "accounts" || currentView === "projects") && (
             <button
               onClick={() => setAllCollapsed(visibleGroupKeys, !allGroupsCollapsed)}
               className="shrink-0 px-2 py-1 rounded-lg text-[11px] font-semibold uppercase tracking-wide border border-gray-300 bg-gray-50 text-[var(--twilio-gray-80)] hover:bg-gray-100 transition-colors"
@@ -2597,9 +2441,9 @@ function DropZone({
             <DueDateView items={viewItems} onExpand={onExpand} onSave={onSaveFieldsOnly ?? onSave} onDragStart={onDragStart} onDragEnd={onDragLeave} />
           </div>
         )}
-        {currentView === "projects" && (
+        {currentView === "accounts" && (
           <div className="flex-1 p-4 overflow-auto">
-            <ProjectsView
+            <AccountsView
               items={viewItems}
               accounts={accounts ?? []}
               onExpand={onExpand}
@@ -2609,321 +2453,27 @@ function DropZone({
               onAccountDrop={onAccountDrop}
               onDragStart={onDragStart}
               onDragEnd={onDragLeave}
+              starredAccountKey={starredAccountKey}
+              onStarAccount={onStarAccount}
             />
           </div>
         )}
-        {currentView === "kanban" && <div className="flex-1 overflow-y-auto">
-          {(accounts ?? []).length === 0 && (
-            <p className="text-sm text-[var(--twilio-navy)] p-3">No accounts loaded</p>
-          )}
-          {/* No Account row — listed first */}
-          {(() => {
-            const noAccItems = filteredItems.filter((i) => !i.account_name);
-            const noAccCompleted = (completedItems ?? []).filter((i) => !i.account_name && !(pinnedIds ?? new Set()).has(i.airtable_id));
-            const zoneKey = "account-none" as Zone;
-            const isAccOver = dragOverZone === zoneKey;
-            const groupKey = NO_ACCOUNT_GROUP_KEY;
-            const rowCollapsed = isCollapsed(groupKey);
-            return (
-              <div
-                data-drop-specific="true"
-                className={`flex flex-col border-b border-gray-100 transition-colors ${isAccOver ? "bg-indigo-50" : "hover:bg-gray-50"}`}
-                onDragOver={(e) => { e.stopPropagation(); onDragOver(e, zoneKey); }}
-                onDragLeave={(e) => { if (leftElement(e)) onDragLeave(); }}
-                onDrop={(e) => { e.stopPropagation(); onDrop(e, "accounts", "none"); }}
-              >
-                <div className="flex items-stretch">
-                  <div className="w-36 shrink-0 px-3 py-2 border-r border-gray-100 flex flex-col justify-center">
-                    <button
-                      onClick={() => toggleCollapse(groupKey)}
-                      title={rowCollapsed ? "Expand No Account" : "Collapse No Account"}
-                      className="flex items-center gap-1.5 text-left min-w-0"
-                    >
-                      <CollapseChevron collapsed={rowCollapsed} />
-                      <p className="text-sm font-medium text-[var(--twilio-gray-60)] leading-tight italic truncate">No Account</p>
-                    </button>
-                    {rowCollapsed && <div className="mt-1 pl-4"><GroupCounts items={[...noAccItems, ...noAccCompleted]} /></div>}
-                  </div>
-                  {rowCollapsed && <CollapsedRowDropHint active={isAccOver} dragInFlight={!!externalDragId} name="No Account" />}
-                  {!rowCollapsed && <>
-                  <div className="flex-1 overflow-x-auto">
-                    <div className="flex flex-row gap-2 p-2 min-w-0">
-                      {noAccItems.map((item) => (
-                        <div key={item.airtable_id} className="w-44 shrink-0">
-                          <KanbanCard item={item} zone="accounts" onDragStart={(e) => onDragStart(e, item)} onSave={(fields) => onSave(item, fields)} onExpandClick={() => onExpand(item)} onDelete={onDelete ? () => onDelete(item) : undefined} onUpdated={onUpdated} />
-                        </div>
-                      ))}
-                      {noAccItems.length === 0 && (
-                        <div className={`w-36 shrink-0 flex items-center justify-center h-16 rounded-lg border-2 border-dashed text-sm ${isAccOver ? "border-indigo-400 text-indigo-600" : "border-gray-300 text-[var(--twilio-gray-60)]"}`}>Drop here</div>
-                      )}
-                    </div>
-                  </div>
-                  {/* Done drop target + completed deck trigger */}
-                  <div className="flex items-center shrink-0">
-                    <div
-                      data-drop-specific="true"
-                      className={`flex flex-col items-center justify-center w-14 self-stretch transition-colors cursor-default ${dragOverZone === "done-accounts-none" ? "bg-emerald-100" : "hover:bg-emerald-50"}`}
-                      style={{ borderLeft: "1px solid #e5e7eb" }}
-                      onDragOver={(e) => { e.stopPropagation(); onDragOver(e, "done-accounts-none" as Zone); }}
-                      onDragLeave={onDragLeave}
-                      onDrop={(e) => { e.stopPropagation(); onDrop(e, "done-accounts", "none"); }}
-                      title="Drop here to mark Done"
-                    >
-                      <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" className={`w-3.5 h-3.5 transition-colors ${dragOverZone === "done-accounts-none" ? "text-emerald-600" : "text-emerald-400"}`}>
-                        <path d="M2 7l3.5 3.5L12 3.5" strokeLinecap="round" strokeLinejoin="round"/>
-                      </svg>
-                      <span className={`text-[9px] font-semibold uppercase tracking-wide mt-0.5 transition-colors ${dragOverZone === "done-accounts-none" ? "text-emerald-700" : "text-emerald-400"}`}>Done</span>
-                    </div>
-                    {noAccCompleted.length > 0 && onPin && (
-                      <div className="px-2 flex items-center">
-                        <CompletedDeckTrigger
-                          items={noAccCompleted}
-                          open={openDeckKey === "none"}
-                          onToggle={() => setOpenDeckKey(openDeckKey === "none" ? null : "none")}
-                        />
-                      </div>
-                    )}
-                  </div>
-                  </>}
-                </div>
-                {/* Expanded completed row */}
-                {!rowCollapsed && openDeckKey === "none" && noAccCompleted.length > 0 && onPin && (
-                  <div
-                    data-drop-specific="true"
-                    className="flex gap-2 px-3 pb-2 overflow-x-auto transition-colors"
-                    style={{ borderTop: "1px solid #f0fdf4", background: dragOverZone === "done-accounts-none" ? "#dcfce7" : "#f0fdf4", scrollbarWidth: "thin" }}
-                    onDragOver={(e) => { e.stopPropagation(); onDragOver(e, "done-accounts-none" as Zone); }}
-                    onDragLeave={onDragLeave}
-                    onDrop={(e) => { e.stopPropagation(); onDrop(e, "done-accounts", "none"); }}
-                  >
-                    <p className="text-[10px] font-semibold text-emerald-600 uppercase tracking-wide self-center shrink-0 mr-1">
-                      {dragOverZone === "done-accounts-none" ? "Drop to mark Done" : "Completed"}
-                    </p>
-                    {noAccCompleted.map((item) => (
-                      <div key={item.airtable_id} className="shrink-0 w-44 py-2 flex flex-col gap-1 group">
-                        <div className="relative">
-                          <KanbanCard item={item} zone="accounts" onDragStart={(e) => onDragStart(e, item)} onSave={(fields) => onSave(item, fields)} onExpandClick={() => onExpand(item)} onDelete={onDelete ? () => onDelete(item) : undefined} onUpdated={onUpdated} />
-                          <button
-                            onClick={() => onPin(item)}
-                            title="Pin to active list"
-                            className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 transition-opacity"
-                            style={{ background: "rgba(255,255,255,0.9)", border: "none", borderRadius: 4, cursor: "pointer", padding: 2, color: "#9ca3af" }}
-                          >
-                            <svg viewBox="0 0 16 16" width="10" height="10" fill="currentColor"><path d="M9.828.722a.5.5 0 01.354.146l4.95 4.95a.5.5 0 010 .707c-.48.48-1.072.588-1.503.588-.177 0-.335-.018-.46-.039l-3.134 3.134a5.927 5.927 0 01.16 1.013c.046.702-.032 1.687-.72 2.375a.5.5 0 01-.707 0l-2.829-2.828-3.182 3.182c-.195.195-1.219.902-1.414.707-.195-.195.512-1.22.707-1.414l3.182-3.182-2.828-2.829a.5.5 0 010-.707c.688-.688 1.673-.767 2.375-.72a5.922 5.922 0 011.013.16l3.134-3.133a2.772 2.772 0 01-.04-.461c0-.43.108-1.022.589-1.503a.5.5 0 01.353-.146z"/></svg>
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            );
-          })()}
-          {(accounts ?? []).map((acc) => {
-            const accItems = filteredItems.filter((i) => i.account_name?.toLowerCase() === acc.name.toLowerCase());
-            const accCompleted = (completedItems ?? []).filter((i) => i.account_name?.toLowerCase() === acc.name.toLowerCase() && !(pinnedIds ?? new Set()).has(i.airtable_id));
-            // Items that belong to this account but are rendered elsewhere — shown as
-            // ghosts so the row never looks emptier than it is. Either staged in
-            // today/active, or hoisted into Pinned In Progress by focus mode.
-            const stagedItems = (allRealItems ?? []).filter((i) => {
-              const z = itemZones?.[i.airtable_id];
-              const pinnedAway = !!focusMode && focusPinnedIds.has(i.airtable_id);
-              return (z === "today" || z === "active" || pinnedAway)
-                && i.account_name?.toLowerCase() === acc.name.toLowerCase();
-            });
-            const zoneKey = `account-${acc.key}` as Zone;
-            const isAccOver = dragOverZone === zoneKey;
-            const groupKey = accountGroupKey(acc.name);
-            const rowCollapsed = isCollapsed(groupKey);
-            return (
-              <div
-                key={acc.key}
-                data-drop-specific="true"
-                className={`flex flex-col border-b border-gray-100 transition-colors ${isAccOver ? "bg-indigo-50" : "hover:bg-gray-50"}`}
-                onDragOver={(e) => { e.stopPropagation(); onDragOver(e, zoneKey); }}
-                onDragLeave={(e) => { if (leftElement(e)) onDragLeave(); }}
-                onDrop={(e) => { e.stopPropagation(); onDrop(e, "accounts", acc.key); }}
-              >
-                <div className="flex items-stretch">
-                  {/* Account label column. The star and the collapse toggle are siblings —
-                      nesting one button inside the other would be invalid. */}
-                  <div className="w-36 shrink-0 px-3 py-2 border-r border-gray-100 flex flex-col justify-center">
-                    <div className="flex items-center gap-1.5 min-w-0">
-                      <button title={starredAccountKey === acc.key ? "Remove auto-assign" : "Auto-assign blank cards to this account"} onClick={() => onStarAccount?.(starredAccountKey === acc.key ? null : acc.key)} className="shrink-0 leading-none transition-transform hover:scale-110">
-                        <svg viewBox="0 0 20 20" fill={starredAccountKey === acc.key ? "#f59e0b" : "none"} stroke={starredAccountKey === acc.key ? "#f59e0b" : "#9ca3af"} strokeWidth="1.5" className="w-4 h-4">
-                          <path strokeLinecap="round" strokeLinejoin="round" d="M9.049 2.927c.3-.921 1.603-.921 1.902 0l1.07 3.292a1 1 0 00.95.69h3.462c.969 0 1.371 1.24.588 1.81l-2.8 2.034a1 1 0 00-.364 1.118l1.07 3.292c.3.921-.755 1.688-1.54 1.118l-2.8-2.034a1 1 0 00-1.175 0l-2.8 2.034c-.784.57-1.838-.197-1.539-1.118l1.07-3.292a1 1 0 00-.364-1.118L2.98 8.72c-.783-.57-.38-1.81.588-1.81h3.461a1 1 0 00.951-.69l1.07-3.292z"/>
-                        </svg>
-                      </button>
-                      <button
-                        onClick={() => toggleCollapse(groupKey)}
-                        title={rowCollapsed ? `Expand ${acc.name}` : `Collapse ${acc.name}`}
-                        className="flex items-center gap-1 min-w-0 text-left"
-                      >
-                        <CollapseChevron collapsed={rowCollapsed} />
-                        <p className="text-sm font-medium text-[var(--twilio-navy)] leading-tight truncate">{acc.name}</p>
-                      </button>
-                    </div>
-                    {rowCollapsed
-                      ? <div className="mt-1 pl-5"><GroupCounts items={[...accItems, ...accCompleted]} /></div>
-                      : acc.source === "airtable" && <span className="text-[10px] text-[var(--twilio-gray-60)] mt-0.5 pl-5">Airtable</span>}
-                  </div>
-                  {rowCollapsed && <CollapsedRowDropHint active={isAccOver} dragInFlight={!!externalDragId} name={acc.name} />}
-                  {!rowCollapsed && <>
-                  {/* Cards scrolling horizontally */}
-                  <div className="flex-1 overflow-x-auto">
-                    <div className="flex flex-row gap-2 p-2 min-w-0">
-                      {accItems.map((item) => (
-                        <div key={item.airtable_id} className="w-44 shrink-0">
-                          <KanbanCard item={item} zone="accounts" onDragStart={(e) => onDragStart(e, item)} onSave={(fields) => onSave(item, fields)} onExpandClick={() => onExpand(item)} onDelete={onDelete ? () => onDelete(item) : undefined} onUpdated={onUpdated} />
-                        </div>
-                      ))}
-                      {/* Ghost cards for items rendered in another panel */}
-                      {stagedItems.map((item) => {
-                        const z = itemZones?.[item.airtable_id];
-                        const pinnedAway = !!focusMode && focusPinnedIds.has(item.airtable_id);
-                        const label = pinnedAway ? "Pinned to Focus" : z === "active" ? "In Progress" : "Stage Today";
-                        const pillClass = pinnedAway
-                          ? "bg-violet-100 text-violet-700"
-                          : z === "active" ? "bg-yellow-100 text-yellow-700" : "bg-indigo-50 text-indigo-600";
-                        return (
-                          <div key={item.airtable_id} className="w-44 shrink-0 relative group/ghost">
-                            <div className="rounded-lg border border-dashed border-gray-300 bg-white opacity-50 px-3 py-2.5 flex flex-col gap-1 select-none pointer-events-none"
-                              style={{ borderStyle: "dashed" }}>
-                              <p className="text-xs font-medium text-[var(--twilio-navy)] italic leading-snug line-clamp-2">
-                                {item.task || "Untitled"}
-                              </p>
-                              <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full w-fit ${pillClass}`}>
-                                {label}
-                              </span>
-                            </div>
-                            {/* Restore button — visible on hover. Pinned-away cards are
-                                unpinned from the Pinned In Progress section instead. */}
-                            {!pinnedAway && (
-                              <button
-                                onClick={() => onRestoreToViews?.(item)}
-                                title={`Remove from ${label} and restore to Views`}
-                                className="absolute top-1.5 right-1.5 opacity-0 group-hover/ghost:opacity-100 transition-opacity flex items-center gap-0.5 text-[10px] font-semibold text-indigo-600 bg-white border border-indigo-200 rounded-full px-1.5 py-0.5 shadow-sm hover:bg-indigo-50 pointer-events-auto"
-                              >
-                                <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.8" className="w-2.5 h-2.5 shrink-0"><path d="M9 3L3 9M3 3l6 6" strokeLinecap="round"/></svg>
-                                Restore
-                              </button>
-                            )}
-                          </div>
-                        );
-                      })}
-                      {accItems.length === 0 && stagedItems.length === 0 && (
-                        <div className={`w-36 shrink-0 flex items-center justify-center h-16 rounded-lg border-2 border-dashed text-sm ${isAccOver ? "border-indigo-400 text-indigo-600" : "border-gray-300 text-[var(--twilio-gray-60)]"}`}>Drop here</div>
-                      )}
-                      {accItems.length === 0 && stagedItems.length > 0 && (
-                        <div className={`w-36 shrink-0 flex items-center justify-center h-16 rounded-lg border-2 border-dashed text-sm ${isAccOver ? "border-indigo-400 text-indigo-600" : "border-gray-200 text-gray-300"}`}>Drop here</div>
-                      )}
-                    </div>
-                  </div>
-                  {/* Done drop target + completed deck trigger */}
-                  <div className="flex items-center shrink-0">
-                    <div
-                      data-drop-specific="true"
-                      className={`flex flex-col items-center justify-center w-14 self-stretch transition-colors cursor-default ${dragOverZone === `done-accounts-${acc.key}` ? "bg-emerald-100" : "hover:bg-emerald-50"}`}
-                      style={{ borderLeft: "1px solid #e5e7eb" }}
-                      onDragOver={(e) => { e.stopPropagation(); onDragOver(e, `done-accounts-${acc.key}` as Zone); }}
-                      onDragLeave={onDragLeave}
-                      onDrop={(e) => { e.stopPropagation(); onDrop(e, "done-accounts", acc.key); }}
-                      title="Drop here to mark Done"
-                    >
-                      <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" className={`w-3.5 h-3.5 transition-colors ${dragOverZone === `done-accounts-${acc.key}` ? "text-emerald-600" : "text-emerald-400"}`}>
-                        <path d="M2 7l3.5 3.5L12 3.5" strokeLinecap="round" strokeLinejoin="round"/>
-                      </svg>
-                      <span className={`text-[9px] font-semibold uppercase tracking-wide mt-0.5 transition-colors ${dragOverZone === `done-accounts-${acc.key}` ? "text-emerald-700" : "text-emerald-400"}`}>Done</span>
-                    </div>
-                    {accCompleted.length > 0 && onPin && (
-                      <div className="px-2 flex items-center">
-                        <CompletedDeckTrigger
-                          items={accCompleted}
-                          open={openDeckKey === acc.key}
-                          onToggle={() => setOpenDeckKey(openDeckKey === acc.key ? null : acc.key)}
-                        />
-                      </div>
-                    )}
-                  </div>
-                  </>}
-                </div>
-                {/* Expanded completed row */}
-                {!rowCollapsed && openDeckKey === acc.key && accCompleted.length > 0 && onPin && (
-                  <div
-                    data-drop-specific="true"
-                    className="flex gap-2 px-3 pb-2 overflow-x-auto transition-colors"
-                    style={{ borderTop: "1px solid #f0fdf4", background: dragOverZone === `done-accounts-${acc.key}` ? "#dcfce7" : "#f0fdf4", scrollbarWidth: "thin" }}
-                    onDragOver={(e) => { e.stopPropagation(); onDragOver(e, `done-accounts-${acc.key}` as Zone); }}
-                    onDragLeave={onDragLeave}
-                    onDrop={(e) => { e.stopPropagation(); onDrop(e, "done-accounts", acc.key); }}
-                  >
-                    <p className="text-[10px] font-semibold text-emerald-600 uppercase tracking-wide self-center shrink-0 mr-1">
-                      {dragOverZone === `done-accounts-${acc.key}` ? "Drop to mark Done" : "Completed"}
-                    </p>
-                    {accCompleted.map((item) => (
-                      <div key={item.airtable_id} className="shrink-0 w-44 py-2 flex flex-col gap-1 group">
-                        <div className="relative">
-                          <KanbanCard item={item} zone="accounts" onDragStart={(e) => onDragStart(e, item)} onSave={(fields) => onSave(item, fields)} onExpandClick={() => onExpand(item)} onDelete={onDelete ? () => onDelete(item) : undefined} onUpdated={onUpdated} />
-                          <button
-                            onClick={() => onPin(item)}
-                            title="Pin to active list"
-                            className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 transition-opacity"
-                            style={{ background: "rgba(255,255,255,0.9)", border: "none", borderRadius: 4, cursor: "pointer", padding: 2, color: "#9ca3af" }}
-                          >
-                            <svg viewBox="0 0 16 16" width="10" height="10" fill="currentColor"><path d="M9.828.722a.5.5 0 01.354.146l4.95 4.95a.5.5 0 010 .707c-.48.48-1.072.588-1.503.588-.177 0-.335-.018-.46-.039l-3.134 3.134a5.927 5.927 0 01.16 1.013c.046.702-.032 1.687-.72 2.375a.5.5 0 01-.707 0l-2.829-2.828-3.182 3.182c-.195.195-1.219.902-1.414.707-.195-.195.512-1.22.707-1.414l3.182-3.182-2.828-2.829a.5.5 0 010-.707c.688-.688 1.673-.767 2.375-.72a5.922 5.922 0 011.013.16l3.134-3.133a2.772 2.772 0 01-.04-.461c0-.43.108-1.022.589-1.503a.5.5 0 01.353-.146z"/></svg>
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            );
-          })}
-          {/* Unmatched account — catch-all so an item whose account_name matches no known
-              account is never silently rendered nowhere. One row for all of them, so a bad
-              sync can't explode the grid into hundreds of rows. Deliberately not a drop
-              target and with no Done column: filing into an unresolvable bucket has no
-              meaning. Each card shows its own account_name badge. */}
-          {(() => {
-            const known = new Set((accounts ?? []).map((a) => a.name.toLowerCase()));
-            const orphans = filteredItems.filter(
-              (i) => i.account_name && !known.has(i.account_name.toLowerCase())
-            );
-            if (orphans.length === 0) return null;
-            const rowCollapsed = isCollapsed(UNMATCHED_GROUP_KEY);
-            return (
-              <div className="flex flex-col border-b border-gray-100 transition-colors hover:bg-gray-50">
-                <div className="flex items-stretch">
-                  <div className="w-36 shrink-0 px-3 py-2 border-r border-gray-100 flex flex-col justify-center">
-                    <button
-                      onClick={() => toggleCollapse(UNMATCHED_GROUP_KEY)}
-                      title={rowCollapsed ? "Expand unmatched" : "Collapse unmatched"}
-                      className="flex items-center gap-1.5 min-w-0 text-left"
-                    >
-                      <CollapseChevron collapsed={rowCollapsed} />
-                      <p className="text-sm font-medium text-amber-700 leading-tight italic truncate">Unmatched account</p>
-                    </button>
-                    {rowCollapsed
-                      ? <div className="mt-1 pl-4"><GroupCounts items={orphans} /></div>
-                      : <span className="text-[10px] text-amber-600 mt-0.5 pl-4">No matching account</span>}
-                  </div>
-                  {!rowCollapsed && (
-                    <div className="flex-1 overflow-x-auto">
-                      <div className="flex flex-row gap-2 p-2 min-w-0">
-                        {orphans.map((item) => (
-                          <div key={item.airtable_id} className="w-44 shrink-0">
-                            <KanbanCard item={item} zone="accounts" onDragStart={(e) => onDragStart(e, item)} onSave={(fields) => onSave(item, fields)} onExpandClick={() => onExpand(item)} onDelete={onDelete ? () => onDelete(item) : undefined} onUpdated={onUpdated} />
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              </div>
-            );
-          })()}
-        </div>}
+        {currentView === "projects" && (
+          <div className="flex-1 p-4 overflow-auto">
+            <ProjectsTreeView
+              items={viewItems}
+              accounts={accounts ?? []}
+              projects={projects ?? []}
+              accountIdByName={accountIdByName ?? new Map()}
+              onExpand={onExpand}
+              externalDragId={externalDragId}
+              dragAccountName={dragAccountName}
+              onAssign={onAssignToProject}
+              onDragStart={onDragStart}
+              onDragEnd={onDragLeave}
+            />
+          </div>
+        )}
       </div>
     );
   }
@@ -2993,34 +2543,33 @@ function DropZone({
               } : undefined}
             >
               {exportMode && (
-                <button
-                  onClick={() => toggleItem({
-                    id: exportKey,
-                    type: "action_item",
-                    label: item.task || "Untitled",
-                    summary: `${item.status} · ${item.priority} · ${item.account_name ?? "No account"}`,
-                    content: `Action Item: ${item.task || "Untitled"}\nStatus: ${item.status}\nPriority: ${item.priority}\nAccount: ${item.account_name ?? "N/A"}\nAssignee: ${item.assignee_name ?? "Unassigned"}\nDue: ${item.due_date ?? "No date"}\nDetails: ${item.task_details ?? ""}`,
-                    accountName: item.account_name ?? undefined,
-                  })}
-                  style={{
-                    position: "absolute", inset: 0, zIndex: 10, cursor: "pointer",
-                    background: sel ? "rgba(226,35,26,0.08)" : "transparent",
-                    border: sel ? "2px solid var(--twilio-red, #e22)" : "2px solid transparent",
-                    borderRadius: "8px",
-                    display: "flex", alignItems: "flex-start", justifyContent: "flex-end",
-                    padding: "4px",
+                // Only the corner select control sits over the card. This used to be a
+                // full-card overlay <button>, which (1) swallowed the card's dragstart, so
+                // nothing could be dragged out of Unstaged while the tray was open, and
+                // (2) was a native <button> drop target, which browsers don't reliably
+                // bubble `drop` through — so dropping on a Stage Today / Currently Tracking
+                // card did nothing. A small non-button element has neither problem.
+                <div
+                  role="button"
+                  tabIndex={0}
+                  aria-label={sel ? "Remove from export tray" : "Add to export tray"}
+                  aria-pressed={sel}
+                  data-testid="export-select"
+                  onClick={(e) => { e.stopPropagation(); toggleActionItemForExport(item); }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleActionItemForExport(item); }
                   }}
-                >
-                  <span style={{
+                  style={{
+                    position: "absolute", top: 4, right: 4, zIndex: 10, cursor: "pointer",
                     width: "18px", height: "18px", borderRadius: "50%",
                     background: sel ? "var(--twilio-red, #e22)" : "rgba(255,255,255,0.9)",
                     border: sel ? "none" : "1.5px solid rgba(0,0,0,0.2)",
                     display: "flex", alignItems: "center", justifyContent: "center",
-                    fontSize: "11px", color: "#fff", flexShrink: 0,
-                  }}>
-                    {sel ? "✓" : ""}
-                  </span>
-                </button>
+                    fontSize: "11px", color: "#fff",
+                  }}
+                >
+                  {sel ? "✓" : ""}
+                </div>
               )}
               <KanbanCard
                 item={item}
@@ -3108,6 +2657,9 @@ function StatusBoardView({
   onDragStart?: (e: React.DragEvent, item: AirtableActionItem) => void;
   onDragEnd?: () => void;
 }) {
+  const { label: statusLabel } = useStatusLabels();
+  // Shared with every other status-column surface; no direction chosen = list order unchanged.
+  const { sortDirection, toggleSort, applySort } = useColumnSort();
   const [dragId, setDragId] = useState<string | null>(null);
   const [overCol, setOverCol] = useState<AirtableActionItem["status"] | null>(null);
   // Optimistic local status overrides so the move feels instant
@@ -3162,21 +2714,22 @@ function StatusBoardView({
   <>
     <div className="flex gap-4 overflow-x-auto pb-2 flex-1" style={{ scrollbarWidth: "thin", alignItems: "stretch" }}>
       {STATUS_COLUMNS.map((col) => {
-        const colItems = items.filter((i) => effectiveStatus(i) === col);
+        const colItems = applySort(items.filter((i) => effectiveStatus(i) === col), col);
         const isOver = overCol === col;
         return (
           <div
             key={col}
             className={`flex flex-col rounded-lg shrink-0 flex-1 transition-colors ${isOver ? "bg-indigo-50" : "bg-white"}`}
-            style={{ minWidth: 280, border: isOver ? "1.5px solid #818cf8" : "1px solid #e5e7eb", maxHeight: "calc(100vh - 200px)" }}
+            style={{ minWidth: 280, border: isOver ? "1.5px solid #818cf8" : "1px solid var(--border-subtle)", maxHeight: "calc(100vh - 200px)" }}
             data-drop-specific="true"
             onDragOver={(e) => { e.preventDefault(); setOverCol(col); }}
             onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setOverCol(null); }}
             onDrop={(e) => { e.stopPropagation(); void handleDrop(col, e); }}
           >
             <div className="flex items-center gap-2 px-4 py-3 border-b border-gray-100 shrink-0">
-              <span className="text-sm font-semibold text-[var(--twilio-navy)]">{col}</span>
+              <span className="text-sm font-semibold text-[var(--twilio-navy)]">{statusLabel(col)}</span>
               <span className="text-sm text-[var(--twilio-gray-60)] font-normal">{colItems.length}</span>
+              <ColumnSortButton status={col} direction={sortDirection(col)} onToggle={toggleSort} className="ml-auto" />
             </div>
             <div className="flex flex-col overflow-y-auto flex-1 px-2 py-2 gap-0" style={{ scrollbarWidth: "thin" }}>
               {colItems.map((item) => (
@@ -3243,14 +2796,14 @@ function StatusBoardView({
       {/* Blocked + Backlogged share one column, stacked in rows */}
       <div className="flex flex-col shrink-0 flex-1 gap-0" style={{ minWidth: 280, maxHeight: "calc(100vh - 200px)" }}>
         {(["Blocked", "Backlogged"] as const).map((col, i) => {
-          const colItems = items.filter((item) => effectiveStatus(item) === col);
+          const colItems = applySort(items.filter((item) => effectiveStatus(item) === col), col);
           const isOver = overCol === col;
           return (
             <div
               key={col}
               className={`flex flex-col flex-1 transition-colors overflow-hidden ${isOver ? (col === "Blocked" ? "bg-red-50" : "bg-slate-50") : "bg-white"}`}
               style={{
-                border: isOver ? `1.5px solid ${col === "Blocked" ? "#f87171" : "#94a3b8"}` : "1px solid #e5e7eb",
+                border: isOver ? `1.5px solid ${col === "Blocked" ? "#f87171" : "#94a3b8"}` : "1px solid var(--border-subtle)",
                 borderRadius: i === 0 ? "8px 8px 0 0" : "0 0 8px 8px",
                 marginTop: i === 1 ? "-1px" : 0,
               }}
@@ -3260,8 +2813,9 @@ function StatusBoardView({
               onDrop={(e) => { e.stopPropagation(); void handleDrop(col, e); }}
             >
               <div className="flex items-center gap-2 px-4 py-3 border-b border-gray-100 shrink-0">
-                <span className={`text-sm font-semibold ${col === "Blocked" ? "text-red-700" : "text-slate-600"}`}>{col}</span>
+                <span className={`text-sm font-semibold ${col === "Blocked" ? "text-red-700" : "text-slate-600"}`}>{statusLabel(col)}</span>
                 <span className="text-sm text-[var(--twilio-gray-60)] font-normal">{colItems.length}</span>
+                <ColumnSortButton status={col} direction={sortDirection(col)} onToggle={toggleSort} className="ml-auto" />
               </div>
               <div className="flex flex-col overflow-y-auto flex-1 px-2 py-2 gap-0" style={{ scrollbarWidth: "thin" }}>
                 {colItems.map((item) => (
@@ -3369,6 +2923,7 @@ function DueDateView({
   onDragStart?: (e: React.DragEvent, item: AirtableActionItem) => void;
   onDragEnd?: () => void;
 }) {
+  const { label: statusLabel } = useStatusLabels();
   const [ctxState, setCtxState] = useState<{ x: number; y: number; item: AirtableActionItem } | null>(null);
   const { isPinned, toggle: toggleFocusPin } = useFocusPins();
   const { exportMode, toggleItem, isSelected } = useExport();
@@ -3434,7 +2989,7 @@ function DueDateView({
                     <p className="text-[11px] font-medium text-[var(--twilio-navy)] opacity-60 truncate">{item.account_name}</p>
                   )}
                   <div className="flex flex-wrap gap-1 items-center">
-                    <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${STATUS_COLORS[item.status] ?? "bg-gray-100"}`}>{item.status}</span>
+                    <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${STATUS_COLORS[item.status] ?? "bg-gray-100"}`}>{statusLabel(item.status)}</span>
                     <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${PRIORITY_COLORS[item.priority]}`}>{item.priority}</span>
                     {item.due_date && (
                       <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-amber-50 text-amber-700">
@@ -3499,7 +3054,7 @@ interface ProjectGroup {
   unmatched?: boolean;
 }
 
-function ProjectsView({
+function AccountsView({
   items,
   accounts,
   onExpand,
@@ -3509,12 +3064,17 @@ function ProjectsView({
   onAccountDrop,
   onDragStart,
   onDragEnd,
+  starredAccountKey,
+  onStarAccount,
 }: {
   items: AirtableActionItem[];
   accounts: KanbanAccount[];
   onExpand: (item: AirtableActionItem) => void;
   onSave: (item: AirtableActionItem, fields: Partial<AirtableActionItem>) => Promise<void>;
   externalDragId?: string | null;
+  /** The account new blank cards are pre-assigned to (the star). */
+  starredAccountKey?: string | null;
+  onStarAccount?: (key: string | null) => void;
   onExternalDrop?: (airtableId: string, status: AirtableActionItem["status"]) => void;
   /** File the dragged card under an account. `"none"` clears the account. */
   onAccountDrop?: (e: React.DragEvent, accountKey: string) => void;
@@ -3680,15 +3240,33 @@ function ProjectsView({
           >
             {/* Group header. Doubles as the drop target for a collapsed group, which is the
                 only part of it on screen. */}
-            <button
-              onClick={() => { if (!isEmpty) toggleGroup(groupKey); }}
-              title={isDropTarget && dragInFlight ? `Drop to file under ${displayName}` : undefined}
-              // Left enabled when empty even though the click is a no-op: a disabled button
-              // does not reliably receive drop events, and the header IS the drop target for
-              // an empty group. The hover style is dropped instead, so it doesn't advertise
-              // a toggle that has nothing to toggle.
-              className={`w-full flex items-center gap-3 px-4 py-3 border-b border-gray-100 transition-colors text-left ${isOver ? "bg-indigo-50" : isEmpty ? "cursor-default" : "hover:bg-gray-50"}`}
+            <div
+              data-testid={`account-header-${groupKey}`}
+              className={`w-full flex items-center gap-3 px-4 py-3 border-b border-gray-100 transition-colors ${isOver ? "bg-indigo-50" : isEmpty ? "cursor-default" : "hover:bg-gray-50"}`}
             >
+              {/* The star sits in the account's own header: new blank cards are filed under the
+                  starred account. A sibling of the toggle, never nested in it (button-in-button). */}
+              {accountKey && accountKey !== "none" && !group.unmatched && onStarAccount && (
+                <button
+                  type="button"
+                  title={starredAccountKey === accountKey ? "Remove auto-assign" : "Auto-assign blank cards to this account"}
+                  aria-label={starredAccountKey === accountKey ? `Remove auto-assign from ${displayName}` : `Auto-assign blank cards to ${displayName}`}
+                  aria-pressed={starredAccountKey === accountKey}
+                  onClick={() => onStarAccount(starredAccountKey === accountKey ? null : accountKey)}
+                  className="shrink-0 leading-none transition-transform hover:scale-110"
+                >
+                  <svg viewBox="0 0 20 20" fill={starredAccountKey === accountKey ? "#f59e0b" : "none"} stroke={starredAccountKey === accountKey ? "#f59e0b" : "#9ca3af"} strokeWidth="1.5" className="w-4 h-4">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M9.049 2.927c.3-.921 1.603-.921 1.902 0l1.07 3.292a1 1 0 00.95.69h3.462c.969 0 1.371 1.24.588 1.81l-2.8 2.034a1 1 0 00-.364 1.118l1.07 3.292c.3.921-.755 1.688-1.54 1.118l-2.8-2.034a1 1 0 00-1.175 0l-2.8 2.034c-.784.57-1.838-.197-1.539-1.118l1.07-3.292a1 1 0 00-.364-1.118L2.98 8.72c-.783-.57-.38-1.81.588-1.81h3.461a1 1 0 00.951-.69l1.07-3.292z"/>
+                  </svg>
+                </button>
+              )}
+              <button
+                onClick={() => { if (!isEmpty) toggleGroup(groupKey); }}
+                title={isDropTarget && dragInFlight
+                  ? `Drop to file under ${displayName}`
+                  : isEmpty ? undefined : isCollapsed ? `Expand ${displayName}` : `Collapse ${displayName}`}
+                className="flex-1 min-w-0 flex items-center gap-3 text-left"
+              >
               {isEmpty ? (
                 <span className="w-3 shrink-0" aria-hidden="true" />
               ) : (
@@ -3722,7 +3300,8 @@ function ProjectsView({
                   </span>
                 )}
               </span>
-            </button>
+              </button>
+            </div>
             {/* Status board for this account */}
             {!isCollapsed && !isEmpty && (
               <div className="p-4">
@@ -3751,14 +3330,28 @@ function ProjectsView({
 
 // ── Main page ─────────────────────────────────────────────────────────────────
 
-type PageView = "kanban" | "status" | "due" | "projects";
+type PageView = "accounts" | "status" | "due" | "projects";
+
+/**
+ * The saved view. Before the Projects view was rebuilt, "kanban" was the Views grid and
+ * "projects" was the per-account status boards; those boards are now "accounts" (and the
+ * grid is gone), so both old ids land there. Stored under a new key so a returning user's
+ * old "projects" can't be mistaken for the new Projects view.
+ */
+function readStoredPageView(): PageView {
+  const current = localStorage.getItem("actionItemsView-v2");
+  if (current === "accounts" || current === "status" || current === "due" || current === "projects") return current;
+  const legacy = localStorage.getItem("actionItemsView");
+  if (legacy === "status" || legacy === "due") return legacy;
+  return "accounts";
+}
 
 export default function ActionItemsPage() {
   const { reportError } = useAppError();
   const [allItems, setAllItems] = useState<AirtableActionItem[]>([]);
   const [accounts, setAccounts] = useState<KanbanAccount[]>([]);
   const [isLoading, setIsLoading] = useState(true);
-  const [pageView, setPageView] = useState<PageView>(() => (localStorage.getItem("actionItemsView") as PageView) ?? "kanban");
+  const [pageView, setPageView] = useState<PageView>(readStoredPageView);
   const [search, setSearch] = useState("");
 
   // Focus mode. Pins live in the shared useFocusPins store so cards on the Calendar and
@@ -3842,23 +3435,41 @@ export default function ActionItemsPage() {
   const [showLogs, setShowLogs] = useState(false);
   const [autoTrack, setAutoTrack] = useState(false);
 
-  // Pinned completed items — persist across sessions
-  const [pinnedIds, setPinnedIds] = useState<Set<string>>(() => {
-    try { return new Set(JSON.parse(localStorage.getItem("actionItemPinned") ?? "[]")); } catch { return new Set(); }
-  });
+  // ── Projects view ─────────────────────────────────────────────────────────
+  const { data: projects, setActionIds } = useAccountProjects();
+  // Projects are keyed by the Django Account id; the page's account list mixes Airtable and
+  // app ids, so the Projects view joins on the (lowercased) account name.
+  const [accountIdByName, setAccountIdByName] = useState<Map<string, number>>(() => new Map());
+  const dragItem = dragId ? allItems.find((i) => i.airtable_id === dragId) : undefined;
+  const dragAccountName = dragItem?.account_name?.trim().toLowerCase() || null;
 
-  function handlePin(item: AirtableActionItem) {
-    setPinnedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(item.airtable_id)) {
-        next.delete(item.airtable_id);
-      } else {
-        next.add(item.airtable_id);
-      }
-      localStorage.setItem("actionItemPinned", JSON.stringify([...next]));
-      return next;
-    });
+  /** Move the dragged action item onto a project, a goal, or an account's "No project" row. */
+  async function handleAssignToProject(target: DropTarget) {
+    const item = dragItem;
+    setDragId(null);
+    if (!item || item.airtable_id.startsWith("local-")) return;
+    const updates = moveActionItem(
+      projects.filter((p) => p.account === target.accountId),
+      item.airtable_id,
+      target.projectId,
+    );
+    if (updates.length === 0) return;
+    try {
+      await setActionIds(updates);
+      const dest = target.projectId == null ? null : projects.find((p) => p.id === target.projectId);
+      addLog({
+        category: "action_item",
+        message: dest
+          ? `Moved "${item.task || "Untitled"}" to ${dest.kind === "goal" ? "goal" : "project"} "${dest.name || "Untitled"}"`
+          : `Removed "${item.task || "Untitled"}" from its projects`,
+        links: [{ label: "View action items", path: "/action-items" }],
+        resource: { type: "action_item", id: item.airtable_id },
+      });
+    } catch {
+      reportError("Could not move the action item to that project. Nothing was changed.");
+    }
   }
+
   const pageRef = useRef<HTMLDivElement>(null);
   useLogGlow(pageRef);
 
@@ -3906,13 +3517,8 @@ export default function ActionItemsPage() {
     return () => ro.disconnect();
   }, [allItems]);
 
-  // How many blank cards to show — 1 on narrow viewports, 2 on wide
-  const [blankCount, setBlankCount] = useState(() => window.innerWidth >= 1100 ? 2 : 1);
-  useLayoutEffect(() => {
-    const update = () => setBlankCount(window.innerWidth >= 1100 ? 2 : 1);
-    window.addEventListener("resize", update);
-    return () => window.removeEventListener("resize", update);
-  }, []);
+  // Exactly one New card under Unstaged, so Stage Today and Currently Tracking get the room.
+  const blankCount = 1;
 
   // Starred account: when set, blank cards are pre-assigned to that account
   const [starredAccountKey, setStarredAccountKey] = useState<string | null>(() =>
@@ -3973,14 +3579,14 @@ export default function ActionItemsPage() {
     };
   }
 
-  // Ensure exactly `target` blank items exist in Unstaged (default 2, reduced to 1 on narrow viewports)
+  // Ensure exactly `target` blank items exist in Unstaged (one)
   function topUpBlanks(
     currentItems: AirtableActionItem[],
     currentZones: Record<string, Zone>,
     accountKey: string | null,
     allAccounts: KanbanAccount[],
     profile: UserProfile | null = null,
-    target = 2,
+    target = blankCount,
   ) {
     const unstagedBlanks = currentItems.filter(
       (i) => i.airtable_id.startsWith("local-") && (currentZones[i.airtable_id] ?? "unstaged") === "unstaged"
@@ -4096,6 +3702,9 @@ export default function ActionItemsPage() {
         }));
       const mergedAccounts = [...atAccounts, ...appAccounts].sort((a, b) => a.name.localeCompare(b.name));
       setAccounts(mergedAccounts);
+      setAccountIdByName(new Map(
+        appAccountsRes.data.results.map((a: { id: number; company_name: string }) => [a.company_name.trim().toLowerCase(), a.id] as [string, number]),
+      ));
 
       // Real items default to "today" if not previously placed; create exactly 2 fresh blanks
       const base = itemsRes.data as AirtableActionItem[];
@@ -4119,7 +3728,7 @@ export default function ActionItemsPage() {
         if (key.startsWith("local-")) delete currentZones[key];
       }
       const starKey = localStorage.getItem("actionItemStarredAccount");
-      const targetBlanks = window.innerWidth >= 1100 ? 2 : 1;
+      const targetBlanks = blankCount;
       const { newItems, newZones } = topUpBlanks(base, currentZones, starKey, mergedAccounts, loadedProfile, targetBlanks);
       localStorage.setItem("actionItemZones", JSON.stringify(newZones));
       setZonesRaw(newZones);
@@ -4206,6 +3815,37 @@ export default function ActionItemsPage() {
     // scheduleSilentReload is stable, so listing it cannot cause a re-subscribe.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scheduleSilentReload]);
+
+  // Pinned cards the user has dragged into Stage Today / Currently Tracking (see inPinnedSection).
+  const [stagedPins, setStagedPins] = useState<Set<string>>(() => {
+    try { return new Set<string>(JSON.parse(localStorage.getItem("actionPinnedStaged") ?? "[]")); } catch { return new Set(); }
+  });
+  function updateStagedPins(fn: (prev: Set<string>) => Set<string>) {
+    setStagedPins((prev) => {
+      const next = fn(prev);
+      localStorage.setItem("actionPinnedStaged", JSON.stringify([...next]));
+      return next;
+    });
+  }
+
+  function zoneOf(i: AirtableActionItem): Zone {
+    return zones[i.airtable_id] ?? (i.airtable_id.startsWith("local-")
+      ? "unstaged"
+      : i.account_name ? "accounts" : "today");
+  }
+
+  /**
+   * Focus mode hoists a pinned card into Pinned In Progress. The exception is a card the
+   * user dragged out of that section into Stage Today / Currently Tracking: it then
+   * renders in that column (otherwise the drop looked like it did nothing, because the
+   * column hid every pinned card), and goes back to the Pinned section when it is dragged
+   * to any other zone or unpinned. Mounted exactly once either way.
+   */
+  function inPinnedSection(i: AirtableActionItem): boolean {
+    if (!focusMode || !focusPinnedIds.has(i.airtable_id)) return false;
+    const z = zoneOf(i);
+    return !(stagedPins.has(i.airtable_id) && (z === "today" || z === "active"));
+  }
 
   function itemsInZone(zone: Zone): AirtableActionItem[] {
     return allItems.filter((i) => {
@@ -4375,6 +4015,18 @@ export default function ActionItemsPage() {
 
     // Use activeId from here on
     const resolvedId = activeId;
+
+    // A pinned card dropped on a staging column moves there; anywhere else it returns to
+    // the Pinned In Progress section.
+    if (focusMode && focusPinnedIds.has(resolvedId)) {
+      const staging = targetZone === "today" || targetZone === "active";
+      updateStagedPins((prev) => {
+        if (staging === prev.has(resolvedId)) return prev;
+        const next = new Set(prev);
+        if (staging) next.add(resolvedId); else next.delete(resolvedId);
+        return next;
+      });
+    }
 
     if (targetZone === "accounts" && accountKey != null) {
       const prevZoneAccounts = prevZoneGlobal;
@@ -4830,9 +4482,13 @@ export default function ActionItemsPage() {
     <div ref={pageRef} className="flex flex-col h-full overflow-auto">
       {/* Page heading */}
       <div className="flex items-center justify-between px-6 pt-6 pb-4 shrink-0">
-        <div>
+        <div className="shrink-0">
           <h1 className="text-3xl font-semibold text-[var(--twilio-navy)] flex items-center gap-2"><ChecklistIcon width={24} height={24} style={{ flexShrink: 0 }} />Action Items</h1>
           <p className="text-sm text-[var(--twilio-navy)] mt-1">{allItems.filter(i => !i.airtable_id.startsWith("local-")).length} items from Airtable</p>
+        </div>
+        {/* Pinned Claude skills: centred between the title and the buttons, scrolling when they overflow */}
+        <div className="flex-1 min-w-0 mx-6 overflow-x-auto" data-testid="action-items-skills-row">
+          <PinnedSkillsSection page="action-items" variant="row" align="center" />
         </div>
         <div className="flex items-center gap-3">
           <button
@@ -4878,8 +4534,10 @@ export default function ActionItemsPage() {
           // In focus mode a pinned card is hoisted into the Pinned In Progress section and
           // must not also render in its own zone panel — two mounted KanbanCards for one
           // item would each hold a rival copy of its unsaved form state.
-          const hiddenByFocus = (item: AirtableActionItem) =>
-            focusMode && focusPinnedIds.has(item.airtable_id);
+          // A pinned card that has been staged (Stage Today / Currently Tracking) renders in
+          // that panel and is dropped from the Pinned section; it returns to the Pinned
+          // section when it is dragged back out to Views. Either way it is mounted once.
+          const hiddenByFocus = (item: AirtableActionItem) => inPinnedSection(item);
           const filteredItemsInZone = (zone: Zone) =>
             orderForZone(zone, itemsInZone(zone).filter(kanbanFilter).filter((i) => !hiddenByFocus(i)));
           return (<>
@@ -4920,7 +4578,7 @@ export default function ActionItemsPage() {
         {/* Row 1: Unstaged | Stage Today | In Progress — horizontally scrollable when viewport is narrow */}
         <div className="flex gap-3 items-start overflow-x-auto pb-1" style={{ scrollbarWidth: "thin" }}>
         {/* Unstaged: width tracks blankCount so it never crushes the other columns */}
-        <div ref={unstagedWrapRef} className="shrink-0" style={{ width: blankCount === 1 ? "340px" : "680px" }}>
+        <div ref={unstagedWrapRef} className="shrink-0" style={{ width: "340px" }}>
           <DropZone
             zone="unstaged"
             label="Unstaged"
@@ -4959,7 +4617,6 @@ export default function ActionItemsPage() {
           onUpdated={handleItemUpdated}
           className="flex-1"
           style={{ minWidth: "300px", ...(row1Height ? { height: row1Height } : {}) }}
-          focusMode={focusMode}
           reorderable
           collapsible
           dragId={dragId}
@@ -4990,7 +4647,6 @@ export default function ActionItemsPage() {
           onAutoTrackToggle={() => setAutoTrack((v) => !v)}
           className="flex-1"
           style={{ minWidth: "300px", ...(row1Height ? { height: row1Height } : {}) }}
-          focusMode={focusMode}
           reorderable
           collapsible
           dragId={dragId}
@@ -5009,7 +4665,7 @@ export default function ActionItemsPage() {
           <div className="shrink-0 bg-violet-50 rounded-lg border border-violet-200 px-4 py-3">
             <div className="flex items-center gap-2 mb-2">
               <span className="text-sm font-semibold text-violet-800">Pinned In Progress</span>
-              <span className="text-xs text-violet-600">{focusPinnedIds.size} pinned</span>
+              <span className="text-xs text-violet-600">{focusPinnedIds.size} pinned{allItems.some((i) => focusPinnedIds.has(i.airtable_id) && !inPinnedSection(i)) ? " · staged ones show in their column" : ""}</span>
             </div>
             {focusPinnedIds.size === 0 ? (
               <p className="text-xs text-violet-500">Right-click any action item and choose “Pin to Focus” to track it here.</p>
@@ -5019,7 +4675,8 @@ export default function ActionItemsPage() {
                 {Array.from(focusPinnedIds).map((id) => {
                   const pinnedItem = allItems.find((i) => i.airtable_id === id);
                   if (!pinnedItem || pinnedItem.airtable_id.startsWith("local-")) return null;
-                  const homeZone: Zone = zones[id] ?? (pinnedItem.account_name ? "accounts" : "today");
+                  if (!inPinnedSection(pinnedItem)) return null; // staged: shown in its panel
+                  const homeZone: Zone = zoneOf(pinnedItem);
                   return (
                     // PINNED_CARD_WIDTH matches the Views grid, the app's standard card size.
                     <div key={id} className={`${PINNED_CARD_WIDTH} shrink-0 flex flex-col gap-1`}>
@@ -5069,20 +4726,17 @@ export default function ActionItemsPage() {
           onUpdated={handleItemUpdated}
           starredAccountKey={starredAccountKey}
           onStarAccount={setStarred}
-          completedItems={allItems.filter((i) => i.status === "Done")}
-          pinnedIds={pinnedIds}
-          onPin={handlePin}
-          myCollabId={myProfile?.airtable_collaborator_id ?? null}
+          projects={projects}
+          accountIdByName={accountIdByName}
+          dragAccountName={dragAccountName}
+          onAssignToProject={handleAssignToProject}
           className="flex-1"
           pageView={pageView}
-          onPageViewChange={(v) => { setPageView(v); localStorage.setItem("actionItemsView", v); }}
+          onPageViewChange={(v) => { setPageView(v); localStorage.setItem("actionItemsView-v2", v); }}
           search={search}
           onSearchChange={setSearch}
           allRealItems={allItems.filter((i) => !i.airtable_id.startsWith("local-"))}
           onSaveFieldsOnly={async (item, fields) => { await handleSaveItem(item.airtable_id, fields); }}
-          itemZones={zones}
-          focusMode={focusMode}
-          onRestoreToViews={(item) => setZones((prev) => ({ ...prev, [item.airtable_id]: "accounts" }))}
           externalDragId={dragId}
           onAccountDrop={handleAccountGroupDrop}
           onExternalDropWithStatus={async (airtableId, status) => {
@@ -5104,7 +4758,20 @@ export default function ActionItemsPage() {
       </div>{/* end main content wrapper */}
 
       {/* Card edit modal */}
-      {editItem && (
+      {editItem && !editItem.airtable_id.startsWith("local-") && (
+        <ActionItemModal
+          item={editItem}
+          accountId={accounts.find((a) => a.name === editItem.account_name)?.id}
+          teamMembers={teamMembers}
+          onClose={() => setEditItem(null)}
+          onUpdated={handleItemUpdated}
+          onAutosaved={handleItemUpdated}
+          onConverted={() => { setAllItems((prev) => prev.filter((i) => i.airtable_id !== editItem.airtable_id)); setEditItem(null); }}
+          onDeleted={() => { void handleDeleteItem(editItem); }}
+        />
+      )}
+      {/* local-* drafts keep the legacy editor (optimistic local-* protocol is out of scope). */}
+      {editItem && editItem.airtable_id.startsWith("local-") && (
         <CardModal
           item={editItem}
           onClose={() => setEditItem(null)}

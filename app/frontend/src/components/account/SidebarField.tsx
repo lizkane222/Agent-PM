@@ -79,7 +79,7 @@ export function SidebarField({
         >
           <span className="flex-1 min-w-0">{display}</span>
           {!readOnly && (
-            <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" className="w-2.5 h-2.5 shrink-0 opacity-0 group-hover/field:opacity-30 transition-opacity" style={{ color: "var(--twilio-navy)" }}>
+            <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" className="w-2.5 h-2.5 shrink-0 opacity-0 group-hover/field:opacity-30 transition-opacity" style={{ color: "var(--text-ink)" }}>
               <path d="M8 1.5l2.5 2.5-6 6L2 10.5l.5-2.5 6-6z" strokeLinejoin="round"/>
             </svg>
           )}

@@ -391,13 +391,32 @@ def _push_new_agentpm_events(user, service, window_start, window_end):
         calendar_id__in=AGENTPM_OWNED_CALENDAR_IDS,
         start_datetime__gte=window_start,
         start_datetime__lte=window_end,
-    )
+        # A reminder is a point in time, drawn from its due time (scheduler/reminder_calendar.py).
+        # Google would give it a duration and the next pull would write that back, turning the
+        # marker into a block again — so reminders stay in AgentPM and are never mirrored.
+    ).exclude(calendar_id="reminders")
 
     pushed = 0
-    for event in pending:
-        google_event_id = _insert_agentpm_event_in_google(event, service)
+    import uuid
+
+    for event in list(pending):
+        # Claim the row with a conditional UPDATE before talking to Google. The per-user sync
+        # lock is a process-local cache, so Daphne's poll and the Celery worker can both reach
+        # this loop with the same unpushed row and each insert it, producing two Google events
+        # and, after the pull, two blocks (2026-11-12). Only the caller whose UPDATE matches
+        # a row still blank wins; the other skips it.
+        claim = f"claiming:{uuid.uuid4().hex}"
+        if not CalendarEvent.objects.filter(pk=event.pk, google_event_id="").update(google_event_id=claim):
+            continue
+        try:
+            google_event_id = _insert_agentpm_event_in_google(event, service)
+        except BaseException:
+            CalendarEvent.objects.filter(pk=event.pk, google_event_id=claim).update(google_event_id="")
+            raise
         if not google_event_id:
-            continue  # already logged; the local row stays and the next sync retries
+            # already logged; release the claim so the next sync retries
+            CalendarEvent.objects.filter(pk=event.pk, google_event_id=claim).update(google_event_id="")
+            continue
         # .update() rather than .save() so `updated_at` (auto_now) is not bumped — mirroring
         # to Google is not a local edit, and a false "recently edited" flag makes the next
         # sync's PHASE 1 re-push the row for no reason.
@@ -577,6 +596,11 @@ def _sync_google_calendar(user, creds):
             # A scheduled reminder that resolved to "primary" would render as an ordinary
             # meeting, lose its reminder colour, and drop out of the reminder edit path.
             resolved_calendar_id = AGENTPM_SOURCE_TO_CALENDAR_ID.get(agentpm_source, "primary")
+            if resolved_calendar_id == "reminders":
+                # A reminder is a point in time owned by AgentPM (scheduler/reminder_calendar.py),
+                # and is no longer mirrored to Google. A copy made before that is left alone:
+                # Google gave it a duration, and importing it would turn the marker back into a block.
+                continue
 
             defaults = {
                 "title": item.get("summary", "(No title)"),
@@ -1330,6 +1354,8 @@ class GmailThreadsView(APIView):
                         max_tokens=300,
                         messages=[{"role": "user", "content": prompt}],
                     )
+                    from agents.usage import record_llm_usage
+                    record_llm_usage(request.user, "Gmail threads", msg)
                     import json as _json
                     parsed = _json.loads(msg.content[0].text)
                     t["summary"]      = parsed.get("summary", "")

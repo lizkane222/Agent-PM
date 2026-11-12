@@ -6,6 +6,7 @@ import { ThreadCard, ThreadExpanded } from "./ThreadCard";
 import { ThreadChatPanel } from "./ThreadChatPanel";
 import { STATUS_COLORS } from "./EmailStatusBadge";
 
+import { localDateKey } from "../../lib/timelineDay";
 export function EmailChainSection({ account }: { account: Account }) {
   const [threads, setThreads] = useState<GmailThread[]>([]);
   const [loading, setLoading] = useState(false);
@@ -87,7 +88,7 @@ export function EmailChainSection({ account }: { account: Account }) {
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `${account.company_name.toLowerCase().replace(/\s+/g, "-")}-email-status-${new Date().toISOString().slice(0,10)}.md`;
+      a.download = `${account.company_name.toLowerCase().replace(/\s+/g, "-")}-email-status-${localDateKey(new Date())}.md`;
       a.click();
       URL.revokeObjectURL(url);
     } finally {

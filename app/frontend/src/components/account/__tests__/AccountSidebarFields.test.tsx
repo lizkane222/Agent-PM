@@ -41,7 +41,7 @@ describe("SlackChannelsField", () => {
   it("shows workspace · #channel with a C# / A# badge and a tooltip link", () => {
     render(<SlackChannelsField channels={[ch(), ch({ workspace: "Twilio", channel: "acme-internal", type: "account_team", url: "https://twilio.slack.com/x" })]} onChange={vi.fn()} />);
     const labels = screen.getAllByTestId("slack-channel-label").map((e) => e.textContent);
-    expect(labels).toEqual(["Acme Corp · #acme-support", "Twilio · #acme-internal"]);
+    expect(labels).toEqual(["#acme-support", "#acme-internal"]);
     expect(screen.getByText("C#")).toBeInTheDocument();
     expect(screen.getByText("A#")).toBeInTheDocument();
     const tips = screen.getAllByRole("tooltip");
@@ -57,7 +57,8 @@ describe("SlackChannelsField", () => {
     const onChange = vi.fn().mockResolvedValue(undefined);
     render(<SlackChannelsField channels={[]} onChange={onChange} />);
     fireEvent.click(screen.getByText("+ Add channel"));
-    fireEvent.change(screen.getByLabelText("Slack workspace"), { target: { value: "Acme" } });
+    fireEvent.change(screen.getByLabelText("Slack workspace"), { target: { value: "__custom__" } });
+    fireEvent.change(screen.getByLabelText("Custom workspace name"), { target: { value: "Acme" } });
     fireEvent.change(screen.getByLabelText("Slack channel"), { target: { value: "#help" } });
     fireEvent.change(screen.getByLabelText("Slack channel URL"), { target: { value: "https://acme.slack.com/c" } });
     fireEvent.change(screen.getByLabelText("Slack channel type"), { target: { value: "account_team" } });
@@ -71,7 +72,8 @@ describe("SlackChannelsField", () => {
     fireEvent.click(screen.getByText("+ Add channel"));
     fireEvent.click(screen.getByText("Save"));
     expect(screen.getByRole("alert")).toHaveTextContent(/required/i);
-    fireEvent.change(screen.getByLabelText("Slack workspace"), { target: { value: "A" } });
+    fireEvent.change(screen.getByLabelText("Slack workspace"), { target: { value: "__custom__" } });
+    fireEvent.change(screen.getByLabelText("Custom workspace name"), { target: { value: "A" } });
     fireEvent.change(screen.getByLabelText("Slack channel"), { target: { value: "b" } });
     fireEvent.change(screen.getByLabelText("Slack channel URL"), { target: { value: "javascript:alert(1)" } });
     fireEvent.click(screen.getByText("Save"));
@@ -93,7 +95,8 @@ describe("SlackChannelsField", () => {
   it("keeps the form open with an error when saving fails", async () => {
     render(<SlackChannelsField channels={[]} onChange={vi.fn().mockRejectedValue(new Error("x"))} />);
     fireEvent.click(screen.getByText("+ Add channel"));
-    fireEvent.change(screen.getByLabelText("Slack workspace"), { target: { value: "A" } });
+    fireEvent.change(screen.getByLabelText("Slack workspace"), { target: { value: "__custom__" } });
+    fireEvent.change(screen.getByLabelText("Custom workspace name"), { target: { value: "A" } });
     fireEvent.change(screen.getByLabelText("Slack channel"), { target: { value: "b" } });
     fireEvent.change(screen.getByLabelText("Slack channel URL"), { target: { value: "https://a.com" } });
     fireEvent.click(screen.getByText("Save"));

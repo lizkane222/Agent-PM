@@ -242,6 +242,53 @@ class GongNotesByPkAPITests(TestCase):
         self.assertEqual(resp.status_code, 401)
 
 
+class EnsureMeetingForEventTests(TestCase):
+    """POST /airtable/meetings/by-event/<event_id>/ensure/ — the meeting row behind an event."""
+
+    def setUp(self):
+        self.user = make_user("ensureuser")
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+        make_airtable_account()
+
+    def url(self, event):
+        return f"/api/v1/airtable/meetings/by-event/{event.pk}/ensure/"
+
+    def test_unauthenticated_is_401(self):
+        event = make_calendar_event(self.user, agentpm_airtable_id="")
+        self.assertEqual(APIClient().post(self.url(event)).status_code, 401)
+
+    def test_returns_the_linked_meeting_without_creating_another(self):
+        meeting = make_meeting(airtable_id="recENSURE1")
+        event = make_calendar_event(self.user, agentpm_airtable_id="recENSURE1")
+        before = AirtableMeeting.objects.count()
+        resp = self.client.post(self.url(event))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["id"], meeting.pk)
+        self.assertEqual(AirtableMeeting.objects.count(), before)
+
+    def test_creates_a_stub_when_the_event_has_none_and_is_idempotent(self):
+        event = make_calendar_event(self.user, title="Calendar only", agentpm_airtable_id="")
+        first = self.client.post(self.url(event))
+        self.assertEqual(first.status_code, 200)
+        self.assertTrue(AirtableMeeting.objects.filter(pk=first.data["id"], name="Calendar only").exists())
+        event.refresh_from_db()
+        self.assertTrue(event.agentpm_airtable_id.startswith("local-"))
+        second = self.client.post(self.url(event))
+        self.assertEqual(second.data["id"], first.data["id"])
+        self.assertEqual(AirtableMeeting.objects.filter(name="Calendar only").count(), 1)
+
+    def test_another_users_event_is_404_and_creates_nothing(self):
+        other = make_user("someoneelse")
+        event = make_calendar_event(other, title="Private", agentpm_airtable_id="")
+        resp = self.client.post(self.url(event))
+        self.assertEqual(resp.status_code, 404)
+        self.assertFalse(AirtableMeeting.objects.filter(name="Private").exists())
+
+    def test_unknown_event_is_404(self):
+        self.assertEqual(self.client.post("/api/v1/airtable/meetings/by-event/999999/ensure/").status_code, 404)
+
+
 class GongNotesByEventAPITests(TestCase):
     """PATCH /airtable/meetings/by-event/<event_id>/gong-notes/ — saves via CalendarEvent."""
 
@@ -2478,7 +2525,7 @@ class AssignmentRuleTests(APITestCase):
 # token cannot create new options, so any value we send that is not already an option
 # is rejected with INVALID_MULTIPLE_CHOICE_OPTIONS and the whole write fails. These are
 # the options the base actually has (read from the metadata API, 2026-10-16).
-AIRTABLE_STATUS_OPTIONS = {"Not Started", "In Progress", "Blocked", "Ready", "Completed"}
+AIRTABLE_STATUS_OPTIONS = {"Not Started", "In Progress", "Blocked", "Ready", "Completed", "Backlogged"}
 AIRTABLE_PRIORITY_OPTIONS = {"Low", "Medium", "High", "Urgent"}
 
 
@@ -2509,3 +2556,153 @@ class ActionItemSelectOptionMappingTests(TestCase):
         for status in ("Open", "In Progress", "Done", "Blocked"):
             with self.subTest(status=status):
                 self.assertEqual(_AT_TO_STATUS[self._fields(status=status)["Status"]], status)
+
+
+class RecurringEventAccountLinkTests(APITestCase):
+    """Linking one instance of a recurring meeting can reach the rest of the series, but only
+    when the user switched "update subsequent recurring" / "update historical" on."""
+
+    SERIES = "abc123def"
+
+    def setUp(self):
+        from scheduler.models import CalendarEvent
+        cache.clear()
+        self.user = User.objects.create_user(username="seriesuser", password="{PASSWORD}")
+        self.other = User.objects.create_user(username="seriesother", password="{PASSWORD}")
+        self.client.force_authenticate(user=self.user)
+        self.acme = AirtableAccount.objects.create(airtable_id="recSERIESACME", name="Acme Corp")
+        self.beta = AirtableAccount.objects.create(airtable_id="recSERIESBETA", name="Beta Inc")
+        now = timezone.now()
+        self.uids = {}
+        for label, days in (("past2", -14), ("past1", -7), ("this", 0), ("next1", 7), ("next2", 14)):
+            uid = f"{self.SERIES}_{(now + dt.timedelta(days=days)).strftime('%Y%m%d')}"
+            self.uids[label] = uid
+            CalendarEvent.objects.create(
+                owner=self.user, google_event_id=uid, title="Weekly sync",
+                start_datetime=now + dt.timedelta(days=days),
+                end_datetime=now + dt.timedelta(days=days, hours=1),
+            )
+        # Another user's copy of the same series must never be touched.
+        CalendarEvent.objects.create(
+            owner=self.other, google_event_id=f"{self.SERIES}_20200101", title="Weekly sync",
+            start_datetime=now - dt.timedelta(days=2000), end_datetime=now - dt.timedelta(days=2000, hours=-1),
+        )
+
+    def _link(self, label="this", **flags):
+        return self.client.post(
+            "/api/v1/airtable/categorize/",
+            {"event_uid": self.uids[label], "account_id": self.acme.id, "account_name": "Acme Corp", **flags},
+            format="json",
+        )
+
+    def _linked(self, label):
+        return CalendarEventAccountLink.objects.filter(
+            calendar_event_uid=self.uids[label], account=self.acme
+        ).exists()
+
+    def test_both_off_by_default_links_only_the_one_event(self):
+        resp = self._link()
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotIn("series_updated", resp.json())
+        self.assertEqual(
+            [l for l in self.uids if self._linked(l)], ["this"],
+        )
+
+    def test_subsequent_links_later_instances_only(self):
+        resp = self._link(update_subsequent=True)
+        self.assertEqual(resp.json()["series_updated"]["subsequent"], 2)
+        self.assertEqual(sorted(l for l in self.uids if self._linked(l)), ["next1", "next2", "this"])
+
+    def test_historical_links_earlier_instances_only(self):
+        resp = self._link(update_historical=True)
+        self.assertEqual(resp.json()["series_updated"]["historical"], 2)
+        self.assertEqual(sorted(l for l in self.uids if self._linked(l)), ["past1", "past2", "this"])
+
+    def test_never_touches_another_users_copy(self):
+        self._link(update_subsequent=True, update_historical=True)
+        self.assertFalse(CalendarEventAccountLink.objects.filter(
+            calendar_event_uid=f"{self.SERIES}_20200101").exists())
+
+    def test_a_non_recurring_event_is_unaffected_by_the_options(self):
+        resp = self.client.post(
+            "/api/v1/airtable/categorize/",
+            {"event_uid": "plain-event-1", "account_id": self.acme.id, "account_name": "Acme Corp",
+             "update_subsequent": True, "update_historical": True},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["series_updated"]["uids"], [])
+        self.assertEqual(CalendarEventAccountLink.objects.count(), 1)
+
+    def test_subsequent_also_covers_instances_that_sync_later(self):
+        self._link(update_subsequent=True)
+        future = f"{self.SERIES}_{(timezone.now() + dt.timedelta(days=60)).strftime('%Y%m%d')}"
+        resp = self.client.post("/api/v1/airtable/event-links/batch/", {"event_uids": [future]}, format="json")
+        self.assertEqual(resp.json()[future]["account_name"], "Acme Corp")
+        # ...and an earlier unsynced instance does not inherit it.
+        earlier = f"{self.SERIES}_20100101"
+        resp = self.client.post("/api/v1/airtable/event-links/batch/", {"event_uids": [earlier]}, format="json")
+        self.assertFalse(resp.json()[earlier]["linked"])
+
+    def test_without_the_option_a_future_instance_stays_unlinked(self):
+        self._link()
+        future = f"{self.SERIES}_{(timezone.now() + dt.timedelta(days=60)).strftime('%Y%m%d')}"
+        resp = self.client.post("/api/v1/airtable/event-links/batch/", {"event_uids": [future]}, format="json")
+        self.assertFalse(resp.json()[future]["linked"])
+
+    def test_relinking_with_the_option_off_stops_inheritance(self):
+        self._link(update_subsequent=True)
+        self._link()  # same event again, option now off
+        future = f"{self.SERIES}_{(timezone.now() + dt.timedelta(days=60)).strftime('%Y%m%d')}"
+        resp = self.client.post("/api/v1/airtable/event-links/batch/", {"event_uids": [future]}, format="json")
+        self.assertFalse(resp.json()[future]["linked"])
+
+    def test_a_later_rule_wins_over_an_earlier_one(self):
+        self._link(update_subsequent=True)
+        self.client.post(
+            "/api/v1/airtable/categorize/",
+            {"event_uid": self.uids["next1"], "account_id": self.beta.id, "account_name": "Beta Inc",
+             "update_subsequent": True},
+            format="json",
+        )
+        future = f"{self.SERIES}_{(timezone.now() + dt.timedelta(days=60)).strftime('%Y%m%d')}"
+        resp = self.client.post("/api/v1/airtable/event-links/batch/", {"event_uids": [future]}, format="json")
+        self.assertEqual(resp.json()[future]["account_name"], "Beta Inc")
+
+    def test_unauthenticated_is_refused(self):
+        self.client.force_authenticate(user=None)
+        self.assertEqual(self._link(update_subsequent=True).status_code, 401)
+
+    def test_numeric_event_key_resolves_to_the_series(self):
+        from scheduler.models import CalendarEvent
+        pk = CalendarEvent.objects.get(owner=self.user, google_event_id=self.uids["this"]).pk
+        resp = self.client.post(
+            "/api/v1/airtable/categorize/",
+            {"event_uid": str(pk), "account_id": self.acme.id, "account_name": "Acme Corp",
+             "update_historical": True},
+            format="json",
+        )
+        self.assertEqual(resp.json()["series_updated"]["historical"], 2)
+
+
+class MeetingNotesScanHonoursCalendarLinksTests(TestCase):
+    """The scoped notes scan found events only through the unpopulated CalendarEvent.account FK,
+    so a series linked on the calendar page was invisible to it."""
+
+    def test_an_event_linked_on_the_calendar_page_is_a_scoped_candidate(self):
+        from integrations.meeting_notes import candidate_events
+        from scheduler.models import CalendarEvent
+        user = User.objects.create_user(username="notesscanuser", password="{PASSWORD}")
+        acct = AirtableAccount.objects.create(airtable_id="recNOTESSCAN", name="Notes Scan Co")
+        now = timezone.now()
+        linked = CalendarEvent.objects.create(
+            owner=user, google_event_id="zzz999_20200101", title="Totally unrelated title",
+            start_datetime=now - dt.timedelta(days=3), end_datetime=now - dt.timedelta(days=3, hours=-1))
+        CalendarEvent.objects.create(
+            owner=user, google_event_id="zzz999_20200108", title="Other unrelated title",
+            start_datetime=now - dt.timedelta(days=2), end_datetime=now - dt.timedelta(days=2, hours=-1))
+        CalendarEventAccountLink.objects.create(
+            calendar_event_uid="zzz999_20200101", account=acct, match_method="series")
+        self.assertEqual(
+            list(candidate_events(user, 30, account=str(acct.pk))), [linked])
+        self.assertEqual(list(candidate_events(user, 30, account_name="Notes Scan Co")), [linked])

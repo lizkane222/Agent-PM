@@ -384,7 +384,7 @@ export default function CommentComposer({ onSubmit, onCancel, placeholder, autoF
           autoFocus={autoFocus}
           placeholder={placeholder ?? "Write a comment… (@name to mention, @# to reference a record)"}
           className="flex-1 text-sm rounded-xl border border-gray-200 px-3 py-2 resize-none outline-none focus:border-indigo-300 focus:ring-1 focus:ring-indigo-200 bg-white transition-all"
-          style={{ color: "var(--twilio-navy)" }}
+          style={{ color: "var(--text-ink)" }}
         />
         <div className="flex flex-col gap-1 shrink-0">
           <button

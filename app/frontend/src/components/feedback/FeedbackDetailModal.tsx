@@ -124,7 +124,7 @@ export default function FeedbackDetailModal({ item, onClose, onUpdated, onDelete
                   {formatDate(item.created_at)}
                 </span>
               </div>
-              <p style={{ fontSize: "0.9375rem", fontWeight: 600, color: "var(--twilio-navy)", margin: 0, lineHeight: 1.4 }}>
+              <p style={{ fontSize: "0.9375rem", fontWeight: 600, color: "var(--text-ink)", margin: 0, lineHeight: 1.4 }}>
                 {item.description.length > 100 ? item.description.slice(0, 100) + "…" : item.description}
               </p>
               <p style={{ fontSize: "0.75rem", color: "var(--twilio-gray-60)", marginTop: 2 }}>
@@ -150,13 +150,13 @@ export default function FeedbackDetailModal({ item, onClose, onUpdated, onDelete
         {/* Body */}
         <div style={{ flex: 1, overflowY: "auto", padding: "16px 20px" }}>
           {/* Full description */}
-          <p style={{ fontSize: "0.875rem", color: "var(--twilio-navy)", lineHeight: 1.6, marginBottom: 12, whiteSpace: "pre-wrap" }}>{item.description}</p>
+          <p style={{ fontSize: "0.875rem", color: "var(--text-ink)", lineHeight: 1.6, marginBottom: 12, whiteSpace: "pre-wrap" }}>{item.description}</p>
 
           {/* Element / location */}
           {item.element_label && (
             <div style={{ marginBottom: 12, padding: "8px 12px", borderRadius: 6, background: "rgba(219,19,26,0.05)", border: "1px solid rgba(219,19,26,0.15)" }}>
               <p style={{ fontSize: "0.6875rem", fontWeight: 600, color: "var(--twilio-red,#DB131A)", margin: "0 0 2px", textTransform: "uppercase", letterSpacing: "0.04em" }}>Attached element</p>
-              <p style={{ fontSize: "0.8125rem", fontWeight: 600, color: "var(--twilio-navy)", margin: 0 }}>{item.element_label}</p>
+              <p style={{ fontSize: "0.8125rem", fontWeight: 600, color: "var(--text-ink)", margin: 0 }}>{item.element_label}</p>
               {item.element_path && <p style={{ fontSize: "0.6875rem", color: "var(--twilio-gray-60)", margin: "2px 0 0", fontFamily: "monospace" }}>{item.element_path}</p>}
               {item.page_url && <p style={{ fontSize: "0.6875rem", color: "var(--twilio-gray-60)", margin: "2px 0 0", wordBreak: "break-all" }}>{item.page_url}</p>}
             </div>
@@ -210,7 +210,7 @@ export default function FeedbackDetailModal({ item, onClose, onUpdated, onDelete
               {comments.map(c => (
                 <div key={c.id} style={{ padding: "8px 12px", borderRadius: 6, background: "var(--twilio-gray-10, #f4f4f6)", border: "1px solid var(--border, rgba(0,0,0,0.06))" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-                    <span style={{ fontSize: "0.75rem", fontWeight: 600, color: "var(--twilio-navy)" }}>{c.author_display}</span>
+                    <span style={{ fontSize: "0.75rem", fontWeight: 600, color: "var(--text-ink)" }}>{c.author_display}</span>
                     <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                       <span style={{ fontSize: "0.6875rem", color: "var(--twilio-gray-40)" }}>{formatDate(c.created_at)}</span>
                       {editingCommentId !== c.id && (
@@ -243,7 +243,7 @@ export default function FeedbackDetailModal({ item, onClose, onUpdated, onDelete
                         style={{
                           resize: "vertical", padding: "6px 8px",
                           borderRadius: 4, border: "1px solid var(--border, rgba(0,0,0,0.12))",
-                          fontSize: "0.875rem", fontFamily: "var(--font-base)", color: "var(--twilio-navy)",
+                          fontSize: "0.875rem", fontFamily: "var(--font-base)", color: "var(--text-ink)",
                           background: "var(--surface, #fff)", outline: "none",
                         }}
                         onKeyDown={e => {
@@ -264,7 +264,7 @@ export default function FeedbackDetailModal({ item, onClose, onUpdated, onDelete
                       </div>
                     </div>
                   ) : (
-                    <p style={{ fontSize: "0.875rem", color: "var(--twilio-navy)", margin: 0, whiteSpace: "pre-wrap" }}>{c.content}</p>
+                    <p style={{ fontSize: "0.875rem", color: "var(--text-ink)", margin: 0, whiteSpace: "pre-wrap" }}>{c.content}</p>
                   )}
                 </div>
               ))}
@@ -280,7 +280,7 @@ export default function FeedbackDetailModal({ item, onClose, onUpdated, onDelete
                 style={{
                   flex: 1, resize: "vertical", padding: "7px 10px",
                   borderRadius: 6, border: "1px solid var(--border, rgba(0,0,0,0.12))",
-                  fontSize: "0.875rem", fontFamily: "var(--font-base)", color: "var(--twilio-navy)",
+                  fontSize: "0.875rem", fontFamily: "var(--font-base)", color: "var(--text-ink)",
                   background: "var(--surface, #fff)", outline: "none",
                 }}
                 onKeyDown={e => {

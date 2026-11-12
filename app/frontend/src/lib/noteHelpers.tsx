@@ -126,7 +126,7 @@ export function renderNoteWithReferences(
 ): React.ReactNode {
   if (!references || references.length === 0) {
     // No references: render HTML as-is with dangerouslySetInnerHTML
-    return <div dangerouslySetInnerHTML={{ __html: sanitizeHtml(plainToHtml(html)) }} />;
+    return <div className="rich-text" dangerouslySetInnerHTML={{ __html: sanitizeHtml(plainToHtml(html)) }} />;
   }
 
   // With references: parse HTML and replace href links with ReferenceLink components
@@ -138,12 +138,12 @@ export function renderNoteWithReferences(
     doc = parser.parseFromString(`<div>${sanitized}</div>`, "text/html");
   } catch {
     // Fallback if parsing fails
-    return <div dangerouslySetInnerHTML={{ __html: sanitized }} />;
+    return <div className="rich-text" dangerouslySetInnerHTML={{ __html: sanitized }} />;
   }
 
   // Find all anchor tags and match against references by href
   const root = doc.body.firstChild;
-  if (!root) return <div dangerouslySetInnerHTML={{ __html: sanitized }} />;
+  if (!root) return <div className="rich-text" dangerouslySetInnerHTML={{ __html: sanitized }} />;
 
   const renderNode = (node: Node): React.ReactNode[] => {
     const result: React.ReactNode[] = [];
@@ -178,12 +178,16 @@ export function renderNoteWithReferences(
             );
           }
         } else {
-          // Other elements: recurse
+          // Other elements: recurse, KEEPING their attributes. They used to be dropped, which turned
+          // a checklist's <input type="checkbox"> into a plain text box and lost data-type="taskList",
+          // so no list styling could apply to a note that contained a record reference.
+          const tag = el.tagName.toLowerCase();
           result.push(
             React.createElement(
-              el.tagName.toLowerCase(),
-              { key: el.outerHTML },
-              renderNode(child)
+              tag,
+              { ...elementProps(el), key: el.outerHTML },
+              // React throws if a void element (br, hr, input, img…) is given children, even [].
+              VOID_TAGS.has(tag) ? undefined : renderNode(child)
             )
           );
         }
@@ -192,7 +196,42 @@ export function renderNoteWithReferences(
     return result;
   };
 
-  return <div>{renderNode(root)}</div>;
+  return <div className="rich-text">{renderNode(root)}</div>;
+}
+
+const VOID_TAGS = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"]);
+
+// HTML attribute -> React prop, for the ones whose names differ.
+const ATTR_TO_PROP: Record<string, string> = {
+  class: "className", for: "htmlFor", colspan: "colSpan", rowspan: "rowSpan", tabindex: "tabIndex",
+  readonly: "readOnly", checked: "defaultChecked", contenteditable: "contentEditable", datetime: "dateTime",
+};
+
+function parseInlineStyle(css: string): React.CSSProperties {
+  const style: Record<string, string> = {};
+  for (const decl of css.split(";")) {
+    const i = decl.indexOf(":");
+    if (i < 1) continue;
+    const name = decl.slice(0, i).trim().replace(/-([a-z])/g, (_, c: string) => c.toUpperCase());
+    const value = decl.slice(i + 1).trim();
+    if (name && value) style[name] = value;
+  }
+  return style as React.CSSProperties;
+}
+
+/** Props that recreate an element's attributes. Event handlers are never copied. */
+export function elementProps(el: Element): Record<string, unknown> {
+  const props: Record<string, unknown> = {};
+  for (const attr of Array.from(el.attributes)) {
+    const name = attr.name.toLowerCase();
+    if (name.startsWith("on")) continue;
+    if (name === "style") { props.style = parseInlineStyle(attr.value); continue; }
+    if (name === "checked") { props.defaultChecked = true; continue; }
+    props[ATTR_TO_PROP[name] ?? attr.name] = attr.value;
+  }
+  // A checkbox shown in a saved note is a record of state, not a control.
+  if (el.tagName === "INPUT" && el.getAttribute("type") === "checkbox") props.readOnly = true;
+  return props;
 }
 
 // On paste: if text is selected and clipboard looks like a URL, wrap as [selection](url)

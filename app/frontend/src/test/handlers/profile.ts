@@ -12,6 +12,9 @@ export const mockNotification = (overrides: Partial<AppNotification> = {}): AppN
   status: "sent",
   read_at: null,
   created_at: "2026-10-19T12:00:00Z",
+  reminder: null,
+  fired_for: null,
+  can_snooze: false,
   ...overrides,
 });
 

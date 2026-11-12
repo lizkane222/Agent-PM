@@ -107,6 +107,9 @@ class AirtableActionItem(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     marked_done_at = models.DateTimeField(null=True, blank=True)
+    # When `status` last actually changed. Unlike updated_at (auto_now, bumped by ANY save,
+    # including every Airtable pull), this moves only on a real status transition.
+    status_changed_at = models.DateTimeField(null=True, blank=True)
     last_synced = models.DateTimeField(auto_now=True)
     # Rich references: list of {resource_type, resource_id, label, url} objects added via @# trigger
     references = models.JSONField(
@@ -216,7 +219,12 @@ class CalendarEventAccountLink(models.Model):
     )
     match_method = models.CharField(
         max_length=32, blank=True, default="",
-        help_text="domain | title | fulltext | manual"
+        help_text="domain | title | fulltext | manual | series"
+    )
+    apply_to_future = models.BooleanField(
+        default=False,
+        help_text="Set when the user chose 'update subsequent recurring': later instances of "
+                  "this recurring event inherit this account when they sync.",
     )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

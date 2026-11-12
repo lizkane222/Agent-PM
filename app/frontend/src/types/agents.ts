@@ -13,6 +13,8 @@ export interface AgentMessage {
   content: string;
   input_tokens: number;
   output_tokens: number;
+  /** What this message cost at the current price (decimal string). Additive. */
+  cost_usd?: string;
   tool_calls: ToolCall[];
   created_at: string;
 }
@@ -98,7 +100,11 @@ export interface SkillRunInput {
   records?: SkillContextRecord[];
   slack?: SlackSource[];
   template_key?: string;
+  /** "last 30 days", "October", "2026-10-01..2026-10-31"; fills a skill's ${date_range} placeholders. */
+  date_range?: string;
   args?: Record<string, string>;
+  /** Where it was launched from (a pinned-skills page key); shown in the Console. */
+  page?: string;
 }
 
 export interface SkillRunResult {
@@ -106,6 +112,59 @@ export interface SkillRunResult {
   /** Plain, spoken-style brief — the voice launch context and the "script to read" fallback. */
   script: string;
   warnings: string[];
+  /** The Console run opened for this launch; send it with the chat message that executes it. */
+  run_id?: string | null;
+  /** Set when the data was too big for one chat message and is stored for the agent to read in parts. */
+  data_staged?: { parts: number; characters: number } | null;
+}
+
+/** The pages a skill can be pinned to. Mirrors `SkillPagePin.PAGES` on the server. */
+export type SkillPageKey = "calendar" | "action-items" | "reminders" | "account-detail" | "layouts" | "activity-log";
+
+export interface PagePin {
+  id: number;
+  page: SkillPageKey;
+  /** "everyone" is an admin's pin, shown to all users. */
+  scope: "mine" | "everyone";
+  can_remove: boolean;
+  skill: AgentSkill;
+}
+
+export type SkillRunStatus = "launched" | "running" | "completed" | "failed";
+
+export interface SkillRunRow {
+  id: string;
+  skill: number | null;
+  skill_name: string;
+  surface: "chat" | "voice";
+  page: string;
+  params: Record<string, unknown>;
+  status: SkillRunStatus;
+  started_at: string;
+  finished_at: string | null;
+  tool_count: number;
+  records_created: number;
+  records_updated: number;
+  input_tokens: number;
+  output_tokens: number;
+  user_username: string;
+}
+
+export interface SkillRunEventRow {
+  id: number;
+  ts: string;
+  kind: "launched" | "tool" | "finished";
+  tool_name: string;
+  status: "" | "ok" | "created" | "updated" | "error";
+  error_code: string;
+  summary: string;
+  args: Record<string, unknown>;
+  duration_ms: number | null;
+  record: { type: string; id: string; label: string; url: string } | null;
+}
+
+export interface SkillRunDetail extends SkillRunRow {
+  events: SkillRunEventRow[];
 }
 
 export interface KeywordTemplate {

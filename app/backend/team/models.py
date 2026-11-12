@@ -75,6 +75,9 @@ class UserProfile(models.Model):
     notify_default_slack = models.BooleanField(default=False)
     notify_default_push = models.BooleanField(default=False)
     notify_default_sms = models.BooleanField(default=False)
+    # Whether teammates on a shared account may add this person as a recipient of their
+    # reminders. On by default; switching it off lists the person as unavailable instead.
+    allow_reminders_from_others = models.BooleanField(default=True)
 
     # ── Web Push subscription ─────────────────────────────────────────────────
     # JSON blob: {"endpoint": "...", "keys": {"p256dh": "...", "auth": "..."}}
@@ -119,6 +122,12 @@ class UserProfile(models.Model):
     # set from the calendar's right-click menu. Empty dict means "use the defaults"
     # (DEFAULT_CATEGORY_COLORS in the frontend's lib/eventColors.ts).
     calendar_colors = models.JSONField(default=dict, blank=True)
+
+    # ── Status display names ──────────────────────────────────────────────────
+    # Per-user DISPLAY preference for action-item statuses, validated by
+    # UserProfileSerializer: {"Open": "Not Started", "Done": "Completed"}.
+    # Stored/API/Airtable status values never change; absent key = canonical name.
+    status_labels = models.JSONField(default=dict, blank=True)
 
     # ── Gmail watch configuration ──────────────────────────────────────────────
     # JSON blob controlling Gmail sync filtering and labeling:
@@ -184,6 +193,9 @@ class TeamMember(models.Model):
     )
     full_name = models.CharField(max_length=200)
     email = models.EmailField(unique=True)
+    # Other addresses this person uses (a Segment or SendGrid address, say). `email` stays the
+    # unique primary; callers that must pick one prefer the twilio.com address among all of them.
+    additional_emails = models.JSONField(default=list, blank=True)
     title = models.CharField(max_length=150, blank=True)
     department = models.CharField(max_length=100, blank=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="active")
@@ -198,11 +210,34 @@ class TeamMember(models.Model):
     slack_handle = models.CharField(max_length=80, blank=True)
     avatar_url = models.URLField(blank=True)
     joined_at = models.DateField(null=True, blank=True)
+    # A zone someone ELSE set for this person. Kept apart from UserProfile.timezone so the
+    # person's own setting always wins and is never overwritten by (or merged into) this.
+    assigned_timezone = models.CharField(max_length=60, blank=True)
+    assigned_timezone_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    assigned_timezone_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         ordering = ["full_name"]
+
+    def own_timezone(self) -> str:
+        """The person's own zone. UserProfile.timezone defaults to "UTC" for everyone, so "UTC"
+        is read as "never chose one" (a real UTC user can still be coordinated via assignment)."""
+        profile = getattr(self.user, "profile", None) if self.user_id else None
+        tz = (getattr(profile, "timezone", "") or "").strip()
+        return "" if tz.upper() == "UTC" else tz
+
+    def timezone_with_source(self) -> tuple[str, str]:
+        """(zone, 'self'|'assigned'|''): own setting first, then an assignment, else nothing."""
+        own = self.own_timezone()
+        if own:
+            return own, "self"
+        if self.assigned_timezone:
+            return self.assigned_timezone, "assigned"
+        return "", ""
 
     def __str__(self) -> str:
         return f"{self.full_name} <{self.email}>"
@@ -265,6 +300,14 @@ class Notification(models.Model):
     link = models.CharField(max_length=500, blank=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="sent")
     read_at = models.DateTimeField(null=True, blank=True)
+    # For a reminder notification: which reminder fired, and which of its moments (its due time
+    # or one of its calendar blocks). An unread in-app reminder notification stays on screen
+    # until the user acknowledges it or snoozes the reminder, so the alert has to be able to
+    # find the reminder to snooze, and to say which block was the one that fired.
+    reminder = models.ForeignKey(
+        "scheduler.Reminder", null=True, blank=True, on_delete=models.SET_NULL, related_name="notifications",
+    )
+    fired_for = models.DateTimeField(null=True, blank=True)
     # The account this notification is about, when it is about one. Drives the per-account
     # Activity Log; it never widens who can read the notification (still owner-only).
     account = models.ForeignKey(

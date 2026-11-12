@@ -17,7 +17,7 @@ def clean_slack_channels(value) -> list[dict]:
     """Return a normalised list, or raise ValidationError.
 
     Only http(s) URLs are accepted (blocks `javascript:` and friends); a leading `#` on the
-    channel name is dropped; unknown keys are discarded.
+    channel name is dropped; unknown keys are discarded. `workspace_icon` is an optional http(s) image URL.
     """
     if value in (None, ""):
         return []
@@ -42,5 +42,14 @@ def clean_slack_channels(value) -> list[dict]:
             raise serializers.ValidationError("Slack channel URLs must start with http:// or https://.")
         if kind not in CHANNEL_TYPES:
             raise serializers.ValidationError("Slack channel type must be customer_facing or account_team.")
-        cleaned.append({"workspace": workspace, "channel": channel, "url": url, "type": kind})
+        item = {"workspace": workspace, "channel": channel, "url": url, "type": kind}
+        # Optional icon for a custom workspace; preset workspaces draw a built-in icon instead.
+        icon = entry.get("workspace_icon")
+        icon = str(icon).strip() if icon else ""
+        if icon:
+            iparsed = urlparse(icon)
+            if len(icon) > MAX_URL or iparsed.scheme not in ("http", "https") or not iparsed.netloc:
+                raise serializers.ValidationError("Workspace icon URLs must start with http:// or https://.")
+            item["workspace_icon"] = icon
+        cleaned.append(item)
     return cleaned

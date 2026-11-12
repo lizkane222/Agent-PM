@@ -31,7 +31,7 @@ export function ContactNoteRow({
 
   if (editing) {
     return (
-      <li className={`flex items-start gap-${isXs ? "1.5" : "2"} ${isXs ? "text-[11px]" : "text-xs"}`} style={{ color: "var(--twilio-navy)" }}>
+      <li className={`flex items-start gap-${isXs ? "1.5" : "2"} ${isXs ? "text-[11px]" : "text-xs"}`} style={{ color: "var(--text-ink)" }}>
         <span className={`${isXs ? "w-1.5 h-1.5" : "w-1.5 h-1.5"} rounded-full bg-gray-300 shrink-0 mt-1.5`} />
         <div className="flex-1 flex flex-col gap-1">
           <textarea
@@ -44,7 +44,7 @@ export function ContactNoteRow({
             }}
             rows={2}
             className={`w-full rounded border border-gray-200 bg-white px-2 py-1 ${isXs ? "text-[11px]" : "text-xs"} focus:border-indigo-300 focus:outline-none resize-y`}
-            style={{ color: "var(--twilio-navy)" }}
+            style={{ color: "var(--text-ink)" }}
           />
           <div className="flex gap-1.5">
             <button
@@ -63,7 +63,7 @@ export function ContactNoteRow({
   }
 
   return (
-    <li className={`group/note flex items-start gap-${isXs ? "1.5" : "2"} ${isXs ? "text-[11px]" : "text-xs"}`} style={{ color: "var(--twilio-navy)" }}>
+    <li className={`group/note flex items-start gap-${isXs ? "1.5" : "2"} ${isXs ? "text-[11px]" : "text-xs"}`} style={{ color: "var(--text-ink)" }}>
       <span className="w-1.5 h-1.5 rounded-full bg-gray-300 shrink-0 mt-1.5" />
       <span className="flex-1 leading-relaxed">{note.content}</span>
       <button

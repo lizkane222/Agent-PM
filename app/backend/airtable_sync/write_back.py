@@ -147,15 +147,15 @@ def push_account_segment_workspaces(airtable_account) -> bool:
 # Status is a single-select field and the sync token cannot create new options, so a
 # value the base does not already have fails the whole write with
 # INVALID_MULTIPLE_CHOICE_OPTIONS ("Insufficient permissions to create new select
-# option"). The base's options are: Not Started, In Progress, Blocked, Ready, Completed.
+# option"). The base's options are: Not Started, In Progress, Blocked, Ready, Completed, plus Backlogged once
+# `ensure_airtable_status_options --commit` has run.
 _STATUS_TO_AT = {
     "Open": "Not Started",
     "In Progress": "In Progress",
     "Done": "Completed",
     "Blocked": "Blocked",
-    # No Backlogged option exists in Airtable. Not Started is the closest, but it means
-    # a Backlogged item reads back as Open on the next pull (sync._AT_TO_STATUS).
-    "Backlogged": "Not Started",
+    # Added to the base's Status field by `manage.py ensure_airtable_status_options`.
+    "Backlogged": "Backlogged",
 }
 def airtable_status_for(status: str) -> str:
     """The Status option name Airtable uses for one of our statuses."""
@@ -164,7 +164,7 @@ def airtable_status_for(status: str) -> str:
 
 def status_fits_airtable(status: str) -> bool:
     """False for a status Airtable has no option for (it would read back as another one)."""
-    return status != "Backlogged"
+    return status in _STATUS_TO_AT
 
 
 def push_action_item_status(item) -> bool:
@@ -460,6 +460,10 @@ def push_customer_contact_delete(airtable_id: str) -> bool:
 
 # ── Account Artifacts ─────────────────────────────────────────────────────────
 
+def _artifact_user_label(user) -> str:
+    return user.get_full_name() or user.username
+
+
 def _artifact_fields(artifact) -> dict:
     return {
         "Name": artifact.name,
@@ -483,7 +487,19 @@ def push_artifact_upsert(artifact) -> bool:
         return False
     try:
         table = get_table(TABLE_ARTIFACTS)
-        _airtable_call(table.batch_upsert, [{"fields": _artifact_fields(artifact)}], key_fields=["Django ID"])
+        fields = _artifact_fields(artifact)
+        if artifact.updated_by_id:
+            fields["Updated By"] = _artifact_user_label(artifact.updated_by)
+        try:
+            _airtable_call(table.batch_upsert, [{"fields": fields}], key_fields=["Django ID"])
+        except Exception:
+            if "Updated By" not in fields:
+                raise
+            # A base without the "Updated By" column (see ensure_airtable_artifact_updated_by)
+            # rejects the whole write; retry without it so the rest still mirrors.
+            logger.warning("Airtable artifact upsert failed with 'Updated By'; retrying without it")
+            fields.pop("Updated By")
+            _airtable_call(table.batch_upsert, [{"fields": fields}], key_fields=["Django ID"])
         logger.info("Upserted Airtable artifact for Django ID %s ('%s')", artifact.id, artifact.name)
         return True
     except Exception:

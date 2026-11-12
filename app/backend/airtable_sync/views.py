@@ -444,6 +444,41 @@ def _meeting_notes_by_event(request, event_id: int, source: str):
     return Response(AirtableMeetingSerializer(meeting).data)
 
 
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def ensure_meeting_for_event(request, event_id: int):
+    """
+    POST /airtable/meetings/by-event/<event_id>/ensure/
+
+    Returns the AirtableMeeting behind a calendar event, creating the same local stub the
+    notes endpoints create when there is none. It writes no notes and sends nothing: the
+    calendar needs a meeting row to hang an action item on ("from this meeting") before
+    anything has been written to the meeting. Same ownership rule as the notes endpoints,
+    404 rather than 403 so an event's existence isn't leaked.
+    """
+    from scheduler.models import CalendarEvent
+    from .meeting_stubs import get_or_create_meeting_for_event
+
+    try:
+        event = CalendarEvent.objects.get(pk=event_id)
+    except CalendarEvent.DoesNotExist:
+        return Response({"detail": "Event not found."}, status=status.HTTP_404_NOT_FOUND)
+
+    if not _staff_sees_all(request.user):
+        allowed = event.owner_id == request.user.id
+        if not allowed and event.account_id:
+            from accounts.models import Account
+            allowed = Account.objects.filter(
+                pk=event.account_id,
+                team_members__user=request.user,
+            ).exists()
+        if not allowed:
+            return Response({"detail": "Event not found."}, status=status.HTTP_404_NOT_FOUND)
+
+    meeting = get_or_create_meeting_for_event(event)
+    return Response(AirtableMeetingSerializer(meeting).data)
+
+
 @api_view(["PATCH"])
 @permission_classes([IsAuthenticated])
 def update_meeting_gong_notes_by_pk(request, meeting_id: int):
@@ -567,6 +602,7 @@ class AirtableActionItemViewSet(viewsets.ModelViewSet):
         from django.utils import timezone as tz
         initial_status = data.get("status", "Open")
         extra = {"marked_done_at": tz.now()} if initial_status == "Done" else {}
+        extra["status_changed_at"] = tz.now()
         item = serializer.save(airtable_id=f"pending-{uuid.uuid4().hex}", **extra)
         airtable_id = push_action_item_create(item)
         if airtable_id:
@@ -614,6 +650,8 @@ class AirtableActionItemViewSet(viewsets.ModelViewSet):
             extra["marked_done_at"] = tz.now()
         elif new_status != "Done" and old_status == "Done":
             extra["marked_done_at"] = None
+        if new_status != old_status:
+            extra["status_changed_at"] = tz.now()
         item = serializer.save(**extra)
         pushed = False
         try:
@@ -661,24 +699,30 @@ class AirtableActionItemViewSet(viewsets.ModelViewSet):
 
         title = request.data.get("title") or f"Action item reminder: {item.task[:120]}"
 
-        # Delete previous reminder if replacing
+        from scheduler import reminder_calendar
+        from scheduler.reminder_recipients import channels_from_request
+
+        # Replace the previous reminder — and its calendar blocks, which would otherwise be left
+        # on the grid with nothing behind them.
         old = item.reminder
         if old:
+            reminder_calendar.occurrences(old).delete()
             old.delete()
 
+        label = item.task[:300]
         reminder = Reminder.objects.create(
             created_by=request.user,
             title=title,
             body=item.task_details or item.task,
             resource_type="action_item",
             resource_id=item.id,
-            resource_label=item.task[:300],
+            resource_label=label,
+            links=[{"resource_type": "action_item", "resource_id": item.id, "resource_label": label}],
             due_at=due_at_dt,
-            notify_in_app=request.data.get("notify_in_app", True),
-            notify_slack=request.data.get("notify_slack", False),
-            notify_push=request.data.get("notify_push", False),
-            notify_sms=request.data.get("notify_sms", False),
+            # Whatever the caller names; otherwise the user's own Settings defaults.
+            **channels_from_request(request.user, request.data),
         )
+        reminder_calendar.sync_reminder_block(reminder, created=True)
         item.reminder = reminder
         item.save(update_fields=["reminder"])
         return Response(AirtableActionItemSerializer(item).data)
@@ -877,9 +921,20 @@ def categorize_event(request):
         account_id=d.get("account_id"),
         categorization=d.get("categorization", ""),
         account_name=d.get("account_name", ""),
+        apply_to_future=d.get("update_subsequent", False),
     )
 
     account = link.account
+    # Recurring meetings: copy the account to the other instances, only when the user switched
+    # the matching option on. Reaches only this user's own synced events.
+    series = None
+    if account and (d.get("update_subsequent") or d.get("update_historical")):
+        from .series import apply_series
+        series = apply_series(
+            request.user, d["event_uid"], account,
+            subsequent=d.get("update_subsequent", False),
+            historical=d.get("update_historical", False),
+        )
     action_items = _action_items_for_account(account, request.user)
     meetings = AirtableMeeting.objects.filter(account=account).order_by("-date")[:10] if account else []
     this_meeting = _resolve_this_meeting(d["event_uid"])
@@ -888,7 +943,7 @@ def categorize_event(request):
     if acct_data:
         acct_data["name"] = _display_account_name(account)
 
-    return Response({
+    body = {
         "needs_categorization": False,
         "match_method": link.match_method,
         "categorization": link.categorization,
@@ -896,7 +951,10 @@ def categorize_event(request):
         "action_items": AirtableActionItemSerializer(action_items, many=True).data,
         "meetings": AirtableMeetingSerializer(meetings, many=True).data,
         "this_meeting": AirtableMeetingSerializer(this_meeting).data if this_meeting else None,
-    })
+    }
+    if series is not None:
+        body["series_updated"] = series  # additive: only present when an option was on
+    return Response(body)
 
 
 @api_view(["PATCH"])
@@ -921,6 +979,9 @@ def update_action_item_status(request, airtable_id):
     old_status = item.status
     item.status = new_status
     update_fields = ["status", "updated_at"]
+    if new_status != old_status:
+        item.status_changed_at = tz.now()
+        update_fields.append("status_changed_at")
     if new_status == "Done" and old_status != "Done":
         item.marked_done_at = tz.now()
         update_fields.append("marked_done_at")
@@ -975,7 +1036,7 @@ def update_action_item_fields(request, airtable_id):
     old_status = item.status  # capture before any mutations
 
     VALID_PRIORITIES = {"Low", "Medium", "High", "Critical"}
-    VALID_STATUSES = {"Open", "In Progress", "Done", "Blocked"}
+    VALID_STATUSES = {"Open", "In Progress", "Done", "Blocked", "Backlogged"}
 
     if "priority" in request.data and request.data["priority"] not in VALID_PRIORITIES:
         return Response(
@@ -1060,6 +1121,9 @@ def update_action_item_fields(request, airtable_id):
     if "status" in request.data:
         from django.utils import timezone as tz
         new_status = request.data["status"]
+        if new_status != old_status:
+            item.status_changed_at = tz.now()
+            local_fields.append("status_changed_at")
         if new_status == "Done" and old_status != "Done":
             item.marked_done_at = tz.now()
             local_fields.append("marked_done_at")
@@ -1151,6 +1215,9 @@ def get_event_link(request):
     link = CalendarEventAccountLink.objects.select_related("account").filter(
         calendar_event_uid=event_uid
     ).exclude(account__isnull=True).first()
+    if not link:
+        from .series import inherit_series_link
+        link = inherit_series_link(event_uid)
     if not link or not link.account:
         return Response({"linked": False})
     return Response({
@@ -1192,6 +1259,29 @@ def batch_event_links(request):
         }
         for lnk in links
     }
+    # Recurring instances with no link of their own inherit from an earlier "update subsequent".
+    from .series import inherit_series_link, parse_instance
+    missing = [u for u in event_uids if u not in linked_by_uid and parse_instance(u)]
+    rules_by_series = {}
+    for uid in missing:
+        series = parse_instance(uid)[0]
+        if series not in rules_by_series:
+            rules_by_series[series] = list(
+                CalendarEventAccountLink.objects.select_related("account").filter(
+                    calendar_event_uid__startswith=f"{series}_",
+                    apply_to_future=True, account__isnull=False,
+                )
+            )
+        if not rules_by_series[series]:
+            continue
+        lnk = inherit_series_link(uid, rules_by_series[series])
+        if lnk and lnk.account:
+            linked_by_uid[uid] = {
+                "linked": True,
+                "airtable_account_id": lnk.account.id,
+                "airtable_id": lnk.account.airtable_id,
+                "account_name": _display_account_name(lnk.account),
+            }
     result = {uid: linked_by_uid.get(uid, {"linked": False}) for uid in event_uids}
     return Response(result)
 

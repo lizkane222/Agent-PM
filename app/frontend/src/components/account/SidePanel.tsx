@@ -86,7 +86,7 @@ export function SidePanel({ panel, onClose, onCreatedActionItem, onMeetingUpdate
             <>
               {/* Status badge */}
               {ev.status !== "confirmed" && (
-                <span style={{ display: "inline-block", fontSize: "0.6875rem", fontWeight: 600, padding: "2px 8px", borderRadius: "6px", background: ev.status === "cancelled" ? "#fee2e2" : "#fef9c3", color: ev.status === "cancelled" ? "#dc2626" : "#a16207", marginBottom: "2px" }}>
+                <span style={{ display: "inline-block", fontSize: "0.6875rem", fontWeight: 600, padding: "2px 8px", borderRadius: "6px", background: ev.status === "cancelled" ? "var(--tint-red-100)" : "var(--tint-yellow-100)", color: ev.status === "cancelled" ? "#dc2626" : "var(--ink-amber)", marginBottom: "2px" }}>
                   {ev.status}
                 </span>
               )}

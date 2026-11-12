@@ -11,6 +11,7 @@ import DashboardPage from "./pages/DashboardPage";
 import PageBuilder from "./components/pagebuilder/PageBuilder";
 import LogsPage from "./pages/LogsPage";
 import LoginPage from "./pages/LoginPage";
+import AuthCallbackPage from "./pages/AuthCallbackPage";
 import RemindersPage from "./pages/RemindersPage";
 import SettingsPage from "./pages/SettingsPage";
 import TeamPage from "./pages/TeamPage";
@@ -109,6 +110,7 @@ export default function App() {
       <PageTracker />
       <Routes>
         <Route path="login" element={<LoginPage />} />
+        <Route path="auth/callback" element={<AuthCallbackPage />} />
         <Route element={<RequireAuth><Layout /></RequireAuth>}>
           <Route index element={<DashboardPage />} />
           <Route path="calendar" element={<CalendarPage />} />
@@ -128,7 +130,7 @@ export default function App() {
           {/* Old location — Admin Data now lives under Settings. */}
           <Route path="admin-data" element={<Navigate to="/settings/admin-data" replace />} />
           <Route path="logs" element={<LogsPage />} />
-          <Route path="edit-preview" element={<PageBuilder />} />
+          <Route path="edit-preview" element={<div className="h-full"><PageBuilder fillParent /></div>} />
           <Route path="profile" element={<ProfilePage />} />
           <Route path="profile/:memberId" element={<ProfilePage />} />
         </Route>

@@ -5,7 +5,7 @@
 import type { AccountArtifact } from "../types/accounts";
 
 export type ArtifactSort =
-  | "created_desc" | "created_asc" | "name_asc" | "name_desc" | "creator" | "file_type" | "link_type";
+  | "created_desc" | "created_asc" | "name_asc" | "name_desc" | "creator" | "category" | "file_type" | "link_type";
 export type ArtifactGroupBy = "none" | "file_type" | "link_type" | "creator";
 
 export interface ArtifactBrowseState {
@@ -14,10 +14,14 @@ export interface ArtifactBrowseState {
   groupBy: ArtifactGroupBy;
   /** Selected type-chip keys (see `typeKey`). Empty = no type filter. */
   types: string[];
+  /** Selected creator names (union). Empty = no creator filter. */
+  creators: string[];
+  /** Only artifacts that an action item uses (from `used_in`). */
+  linkedActionItem: boolean;
 }
 
 export const DEFAULT_ARTIFACT_BROWSE: ArtifactBrowseState = {
-  query: "", sort: "created_desc", groupBy: "none", types: [],
+  query: "", sort: "created_desc", groupBy: "none", types: [], creators: [], linkedActionItem: false,
 };
 
 export const SORT_OPTIONS: { value: ArtifactSort; label: string }[] = [
@@ -26,6 +30,7 @@ export const SORT_OPTIONS: { value: ArtifactSort; label: string }[] = [
   { value: "name_asc", label: "Name A-Z" },
   { value: "name_desc", label: "Name Z-A" },
   { value: "creator", label: "Creator" },
+  { value: "category", label: "Category" },
   { value: "file_type", label: "File type" },
   { value: "link_type", label: "Link type" },
 ];
@@ -97,14 +102,35 @@ export function availableTypes(artifacts: AccountArtifact[]): { key: string; lab
     .sort((x, y) => x.label.localeCompare(y.label));
 }
 
+/** Display name of whoever added the artifact; "" when unknown. */
+export function creatorOf(a: AccountArtifact): string {
+  return a.uploaded_by_username || "";
+}
+
+/** Creator chips for the artifacts currently loaded, with counts, sorted by name. */
+export function availableCreators(artifacts: AccountArtifact[]): { name: string; count: number }[] {
+  const counts = new Map<string, number>();
+  for (const a of artifacts) {
+    const c = creatorOf(a);
+    if (c) counts.set(c, (counts.get(c) ?? 0) + 1);
+  }
+  return [...counts.entries()].map(([name, count]) => ({ name, count })).sort((x, y) => x.name.localeCompare(y.name));
+}
+
+/** True when at least one action item references the artifact. */
+export function isLinkedToActionItem(a: AccountArtifact): boolean {
+  return (a.used_in ?? []).some((r) => r.resource_type === "action_item");
+}
+
 function stripHtml(s: string): string {
   return s.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ");
 }
 
-export function matchesQuery(a: AccountArtifact, query: string): boolean {
+/** `extraText` lets a page that mixes accounts make the account name searchable too. */
+export function matchesQuery(a: AccountArtifact, query: string, extraText?: (a: AccountArtifact) => string): boolean {
   const q = query.trim().toLowerCase();
   if (!q) return true;
-  return [a.name, a.uploaded_by_username, stripHtml(a.description || ""), a.url, a.secondary_url]
+  return [a.name, a.uploaded_by_username, stripHtml(a.description || ""), a.url, a.secondary_url, extraText?.(a)]
     .some((v) => (v ?? "").toLowerCase().includes(q));
 }
 
@@ -124,6 +150,8 @@ export function sortArtifacts(items: AccountArtifact[], sort: ArtifactSort): Acc
     case "name_desc": return out.sort((x, y) => byName(y, x));
     case "created_asc": return out.sort((x, y) => tie(byCreated(x, y), x, y));
     case "creator": return out.sort((x, y) => tie(cmpEmptyLast(x.uploaded_by_username ?? "", y.uploaded_by_username ?? ""), x, y));
+    // The same category the Category chips show (PDF, Image, "docs.google.com (link)" …), A-Z, then by name.
+    case "category": return out.sort((x, y) => tie(cmpEmptyLast(typeLabel(typeKey(x)), typeLabel(typeKey(y))), x, y));
     case "file_type": return out.sort((x, y) => tie(cmpEmptyLast(fileTypeOf(x), fileTypeOf(y)), x, y));
     case "link_type": return out.sort((x, y) => tie(cmpEmptyLast(linkTypeOf(x), linkTypeOf(y)), x, y));
     case "created_desc":
@@ -146,9 +174,16 @@ const CATCH_ALL = new Set(["Links", "Files", "Unknown creator"]);
 export interface ArtifactGroup { label: string; items: AccountArtifact[] }
 
 /** Search + type filter + sort + group. Groups keep the order their first member has in the sort. */
-export function browseArtifacts(artifacts: AccountArtifact[], state: ArtifactBrowseState): ArtifactGroup[] {
+export function browseArtifacts(
+  artifacts: AccountArtifact[], state: ArtifactBrowseState, extraText?: (a: AccountArtifact) => string,
+): ArtifactGroup[] {
   const types = new Set(state.types);
-  const kept = artifacts.filter((a) => matchesQuery(a, state.query) && (types.size === 0 || types.has(typeKey(a))));
+  const creators = new Set(state.creators ?? []);
+  const kept = artifacts.filter((a) =>
+    matchesQuery(a, state.query, extraText)
+    && (types.size === 0 || types.has(typeKey(a)))
+    && (creators.size === 0 || creators.has(creatorOf(a)))
+    && (!state.linkedActionItem || isLinkedToActionItem(a)));
   const sorted = sortArtifacts(kept, state.sort);
   if (state.groupBy === "none") return sorted.length ? [{ label: "", items: sorted }] : [];
   const groups = new Map<string, AccountArtifact[]>();
@@ -163,5 +198,5 @@ export function browseArtifacts(artifacts: AccountArtifact[], state: ArtifactBro
 }
 
 export function isArtifactBrowseActive(state: ArtifactBrowseState): boolean {
-  return !!state.query.trim() || state.types.length > 0;
+  return !!state.query.trim() || state.types.length > 0 || (state.creators ?? []).length > 0 || !!state.linkedActionItem;
 }

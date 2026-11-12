@@ -4,6 +4,7 @@ import { useRightClickComment } from "../comments/CommentContext";
 import CommentCountBadge from "../comments/CommentCountBadge";
 import { meetingHasNotes } from "../../lib/meetingNotes";
 
+import { localDateKey, instantDayKey, dateFieldDayKey } from "../../lib/timelineDay";
 export function fmtDuration(secs: number): string {
   if (!secs) return "—";
   const h = Math.floor(secs / 3600);
@@ -16,7 +17,7 @@ export function fmtDuration(secs: number): string {
 const DAY_ABBR = ["Su", "M", "T", "W", "Th", "F", "Sa"];
 
 function isoDate(d: Date): string {
-  return d.toISOString().slice(0, 10);
+  return localDateKey(d);
 }
 
 /** Returns an array of Date objects for each weekday (Mon–Fri) over the window. */
@@ -75,7 +76,7 @@ function MeetingTimelineBtn({
         data-has-notes={meetingHasNotes(m) ? "true" : "false"}
         title={meetingHasNotes(m) ? "Meeting notes added" : "No meeting notes yet"}
         aria-hidden="true"
-        style={{ marginRight: 3, fontWeight: 700, color: meetingHasNotes(m) ? "#16a34a" : "#9ca3af" }}
+        style={{ marginRight: 3, fontWeight: 700, color: meetingHasNotes(m) ? "#16a34a" : "var(--text-gray-400)" }}
       >
         {meetingHasNotes(m) ? "✓" : "◷"}
       </span>
@@ -167,7 +168,7 @@ export function AccountTimeline({
   const meetingsByDate: Record<string, AirtableMeeting[]> = {};
   for (const m of meetings) {
     if (!m.date) continue;
-    const d = isoDate(new Date(m.date));
+    const d = dateFieldDayKey(m.date);
     (meetingsByDate[d] ??= []).push(m);
   }
 
@@ -182,13 +183,13 @@ export function AccountTimeline({
   const actionsByDate: Record<string, AirtableActionItem[]> = {};
   for (const item of actionItems) {
     if (!item.due_date) continue;
-    const d = isoDate(new Date(item.due_date));
+    const d = dateFieldDayKey(item.due_date);
     (actionsByDate[d] ??= []).push(item);
   }
 
   const calByDate: Record<string, CalendarEvent[]> = {};
   for (const ev of calendarEvents) {
-    const d = isoDate(new Date(ev.start_datetime));
+    const d = instantDayKey(ev.start_datetime);
     (calByDate[d] ??= []).push(ev);
   }
 
@@ -324,12 +325,12 @@ export function AccountTimeline({
                             cursor: "pointer",
                           }}
                         >
-                          <span style={{ flexShrink: 0, fontSize: "0.6rem", color: "#15803d", marginTop: "2px" }}>✓</span>
+                          <span style={{ flexShrink: 0, fontSize: "0.6rem", color: "var(--ink-green)", marginTop: "2px" }}>✓</span>
                           <span style={{
                             fontSize: "0.6rem",
                             fontWeight: 500,
                             lineHeight: 1.3,
-                            color: "#15803d",
+                            color: "var(--ink-green)",
                             textDecoration: "line-through",
                             overflow: "hidden",
                             display: "-webkit-box",
@@ -393,7 +394,7 @@ export function AccountTimeline({
                           fontSize: "0.625rem",
                           fontWeight: 500,
                           lineHeight: 1.35,
-                          color: isDone ? "#15803d" : isOverdue ? "#dc2626" : "#6d28d9",
+                          color: isDone ? "var(--ink-green)" : isOverdue ? "#dc2626" : "#6d28d9",
                           textDecoration: isDone ? "line-through" : "none",
                           overflow: "hidden",
                           display: "-webkit-box",

@@ -232,7 +232,7 @@ export function GongSummaryPanel({ eventId, meetingId: meetingIdProp, existingNo
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "6px" }}>
         <p style={{ fontSize: "0.6875rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em", color: "var(--twilio-gray-60)", margin: 0 }}>Meeting Summary</p>
         <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-          {saveState === "saving" && <span style={{ fontSize: "0.6875rem", color: "#9ca3af" }}>Saving…</span>}
+          {saveState === "saving" && <span style={{ fontSize: "0.6875rem", color: "var(--text-gray-400)" }}>Saving…</span>}
           {saveState === "saved" && <span style={{ fontSize: "0.6875rem", color: "#16a34a" }}>✓ Saved</span>}
           {saveState === "error" && <span style={{ fontSize: "0.6875rem", color: "#dc2626" }}>Save failed</span>}
           <MeetingSummarySourceToggle
@@ -257,7 +257,7 @@ export function GongSummaryPanel({ eventId, meetingId: meetingIdProp, existingNo
             placeholder={source === "zoom"
               ? "Paste your Zoom AI Companion summary or any bulleted text here…"
               : "Paste your Gong notes, meeting summary, or any bulleted text here…"}
-            style={{ width: "100%", fontSize: "0.8125rem", border: "1px solid #e5e7eb", borderRadius: "7px", padding: "8px 10px", outline: "none", resize: "vertical", lineHeight: 1.5, boxSizing: "border-box", color: "var(--twilio-navy)" }}
+            style={{ width: "100%", fontSize: "0.8125rem", border: "1px solid var(--border-subtle)", borderRadius: "7px", padding: "8px 10px", outline: "none", resize: "vertical", lineHeight: 1.5, boxSizing: "border-box", color: "var(--text-ink)" }}
           />
           <button onClick={() => void handleParse()} disabled={!raw.trim()} style={{ marginTop: "5px", width: "100%", padding: "5px 0", fontSize: "0.75rem", fontWeight: 700, background: "#6366f1", color: "#fff", border: "none", borderRadius: "6px", cursor: raw.trim() ? "pointer" : "not-allowed", opacity: raw.trim() ? 1 : 0.4 }}>
             Parse & Save
@@ -266,12 +266,12 @@ export function GongSummaryPanel({ eventId, meetingId: meetingIdProp, existingNo
       )}
 
       {items.length > 0 && (
-        <div style={{ border: "1px solid rgba(0,0,0,0.08)", borderRadius: "8px", background: "#fff", overflow: "hidden" }}>
+        <div style={{ border: "1px solid rgba(0,0,0,0.08)", borderRadius: "8px", background: "var(--surface-card)", overflow: "hidden" }}>
           {items.map((item, i) => {
             if (item.kind === "heading") {
               return (
                 <div key={i} style={{ padding: "6px 10px 3px", borderBottom: "1px solid rgba(0,0,0,0.05)" }}>
-                  <p style={{ fontSize: "0.6875rem", fontWeight: 700, textTransform: "capitalize", color: "var(--twilio-navy)", margin: 0, letterSpacing: "0.01em" }}>{item.text}</p>
+                  <p style={{ fontSize: "0.6875rem", fontWeight: 700, textTransform: "capitalize", color: "var(--text-ink)", margin: 0, letterSpacing: "0.01em" }}>{item.text}</p>
                 </div>
               );
             }
@@ -337,12 +337,12 @@ export function GongBulletRow({ text, eventId, accountName, airtableAccountId, l
       }}
     >
       <span style={{ width: "5px", height: "5px", borderRadius: "50%", background: "#9ca3af", flexShrink: 0, marginTop: "7px" }} />
-      <p style={{ flex: 1, fontSize: "0.8125rem", color: "var(--twilio-navy)", lineHeight: 1.5, margin: 0 }}>{renderWithMentions(text)}</p>
+      <p style={{ flex: 1, fontSize: "0.8125rem", color: "var(--text-ink)", lineHeight: 1.5, margin: 0 }}>{renderWithMentions(text)}</p>
       <div ref={tooltipRef} style={{ display: "flex", alignItems: "center", gap: "2px", flexShrink: 0, position: "relative" }}>
         <button
           title="Create action item"
           onClick={(e) => { setTooltipAnchorY(e.currentTarget.getBoundingClientRect().bottom); setOpenAction(openAction === "action" ? null : "action"); }}
-          style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("action") ? "#2563eb" : "#9ca3af" }}
+          style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("action") ? "#2563eb" : "var(--text-gray-400)" }}
           className={doneActions.has("action") ? "transition-opacity" : "opacity-0 group-hover:opacity-100 transition-opacity"}
         >
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" style={{ width: "12px", height: "12px" }}><path d="M8 5h9M8 10h9M8 15h9" strokeLinecap="round"/><path d="M3 5l1.5 1.5L7 3M3 10l1.5 1.5L7 8M3 15l1.5 1.5L7 13" strokeLinecap="round" strokeLinejoin="round"/></svg>
@@ -350,7 +350,7 @@ export function GongBulletRow({ text, eventId, accountName, airtableAccountId, l
         <button
           title="Set reminder"
           onClick={(e) => { setTooltipAnchorY(e.currentTarget.getBoundingClientRect().bottom); setOpenAction(openAction === "reminder" ? null : "reminder"); }}
-          style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("reminder") ? "#2563eb" : "#9ca3af" }}
+          style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("reminder") ? "#2563eb" : "var(--text-gray-400)" }}
           className={doneActions.has("reminder") ? "transition-opacity" : "opacity-0 group-hover:opacity-100 transition-opacity"}
         >
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" style={{ width: "12px", height: "12px" }}><circle cx="10" cy="10" r="7"/><path d="M10 6v4l3 2" strokeLinecap="round" strokeLinejoin="round"/></svg>
@@ -358,7 +358,7 @@ export function GongBulletRow({ text, eventId, accountName, airtableAccountId, l
         <button
           title="Create meeting"
           onClick={(e) => { setTooltipAnchorY(e.currentTarget.getBoundingClientRect().bottom); setOpenAction(openAction === "calendar" ? null : "calendar"); }}
-          style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("calendar") ? "#2563eb" : "#9ca3af" }}
+          style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("calendar") ? "#2563eb" : "var(--text-gray-400)" }}
           className={doneActions.has("calendar") ? "transition-opacity" : "opacity-0 group-hover:opacity-100 transition-opacity"}
         >
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" style={{ width: "12px", height: "12px" }}><rect x="2" y="4" width="16" height="14" rx="2"/><path d="M2 8h16M6 2v4M14 2v4" strokeLinecap="round"/></svg>

@@ -32,7 +32,7 @@ export default function ActionItemCalendarNotes({ airtableId }: { airtableId: st
         {notes.map((n) => (
           <li key={n.id} className="rounded-lg bg-gray-50 px-3 py-2">
             <div
-              className="text-[13px] text-[var(--twilio-navy)] prose prose-sm max-w-none"
+              className="text-[13px] text-[var(--twilio-navy)] prose prose-sm max-w-none rich-text"
               dangerouslySetInnerHTML={{ __html: sanitizeHtml(n.html || n.text) }}
             />
             <p className="mt-1 text-[11px] text-[var(--twilio-gray-60)]">

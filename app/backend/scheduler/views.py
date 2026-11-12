@@ -1,10 +1,13 @@
 """API views for the scheduler app."""
 
 import logging
+from datetime import timezone as dt_timezone
 
 from asgiref.sync import async_to_sync
+from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from channels.layers import get_channel_layer
-from rest_framework import filters, viewsets
+from rest_framework import filters, serializers, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -15,6 +18,7 @@ from core.query_params import csv_int_params
 from realtime.sync import publish_activity_event
 from .event_log import changed_labels, record_event_change, snapshot as event_snapshot
 
+from . import reminder_calendar, reminder_links, reminder_recipients, reminder_snooze
 from .models import ActionItem, CalendarEvent, MeetingNote, Reminder, Task
 from .serializers import ActionItemSerializer, CalendarEventSerializer, MeetingNoteSerializer, ReminderSerializer, TaskSerializer
 
@@ -825,6 +829,9 @@ class ReminderViewSet(viewsets.ModelViewSet):
 
     serializer_class = ReminderSerializer
     permission_classes = [IsAuthenticated]
+    # Honour `?page_size=` (the project default ignores it): the sidebar and the Reminders page
+    # list every reminder, and a fixed 50 would cut the newest off.
+    pagination_class = ClientPageSizePagination
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ["title", "body", "resource_label"]
     ordering_fields = ["due_at", "status", "created_at"]
@@ -841,28 +848,148 @@ class ReminderViewSet(viewsets.ModelViewSet):
             qs = qs.filter(resource_type=resource_type)
         if resource_id:
             qs = qs.filter(resource_id=resource_id)
+        # Optional window on when the reminder is due. A value that is present but not a date
+        # narrows to nothing rather than silently returning everything.
+        for param, lookup in (("due_after", "due_at__gte"), ("due_before", "due_at__lte")):
+            raw = self.request.query_params.get(param)
+            if raw:
+                parsed = parse_datetime(raw.replace(" ", "+")) if raw else None  # a raw "+" in a URL arrives as " "
+                qs = qs.filter(**{lookup: parsed}) if parsed else qs.none()
         return qs
 
     def perform_create(self, serializer):
         reminder = serializer.save(created_by=self.request.user)
+        reminder_calendar.sync_reminder_block(reminder, created=True)
         publish_activity_event(
             self.request.user, "reminder.created",
             "**Created** Reminder",
             detail=reminder.title,
-            metadata={"due_at": reminder.due_at.isoformat() if reminder.due_at else None},
+            metadata={
+                "due_at": reminder.due_at.isoformat() if reminder.due_at else None,
+                # Who else will be notified — the audit trail for "why did X get this?".
+                "recipient_ids": list(reminder.recipients.values_list("pk", flat=True)),
+            },
         )
 
     def perform_update(self, serializer):
+        previous_due_at = serializer.instance.due_at
+        previous_status = serializer.instance.status
         reminder = serializer.save()
+        if reminder.due_at != previous_due_at:
+            reminder_calendar.rearm_if_future(reminder)  # a sent reminder moved to the future fires again
+        reminder_calendar.sync_reminder_block(reminder, previous_due_at=previous_due_at, previous_status=previous_status)
         publish_activity_event(
             self.request.user, "reminder.updated",
             "**Updated** Reminder",
             detail=reminder.title,
+            metadata={"recipient_ids": list(reminder.recipients.values_list("pk", flat=True))},
         )
+
+    @action(detail=True, methods=["post"], url_path="occurrences")
+    def add_occurrence(self, request, pk=None):
+        """
+        Put the reminder on the calendar at another time (`{"start": <ISO instant>}`).
+
+        A reminder can be on the calendar any number of times; each is a 15-minute block and
+        each notifies at its own start. Asking for a minute it is already at returns that
+        occurrence (200) instead of stacking a second block (201 when new).
+        """
+        reminder = self.get_object()
+        start = parse_datetime(str(request.data.get("start") or ""))
+        if start is None:
+            return Response({"start": "Provide a start time (ISO 8601, with an offset)."}, status=400)
+        if timezone.is_naive(start):
+            start = timezone.make_aware(start, dt_timezone.utc)
+        if reminder.status not in reminder_calendar.VISIBLE_STATUSES:
+            return Response({"detail": "A dismissed reminder can't be added to the calendar."}, status=400)
+        occ, created = reminder_calendar.add_occurrence(reminder, start)
+        if created and start <= timezone.now():
+            # Added to a moment that has already passed: nothing to remind about.
+            CalendarEvent.objects.filter(pk=occ.pk).update(reminder_notified_at=timezone.now())
+        return Response(self.get_serializer(reminder).data, status=201 if created else 200)
+
+    @action(detail=True, methods=["patch", "delete"], url_path=r"occurrences/(?P<event_pk>\d+)")
+    def occurrence(self, request, pk=None, event_pk=None):
+        """Move (`PATCH {"start"}`) or remove (`DELETE`) one of the reminder's calendar blocks."""
+        reminder = self.get_object()
+        occ = reminder_calendar.occurrences(reminder).filter(pk=event_pk).first()
+        if occ is None:
+            return Response({"detail": "Not found."}, status=404)
+        if request.method == "DELETE":
+            occ.delete()
+            return Response(self.get_serializer(reminder).data)
+        start = parse_datetime(str(request.data.get("start") or ""))
+        if start is None:
+            return Response({"start": "Provide a start time (ISO 8601, with an offset)."}, status=400)
+        if timezone.is_naive(start):
+            start = timezone.make_aware(start, dt_timezone.utc)
+        if reminder_calendar.move_occurrence(reminder, occ, start) is None:
+            return Response({"start": "The reminder is already on the calendar at that time."}, status=400)
+        reminder.refresh_from_db()
+        return Response(self.get_serializer(reminder).data)
+
+    @action(detail=False, methods=["get"], url_path="link-options")
+    def link_options(self, request):
+        """
+        Records a reminder can be linked to, for the picker: `?type=account|action_item|calendar_event|task`
+        and an optional `?q=` to filter. Only records the caller can already see in the app.
+        """
+        link_type = request.query_params.get("type")
+        if link_type not in reminder_links.LINK_TYPES:
+            return Response({"type": f"Choose one of: {', '.join(reminder_links.LINK_TYPES)}."}, status=400)
+        return Response({"results": reminder_links.search(request.user, link_type, request.query_params.get("q", ""))})
+
+    @action(detail=False, methods=["get"], url_path="recipients")
+    def recipients(self, request):
+        """
+        People who could be notified by a reminder with these links, with availability: the teams of the
+        linked accounts, your manager, and — for a reminder about your Admin workspace — your colleagues.
+
+        Pass `?link=<type>:<id>` once per link (e.g. `link=account:3&link=action_item:11`), or the
+        older `?account=<id>`. The teammates are those on the accounts the links lead to that the
+        caller is on — an action item or meeting counts through the account it is filed under.
+        Links the caller cannot see are an error (404, so it does not reveal what exists). People
+        who have turned off being notified by others are **listed** with `available: false` and a
+        reason, so the UI can show them disabled rather than hide them.
+        """
+        raw = request.query_params.getlist("link")
+        legacy = request.query_params.get("account")
+        if legacy:
+            raw.append(f"account:{legacy}")
+        links = []
+        for item in raw:
+            kind, _, pk = item.partition(":")
+            links.append({"resource_type": kind, "resource_id": pk})
+        try:
+            clean = reminder_links.normalize_links(request.user, links)
+        except serializers.ValidationError:
+            return Response({"detail": "Not found."}, status=404)
+        people, sources = reminder_recipients.pool(request.user, clean)
+        return Response({
+            "results": [c.as_dict() for c in people],
+            # Where the people come from — linked accounts, "Your colleagues", "Your manager" — so the
+            # picker can say so (or why it is empty). `accounts` is kept for older callers.
+            "sources": sources,
+            "accounts": [x for x in sources if x not in (reminder_recipients.MANAGER_LABEL, reminder_recipients.COLLEAGUES_LABEL)],
+        })
 
     def perform_destroy(self, instance):
         title = instance.title
+        # Its calendar blocks go with it. The FK is SET_NULL (so unlinking never erases a block
+        # on purpose), which on a delete would leave an orphan "reminders" block on the grid —
+        # and, if it was mirrored to Google, an orphan event there too.
+        blocks = list(instance.calendar_events.filter(calendar_id="reminders", owner=self.request.user))
         instance.delete()
+        for block in blocks:
+            google_event_id, synced = block.google_event_id, block.is_synced
+            block.delete()
+            if synced and google_event_id:
+                try:
+                    calendar_view = CalendarEventViewSet()
+                    calendar_view.request = self.request
+                    calendar_view._delete_from_google(google_event_id)
+                except Exception:
+                    logger.exception("Failed to delete reminder block '%s' from Google Calendar", title)
         publish_activity_event(
             self.request.user, "reminder.deleted",
             "**Deleted** Reminder",
@@ -874,6 +1001,8 @@ class ReminderViewSet(viewsets.ModelViewSet):
         reminder = self.get_object()
         reminder.status = "dismissed"
         reminder.save(update_fields=["status", "updated_at"])
+        reminder_calendar.sync_reminder_block(reminder)  # a dismissed reminder leaves the grid
+        self._acknowledge_alerts(request.user, reminder)
         publish_activity_event(
             request.user, "reminder.dismissed",
             "**Dismissed** Reminder",
@@ -881,15 +1010,56 @@ class ReminderViewSet(viewsets.ModelViewSet):
         )
         return Response(self.get_serializer(reminder).data)
 
+    @staticmethod
+    def _acknowledge_alerts(user, reminder) -> None:
+        """Snoozing or dismissing answers any alert still on screen for this reminder."""
+        from team.models import Notification
+
+        Notification.objects.filter(
+            user=user, reminder=reminder, kind="reminder", read_at__isnull=True,
+        ).update(read_at=timezone.now())
+
     @action(detail=True, methods=["post"])
     def snooze(self, request, pk=None):
+        """
+        Reschedule the reminder: it fires again at the chosen time, and its calendar block moves.
+
+        Body: `{"until": <ISO instant>}` or `{"preset": "next_account_meeting"}` (15 minutes before
+        the next meeting on the reminder's account), plus optionally `"from": <ISO instant>` — the
+        time the user is looking at (the block the card sits under). That block moves to the new
+        time; if it is the one at the due time the due time moves with it and the reminder is
+        re-armed. Without `from`, the block at the due time moves. Past or invalid times are 400
+        and change nothing. Used to also mark the reminder "snoozed" without touching any time,
+        which stopped it ever firing.
+        """
         reminder = self.get_object()
-        reminder.status = "snoozed"
-        reminder.save(update_fields=["status", "updated_at"])
+        until, error = reminder_snooze.resolve_until(reminder, request.data)
+        if error:
+            return Response({"until": error}, status=400)
+
+        from_start = parse_datetime(str(request.data.get("from") or ""))
+        if from_start is not None and timezone.is_naive(from_start):
+            from_start = timezone.make_aware(from_start, dt_timezone.utc)
+        block = reminder_calendar.occurrence_at(reminder, from_start) if from_start else None
+
+        if block is not None and reminder.status in reminder_calendar.VISIBLE_STATUSES:
+            if reminder_calendar.move_occurrence(reminder, block, until) is None:
+                return Response({"until": "The reminder is already on the calendar at that time."}, status=400)
+            reminder.refresh_from_db()
+        else:
+            previous_due_at, previous_status = reminder.due_at, reminder.status
+            reminder.due_at = until
+            reminder.status = "pending"
+            reminder.save(update_fields=["due_at", "status", "updated_at"])
+            reminder_calendar.sync_reminder_block(
+                reminder, previous_due_at=previous_due_at, previous_status=previous_status
+            )
+        self._acknowledge_alerts(request.user, reminder)
         publish_activity_event(
             request.user, "reminder.snoozed",
             "**Snoozed** Reminder",
             detail=reminder.title,
+            metadata={"until": until.isoformat()},
         )
         return Response(self.get_serializer(reminder).data)
 

@@ -41,7 +41,7 @@ export function MeetingNotesPanel({ eventId, accountName, airtableAccountId, lin
   return (
     <div style={{ marginTop: "12px" }}>
       <p style={{ fontSize: "0.6875rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em", color: "var(--twilio-gray-60)", marginBottom: "6px" }}>Meeting Notes</p>
-      <div style={{ border: "1px solid rgba(0,0,0,0.08)", borderRadius: "8px", background: "#fff", overflow: "hidden" }}>
+      <div style={{ border: "1px solid rgba(0,0,0,0.08)", borderRadius: "8px", background: "var(--surface-card)", overflow: "hidden" }}>
         <div style={{ display: "flex", alignItems: "flex-start", gap: "6px", padding: "6px 10px", borderBottom: notes.length > 0 ? "1px solid rgba(0,0,0,0.06)" : undefined }}>
           <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: "#d1d5db", flexShrink: 0, marginTop: "7px" }} />
           <textarea
@@ -54,7 +54,7 @@ export function MeetingNotesPanel({ eventId, accountName, airtableAccountId, lin
             }}
             placeholder="Add a note… (Shift+Enter for new line)"
             disabled={saving}
-            style={{ flex: 1, fontSize: "0.8125rem", color: "var(--twilio-navy)", background: "transparent", border: "none", outline: "none", resize: "none", lineHeight: 1.5, padding: "1px 0" }}
+            style={{ flex: 1, fontSize: "0.8125rem", color: "var(--text-ink)", background: "transparent", border: "none", outline: "none", resize: "none", lineHeight: 1.5, padding: "1px 0" }}
           />
           {draft.trim() && (
             <button onClick={() => void addNote()} disabled={saving} style={{ fontSize: "0.6875rem", fontWeight: 600, color: "#6366f1", background: "none", border: "none", cursor: "pointer", padding: "2px 0", flexShrink: 0, marginTop: "4px" }}>

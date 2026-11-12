@@ -133,6 +133,22 @@ class PublicItemTests(APITestCase):
         self.assertEqual(self.client.post(PUBLIC, {"item_type": "artifact_link", "title": "x"}, format="json").status_code, 400)
         self.assertEqual(self.client.post(PUBLIC, {"item_type": "record_ref", "title": "x"}, format="json").status_code, 400)
 
+    def test_public_note_keeps_lists_and_checklist_state(self):
+        task = (
+            '<ul data-type="taskList">'
+            '<li data-checked="true" data-type="taskItem"><label><input type="checkbox" checked><span></span></label><div><p>done</p></div></li>'
+            '<li data-checked="false" data-type="taskItem"><label><input type="checkbox"><span></span></label><div><p>todo</p></div></li>'
+            '</ul><ol><li><p>one</p></li></ol><ul><li><p>dot</p></li></ul>'
+        )
+        self.client.force_authenticate(self.a)
+        body = self.client.post(PUBLIC, {"item_type": "note", "title": "L", "body": task}, format="json").data["body"]
+        self.assertIn("\u2611 done", body)
+        self.assertIn("\u2610 todo", body)
+        self.assertNotIn("<input", body)
+        self.assertNotIn("taskList", body)
+        self.assertIn("<ol><li>", body)
+        self.assertIn("<ul><li><p>dot", body)
+
     def test_blocked_file_type(self):
         self.client.force_authenticate(self.a)
         f = SimpleUploadedFile("x.sh", b"echo hi")

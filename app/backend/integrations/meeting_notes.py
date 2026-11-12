@@ -261,6 +261,22 @@ def _unlinked_title_q(names) -> Q:
     return q
 
 
+def _linked_event_uids(airtable_accounts):
+    """Google event ids the user linked to these accounts on the calendar page.
+
+    The calendar's account link lives in `CalendarEventAccountLink`, not in the
+    `CalendarEvent.account` FK, so a scoped scan that read only the FK skipped every event the user
+    had linked there (including a recurring series linked with "update historical").
+    """
+    from airtable_sync.models import CalendarEventAccountLink
+
+    return list(
+        CalendarEventAccountLink.objects.filter(account__in=airtable_accounts)
+        .exclude(calendar_event_uid="")
+        .values_list("calendar_event_uid", flat=True)
+    )
+
+
 def candidate_events(user, days: int, account_name: str = "", account: str = ""):
     """Calendar events the user owns that have no AirtableMeeting behind them yet.
 
@@ -307,11 +323,14 @@ def candidate_events(user, days: int, account_name: str = "", account: str = "")
         )
         qs = qs.filter(
             Q(account_id__in=accounts.values_list("pk", flat=True))
+            | Q(google_event_id__in=_linked_event_uids(at_rows))
             | _unlinked_title_q(names)
         )
     elif account_name:
         qs = qs.filter(
             Q(account__company_name__iexact=account_name)
+            | Q(google_event_id__in=_linked_event_uids(
+                AirtableAccount.objects.filter(name__iexact=account_name)))
             | _unlinked_title_q({account_name})
         )
 
@@ -618,7 +637,7 @@ def is_recording_only(notes: str) -> bool:
     return text.splitlines()[:1] == [RECORDING_HEADING] and not _RECAP_HEADING_RE.search(text)
 
 
-def summarize_email(body: str, meeting_name: str, source: str) -> str:
+def summarize_email(body: str, meeting_name: str, source: str, user=None) -> str:
     """Normalise a recap email into headed bullets, falling back to the raw text."""
     body = (body or "").strip()
     if not body:
@@ -646,6 +665,9 @@ def summarize_email(body: str, meeting_name: str, source: str) -> str:
                 ),
             }],
         )
+        from agents.usage import record_llm_usage
+
+        record_llm_usage(user, "Meeting notes", message)
         text = "".join(
             block.text for block in message.content if getattr(block, "type", "") == "text"
         ).strip()
@@ -903,7 +925,7 @@ def sync_meeting_notes_from_email(
                 continue
 
             try:
-                summary = summarize_email(best["body"], meeting.name, source)
+                summary = summarize_email(best["body"], meeting.name, source, user=user)
             except Exception as exc:  # defensive: summarize_email already catches
                 logger.exception("meeting_notes: summarisation failed for meeting %s", meeting.pk)
                 report["errors"].append({

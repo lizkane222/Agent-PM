@@ -12,7 +12,7 @@ The command will:
 3. Report created / updated / failed counts.
 
 Fields synced:
-    Full Name, Email, Title, Department, Status, Slack Handle, Avatar URL,
+    Full Name, Email, Second Email, Title, Department, Status, Slack Handle, Avatar URL,
     Joined At, Manager, Tags, Created At, Updated At, Django ID
 """
 
@@ -25,6 +25,8 @@ truststore.inject_into_ssl()
 import requests
 from django.conf import settings
 from django.core.management.base import BaseCommand
+
+from team.emails import preferred_email, second_email
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,11 @@ _REQUIRED_FIELDS = [
     # "Django ID"   — number
     #
     # Fields we need to add if missing:
+    {
+        "name": "Second Email",
+        "type": "email",
+        "description": "A second address for this person (Segment, SendGrid…). The twilio.com address is kept in Email.",
+    },
     {
         "name": "Manager",
         "type": "singleLineText",
@@ -132,7 +139,9 @@ def _member_fields(member) -> dict:
     """Map a Django TeamMember instance → Airtable field dict."""
     fields: dict = {
         "Full Name": member.full_name,
-        "Email": member.email,
+        # The twilio.com address is preferred; the next best one goes in "Second Email".
+        "Email": preferred_email(member),
+        "Second Email": second_email(member) or None,
         "Django ID": member.pk,
     }
     if member.title:

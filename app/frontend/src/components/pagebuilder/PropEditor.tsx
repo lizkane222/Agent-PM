@@ -304,7 +304,7 @@ export default function PropEditor({ node, onChange }: Props) {
                 onChange={(e) => set("lineHeight", Number(e.target.value))}
                 style={{ flex: 1 }}
               />
-              <span style={{ fontSize: 11, minWidth: 28, textAlign: "right", color: "#6B7280" }}>
+              <span style={{ fontSize: 11, minWidth: 28, textAlign: "right", color: "var(--text-gray-500)" }}>
                 {((p.lineHeight as number) ?? 1.5).toFixed(2)}
               </span>
             </div>
@@ -319,7 +319,7 @@ export default function PropEditor({ node, onChange }: Props) {
                 onChange={(e) => set("letterSpacing", `${e.target.value}em`)}
                 style={{ flex: 1 }}
               />
-              <span style={{ fontSize: 11, minWidth: 36, textAlign: "right", color: "#6B7280" }}>
+              <span style={{ fontSize: 11, minWidth: 36, textAlign: "right", color: "var(--text-gray-500)" }}>
                 {String(p.letterSpacing ?? "0em")}
               </span>
             </div>
@@ -448,7 +448,7 @@ export default function PropEditor({ node, onChange }: Props) {
           {(p.accountName as string) && (
             <Row label="Account">
               <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                <span style={{ fontSize: 12, color: "#374151", flex: 1 }}>{p.accountName as string}</span>
+                <span style={{ fontSize: 12, color: "var(--text-gray-700)", flex: 1 }}>{p.accountName as string}</span>
                 <button
                   onClick={() => { set("accountId", 0); set("accountName", ""); set("meetings", []); }}
                   className="text-[10px] text-red-400 hover:text-red-600"
@@ -458,7 +458,7 @@ export default function PropEditor({ node, onChange }: Props) {
           )}
           {Array.isArray(p.meetings) && (p.meetings as unknown[]).length > 0 && (
             <Row label="Meetings">
-              <span style={{ fontSize: 12, color: "#6B7280" }}>{(p.meetings as unknown[]).length} fetched</span>
+              <span style={{ fontSize: 12, color: "var(--text-gray-500)" }}>{(p.meetings as unknown[]).length} fetched</span>
             </Row>
           )}
         </>

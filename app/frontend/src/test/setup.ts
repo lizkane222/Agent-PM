@@ -6,7 +6,7 @@ import { server } from "./msw-server";
 import { resetRequestCache } from "../lib/requestCache";
 import { resetCommentSummaries } from "../lib/commentSummaryStore";
 import { reloadActionItemZones } from "../hooks/useActionItemZoneSets";
-import { reloadStatusArrivalOrder } from "../hooks/useStatusArrivalOrder";
+import { reloadStatusArrivalOrder, reloadColumnSort } from "../hooks/useStatusArrivalOrder";
 import { reloadQuickLinks } from "../hooks/useQuickLinks";
 import { reloadAccountSectionCollapse } from "../hooks/useAccountSectionCollapse";
 import { resetLiveTimers } from "../lib/liveTimers";
@@ -52,6 +52,20 @@ if (!document.elementFromPoint) {
   document.elementFromPoint = () => document.body;
 }
 
+// ProseMirror scrolls the caret into view after every state change (toggling a list, typing) by
+// measuring a DOM Range. jsdom has no layout and no Range.getClientRects, so the call throws from a
+// timer and surfaces as an "Unhandled error" that makes `vitest run` exit non-zero even though every
+// test passed. Zero-size rectangles are what a layout-less environment would truthfully report.
+const emptyRect = () => ({ x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0, toJSON: () => ({}) });
+if (typeof Range !== "undefined") {
+  if (!Range.prototype.getClientRects) {
+    Range.prototype.getClientRects = () => ({ length: 0, item: () => null, [Symbol.iterator]: function* () {} }) as unknown as DOMRectList;
+  }
+  if (!Range.prototype.getBoundingClientRect) {
+    Range.prototype.getBoundingClientRect = () => emptyRect() as DOMRect;
+  }
+}
+
 beforeAll(() => {
   server.listen({ onUnhandledRequest: "error" });
   server.use(...extraHandlers);
@@ -75,6 +89,7 @@ afterEach(() => {
   // Same trap again for the kanban status arrival order (hooks/useStatusArrivalOrder.ts):
   // a status move recorded by one test would otherwise still order the next test's columns.
   reloadStatusArrivalOrder();
+  reloadColumnSort();
   // Module-level store: localStorage.clear() fires no event, so a link added by one test would
   // otherwise still be listed in the next.
   reloadQuickLinks();

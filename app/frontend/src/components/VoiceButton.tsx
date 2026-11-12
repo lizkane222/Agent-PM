@@ -187,6 +187,8 @@ export default function VoiceButton({ onTurn, onTranscript }: VoiceButtonProps) 
     function onLaunch(e: Event) {
       const detail = (e as CustomEvent<VoiceLaunchDetail>).detail;
       if (!detail?.script) return;
+      // Tell the sender a session is handling this (see ExportBar's fallback).
+      e.preventDefault();
       pendingKeyRef.current = detail.key;
       setBrief(detail);
       void startCallRef.current();

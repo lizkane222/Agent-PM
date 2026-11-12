@@ -5,7 +5,7 @@ import { server } from "../../test/msw-server";
 import { mockAllocation } from "../../test/handlers/profile";
 import type { TimeAllocationRow } from "../../types/salesforce";
 import TimeAllocationPanel, {
-  allocationDays, rowsToDayAccounts, localDate, NO_ACCOUNT_LABEL,
+  allocationDays, rowsToDayAccounts, localDate, NO_ACCOUNT_LABEL, ADMIN_LABEL,
 } from "../TimeAllocationPanel";
 
 const today = () => localDate(new Date());
@@ -226,5 +226,70 @@ describe("TimeAllocationPanel", () => {
     // Any other request would hit onUnhandledRequest: "error".
     render(<TimeAllocationPanel />);
     await screen.findByText(/Nothing to show between/i);
+  });
+});
+
+describe("frozen axes and the Admin row", () => {
+  it("bar chart: the hours axis is outside the scrolling area, so it never scrolls away", async () => {
+    serve([row({ account: "Autodesk", minutes: 120 })]);
+    const { container } = render(<TimeAllocationPanel />);
+    await screen.findByText(/across 1 account/i);
+    const axis = screen.getByTestId("bar-y-axis");
+    expect(axis.textContent).toMatch(/\dh|\dm/);
+    const scroller = container.querySelector("div[style*='overflow-x: auto']") as HTMLElement;
+    expect(scroller.contains(axis)).toBe(false);
+    // The hour labels live only in the frozen axis; the scrolling plot has none.
+    expect(scroller.textContent).not.toMatch(/^\s*\d+h/);
+    expect(scroller.querySelectorAll("line").length).toBeGreaterThan(0);
+  });
+
+  it("table: the Account column (header, rows and total) is sticky at the left", async () => {
+    serve([row({ account: "Autodesk", minutes: 120 })]);
+    const { container } = render(<TimeAllocationPanel />);
+    await screen.findByText(/across 1 account/i);
+    fireEvent.click(screen.getByRole("button", { name: "Table" }));
+    await screen.findByRole("table");
+    const frozen = Array.from(container.querySelectorAll("[data-frozen='account']")) as HTMLElement[];
+    // header + Admin + Autodesk + footer
+    expect(frozen.length).toBe(4);
+    for (const el of frozen) {
+      expect(el.style.position).toBe("sticky");
+      expect(el.style.left).toBe("0px");
+      expect(el.style.background).not.toBe("transparent");
+    }
+  });
+
+  it("heatmap: the account list is outside the scrolling area", async () => {
+    serve([row({ account: "Autodesk", minutes: 120 })]);
+    const { container } = render(<TimeAllocationPanel />);
+    await screen.findByText(/across 1 account/i);
+    fireEvent.click(screen.getByRole("button", { name: "Heatmap" }));
+    const labels = await screen.findByTestId("heatmap-accounts");
+    const scroller = container.querySelector("div[style*='overflow-x: auto']") as HTMLElement;
+    expect(scroller.contains(labels)).toBe(false);
+    expect(labels.textContent).toContain("Autodesk");
+    expect(scroller.textContent).not.toContain("Autodesk");
+  });
+
+  it("Admin is listed first in all three views even when no time went to it", async () => {
+    serve([row({ account: "Autodesk", minutes: 120 })]);
+    render(<TimeAllocationPanel />);
+    await screen.findByText(/across 1 account/i);
+    expect(screen.getByText(ADMIN_LABEL)).toBeInTheDocument(); // legend
+    fireEvent.click(screen.getByRole("button", { name: "Table" }));
+    const table = await screen.findByRole("table");
+    const names = within(table).getAllByRole("row").map(r => r.querySelector("td")?.textContent?.trim());
+    expect(names.indexOf(ADMIN_LABEL)).toBe(1); // right after the header row
+    fireEvent.click(screen.getByRole("button", { name: "Heatmap" }));
+    expect((await screen.findByTestId("heatmap-accounts")).textContent).toContain(ADMIN_LABEL);
+  });
+
+  it("shows Admin time when there is some", async () => {
+    serve([row({ account: ADMIN_LABEL, minutes: 90 }), row({ account: "Autodesk", minutes: 60 })]);
+    render(<TimeAllocationPanel />);
+    expect(await screen.findByText(/2h 30m across 2 accounts/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Table" }));
+    const tr = (await screen.findByText(ADMIN_LABEL, { selector: "td" })).closest("tr") as HTMLElement;
+    expect(tr.textContent).toContain("1h 30m");
   });
 });

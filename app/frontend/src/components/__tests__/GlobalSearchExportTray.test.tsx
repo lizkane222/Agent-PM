@@ -90,14 +90,40 @@ describe("GlobalSearch — add selected to the export tray", () => {
     await waitFor(() => expect(tray().textContent).toBe("account:1,action_item:2"));
   });
 
-  it("clears the selection so reopening search does not offer the button again", async () => {
+  it("keeps the selection after Add to tray, so reopening search still has it", async () => {
     renderSearch();
     await openAndSearch();
     select("Alpha Account");
     fireEvent.click(await screen.findByRole("button", { name: "Add 1 to export tray" }));
     act(() => { window.dispatchEvent(new CustomEvent("open-global-search")); });
     await screen.findByPlaceholderText(/Search everything/i);
+    expect(screen.getByRole("button", { name: "Add 1 to export tray" })).toBeInTheDocument();
+  });
+
+  it("keeps the selection after Export to Layouts", async () => {
+    renderSearch();
+    await openAndSearch();
+    select("Alpha Account");
+    fireEvent.click(await screen.findByRole("button", { name: /Export to Layouts/i }));
+    await screen.findByText("full builder");
+    expect(JSON.parse(localStorage.getItem("agentpm_search_selection")!)).toHaveProperty("account:1");
+  });
+
+  it("restores the selection after a remount and offers the results to add", async () => {
+    localStorage.setItem("agentpm_search_selection", JSON.stringify({ "account:1": RESULTS[0] }));
+    renderSearch();
+    act(() => { window.dispatchEvent(new CustomEvent("open-global-search")); });
+    fireEvent.click(await screen.findByRole("button", { name: "Add 1 to export tray" }));
+    await waitFor(() => expect(tray().textContent).toBe("account:1"));
+  });
+
+  it("Clear selection deselects and forgets it", async () => {
+    renderSearch();
+    await openAndSearch();
+    select("Alpha Account");
+    fireEvent.click(await screen.findByRole("button", { name: /Clear selection/i }));
     expect(screen.queryByRole("button", { name: /to export tray/i })).toBeNull();
+    expect(localStorage.getItem("agentpm_search_selection")).toBeNull();
   });
 
   it("'Export to Layouts' still adds the selection and goes to the full builder", async () => {

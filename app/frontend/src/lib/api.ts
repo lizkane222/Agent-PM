@@ -17,6 +17,8 @@ import axios, {
 import type {
   Account,
   AccountArtifact,
+  AccountTicket,
+  TicketKind,
   AccountNote,
   CustomerContact,
   CustomerContactNote,
@@ -36,6 +38,10 @@ import type {
   KeywordTemplate,
   KeywordExpansion,
   SlackConversations,
+  SkillPageKey,
+  PagePin,
+  SkillRunRow,
+  SkillRunDetail,
   AgentTool,
   ClaudeSkill,
   Comment,
@@ -52,6 +58,10 @@ import type {
   PageLayout,
   PaginatedResponse,
   Reminder,
+  ReminderLink,
+  ReminderLinkOption,
+  ReminderLinkType,
+  ReminderRecipientChoices,
   AccountProject,
   ProjectMember,
   SalesforceProjectData,
@@ -427,9 +437,9 @@ export const schedulerApi = {
   listEvents: (params?: Record<string, string>) =>
     apiClient.get<CalendarEvent[]>("/scheduler/events/", { params }),
   /** Compare calendars: busy blocks for up to 8 people (titles only on shared accounts). */
-  getAvailability: (emails: string[], start: string, end: string) =>
+  getAvailability: (emails: string[], start: string, end: string, opts: { includeSelf?: boolean } = {}) =>
     apiClient.get<{ start: string; end: string; people: import("./availability").PersonAvailability[] }>(
-      "/scheduler/availability/", { params: { emails: emails.join(","), start, end } },
+      "/scheduler/availability/", { params: { emails: emails.join(","), start, end, ...(opts.includeSelf ? { include_self: 1 } : {}) } },
     ),
   /** `send_invites` asks Google to email the guests (default: yes when there are any). */
   createEvent: (data: Partial<CalendarEvent> & { send_invites?: boolean }) =>
@@ -472,16 +482,42 @@ export const schedulerApi = {
 
   listReminders: (params?: Record<string, string>) =>
     apiClient.get<PaginatedResponse<Reminder>>("/scheduler/reminders/", { params }),
-  createReminder: (data: Omit<Partial<Reminder>, "id" | "created_by" | "created_by_username" | "created_at" | "updated_at">) =>
+  /**
+   * `confirm_notify_others` must be `true` whenever `recipients` names someone — the server
+   * refuses otherwise. Set it only after the user has answered the "are you sure you want to
+   * notify these users?" prompt.
+   */
+  createReminder: (data: Omit<Partial<Reminder>, "id" | "created_by" | "created_by_username" | "created_at" | "updated_at" | "recipient_details"> & { confirm_notify_others?: boolean }) =>
     apiClient.post<Reminder>("/scheduler/reminders/", data),
-  updateReminder: (id: number, data: Partial<Reminder>) =>
+  updateReminder: (id: number, data: Partial<Reminder> & { confirm_notify_others?: boolean }) =>
     apiClient.patch<Reminder>(`/scheduler/reminders/${id}/`, data),
+  /** Put the reminder on the calendar at another time (15 minutes). Same minute twice = one block. */
+  addReminderOccurrence: (id: number, start: string) =>
+    apiClient.post<Reminder>(`/scheduler/reminders/${id}/occurrences/`, { start }),
+  /** Move one of the reminder's calendar blocks. Moving the one at the due time moves the due time. */
+  moveReminderOccurrence: (id: number, eventId: number, start: string) =>
+    apiClient.patch<Reminder>(`/scheduler/reminders/${id}/occurrences/${eventId}/`, { start }),
+  removeReminderOccurrence: (id: number, eventId: number) =>
+    apiClient.delete<Reminder>(`/scheduler/reminders/${id}/occurrences/${eventId}/`),
+  /** Records of a type the caller can already see, for the link picker; `q` filters by name. */
+  listReminderLinkOptions: (type: ReminderLinkType, q = "") =>
+    apiClient.get<{ results: ReminderLinkOption[] }>("/scheduler/reminders/link-options/", { params: { type, q } }),
+  /**
+   * Teammates a reminder with these links could notify: those on the accounts the links lead to
+   * (an account, or the account an action item or meeting is filed under) that the caller is on.
+   * Includes who has opted out (`available: false`), so the picker can show them disabled.
+   */
+  listReminderRecipients: (links: Pick<ReminderLink, "resource_type" | "resource_id">[]) =>
+    apiClient.get<ReminderRecipientChoices>("/scheduler/reminders/recipients/", {
+      params: new URLSearchParams(links.map((l) => ["link", `${l.resource_type}:${l.resource_id}`])),
+    }),
   deleteReminder: (id: number) =>
     apiClient.delete(`/scheduler/reminders/${id}/`),
   dismissReminder: (id: number) =>
     apiClient.post<Reminder>(`/scheduler/reminders/${id}/dismiss/`),
-  snoozeReminder: (id: number) =>
-    apiClient.post<Reminder>(`/scheduler/reminders/${id}/snooze/`),
+  /** Reschedule: `{ until }` (ISO instant) or `{ preset: "next_account_meeting" }`; `from` is the time the card shows, so that block moves. */
+  snoozeReminder: (id: number, body: ({ until: string } | { preset: "next_account_meeting" }) & { from?: string }) =>
+    apiClient.post<Reminder>(`/scheduler/reminders/${id}/snooze/`, body),
 
   listMeetingNotes: (eventId: number) =>
     apiClient.get<PaginatedResponse<MeetingNote>>("/scheduler/meeting-notes/", { params: { event: eventId, page_size: 200 } }),
@@ -544,9 +580,15 @@ export const teamApi = {
   getMember: (id: number) => apiClient.get<TeamMember>(`/team/members/${id}/`),
   createMember: (data: Partial<TeamMember>) =>
     apiClient.post<TeamMember>("/team/members/", data),
+  /** Record another address for a colleague (PM+ or themselves); a duplicate of another member's is a 409. */
+  addMemberEmail: (id: number, email: string) =>
+    apiClient.post<TeamMember>(`/team/members/${id}/add-email/`, { email }),
   updateMember: (id: number, data: Partial<TeamMember>) =>
     apiClient.patch<TeamMember>(`/team/members/${id}/`, data),
   deleteMember: (id: number) => apiClient.delete(`/team/members/${id}/`),
+  /** Record a zone for a colleague with none of their own; `timezone: ""` clears your own assignment. */
+  assignMemberTimezone: (id: number, timezone: string) =>
+    apiClient.post<TeamMember>(`/team/members/${id}/assign-timezone/`, { timezone }),
   listMemberDocuments: (memberId: number) =>
     apiClient.get<TeamMemberDocument[]>(`/team/members/${memberId}/documents/`),
   addMemberDocument: (memberId: number, data: Partial<TeamMemberDocument>) =>
@@ -580,6 +622,16 @@ export interface AccountActivityLogResponse {
 }
 
 export const accountsApi = {
+  // Tickets / product gaps. The list is a DRF page envelope; unwrapResults hands back an array.
+  listTickets: (params?: Record<string, string>) =>
+    unwrapResults(apiClient.get<AccountTicket[] | PaginatedResponse<AccountTicket>>("/accounts/tickets/", { params })),
+  createTicket: (payload: Partial<AccountTicket>) =>
+    apiClient.post<AccountTicket>("/accounts/tickets/", payload),
+  updateTicket: (id: number, payload: Partial<AccountTicket>) =>
+    apiClient.patch<AccountTicket>(`/accounts/tickets/${id}/`, payload),
+  deleteTicket: (id: number) => apiClient.delete(`/accounts/tickets/${id}/`),
+  assignTicket: (id: number, payload: { account: number; kind?: TicketKind; title?: string }) =>
+    apiClient.post<AccountTicket>(`/accounts/tickets/${id}/assign/`, payload),
   listAccounts: (params?: Record<string, string>, opts?: { fresh?: boolean }) =>
     apiClient.get<PaginatedResponse<Account>>("/accounts/accounts/", { params, ...freshConfig(opts) }),
   getAccount: (id: number) => apiClient.get<Account>(`/accounts/accounts/${id}/`),
@@ -595,13 +647,20 @@ export const accountsApi = {
   deleteAccount: (id: number) => apiClient.delete(`/accounts/accounts/${id}/`),
   listNotes: (accountId: number) =>
     apiClient.get<AccountNote[]>(`/accounts/accounts/${accountId}/notes/`),
-  createNote: (accountId: number, content: string) =>
-    apiClient.post<AccountNote>(`/accounts/accounts/${accountId}/notes/`, { content }),
+  createNote: (accountId: number, content: string, references?: { resource_type: string; resource_id: number; label: string; url: string }[]) =>
+    apiClient.post<AccountNote>(`/accounts/accounts/${accountId}/notes/`, references ? { content, references } : { content }),
   updateNote: (noteId: number, content: string) =>
     apiClient.patch<AccountNote>(`/accounts/notes/${noteId}/`, { content }),
   deleteNote: (noteId: number) => apiClient.delete(`/accounts/notes/${noteId}/`),
   listCalendarEvents: (accountId: number) =>
     apiClient.get<CalendarEvent[]>(`/accounts/accounts/${accountId}/calendar-events/`),
+  /** Timeline data kept on the server: the caller's own events (`mine`) or every account
+   *  teammate's, de-duplicated (`team`). Meetings include those reached through the events. */
+  getTimeline: (accountId: number, scope: "mine" | "team") =>
+    apiClient.get<{ scope: "mine" | "team"; events: CalendarEvent[]; meetings: AirtableMeeting[] }>(
+      `/accounts/accounts/${accountId}/timeline/`,
+      { params: { scope } },
+    ),
   listMeetings: (accountId: number) =>
     apiClient.get<CalendarEvent[]>(`/accounts/accounts/${accountId}/meetings/`),
   listAccountActionItems: (accountId: number) =>
@@ -719,6 +778,9 @@ export const accountsApi = {
     apiClient.delete(`/accounts/contact-notes/${noteId}/`),
   getAdminAccount: (opts?: { fresh?: boolean }) =>
     apiClient.get<Account>("/accounts/admin-account/", freshConfig(opts)),
+  /** Every project and goal the caller can see, across accounts, in one request. */
+  listAllProjects: () =>
+    apiClient.get<PaginatedResponse<AccountProject>>("/accounts/projects/", { params: { page_size: "500" } }),
   listProjectsByAccount: (accountName: string) =>
     apiClient.get<PaginatedResponse<AccountProject>>("/accounts/projects/", { params: { account_name: accountName } }),
   createProject: (data: Partial<AccountProject> & { account: number; name: string }) =>
@@ -824,6 +886,9 @@ export const airtableApi = {
     account_id?: number | null;
     account_name?: string;
     categorization?: string;
+    /** Recurring meetings: also link later / earlier synced instances. Both default to off. */
+    update_subsequent?: boolean;
+    update_historical?: boolean;
   }) => apiClient.post<EventMatchResult>("/airtable/categorize/", data),
   getEventLink: (event_uid: string) =>
     apiClient.get<{ linked: boolean; airtable_account_id?: number; airtable_id?: string; account_name?: string }>(
@@ -839,6 +904,9 @@ export const airtableApi = {
     apiClient.get<{ results: AirtableMeeting[] }>("/airtable/meetings/", { params }),
   getMeeting: (meetingId: number) =>
     apiClient.get<AirtableMeeting>(`/airtable/meetings/${meetingId}/`),
+  /** The meeting row behind a calendar event (a local stub is created if there is none). Writes no notes. */
+  ensureMeetingForEvent: (calendarEventId: number) =>
+    apiClient.post<AirtableMeeting>(`/airtable/meetings/by-event/${calendarEventId}/ensure/`),
   updateMeetingGongNotes: (calendarEventId: number, gongNotes: string, references?: CommentReference[]) =>
     apiClient.patch<AirtableMeeting>(`/airtable/meetings/by-event/${calendarEventId}/gong-notes/`, { gong_notes: gongNotes, ...(references && { references }) }),
   updateMeetingGongNotesByPk: (meetingId: number, gongNotes: string, references?: CommentReference[]) =>
@@ -974,6 +1042,22 @@ export const agentToolsApi = {
   list: () => apiClient.get<{ tools: AgentTool[] }>("/agents/tools/"),
 };
 
+/** Skills pinned to app pages (calendar, reminders, …). Admins may pin for everyone. */
+export const skillPinsApi = {
+  list: (page: SkillPageKey) =>
+    apiClient.get<{ results: PagePin[] }>("/skills/page-pins/", { params: { page }, noCache: true }),
+  add: (page: SkillPageKey, skillId: number, everyone = false) =>
+    apiClient.post<PagePin>("/skills/page-pins/", { page, skill_id: skillId, everyone }),
+  remove: (id: number) => apiClient.delete(`/skills/page-pins/${id}/`),
+};
+
+/** The skill-run Console. Admins may add `scope: "all"`. */
+export const skillRunsApi = {
+  list: (params?: { scope?: "all"; skill?: number; page_size?: string }) =>
+    apiClient.get<PaginatedResponse<SkillRunRow>>("/skills/runs/", { params, noCache: true }),
+  get: (id: string) => apiClient.get<SkillRunDetail>(`/skills/runs/${id}/`, { noCache: true }),
+};
+
 /** Daily token budgets (admin) and the signed-in user's own state. */
 export const tokenBudgetApi = {
   overview: () =>
@@ -1053,7 +1137,7 @@ export const agentSkillsApi = {
     apiClient.post<{ results: SkillEstimateRow[]; failed: string[]; remaining: number }>(
       "/skills/agent-skills/token-estimates/", skillId === undefined ? {} : { skill_id: skillId }),
   voiceStart: (id: number, input?: SkillRunInput) =>
-    apiClient.post<{ key: string; script: string; warnings: string[] }>(`/skills/agent-skills/${id}/voice-start/`, input ?? {}),
+    apiClient.post<{ key: string; script: string; warnings: string[]; run_id?: string | null }>(`/skills/agent-skills/${id}/voice-start/`, input ?? {}),
   keywordCatalog: () =>
     apiClient.get<{ keywords: KeywordTemplate[] }>("/skills/agent-skills/resolve-keywords/"),
   resolveKeywords: (text: string) =>
@@ -1111,13 +1195,14 @@ export const workingSessionApi = {
 };
 
 export const userPageNoteApi = {
-  list: () =>
+  /** Pass `{ account }` to get only the caller's notes filed under that account. */
+  list: (params?: { account?: number }) =>
     unwrapResults(apiClient.get<UserPageNote[] | PaginatedResponse<UserPageNote>>(
-      "/layouts/page-notes/",
+      "/layouts/page-notes/", params ? { params } : undefined,
     )),
-  create: (data: { content: string; account_ref_label?: string }) =>
+  create: (data: { content: string; account_ref_label?: string; account?: number | null }) =>
     apiClient.post<UserPageNote>("/layouts/page-notes/", data),
-  update: (id: number, data: Partial<Pick<UserPageNote, "content" | "account_ref_label">>) =>
+  update: (id: number, data: Partial<Pick<UserPageNote, "content" | "account_ref_label" | "account">>) =>
     apiClient.patch<UserPageNote>(`/layouts/page-notes/${id}/`, data),
   destroy: (id: number) => apiClient.delete(`/layouts/page-notes/${id}/`),
 };

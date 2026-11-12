@@ -1,5 +1,7 @@
 """Models for the skills app — Claude tool definitions and their invocation history."""
 
+import uuid
+
 from django.contrib.auth import get_user_model
 from django.db import models
 
@@ -250,3 +252,107 @@ class VoiceLaunchContext(models.Model):
     skill = models.ForeignKey(AgentSkill, on_delete=models.CASCADE, null=True, blank=True)
     payload = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+
+
+# ── Page pins & the skill-run Console ──────────────────────────────────────────────────
+
+
+class SkillPagePin(models.Model):
+    """
+    A skill pinned to a page of the app (calendar, reminders, an account page, …).
+
+    `user` is the person it belongs to; `user=NULL` is an **everyone-pin** that only an admin
+    can create or remove. The profile page's "Pin to my page" is a different, older mechanism
+    (`AgentSkill.pinned_to_users`) and is untouched.
+    """
+
+    PAGES = [
+        ("calendar", "Calendar"),
+        ("action-items", "Action items"),
+        ("reminders", "Reminders"),
+        ("account-detail", "Account detail (every account)"),
+        ("layouts", "Layouts"),
+        ("activity-log", "Activity log"),
+    ]
+
+    user = models.ForeignKey(User, null=True, blank=True, on_delete=models.CASCADE, related_name="skill_page_pins")
+    skill = models.ForeignKey(AgentSkill, on_delete=models.CASCADE, related_name="page_pins")
+    page = models.CharField(max_length=30, choices=PAGES)
+    created_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+        constraints = [
+            models.UniqueConstraint(fields=["user", "skill", "page"], condition=models.Q(user__isnull=False),
+                                    name="uniq_personal_skill_page_pin"),
+            models.UniqueConstraint(fields=["skill", "page"], condition=models.Q(user__isnull=True),
+                                    name="uniq_everyone_skill_page_pin"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.skill_id} on {self.page} ({'everyone' if self.user_id is None else self.user_id})"
+
+
+class SkillRun(models.Model):
+    """
+    One launch of a saved skill, from a button, a pinned page or a voice launch.
+
+    Created when the run is assembled; the chat turn / voice call that actually executes it
+    attaches to it by id, so the Console can show what the skill did. Without this a chat turn
+    had no link back to the skill that started it.
+    """
+
+    SURFACES = [("chat", "Chat"), ("voice", "Voice")]
+    STATUSES = [("launched", "Launched"), ("running", "Running"), ("completed", "Completed"), ("failed", "Failed")]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="skill_runs")
+    skill = models.ForeignKey(AgentSkill, null=True, blank=True, on_delete=models.SET_NULL, related_name="runs")
+    skill_name = models.CharField(max_length=100)
+    surface = models.CharField(max_length=10, choices=SURFACES, default="chat")
+    page = models.CharField(max_length=30, blank=True, default="")
+    params = models.JSONField(default=dict, blank=True)
+    status = models.CharField(max_length=12, choices=STATUSES, default="launched")
+    started_at = models.DateTimeField(auto_now_add=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    tool_count = models.PositiveIntegerField(default=0)
+    records_created = models.PositiveIntegerField(default=0)
+    records_updated = models.PositiveIntegerField(default=0)
+    input_tokens = models.PositiveIntegerField(default=0)
+    output_tokens = models.PositiveIntegerField(default=0)
+    # Data too big for one chat message, staged here and read by the agent in pages through
+    # `get_skill_run_data`: [{"label": str, "text": str}]. Empty when the prompt fit inline.
+    data_parts = models.JSONField(default=list, blank=True)
+
+    class Meta:
+        ordering = ["-started_at"]
+        indexes = [models.Index(fields=["user", "-started_at"])]
+
+    def __str__(self) -> str:
+        return f"{self.skill_name} ({self.status})"
+
+
+class SkillRunEvent(models.Model):
+    """One line in a run's Console: a tool the skill called, and what came of it."""
+
+    KINDS = [("launched", "Launched"), ("tool", "Tool call"), ("finished", "Finished")]
+
+    run = models.ForeignKey(SkillRun, on_delete=models.CASCADE, related_name="events")
+    ts = models.DateTimeField(auto_now_add=True)
+    kind = models.CharField(max_length=10, choices=KINDS, default="tool")
+    tool_name = models.CharField(max_length=100, blank=True, default="")
+    # ok | created | updated | error
+    status = models.CharField(max_length=10, blank=True, default="")
+    error_code = models.CharField(max_length=60, blank=True, default="")
+    summary = models.CharField(max_length=400, blank=True, default="")
+    args = models.JSONField(default=dict, blank=True)
+    record_type = models.CharField(max_length=40, blank=True, default="")
+    record_id = models.CharField(max_length=64, blank=True, default="")
+    record_label = models.CharField(max_length=200, blank=True, default="")
+    record_url = models.CharField(max_length=500, blank=True, default="")
+    duration_ms = models.PositiveIntegerField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["ts", "id"]
+        indexes = [models.Index(fields=["run", "ts"])]

@@ -34,7 +34,7 @@ export default function AttachmentViewer({
         </div>
         {error && <p style={{ color: "#dc2626" }}>Couldn't load that document.</p>}
         {!doc && !error && <p>Loading…</p>}
-        {doc && <div className="prose prose-sm max-w-none" dangerouslySetInnerHTML={{ __html: markdownToHtml(doc.text) }} />}
+        {doc && <div className="prose prose-sm max-w-none rich-text" dangerouslySetInnerHTML={{ __html: markdownToHtml(doc.text) }} />}
       </div>
     </div>
   );

@@ -12,7 +12,7 @@ import { http, HttpResponse } from "msw";
 import { server } from "../../../test/msw-server";
 
 import { ProjectGoals } from "../ProjectGoals";
-import type { AccountTeamMember, AirtableActionItem, GoalSection, ProjectMember } from "../../../types";
+import type { AccountTeamMember, AirtableActionItem, AirtableMeeting, GoalSection, ProjectMember } from "../../../types";
 
 vi.mock("../../../hooks/useExportTray", () => ({
   useExportTray: () => ({
@@ -265,31 +265,27 @@ describe("ProjectGoals — collapsed action items", () => {
     expect(screen.queryByText("Critical")).not.toBeInTheDocument();
   });
 
-  it("expands a collapsed action item on click without opening the modal", () => {
+  it("opens the action item modal immediately on click, without expanding", () => {
     const { project, goal, item } = setUpGoalWithItem();
     const onSelectAction = vi.fn();
     renderBoard({ goals: [project, goal], actionItems: [item], onSelectAction });
+
+    fireEvent.click(within(screen.getByTestId("goal-row-10")).getAllByRole("button")[0]);
+    fireEvent.click(screen.getByText("Ship it"));
+
+    expect(onSelectAction).toHaveBeenCalledTimes(1);
+    expect(onSelectAction).toHaveBeenCalledWith(item);
+    expect(screen.queryByText("Some details about the task")).not.toBeInTheDocument();
+  });
+
+  it("expands inline on click only when no modal handler is supplied", () => {
+    const { project, goal, item } = setUpGoalWithItem();
+    renderBoard({ goals: [project, goal], actionItems: [item] });
 
     fireEvent.click(within(screen.getByTestId("goal-row-10")).getAllByRole("button")[0]);
     fireEvent.click(screen.getByText("Ship it"));
 
     expect(screen.getByText("Some details about the task")).toBeInTheDocument();
-    expect(onSelectAction).not.toHaveBeenCalled();
-  });
-
-  it("opens the action item modal only when the already-expanded card is clicked", () => {
-    const { project, goal, item } = setUpGoalWithItem();
-    const onSelectAction = vi.fn();
-    renderBoard({ goals: [project, goal], actionItems: [item], onSelectAction });
-
-    fireEvent.click(within(screen.getByTestId("goal-row-10")).getAllByRole("button")[0]);
-    // First click expands.
-    fireEvent.click(screen.getByText("Ship it"));
-    expect(onSelectAction).not.toHaveBeenCalled();
-
-    // Second click, now on the expanded full card, opens the modal.
-    fireEvent.click(screen.getByText("Ship it"));
-    expect(onSelectAction).toHaveBeenCalledWith(item);
   });
 
   it("keeps a collapsed row draggable with the same dataTransfer keys the drop handler expects", () => {
@@ -680,5 +676,32 @@ describe("ProjectGoals — sync members to Cloud Coach", () => {
     await openMembers({ projectMembers: [] });
 
     expect(screen.queryByTestId("sync-members-to-cloud-coach")).not.toBeInTheDocument();
+  });
+});
+
+describe("ProjectGoals — same-named (recurring) meetings", () => {
+  const mtg = (id: number, airtable_id: string, name: string) =>
+    ({ id, airtable_id, name, date: "2026-11-01T10:00:00Z" } as unknown as AirtableMeeting);
+  const meetings = [mtg(1, "m1", "Weekly Sync"), mtg(2, "m2", "Weekly Sync"), mtg(3, "m3", "QBR")];
+
+  it("lists meetings with the same exact name once under a goal", () => {
+    const project = baseGoal({ id: "1", kind: "project", goalIds: ["10"] });
+    const goal = baseGoal({ id: "10", kind: "goal", name: "Milestone", meetingIds: ["m1", "m2", "m3"] });
+    renderBoard({ goals: [project, goal], meetings });
+    fireEvent.click(within(screen.getByTestId("goal-row-10")).getAllByRole("button")[0]);
+
+    const rows = screen.getAllByTestId("goal-meeting-row");
+    expect(rows).toHaveLength(2);
+    expect(screen.getAllByText("Weekly Sync")).toHaveLength(1);
+  });
+
+  it("dropping one files every same-named meeting, so each occurrence is linked", () => {
+    const project = baseGoal({ id: "1", kind: "project" });
+    const { onChange } = renderBoard({ goals: [project], meetings });
+
+    fireEvent.drop(screen.getByTestId("project-row-1"), { dataTransfer: makeDataTransfer({ goalMeetingId: "m1" }) });
+
+    const updated = onChange.mock.calls[0][0] as GoalSection[];
+    expect(updated[0].meetingIds).toEqual(["m1", "m2"]);
   });
 });

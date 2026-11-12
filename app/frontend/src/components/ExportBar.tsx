@@ -1,7 +1,10 @@
 import React, { useState } from "react";
+import { Z } from "../lib/zLayers";
 import { useNavigate } from "react-router-dom";
 import { useExport, type ExportItem } from "../context/ExportContext";
 import { addLog } from "../lib/appLog";
+import { agentSkillsApi } from "../lib/api";
+import { VOICE_LAUNCH_EVENT, type VoiceLaunchDetail } from "./VoiceButton";
 
 // Key used on dataTransfer so any drop target can read the item
 export const EXPORT_ITEM_DRAG_KEY = "application/x-export-item";
@@ -89,6 +92,8 @@ function DraggablePill({ item, onRemove }: DraggablePillProps) {
 export default function ExportBar() {
   const { items, clearItems, toggleItem, exportMode, toggleMode } = useExport();
   const navigate = useNavigate();
+  const [voiceBusy, setVoiceBusy] = useState(false);
+  const [voiceNote, setVoiceNote] = useState<string | null>(null);
 
   // Visibility follows `exportMode` — the same flag the sidebar button toggles.
   // Keying it off `items.length` instead (as it used to) meant the button and the
@@ -96,11 +101,46 @@ export default function ExportBar() {
   // all, and closing a full one couldn't hide it.
   if (!exportMode) return null;
 
-  function handleSendToChat() {
-    const text = [
-      "I've selected the following content to export. Please ask me how I'd like to compile it:\n",
+  function buildTrayText(intro: string): string {
+    return [
+      intro,
       ...items.map((item) => `## ${item.label} (${item.type})\n${item.content}`),
     ].join("\n\n---\n\n");
+  }
+
+  /**
+   * Start a voice session that already has the tray's records as context. Same path as a
+   * skill's "Use in Voice": the brief is stashed server-side (the call carries only a key) and
+   * announced on `voice-launch`. Reads and talks only; nothing is sent to anyone.
+   */
+  async function handleSendToVoice() {
+    setVoiceNote(null);
+    setVoiceBusy(true);
+    const text = buildTrayText(
+      "I've collected the following records. Use them as context for this conversation, " +
+      "answer questions about them, and ask me what I'd like to do with them:\n",
+    );
+    const title = `Export tray (${items.length} item${items.length === 1 ? "" : "s"})`;
+    let detail: VoiceLaunchDetail = { script: text, title };
+    try {
+      const { data } = await agentSkillsApi.voiceLaunch(title, text);
+      detail = { key: data.key, script: data.script, title };
+    } catch {
+      // No server context: the call still starts and the brief is shown on screen to read out.
+    } finally {
+      setVoiceBusy(false);
+    }
+    // VoiceButton cancels the event when it takes it; if nothing did, say so with the brief.
+    const handled = !window.dispatchEvent(
+      new CustomEvent(VOICE_LAUNCH_EVENT, { detail, cancelable: true }),
+    );
+    if (!handled) setVoiceNote("Voice isn't available on this page right now. Open the chat page and try again.");
+  }
+
+  function handleSendToChat() {
+    const text = buildTrayText(
+      "I've selected the following content to export. Please ask me how I'd like to compile it:\n",
+    );
 
     const actionItems = items.filter((i) => i.type === "action_item");
     actionItems.forEach((exportItem) => {
@@ -127,7 +167,7 @@ export default function ExportBar() {
       style={{
         position: "sticky",
         top: 0,
-        zIndex: 50,
+        zIndex: Z.nav,
         background: "rgba(219, 19, 26, 0.92)",
         backdropFilter: "blur(8px)",
         WebkitBackdropFilter: "blur(8px)",
@@ -203,6 +243,26 @@ export default function ExportBar() {
           </svg>
           Send to Chat
         </button>
+        )}
+        {items.length > 0 && (
+        <button
+          onClick={() => void handleSendToVoice()}
+          disabled={voiceBusy}
+          title="Start a voice session with these records as context"
+          style={{
+            display: "flex", alignItems: "center", gap: 4,
+            padding: "5px 12px", borderRadius: 6,
+            background: "rgba(255,255,255,0.2)", color: "#fff",
+            border: "1px solid rgba(255,255,255,0.35)", cursor: voiceBusy ? "wait" : "pointer",
+            fontSize: "0.75rem", fontWeight: 600, fontFamily: "var(--font-base)",
+            opacity: voiceBusy ? 0.6 : 1,
+          }}
+        >
+          Send to Voice Session
+        </button>
+        )}
+        {voiceNote && (
+          <span role="status" style={{ fontSize: "0.7rem", color: "#fff", maxWidth: 220 }}>{voiceNote}</span>
         )}
         {items.length > 0 && (
         <button

@@ -88,6 +88,7 @@ export interface AirtableActionItem {
   created_at: string;
   updated_at: string;
   marked_done_at: string | null;
+  status_changed_at?: string | null;
   last_synced: string;
   attachments?: ActionItemAttachment[];
   waiting_on?: ActionItemDependency[];

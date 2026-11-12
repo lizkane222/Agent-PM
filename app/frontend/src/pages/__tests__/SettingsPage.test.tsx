@@ -95,6 +95,14 @@ describe("SettingsPage", () => {
     );
   });
 
+  it("offers the time zone combobox and says the user's own setting overrides assignments", async () => {
+    await renderPage();
+    const field = await screen.findByTestId("timezone-field");
+    expect(field).toBeInTheDocument();
+    expect(screen.getByTestId("timezone-resolved").textContent).toMatch(/America\/New_York/);
+    expect(screen.getByText(/always overrides a time zone a colleague set/i)).toBeInTheDocument();
+  });
+
   it("shows profile display name after loading", async () => {
     await renderPage();
     await waitFor(() =>
@@ -121,7 +129,7 @@ describe("SettingsPage", () => {
     await waitFor(() => expect(screen.getAllByText(/^Active$/i).length).toBeGreaterThanOrEqual(2));
   });
 
-  it("clicking sign out calls logout() and navigates to /oidc/logout/", async () => {
+  it("clicking sign out calls logout() and returns to the login page", async () => {
     const locationMock = { href: "/" };
     Object.defineProperty(window, "location", { value: locationMock, writable: true });
 
@@ -130,7 +138,7 @@ describe("SettingsPage", () => {
     fireEvent.click(btn);
 
     await waitFor(() => expect(mockLogout).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(locationMock.href).toBe("/oidc/logout/"));
+    await waitFor(() => expect(locationMock.href).toBe("/login"));
   });
 
   it("shows Register Gmail watch button when Gmail is connected", async () => {
@@ -270,6 +278,70 @@ describe("SettingsPage", () => {
       const results = await screen.findByTestId("notification-test-results");
       expect(results).toHaveTextContent("Test Slack DM: sent");
       expect(results).toHaveTextContent("Add a phone number under Your Profile.");
+    });
+
+    it("lets a user choose whether other users can notify them, on by default", async () => {
+      await renderPage();
+      const box = await screen.findByRole("checkbox", { name: /Allow other users to notify me/ });
+      expect(box).toBeChecked();
+    });
+
+    it("saves the choice to be notified by other users", async () => {
+      let body: Record<string, unknown> = {};
+      server.use(
+        http.patch("/api/v1/team/profiles/me/", async ({ request }) => {
+          body = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...mockUserProfile, ...body });
+        }),
+      );
+      await renderPage();
+      fireEvent.click(await screen.findByRole("checkbox", { name: /Allow other users to notify me/ }));
+      fireEvent.click(screen.getByRole("button", { name: "Save Profile" }));
+      await screen.findByText("Profile saved.");
+      expect(body.allow_reminders_from_others).toBe(false);
+      expect(screen.getByRole("checkbox", { name: /Allow other users to notify me/ })).not.toBeChecked();
+    });
+
+    it("shows the setting as off when the user has opted out", async () => {
+      server.use(http.get("/api/v1/team/profiles/me/", () =>
+        HttpResponse.json({ ...mockUserProfile, allow_reminders_from_others: false })));
+      await renderPage();
+      expect(await screen.findByRole("checkbox", { name: /Allow other users to notify me/ })).not.toBeChecked();
+    });
+
+    it("offers no email notification option", async () => {
+      await renderPage();
+      await screen.findByRole("checkbox", { name: /Phone \(SMS\)/ });
+      expect(screen.queryByRole("checkbox", { name: /Email notifications/ })).toBeNull();
+    });
+
+    it("never sends notification_email when saving", async () => {
+      let body: Record<string, unknown> = {};
+      server.use(
+        http.patch("/api/v1/team/profiles/me/", async ({ request }) => {
+          body = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...mockUserProfile, ...body });
+        }),
+      );
+      await renderPage();
+      fireEvent.click(await screen.findByRole("button", { name: "Save Profile" }));
+      await screen.findByText("Profile saved.");
+      expect(body).not.toHaveProperty("notification_email");
+    });
+
+    it("shows the carrier's reason when a text is refused", async () => {
+      server.use(
+        http.patch("/api/v1/team/profiles/me/", async ({ request }) =>
+          HttpResponse.json({ ...mockUserProfile, ...((await request.json()) as object) })),
+        http.post("/api/v1/scheduler/notifications/test/", () => HttpResponse.json({ results: [
+          { channel: "sms", status: "failed", detail: "The carrier blocked it: the sending number isn't registered for US A2P 10DLC." },
+        ] })),
+      );
+      await renderPage();
+      fireEvent.click(await screen.findByRole("checkbox", { name: /Phone \(SMS\)/ }));
+      fireEvent.click(screen.getByRole("button", { name: "Save Profile" }));
+      const results = await screen.findByTestId("notification-test-results");
+      expect(results).toHaveTextContent("Test Phone (SMS): The carrier blocked it");
     });
 
     it("an option switched off is not tested", async () => {

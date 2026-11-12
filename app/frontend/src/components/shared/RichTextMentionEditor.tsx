@@ -208,11 +208,15 @@ export interface RichTextMentionEditorProps {
    * (e.g. `@#--all-action-items-${account_name}`). Off by default: only skill and
    * template editors resolve them, so other editors keep plain `@#` behaviour. */
   enableKeywords?: boolean;
+  /** Show an Underline button in the toolbar. Off by default so existing editors (notes, action
+   * items) are unchanged; Ctrl/Cmd+U already works everywhere because StarterKit ships the
+   * extension. */
+  showUnderline?: boolean;
 }
 
 const RichTextMentionEditor = forwardRef<RichTextMentionEditorHandle, RichTextMentionEditorProps>(
   function RichTextMentionEditor(
-    { value, onChange, placeholder, autoFocus, minHeightClassName, onKeyDownCapture, onSubmit, onBlur, refMultiSelect, onMentionSelect, onReferenceSelect, onReferenceInsert, enableKeywords },
+    { value, onChange, placeholder, autoFocus, minHeightClassName, onKeyDownCapture, onSubmit, onBlur, refMultiSelect, onMentionSelect, onReferenceSelect, onReferenceInsert, enableKeywords, showUnderline },
     ref
   ) {
     const [showLink, setShowLink] = useState(false);
@@ -575,11 +579,14 @@ const RichTextMentionEditor = forwardRef<RichTextMentionEditorHandle, RichTextMe
       // Deliberately no focus-within ring/border on the wrapper: the blue box
       // was painted here rather than on the contenteditable, so the index.css
       // text-entry focus reset can't reach it. The caret signals focus.
-      <div className="relative border border-gray-200 rounded-lg overflow-visible bg-white">
+      <div className="relative border border-gray-200 rounded-lg overflow-visible bg-[var(--rte-bg,#ffffff)]">
         {/* Toolbar */}
-        <div className="relative flex flex-wrap items-center gap-0.5 px-2 py-1.5 border-b border-gray-100 bg-[#F4F4F6]">
+        <div className="relative flex flex-wrap items-center gap-0.5 px-2 py-1.5 border-b border-gray-100 bg-[var(--rte-toolbar-bg,#F4F4F6)]">
           <TBtn active={editor.isActive("bold")} onMouseDown={() => editor.chain().focus().toggleBold().run()} title="Bold"><strong>B</strong></TBtn>
           <TBtn active={editor.isActive("italic")} onMouseDown={() => editor.chain().focus().toggleItalic().run()} title="Italic"><em>I</em></TBtn>
+          {showUnderline && (
+            <TBtn active={editor.isActive("underline")} onMouseDown={() => editor.chain().focus().toggleUnderline().run()} title="Underline"><u>U</u></TBtn>
+          )}
           <TBtn active={editor.isActive("strike")} onMouseDown={() => editor.chain().focus().toggleStrike().run()} title="Strikethrough"><s>S</s></TBtn>
           <span className="w-px h-4 bg-gray-300 mx-0.5" />
           <TBtn active={editor.isActive("bulletList")} onMouseDown={() => editor.chain().focus().toggleBulletList().run()} title="Bullet list">• List</TBtn>

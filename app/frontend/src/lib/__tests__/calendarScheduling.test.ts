@@ -5,15 +5,12 @@ import {
   DEFAULT_SLOT_MINUTES,
   LEGACY_SCHEDULED_ITEMS_KEY,
   LEGACY_SCHEDULED_REMINDERS_KEY,
-  REMINDERS_CALENDAR_ID,
   WORK_TRACKING_CALENDAR_ID,
   endFor,
   hasActionItemAt,
-  hasReminderAt,
   migrateLegacyScheduledItems,
   readLegacyItems,
   scheduleActionItem,
-  scheduleReminder,
   startMinute,
 } from "../calendarScheduling";
 import { blankCalendarEvent } from "../../test/handlers/scheduler";
@@ -87,17 +84,6 @@ describe("duplicate detection", () => {
     const meeting = { ...workTrackingEvent("recAAA", "2026-09-15T11:00:00Z"), calendar_id: "primary" };
     expect(hasActionItemAt([meeting], "recAAA", "2026-09-15T11:00:00Z")).toBe(false);
   });
-
-  it("matches a reminder by its reminder id", () => {
-    const rem: CalendarEvent = {
-      ...blankCalendarEvent(2),
-      calendar_id: REMINDERS_CALENDAR_ID,
-      reminder: 7,
-      start_datetime: "2026-09-15T11:00:00Z",
-    };
-    expect(hasReminderAt([rem], 7, "2026-09-15T11:00:00Z")).toBe(true);
-    expect(hasReminderAt([rem], 8, "2026-09-15T11:00:00Z")).toBe(false);
-  });
 });
 
 describe("scheduleActionItem", () => {
@@ -143,28 +129,6 @@ describe("scheduleActionItem", () => {
     await expect(scheduleActionItem({
       airtableId: "recAAA", task: "T", start: "2026-09-15T11:00:00Z", end: "",
     })).rejects.toBeTruthy();
-  });
-});
-
-describe("scheduleReminder", () => {
-  it("POSTs a reminders event linked to the reminder", async () => {
-    const bodies = captureCreates();
-    await scheduleReminder({ reminderId: 42, title: "Call back", start: "2026-09-15T11:00:00Z" });
-
-    expect(bodies[0]).toMatchObject({
-      title: "Call back",
-      calendar_id: REMINDERS_CALENDAR_ID,
-      reminder: 42,
-    });
-  });
-
-  it("defaults the end to a 15-minute block", async () => {
-    const bodies = captureCreates();
-    await scheduleReminder({ reminderId: 42, title: "Call back", start: "2026-09-15T11:00:00.000Z" });
-
-    const { start_datetime: start, end_datetime: end } = bodies[0];
-    expect(new Date(end!).getTime() - new Date(start!).getTime())
-      .toBe(DEFAULT_SLOT_MINUTES * 60_000);
   });
 });
 
@@ -247,15 +211,18 @@ describe("migrateLegacyScheduledItems", () => {
     expect(localStorage.getItem(LEGACY_SCHEDULED_ITEMS_KEY)).toBeNull();
   });
 
-  it("migrates legacy reminders too", async () => {
+  it("does not recreate legacy reminder blocks, but clears them", async () => {
+    // A reminder is drawn from its due time now (one server-side marker, start == end), so a
+    // browser-stored block at some other time is the artefact being retired, not data to keep.
     localStorage.setItem(LEGACY_SCHEDULED_REMINDERS_KEY, JSON.stringify([
       { reminderId: 7, title: "Ping", start: "2026-09-15T11:00:00Z", end: "2026-09-15T11:15:00Z" },
     ]));
     const bodies = captureCreates();
     const result = await migrateLegacyScheduledItems([]);
 
-    expect(result.created).toBe(1);
-    expect(bodies[0]).toMatchObject({ calendar_id: REMINDERS_CALENDAR_ID, reminder: 7 });
+    expect(result.created).toBe(0);
+    expect(result.failed).toBe(0);
+    expect(bodies).toEqual([]);
     expect(localStorage.getItem(LEGACY_SCHEDULED_REMINDERS_KEY)).toBeNull();
   });
 

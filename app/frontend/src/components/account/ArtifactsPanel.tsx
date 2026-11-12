@@ -165,7 +165,7 @@ function ArtifactContextMenu({
               if (e.key === "Escape") { setShowCatInput(false); setCatValue(currentCategory); }
             }}
             placeholder="e.g. Finance, Legal…"
-            style={{ width: "100%", fontSize: "0.75rem", padding: "5px 8px", borderRadius: "6px", border: "1px solid #a5b4fc", outline: "none", background: "#f5f3ff", boxSizing: "border-box" }}
+            style={{ width: "100%", fontSize: "0.75rem", padding: "5px 8px", borderRadius: "6px", border: "1px solid #a5b4fc", outline: "none", background: "var(--tint-violet-50)", boxSizing: "border-box" }}
           />
           <div style={{ display: "flex", gap: "6px", marginTop: "6px" }}>
             <button
@@ -192,7 +192,7 @@ function ArtifactContextMenu({
           onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = "var(--bg, #f5f5f5)"; }}
           onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = "none"; }}
         >
-          <svg viewBox="0 0 16 16" fill="currentColor" style={{ width: 13, height: 13, color: "#6b7280", flexShrink: 0 }}>
+          <svg viewBox="0 0 16 16" fill="currentColor" style={{ width: 13, height: 13, color: "var(--text-gray-500)", flexShrink: 0 }}>
             <path d="M4.715 6.542L3.343 7.914a3 3 0 104.243 4.243l1.828-1.829A3 3 0 008.586 8.4l-.7.7a2 2 0 11-2.83-2.83l1.37-1.37A2 2 0 014.716 6.54zm8.485-2.828a3 3 0 00-4.243 0L7.13 5.542a3 3 0 00.826 4.913l.7-.7a2 2 0 11.83-2.83l1.828-1.828a2 2 0 010 2.828z"/>
           </svg>
           Copy link
@@ -342,7 +342,7 @@ function EditArtifactModal({
   const labelStyle: React.CSSProperties = { display: "block", fontSize: "0.6875rem", fontWeight: 600, color: "var(--text-secondary, #888)", marginBottom: "4px" };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onClose}>
+    <div className="fixed inset-0 z-[9000] flex items-center justify-center bg-black/40" onClick={onClose}>
       <div
         style={{ background: "var(--surface, #fff)", borderRadius: "12px", padding: "24px", width: "100%", maxWidth: "440px", boxShadow: "0 8px 32px rgba(0,0,0,0.15)", fontFamily: "var(--font-base)" }}
         onClick={(e) => e.stopPropagation()}
@@ -591,7 +591,7 @@ function ProjectDropZones({
                 transition: "border-color 0.12s, background 0.12s",
               }}
             >
-              <p style={{ margin: "0 0 5px", fontSize: "0.6875rem", fontWeight: 700, color: "#121C2D", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              <p style={{ margin: "0 0 5px", fontSize: "0.6875rem", fontWeight: 700, color: "var(--text-ink)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                 {goal.name}
               </p>
               {assigned.length > 0 ? (
@@ -629,7 +629,7 @@ function ProjectDropZones({
                             onGoalsChange(goals.map((g) => g.id === goal.id ? { ...g, resources: g.resources.filter((res) => res.id !== r.id) } : g));
                           }}
                           title="Remove from project"
-                          style={{ padding: 0, background: "none", border: "none", cursor: "pointer", color: "#9ca3af", lineHeight: 1, flexShrink: 0, fontSize: "0.75rem" }}
+                          style={{ padding: 0, background: "none", border: "none", cursor: "pointer", color: "var(--text-gray-400)", lineHeight: 1, flexShrink: 0, fontSize: "0.75rem" }}
                         >×</button>
                       </div>
                     );
@@ -1279,7 +1279,7 @@ function AddArtifactModal({
   const linkIcons = ARTIFACT_ICON_CATALOG.filter((e) => !e.key.startsWith("file_"));
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onClose}>
+    <div className="fixed inset-0 z-[9000] flex items-center justify-center bg-black/40" onClick={onClose}>
       <div
         style={{ background: "var(--surface, #fff)", borderRadius: "12px", padding: "24px", width: "100%", maxWidth: "440px", boxShadow: "0 8px 32px rgba(0,0,0,0.15)", fontFamily: "var(--font-base)" }}
         onClick={(e) => e.stopPropagation()}

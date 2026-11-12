@@ -17,10 +17,10 @@ import { isPushOk, summarizePush, type CloudCoachPushResult } from "../lib/cloud
 type ViewMode = "cards" | "list" | "table";
 
 const STATUS_COLORS: Record<Account["status"], React.CSSProperties> = {
-  prospect: { background: "#fef9c3", color: "#a16207" },
-  active: { background: "#dcfce7", color: "#15803d" },
+  prospect: { background: "var(--tint-yellow-100)", color: "var(--ink-amber)" },
+  active: { background: "#dcfce7", color: "var(--ink-green)" },
   inactive: { background: "var(--bg, #f5f5f5)", color: "var(--text-secondary, #888)" },
-  churned: { background: "#fee2e2", color: "#dc2626" },
+  churned: { background: "var(--tint-red-100)", color: "#dc2626" },
 };
 
 const EMPTY_FORM: Partial<Account> & { team_member_ids?: number[] } = {
@@ -118,7 +118,7 @@ function TeamMemberMultiSelect({
       )}
       {open && (
         <div
-          style={{ position: "absolute", top: "calc(100% + 4px)", left: 0, right: 0, zIndex: 100, background: "#fff", border: "1px solid #e5e7eb", borderRadius: "8px", boxShadow: "0 4px 16px rgba(0,0,0,0.12)", maxHeight: "220px", overflowY: "auto" }}
+          style={{ position: "absolute", top: "calc(100% + 4px)", left: 0, right: 0, zIndex: 100, background: "var(--surface-card)", border: "1px solid var(--border-subtle)", borderRadius: "8px", boxShadow: "0 4px 16px rgba(0,0,0,0.12)", maxHeight: "220px", overflowY: "auto" }}
         >
           {members.map((m) => {
             const checked = selectedIds.includes(m.id);

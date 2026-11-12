@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { salesforceApi } from "../../lib/api";
 import type { SalesforceProject, SalesforceTask } from "../../types";
+import { localDateKey } from "../../lib/timelineDay";
 
 interface Props {
   project: SalesforceProject;
@@ -10,7 +11,7 @@ interface Props {
 }
 
 export default function LogTimeModal({ project, task, onClose, onLogged }: Props) {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = localDateKey(new Date());
   const [date, setDate] = useState(today);
   const [hours, setHours] = useState("0");
   const [minutes, setMinutes] = useState("30");
@@ -46,7 +47,7 @@ export default function LogTimeModal({ project, task, onClose, onLogged }: Props
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
+      className="fixed inset-0 z-[9000] flex items-center justify-center bg-black/40"
       onClick={onClose}
     >
       <div

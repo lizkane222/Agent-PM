@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@import "./styles/rich-text.css";
 
 /* ── Twilio Sans Mono font faces ─────────────────────────────────────────────
    Fonts are bundled via Vite (src/assets/fonts/Twilio-Sans-Mono/WOFF2/) and
@@ -136,18 +137,213 @@
   --line-height-base: 1.5;
 }
 
-/* ── Dark mode tokens ────────────────────────────────────────────────────────*/
+/* Surface / border / ink tokens for inline styles.
+   Light values are EXACTLY the literals they replaced in components, so light
+   mode is unchanged; the dark block below redefines them. */
+:root {
+  --surface-card:      #ffffff;
+  --chat-agent-bubble: #ffffff;
+  --surface-subtle:    #f9fafb;
+  --surface-subtle-2:  #f3f4f6;
+  --surface-subtle-3:  #fafafa;
+  --surface-subtle-4:  #f4f4f6;
+  --surface-subtle-5:  #f8fafc;
+  --border-subtle:     #e5e7eb;
+  --border-subtle-2:   #d1d5db;
+  --border-subtle-3:   #f3f4f6;
+  --border-subtle-4:   #e1e3ea;
+  --text-ink:          #121c2d;
+  --text-gray-400:     #9ca3af;
+  --text-gray-500:     #6b7280;
+  --text-gray-700:     #374151;
+  --tint-amber-50:     #fffbeb;
+  --tint-red-100:      #fee2e2;
+  --tint-yellow-100:   #fef9c3;
+  --tint-violet-50:    #f5f3ff;
+  --tint-violet-100:   #ede9fe;
+  --tint-green-50:     #f0fdf4;
+  --tint-indigo-50:    #eef2ff;
+  --ink-red:           #b91c1c;
+  --ink-amber:         #a16207;
+  --ink-indigo:        #4338ca;
+  --ink-green:         #15803d;
+}
+
+/* ── Dark mode ────────────────────────────────────────────────────────────────
+   Layered surfaces, darkest to lightest:
+     page   #0b1120   <body>, the Layout shell
+     card   #141c2f   bg-white / var(--surface-card): cards, panels, modals
+     nested #1c2640   bg-gray-50, slate-50: a section inside a card
+     nested #212d4a   bg-gray-100, slate-100
+     deep   #283657   anything nested one level further
+   Tailwind v4 utilities read --color-* theme variables, so overriding them here
+   (unlayered, so it beats @layer theme) re-colours every utility incl. variants
+   and /opacity forms. --color-white is NOT overridden: text-white is on
+   saturated buttons. bg-white is handled by class rules below.
+   ─────────────────────────────────────────────────────────────────────────── */
 
 [data-theme="dark"] {
-  --twilio-gray-10:    #0D1321;
-  --twilio-gray-20:    #1C2B45;
-  --twilio-gray-40:    #354052;
-  --twilio-gray-60:    #8891AA;
-  --twilio-gray-80:    #CACDD8;
-  --twilio-gray-100:   #F4F4F6;
-  --twilio-white:      #1C2B45;
-  --twilio-navy:       #060D19;
-  --twilio-navy-light: #121C2D;
+  color-scheme: dark;
+
+  --twilio-gray-10:    #0b1120;
+  --twilio-gray-20:    #2d3a5c;
+  --twilio-gray-40:    #7c8aa8;
+  --twilio-gray-60:    #9aa6c0;
+  --twilio-gray-80:    #cbd2e2;
+  --twilio-gray-100:   #f3f5fa;
+  --twilio-white:      #141c2f;
+  --twilio-navy:       #060b16;
+  --twilio-navy-light: #101a2e;
+
+  --surface-card:      #141c2f;
+  --chat-agent-bubble: #28365e;
+  --surface-subtle:    #1c2640;
+  --surface-subtle-2:  #212d4a;
+  --surface-subtle-3:  #1c2640;
+  --surface-subtle-4:  #212d4a;
+  --surface-subtle-5:  #1c2640;
+  --border-subtle:     #2d3a5c;
+  --border-subtle-2:   #3b4a70;
+  --border-subtle-3:   #232f4d;
+  --border-subtle-4:   #2d3a5c;
+  --text-ink:          #f3f5fa;
+  --text-gray-400:     #8190ae;
+  --text-gray-500:     #a9b3ca;
+  --text-gray-700:     #cbd2e2;
+  --tint-amber-50:     #342e2a;
+  --tint-red-100:      #402433;
+  --tint-yellow-100:   #3f3a27;
+  --tint-violet-50:    #2a2747;
+  --tint-violet-100:   #332e57;
+  --tint-green-50:     #163436;
+  --tint-indigo-50:    #1f2a52;
+  --ink-red:           #fca5a5;
+  --ink-amber:         #fcd34d;
+  --ink-indigo:        #a5b4fc;
+  --ink-green:         #86efac;
+
+  /* Variables the components already reference with a light fallback
+     (var(--surface, #fff) ...). Undefined in light mode, so the fallbacks
+     apply there; defined here only. */
+  --surface:           #141c2f;
+  --surface-alt:       rgba(255, 255, 255, 0.05);
+  --surface-raised:    rgba(255, 255, 255, 0.07);
+  --bg:                #1c2640;
+  --bg-card:           #141c2f;
+  --text-primary:      #f3f5fa;
+  --text-secondary:    #9aa6c0;
+  --border:            #2d3a5c;
+
+  /* Rich text editors (RichTextMentionEditor, pagebuilder RichTextEditor) and the
+     Layouts canvas dot grid. Undefined in light mode, so the components'
+     fallbacks (#fff / #F4F4F6 / #AEBBC1) apply there. */
+  --rte-bg:            #1c2640;
+  --rte-toolbar-bg:    #212d4a;
+  --canvas-dot:        rgba(120, 140, 190, 0.25);
+
+  /* Neutral scale (gray and slate share it) */
+  --color-gray-50:  #1c2640;
+  --color-gray-100: #212d4a;
+  --color-gray-200: #2d3a5c;
+  --color-gray-300: #3b4a70;
+  --color-gray-400: #8190ae;
+  --color-gray-500: #98a4bf;
+  --color-gray-600: #b0bad0;
+  --color-gray-700: #c8d0e0;
+  --color-gray-800: #e0e5ef;
+  --color-gray-900: #f3f5fa;
+  --color-gray-950: #f8fafc;
+  --color-slate-50:  #1c2640;
+  --color-slate-100: #212d4a;
+  --color-slate-200: #2d3a5c;
+  --color-slate-300: #3b4a70;
+  --color-slate-400: #8190ae;
+  --color-slate-500: #98a4bf;
+  --color-slate-600: #b0bad0;
+  --color-slate-700: #c8d0e0;
+  --color-slate-800: #e0e5ef;
+  --color-slate-900: #f3f5fa;
+
+  /* Tinted families: 50-300 become dark tints of the hue */
+  --color-red-50: #332232;
+  --color-red-100: #402433;
+  --color-red-200: #512735;
+  --color-red-300: #672b37;
+  --color-amber-50: #342e2a;
+  --color-amber-100: #413628;
+  --color-amber-200: #534025;
+  --color-amber-300: #6a4d21;
+  --color-yellow-50: #32312a;
+  --color-yellow-100: #3f3a27;
+  --color-yellow-200: #504624;
+  --color-yellow-300: #655520;
+  --color-green-50: #163436;
+  --color-green-100: #173e38;
+  --color-green-200: #184b3c;
+  --color-green-300: #195c41;
+  --color-emerald-50: #13323a;
+  --color-emerald-100: #133b3f;
+  --color-emerald-200: #134846;
+  --color-emerald-300: #12584e;
+  --color-blue-50: #192a4b;
+  --color-blue-100: #1c3057;
+  --color-blue-200: #1f3967;
+  --color-blue-300: #23437b;
+  --color-indigo-50: #1f264a;
+  --color-indigo-100: #242b56;
+  --color-indigo-200: #2a3165;
+  --color-indigo-300: #323879;
+  --color-violet-50: #25254b;
+  --color-violet-100: #2c2957;
+  --color-violet-200: #352e67;
+  --color-violet-300: #41347b;
+  --color-purple-50: #29244b;
+  --color-purple-100: #322757;
+  --color-purple-200: #3d2c67;
+  --color-purple-300: #4c327b;
+  --color-pink-50: #32223e;
+  --color-pink-100: #3f2544;
+  --color-pink-200: #50284d;
+  --color-pink-300: #662d57;
+  --color-orange-50: #34282c;
+  --color-orange-100: #422d2a;
+  --color-orange-200: #543428;
+  --color-orange-300: #6b3d26;
+  --color-sky-50: #132f49;
+  --color-sky-100: #133754;
+  --color-sky-200: #124263;
+  --color-sky-300: #125076;
+  --color-teal-50: #143240;
+  --color-teal-100: #143b47;
+  --color-teal-200: #144850;
+  --color-teal-300: #14575c;
+  --color-cyan-50: #123246;
+  --color-cyan-100: #113b50;
+  --color-cyan-200: #10475d;
+  --color-cyan-300: #0f576e;
+  --color-rose-50: #332136;
+  --color-rose-100: #412338;
+  --color-rose-200: #53263c;
+  --color-rose-300: #692941;
+  --color-lime-50: #24352c;
+  --color-lime-100: #2a3f2a;
+  --color-lime-200: #334d28;
+  --color-lime-300: #3f5f26;
+  --color-fuchsia-50: #30224a;
+  --color-fuchsia-100: #3b2455;
+  --color-fuchsia-200: #4b2865;
+  --color-fuchsia-300: #5f2c78;
+
+  /* FullCalendar */
+  --fc-page-bg-color:            #141c2f;
+  --fc-neutral-bg-color:         #1c2640;
+  --fc-neutral-text-color:       #9aa6c0;
+  --fc-border-color:             #2d3a5c;
+  --fc-today-bg-color:           rgba(2, 99, 224, 0.14);
+  --fc-list-event-hover-bg-color:#212d4a;
+  --fc-non-business-color:       rgba(0, 0, 0, 0.18);
+  --fc-highlight-color:          rgba(2, 99, 224, 0.25);
+  --fc-now-indicator-color:      #f87171;
 }
 
 [data-theme="dark"] body {
@@ -352,105 +548,178 @@ select:is(:focus, :focus-visible),
   color: var(--twilio-gray-100) !important;
 }
 
-/* ── Dark mode — hardcoded Tailwind class overrides ─────────────────────────
-   All pages use bg-white / bg-gray-50 / border-gray-* / text-gray-* directly.
-   These overrides flip those to dark-appropriate values without touching every
-   component file.
+/* ── Dark mode — rules that cannot be expressed as theme variables ──────────
+   Unlayered, so they beat Tailwind's @layer utilities without !important.
    ─────────────────────────────────────────────────────────────────────────── */
 
 [data-theme="dark"] {
 
-  /* --twilio-navy resolves to #060D19 in dark mode (sidebar bg), but is also
-     used as text color everywhere. Restore legible values for text uses. */
-  .text-\[var\(--twilio-navy\)\]    { color: #F4F4F6 !important; }
-  .text-\[var\(--twilio-gray-80\)\] { color: #CACDD8 !important; }
-  .text-\[var\(--twilio-gray-60\)\] { color: #8891AA !important; }
-  .text-\[var\(--twilio-gray-40\)\] { color: #606b85 !important; }
+  /* Text that resolves to the (dark-in-dark) navy token. */
+  .text-\[var\(--twilio-navy\)\],
+  .hover\:text-\[var\(--twilio-navy\)\]:hover,
+  .group:hover .group-hover\:text-\[var\(--twilio-navy\)\] { color: #f3f5fa; }
+  .text-\[var\(--twilio-gray-80\)\],
+  .hover\:text-\[var\(--twilio-gray-80\)\]:hover { color: #cbd2e2; }
+  .text-\[var\(--twilio-gray-60\)\],
+  .group:hover .group-hover\:text-\[var\(--twilio-gray-60\)\] { color: #9aa6c0; }
+  .text-\[var\(--twilio-gray-40\)\] { color: #7c8aa8; }
+  .border-\[var\(--twilio-navy\)\] { border-color: #3b4a70; }
 
-  /* Surfaces */
-  .bg-white        { background-color: #1C2B45 !important; }
-  .bg-gray-50      { background-color: #0D1321 !important; }
-  .bg-gray-100     { background-color: #1C2B45 !important; }
-  .bg-amber-50     { background-color: #2a1f00 !important; }
+  /* Surfaces: card level, then one step lighter per nesting level */
+  .bg-white,
+  .hover\:bg-white:hover,
+  .focus\:bg-white:focus { background-color: var(--surface-card); }
+  [class*="bg-white/"] { background-color: color-mix(in srgb, var(--surface-card) 88%, transparent); }
+  .bg-white .bg-white,
+  :is(.bg-gray-50, .bg-slate-50) .bg-white { background-color: var(--surface-subtle); }
+  .bg-white .bg-white .bg-white,
+  :is(.bg-gray-100, .bg-slate-100) .bg-white,
+  :is(.bg-gray-50, .bg-slate-50) :is(.bg-gray-50, .bg-slate-50) { background-color: var(--surface-subtle-2); }
+  .bg-white :is(.bg-gray-50, .bg-slate-50) { background-color: var(--surface-subtle); }
+  .bg-white :is(.bg-gray-100, .bg-slate-100) { background-color: var(--surface-subtle-2); }
+  :is(.bg-gray-50, .bg-slate-50) :is(.bg-gray-100, .bg-slate-100),
+  .bg-white :is(.bg-gray-50, .bg-slate-50) .bg-white,
+  .bg-white :is(.bg-gray-50, .bg-slate-50) :is(.bg-gray-50, .bg-slate-50) { background-color: #283657; }
 
-  /* Borders */
-  .border-gray-100 { border-color: #354052 !important; }
-  .border-gray-200 { border-color: #354052 !important; }
-  .border-gray-300 { border-color: #4a5568 !important; }
-  .border-gray-400 { border-color: #606b85 !important; }
-  .divide-gray-50  > * + * { border-color: #354052 !important; }
-  .divide-gray-100 > * + * { border-color: #354052 !important; }
+  /* A page root that uses bg-gray-50 is the page, not a nested section */
+  .min-h-screen.bg-gray-50,
+  .h-screen.bg-gray-50 { background-color: var(--twilio-gray-10); }
+  aside.bg-gray-50 { background-color: var(--surface-card); }
 
-  /* Text */
-  .text-gray-400   { color: #8891AA !important; }
-  .text-gray-300   { color: #CACDD8 !important; }
+  /* Tinted chips whose Tailwind class is remapped to a light blue elsewhere */
+  .bg-indigo-50  { background-color: #14284d !important; }
+  .bg-indigo-100,
+  .hover\:bg-indigo-100:hover { background-color: #19335f !important; }
+  .border-indigo-200 { border-color: #2a4a80 !important; }
+  .text-indigo-600, .text-indigo-500 { color: #7db4f5 !important; }
+  .text-indigo-700, .text-indigo-800 { color: #a9cdf8 !important; }
+  tr:hover .hover\:bg-indigo-50,
+  .hover\:bg-indigo-50:hover { background-color: #19335f !important; }
+
+  /* Saturated button fills stay saturated; their text stays white. Muted
+     "pill" text on tinted backgrounds is lightened. */
+  .text-red-600, .hover\:text-red-600:hover, .group:hover .group-hover\:text-red-600 { color: #f58585; }
+  .text-red-700, .hover\:text-red-700:hover, .group:hover .group-hover\:text-red-700 { color: #f69898; }
+  .text-red-800, .hover\:text-red-800:hover, .group:hover .group-hover\:text-red-800 { color: #f8abab; }
+  .text-red-900, .hover\:text-red-900:hover, .group:hover .group-hover\:text-red-900 { color: #f9bebe; }
+  .text-amber-600, .hover\:text-amber-600:hover, .group:hover .group-hover\:text-amber-600 { color: #f8c060; }
+  .text-amber-700, .hover\:text-amber-700:hover, .group:hover .group-hover\:text-amber-700 { color: #faca79; }
+  .text-amber-800, .hover\:text-amber-800:hover, .group:hover .group-hover\:text-amber-800 { color: #fad391; }
+  .text-amber-900, .hover\:text-amber-900:hover, .group:hover .group-hover\:text-amber-900 { color: #fcddaa; }
+  .text-yellow-600, .hover\:text-yellow-600:hover, .group:hover .group-hover\:text-yellow-600 { color: #f1ce5e; }
+  .text-yellow-700, .hover\:text-yellow-700:hover, .group:hover .group-hover\:text-yellow-700 { color: #f3d577; }
+  .text-yellow-800, .hover\:text-yellow-800:hover, .group:hover .group-hover\:text-yellow-800 { color: #f6dd90; }
+  .text-yellow-900, .hover\:text-yellow-900:hover, .group:hover .group-hover\:text-yellow-900 { color: #f8e4a9; }
+  .text-green-600, .hover\:text-green-600:hover, .group:hover .group-hover\:text-green-600 { color: #6fd996; }
+  .text-green-700, .hover\:text-green-700:hover, .group:hover .group-hover\:text-green-700 { color: #85dfa6; }
+  .text-green-800, .hover\:text-green-800:hover, .group:hover .group-hover\:text-green-800 { color: #9ce5b7; }
+  .text-green-900, .hover\:text-green-900:hover, .group:hover .group-hover\:text-green-900 { color: #b2ebc7; }
+  .text-emerald-600, .hover\:text-emerald-600:hover, .group:hover .group-hover\:text-emerald-600 { color: #64d2ad; }
+  .text-emerald-700, .hover\:text-emerald-700:hover, .group:hover .group-hover\:text-emerald-700 { color: #7cd8ba; }
+  .text-emerald-800, .hover\:text-emerald-800:hover, .group:hover .group-hover\:text-emerald-800 { color: #93e0c6; }
+  .text-emerald-900, .hover\:text-emerald-900:hover, .group:hover .group-hover\:text-emerald-900 { color: #abe6d3; }
+  .text-blue-600, .hover\:text-blue-600:hover, .group:hover .group-hover\:text-blue-600 { color: #80aef9; }
+  .text-blue-700, .hover\:text-blue-700:hover, .group:hover .group-hover\:text-blue-700 { color: #93bafa; }
+  .text-blue-800, .hover\:text-blue-800:hover, .group:hover .group-hover\:text-blue-800 { color: #a7c7fb; }
+  .text-blue-900, .hover\:text-blue-900:hover, .group:hover .group-hover\:text-blue-900 { color: #bad3fc; }
+  .text-indigo-600, .hover\:text-indigo-600:hover, .group:hover .group-hover\:text-indigo-600 { color: #9a9cf6; }
+  .text-indigo-700, .hover\:text-indigo-700:hover, .group:hover .group-hover\:text-indigo-700 { color: #a9abf7; }
+  .text-indigo-800, .hover\:text-indigo-800:hover, .group:hover .group-hover\:text-indigo-800 { color: #b9baf9; }
+  .text-indigo-900, .hover\:text-indigo-900:hover, .group:hover .group-hover\:text-indigo-900 { color: #c8c9fa; }
+  .text-violet-600, .hover\:text-violet-600:hover, .group:hover .group-hover\:text-violet-600 { color: #b495f9; }
+  .text-violet-700, .hover\:text-violet-700:hover, .group:hover .group-hover\:text-violet-700 { color: #bfa5fa; }
+  .text-violet-800, .hover\:text-violet-800:hover, .group:hover .group-hover\:text-violet-800 { color: #cbb6fb; }
+  .text-violet-900, .hover\:text-violet-900:hover, .group:hover .group-hover\:text-violet-900 { color: #d6c6fc; }
+  .text-purple-600, .hover\:text-purple-600:hover, .group:hover .group-hover\:text-purple-600 { color: #c690fa; }
+  .text-purple-700, .hover\:text-purple-700:hover, .group:hover .group-hover\:text-purple-700 { color: #cfa2fb; }
+  .text-purple-800, .hover\:text-purple-800:hover, .group:hover .group-hover\:text-purple-800 { color: #d8b2fb; }
+  .text-purple-900, .hover\:text-purple-900:hover, .group:hover .group-hover\:text-purple-900 { color: #e1c4fc; }
+  .text-pink-600, .hover\:text-pink-600:hover, .group:hover .group-hover\:text-pink-600 { color: #f388bd; }
+  .text-pink-700, .hover\:text-pink-700:hover, .group:hover .group-hover\:text-pink-700 { color: #f59ac7; }
+  .text-pink-800, .hover\:text-pink-800:hover, .group:hover .group-hover\:text-pink-800 { color: #f6add1; }
+  .text-pink-900, .hover\:text-pink-900:hover, .group:hover .group-hover\:text-pink-900 { color: #f8bfdb; }
+  .text-orange-600, .hover\:text-orange-600:hover, .group:hover .group-hover\:text-orange-600 { color: #fba468; }
+  .text-orange-700, .hover\:text-orange-700:hover, .group:hover .group-hover\:text-orange-700 { color: #fcb27f; }
+  .text-orange-800, .hover\:text-orange-800:hover, .group:hover .group-hover\:text-orange-800 { color: #fcc096; }
+  .text-orange-900, .hover\:text-orange-900:hover, .group:hover .group-hover\:text-orange-900 { color: #fdcead; }
+  .text-sky-600, .hover\:text-sky-600:hover, .group:hover .group-hover\:text-sky-600 { color: #62c4f1; }
+  .text-sky-700, .hover\:text-sky-700:hover, .group:hover .group-hover\:text-sky-700 { color: #7acef3; }
+  .text-sky-800, .hover\:text-sky-800:hover, .group:hover .group-hover\:text-sky-800 { color: #93d6f5; }
+  .text-sky-900, .hover\:text-sky-900:hover, .group:hover .group-hover\:text-sky-900 { color: #abe0f7; }
+  .text-teal-600, .hover\:text-teal-600:hover, .group:hover .group-hover\:text-teal-600 { color: #66d1c5; }
+  .text-teal-700, .hover\:text-teal-700:hover, .group:hover .group-hover\:text-teal-700 { color: #7ed8ce; }
+  .text-teal-800, .hover\:text-teal-800:hover, .group:hover .group-hover\:text-teal-800 { color: #95dfd7; }
+  .text-teal-900, .hover\:text-teal-900:hover, .group:hover .group-hover\:text-teal-900 { color: #ade6e0; }
+  .text-cyan-600, .hover\:text-cyan-600:hover, .group:hover .group-hover\:text-cyan-600 { color: #5dd0e3; }
+  .text-cyan-700, .hover\:text-cyan-700:hover, .group:hover .group-hover\:text-cyan-700 { color: #76d7e7; }
+  .text-cyan-800, .hover\:text-cyan-800:hover, .group:hover .group-hover\:text-cyan-800 { color: #8fdeec; }
+  .text-cyan-900, .hover\:text-cyan-900:hover, .group:hover .group-hover\:text-cyan-900 { color: #a8e5f0; }
+  .text-rose-600, .hover\:text-rose-600:hover, .group:hover .group-hover\:text-rose-600 { color: #f88296; }
+  .text-rose-700, .hover\:text-rose-700:hover, .group:hover .group-hover\:text-rose-700 { color: #f995a6; }
+  .text-rose-800, .hover\:text-rose-800:hover, .group:hover .group-hover\:text-rose-800 { color: #faa9b7; }
+  .text-rose-900, .hover\:text-rose-900:hover, .group:hover .group-hover\:text-rose-900 { color: #fbbcc7; }
+  .text-lime-600, .hover\:text-lime-600:hover, .group:hover .group-hover\:text-lime-600 { color: #afde68; }
+  .text-lime-700, .hover\:text-lime-700:hover, .group:hover .group-hover\:text-lime-700 { color: #bbe37f; }
+  .text-lime-800, .hover\:text-lime-800:hover, .group:hover .group-hover\:text-lime-800 { color: #c8e896; }
+  .text-lime-900, .hover\:text-lime-900:hover, .group:hover .group-hover\:text-lime-900 { color: #d4edad; }
+  .text-fuchsia-600, .hover\:text-fuchsia-600:hover, .group:hover .group-hover\:text-fuchsia-600 { color: #e687f5; }
+  .text-fuchsia-700, .hover\:text-fuchsia-700:hover, .group:hover .group-hover\:text-fuchsia-700 { color: #ea99f6; }
+  .text-fuchsia-800, .hover\:text-fuchsia-800:hover, .group:hover .group-hover\:text-fuchsia-800 { color: #eeacf8; }
+  .text-fuchsia-900, .hover\:text-fuchsia-900:hover, .group:hover .group-hover\:text-fuchsia-900 { color: #f2bef9; }
 
   /* Inputs & selects */
-  input:not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"]),
+  input:not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"]):not([type="color"]):not([type="range"]),
   select,
   textarea {
-    background-color: #0D1321 !important;
-    border-color: #4a5568 !important;
-    color: #F4F4F6 !important;
+    background-color: #0f1729 !important;
+    border-color: #3b4a70 !important;
+    color: #f3f5fa !important;
   }
   input::placeholder,
-  textarea::placeholder { color: #606b85 !important; }
+  textarea::placeholder { color: #7c8aa8 !important; }
+  option { background-color: #141c2f; color: #f3f5fa; }
 
-  /* Code snippets */
-  code { background-color: #354052 !important; color: #F4F4F6 !important; }
+  /* Code */
+  code { background-color: #283657 !important; color: #f3f5fa !important; }
 
-  /* Table rows */
-  .bg-gray-50.border-b { background-color: #121C2D !important; }
-  tr:hover .hover\:bg-indigo-50,
-  .hover\:bg-indigo-50:hover { background-color: #1e2d4a !important; }
-  .hover\:bg-gray-50:hover   { background-color: #121C2D !important; }
-  .hover\:bg-gray-100:hover  { background-color: #1C2B45 !important; }
+  /* Tables and dividers */
+  .divide-gray-50  > * + *,
+  .divide-gray-100 > * + * { border-color: var(--border-subtle); }
+  thead, th { color: inherit; }
 
-  /* Modals */
-  .bg-white.rounded-xl,
-  .bg-white.rounded-lg,
-  .bg-white.shadow-xl {
-    background-color: #1C2B45 !important;
-    border-color: #354052 !important;
-  }
+  /* Editors */
+  .ProseMirror { background-color: transparent; color: #f3f5fa; caret-color: #f3f5fa; }
+  .ProseMirror p.is-editor-empty:first-child::before,
+  .ProseMirror .is-empty::before { color: #7c8aa8; }
+  .ProseMirror a { color: #7db4f5; }
+  .ProseMirror code,
+  .ProseMirror pre { background-color: #283657; color: #f3f5fa; }
+  .ProseMirror blockquote { border-color: #3b4a70; color: #cbd2e2; }
+  .ProseMirror hr { border-color: #3b4a70; }
 
-  /* Sidebar drawer (AccountDetail) */
-  .ml-auto.bg-white { background-color: #1C2B45 !important; }
+  /* FullCalendar */
+  .fc { color: #f3f5fa; }
+  .fc .fc-day-today { background-color: rgba(2, 99, 224, 0.14) !important; }
+  .fc .fc-col-header-cell.fc-day-today { background-color: rgba(2, 99, 224, 0.28) !important; color: #a9cdf8 !important; }
+  .fc .fc-col-header-cell { background-color: #141c2f; }
+  .fc .fc-timegrid-slot-label-cushion,
+  .fc .fc-timegrid-axis-cushion { color: #9aa6c0 !important; }
+  .fc .fc-col-header-cell-cushion,
+  .fc .fc-daygrid-day-number { color: #cbd2e2; }
+  .fc .fc-button { background-color: #283657 !important; border-color: #3b4a70 !important; }
+  .fc .fc-button:hover { background-color: #3b4a70 !important; border-color: #4a5a82 !important; }
+  .fc .fc-button-primary:not(:disabled).fc-button-active { background-color: #0263e0 !important; border-color: #0263e0 !important; }
+  .fc .fc-button:disabled { opacity: 0.45; }
+  .fc-theme-standard td, .fc-theme-standard th, .fc-theme-standard .fc-scrollgrid { border-color: #2d3a5c; }
+  .fc .fc-timegrid-now-indicator-line { border-color: #f87171; }
+  .fc .fc-more-popover,
+  .fc .fc-popover { background-color: #141c2f; border-color: #3b4a70; }
 
-  /* Chat page sidebar */
-  aside.bg-gray-50 { background-color: #0D1321 !important; }
-  .bg-white.border-r { background-color: #1C2B45 !important; }
-
-  /* Chat bubbles — assistant */
-  .bg-white.border.border-gray-200.rounded-bl-sm {
-    background-color: #1C2B45 !important;
-    border-color: #354052 !important;
-  }
-
-  /* User avatar in chat */
-  .bg-gray-300 { background-color: #354052 !important; }
-
-  /* TranscriptFooter */
-  footer.bg-white { background-color: #1C2B45 !important; }
-
-  /* Settings — inline code bg */
-  .bg-gray-100.px-1 { background-color: #354052 !important; }
-
-  /* Note cards */
-  .bg-gray-50.rounded-lg { background-color: #121C2D !important; }
-
-  /* Stat cards (Dashboard) */
-  .bg-white.rounded-lg.border { background-color: #1C2B45 !important; }
-
-  /* Login page */
-  .min-h-screen.bg-gray-50 { background-color: #060D19 !important; }
-
-  /* Action Items card footers */
-  .bg-white.rounded-b-xl,
-  .bg-white.rounded-b-lg { background-color: #1C2B45 !important; }
-
-  /* Active session highlight in Chat sidebar */
-  .bg-white.font-medium { background-color: #1C2B45 !important; }
+  /* Misc */
+  ::-webkit-scrollbar-thumb { background: #3b4a70; }
+  ::-webkit-scrollbar-thumb:hover { background: #4a5a82; }
+  hr { border-color: #2d3a5c; }
+  ::selection { background: rgba(2, 99, 224, 0.45); color: #fff; }
 }
 
 /* ── Log-routed glow animation ───────────────────────────────────────────── */
@@ -468,4 +737,16 @@ select:is(:focus, :focus-visible),
 @keyframes spin {
   from { transform: rotate(0deg); }
   to   { transform: rotate(360deg); }
+}
+
+/* A profile section the user just jumped to or added: a purple glow that fades over three seconds.
+   Set and cleared by `revealSection` (components/profile/sectionLayout.ts). */
+@keyframes section-glow {
+  0%   { box-shadow: 0 0 0 3px rgba(124, 58, 237, 0.55), 0 0 28px 8px rgba(124, 58, 237, 0.45); }
+  70%  { box-shadow: 0 0 0 3px rgba(124, 58, 237, 0.35), 0 0 22px 6px rgba(124, 58, 237, 0.30); }
+  100% { box-shadow: 0 0 0 3px rgba(124, 58, 237, 0),    0 0 0 0 rgba(124, 58, 237, 0); }
+}
+[data-glow="true"] {
+  animation: section-glow 3s ease-out;
+  border-radius: 12px;
 }

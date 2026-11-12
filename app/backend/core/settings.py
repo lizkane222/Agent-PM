@@ -207,6 +207,7 @@ REST_FRAMEWORK = {
         "anon": "20/min",
         "user": "200/min",
         "login": "5/min",
+        "google_login": "20/min",  # start + callback per sign-in, so 10 sign-ins a minute per IP
         "agent_stream": "30/min",
         "sync_token": "10/min",
     },
@@ -222,6 +223,20 @@ OIDC_OP_JWKS_ENDPOINT = os.environ.get("OKTA_JWKS_ENDPOINT", "")
 OIDC_RP_SIGN_ALGO = "RS256"
 OIDC_STORE_ACCESS_TOKEN = False
 OIDC_STORE_ID_TOKEN = False
+# ── Sign in with Google (core/google_login.py) ────────────────────────────────
+# Uses the same Google OAuth client as Calendar. Register GOOGLE_LOGIN_REDIRECT_URI as an
+# authorised redirect URI on that client in the Google Cloud Console.
+GOOGLE_LOGIN_ENABLED = os.getenv("GOOGLE_LOGIN_ENABLED", "on").strip().lower() in ("on", "true", "1", "yes")
+GOOGLE_LOGIN_ALLOWED_DOMAIN = os.getenv("GOOGLE_LOGIN_ALLOWED_DOMAIN", "twilio.com").strip().lower()
+GOOGLE_LOGIN_REDIRECT_URI = os.getenv(
+    "GOOGLE_LOGIN_REDIRECT_URI", "http://localhost:8000/api/v1/auth/google/callback/"
+)
+GOOGLE_LOGIN_FRONTEND_URL = os.getenv("GOOGLE_LOGIN_FRONTEND_URL", "http://localhost:5173")
+# Off: only people who already have an AgentPM user can sign in. On: a verified @domain
+# account gets a new (Basic access) user on first sign-in.
+GOOGLE_LOGIN_AUTO_CREATE = os.getenv("GOOGLE_LOGIN_AUTO_CREATE", "off").strip().lower() in ("on", "true", "1", "yes")
+# Turns off /auth/token/ (username + password) entirely. Leave off until Google sign-in is proven.
+AUTH_PASSWORD_LOGIN_DISABLED = os.getenv("AUTH_PASSWORD_LOGIN_DISABLED", "off").strip().lower() in ("on", "true", "1", "yes")
 LOGIN_REDIRECT_URL = os.getenv("LOGIN_REDIRECT_URL", "http://localhost:5173/")
 LOGOUT_REDIRECT_URL = os.getenv("LOGOUT_REDIRECT_URL", "http://localhost:5173/")
 
@@ -274,6 +289,10 @@ CELERY_BEAT_SCHEDULE = {
     },
     "meeting-notes-every-10-minutes": {
         "task": "integrations.tasks.check_meeting_notes_all_users",
+        "schedule": 600,
+    },
+    "ticket-scan-every-10-minutes": {
+        "task": "integrations.tasks.scan_tickets_all_users",
         "schedule": 600,
     },
     "deliver-due-reminders-every-minute": {
@@ -370,6 +389,8 @@ AGENT_BLOCK_OPUS = os.getenv("AGENT_BLOCK_OPUS", "1") not in ("0", "false", "Fal
 # loudly. It caught integrations.summarize_email genuinely calling the gateway from a
 # test once the ANTHROPIC_API_KEY gate was removed.
 _RUNNING_TESTS = "test" in sys.argv or os.getenv("DJANGO_RUNNING_TESTS") == "1"
+# A fresh cache per test, so throttle counters keyed by user id can't leak between tests (core/test_runner.py).
+TEST_RUNNER = "core.test_runner.FreshCacheRunner"
 if _RUNNING_TESTS:
     AGENT_GATEWAY_TOKEN_COMMAND = ""
     ANTHROPIC_API_KEY = ""

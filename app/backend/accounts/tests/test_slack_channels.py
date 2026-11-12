@@ -91,3 +91,16 @@ class SlackChannelsTest(APITestCase):
         self._patch([_entry()])
         self._patch([_entry()])
         self.assertEqual(AgentActivityEvent.objects.filter(metadata__field="slack_channels").count(), 1)
+
+    def test_workspace_icon_is_kept_when_http_and_rejected_otherwise(self):
+        resp = self._patch([_entry(workspace_icon="https://acme.slack.com/favicon.ico")])
+        self.assertEqual(resp.status_code, 200, resp.data)
+        got = self.client.get(f"{URL}{self.account.id}/").data["slack_channels"]
+        self.assertEqual(got[0]["workspace_icon"], "https://acme.slack.com/favicon.ico")
+        for bad in ("javascript:alert(1)", "data:image/png;base64,xx", "acme.com/x.png"):
+            self.assertEqual(self._patch([_entry(workspace_icon=bad)]).status_code, 400, bad)
+
+    def test_blank_icon_is_omitted(self):
+        self._patch([_entry(workspace_icon="  ")])
+        got = self.client.get(f"{URL}{self.account.id}/").data["slack_channels"]
+        self.assertNotIn("workspace_icon", got[0])

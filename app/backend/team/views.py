@@ -1,6 +1,9 @@
 """API views for the team app."""
 
+from zoneinfo import available_timezones
+
 from django.db import models
+from django.utils import timezone
 from django.shortcuts import get_object_or_404
 from rest_framework import filters, mixins, viewsets
 from rest_framework.decorators import action
@@ -297,6 +300,10 @@ class TagViewSet(viewsets.ModelViewSet):
             raise PermissionDenied("Only staff users may modify tags.")
 
 
+# What a member may change on their own TeamMember record (everything else is Admin-only).
+SELF_EDITABLE_FIELDS = {"full_name", "slack_handle", "avatar_url", "additional_emails"}
+
+
 class TeamMemberViewSet(viewsets.ModelViewSet):
     """Team members scoped to teams the current user belongs to."""
 
@@ -314,10 +321,22 @@ class TeamMemberViewSet(viewsets.ModelViewSet):
         # linked Django user). Only staff may create/update/delete them.
         # The `documents` action is exempt — it enforces its own self-or-staff
         # check, since a member may add docs to their own profile.
-        if getattr(self, "action", None) == "documents":
+        if getattr(self, "action", None) in ("documents", "assign_timezone", "add_email"):
             return
-        if request.method not in SAFE_METHODS and not request.user.is_staff:
-            raise PermissionDenied("Only staff users may modify team members.")
+        if request.method in SAFE_METHODS or is_admin(request.user):
+            return
+        # A member may edit their own card, but only the personal fields: the title,
+        # department, manager and login link decide how the org sees them.
+        if request.method in ("PUT", "PATCH") and self._is_own_record(request):
+            blocked = set(request.data.keys()) - SELF_EDITABLE_FIELDS
+            if not blocked:
+                return
+            raise PermissionDenied("Only an Admin may change: " + ", ".join(sorted(blocked)) + ".")
+        raise PermissionDenied("Only Admins may modify team members.")
+
+    def _is_own_record(self, request) -> bool:
+        pk = self.kwargs.get("pk")
+        return bool(pk) and TeamMember.objects.filter(pk=pk, user=request.user).exists()
 
     def get_queryset(self):
         # Staff can see all (unless override disabled); regular users see:
@@ -333,7 +352,7 @@ class TeamMemberViewSet(viewsets.ModelViewSet):
                 | models.Q(user__memberships__team_id__in=user_team_ids)
                 | models.Q(user__isnull=True)
             ).distinct()
-        qs = qs.prefetch_related("tags").select_related("manager", "user")
+        qs = qs.prefetch_related("tags").select_related("manager", "user", "user__profile", "assigned_timezone_by")
         status_filter = self.request.query_params.get("status")
         department = self.request.query_params.get("department")
         tag = self.request.query_params.get("tag")
@@ -344,6 +363,93 @@ class TeamMemberViewSet(viewsets.ModelViewSet):
         if tag:
             qs = qs.filter(tags__name__icontains=tag)
         return qs
+
+    @action(detail=True, methods=["post"], url_path="add-email")
+    def add_email(self, request, pk=None):
+        """
+        Record another address for a team member (e.g. the Segment address a colleague was invited
+        under), so a calendar guest using it is recognised as them. Body: {"email": "..."}.
+
+        PM and above, or the member themselves: an address decides who a guest "is", so a Basic user
+        cannot attach one to someone else. Unscoped lookup like `assign_timezone` (the chip is already
+        on the account). An address another member already uses is refused, never moved.
+        """
+        from core.mixins import is_pm_or_above
+        from django.core.exceptions import ValidationError as DjangoValidationError
+        from django.core.validators import validate_email
+        from team.emails import all_emails
+
+        member = get_object_or_404(TeamMember.objects.select_related("user", "manager"), pk=pk)
+        if not (is_pm_or_above(request.user) or member.user_id == request.user.id):
+            raise PermissionDenied("Only a PM or Admin can add an email address to someone else.")
+        raw = request.data.get("email")
+        email = raw.strip().lower() if isinstance(raw, str) else ""
+        try:
+            validate_email(email)
+        except DjangoValidationError:
+            return Response({"email": ["Enter a valid email address."]}, status=400)
+        if email in {e.lower() for e in all_emails(member)}:
+            return Response(self.get_serializer(member).data)
+        clash = TeamMember.objects.exclude(pk=member.pk).filter(
+            models.Q(email__iexact=email) | models.Q(additional_emails__icontains=f'"{email}"')
+        )
+        if clash.exists():
+            return Response({"email": ["Another team member already uses this address."]}, status=409)
+        if len(member.additional_emails or []) >= 10:
+            return Response({"email": ["At most 10 additional addresses."]}, status=400)
+        member.additional_emails = [*(member.additional_emails or []), email]
+        member.save(update_fields=["additional_emails", "updated_at"])
+        from airtable_sync.team_push import push_member
+        push_member(member)
+        return Response(self.get_serializer(member).data)
+
+    @action(detail=True, methods=["post"], url_path="assign-timezone")
+    def assign_timezone(self, request, pk=None):
+        """
+        Record a time zone for a colleague who has not set their own.
+
+        Precedence: the person's own profile zone always wins, so nothing can be assigned while
+        it is set. An assignment can only be changed or cleared (blank `timezone`) by whoever made
+        it, or an Admin. Looked up unscoped like `documents`: the chip is already on the account.
+        """
+        member = get_object_or_404(
+            TeamMember.objects.select_related("user", "user__profile", "assigned_timezone_by"), pk=pk
+        )
+        if member.user_id == request.user.id:
+            raise PermissionDenied("Set your own time zone in Settings.")
+        zone = str(request.data.get("timezone", "") or "").strip()
+        if zone and zone not in available_timezones():
+            return Response({"timezone": ["Unknown time zone."]}, status=400)
+        _, source = member.timezone_with_source()
+        if source == "self":
+            return Response(
+                {"detail": "This person has set their own time zone; it cannot be assigned."},
+                status=409,
+            )
+        if source == "assigned":
+            if not (member.assigned_timezone_by_id == request.user.id or is_admin(request.user)):
+                return Response({"detail": "A time zone is already set for this person."}, status=409)
+        elif not zone:
+            return Response({"timezone": ["Choose a time zone."]}, status=400)
+        before = member.assigned_timezone
+        member.assigned_timezone = zone
+        member.assigned_timezone_by = request.user if zone else None
+        member.assigned_timezone_at = timezone.now() if zone else None
+        member.save(update_fields=["assigned_timezone", "assigned_timezone_by", "assigned_timezone_at", "updated_at"])
+        if before != zone:
+            from realtime.sync import publish_activity_event
+
+            try:
+                publish_activity_event(
+                    request.user,
+                    "team_member.timezone_assigned",
+                    f"**Time zone** for {member.full_name} " + (f'set to "{zone}"' if zone else f'cleared (was "{before}")'),
+                    detail=member.full_name,
+                    metadata={"resource": {"type": "team_member", "id": str(member.pk)}, "from": before, "to": zone},
+                )
+            except Exception:  # noqa: BLE001 - the log must never fail the save
+                pass
+        return Response(self.get_serializer(member).data)
 
     @action(detail=True, methods=["get", "post"], url_path="documents")
     def documents(self, request, pk=None):

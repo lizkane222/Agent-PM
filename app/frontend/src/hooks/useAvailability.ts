@@ -8,7 +8,7 @@ import type { PersonAvailability } from "../lib/availability";
  * history warns against). Not a `useResource` hook: the response is a keyed object for a
  * caller-chosen set of people, not an entity list.
  */
-export function useAvailability(emails: string[], range: { start: string; end: string } | null) {
+export function useAvailability(emails: string[], range: { start: string; end: string } | null, opts: { includeSelf?: boolean } = {}) {
   const [people, setPeople] = useState<PersonAvailability[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -19,7 +19,7 @@ export function useAvailability(emails: string[], range: { start: string; end: s
     if (!range || emails.length === 0) { setPeople([]); setError(null); return; }
     let cancelled = false;
     setLoading(true);
-    schedulerApi.getAvailability(emails, range.start, range.end)
+    schedulerApi.getAvailability(emails, range.start, range.end, opts)
       .then(({ data }) => { if (!cancelled) { setPeople(data.people); setError(null); } })
       .catch((err: unknown) => {
         if (cancelled) return;
@@ -30,7 +30,7 @@ export function useAvailability(emails: string[], range: { start: string; end: s
     return () => { cancelled = true; };
   // `key` stands in for `emails`, whose identity changes every render.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key, range?.start, range?.end, tick]);
+  }, [key, range?.start, range?.end, tick, opts.includeSelf]);
 
   const refetch = useCallback(() => setTick((t) => t + 1), []);
   return { people, loading, error, refetch };

@@ -9,6 +9,7 @@ import type {
   AirtableMeeting,
   CustomerContact,
   ProjectMember,
+  AccountTicket,
 } from "../../types";
 
 export const mockAccount: Account = {
@@ -23,6 +24,7 @@ export const mockAccount: Account = {
   owner_username: "alice",
   primary_contact: null,
   primary_contact_name: null,
+  primary_contact_text: "",
   team_members: [],
   notes_count: 1,
   created_by: 1,
@@ -51,6 +53,7 @@ export const mockContact: CustomerContact = {
   email: "bob@acme.com",
   team: "",
   is_main_poc: false,
+  timezone: "",
   airtable_id: "",
   notes_count: 0,
   notes: [],
@@ -180,7 +183,61 @@ export function activityLogResponse(rows: Array<Record<string, unknown>> = []) {
   return { counts, results: rows };
 }
 
+export const mockTicket: AccountTicket = {
+  id: 501,
+  account: 1,
+  account_name: "Acme Corp",
+  kind: "jira",
+  url: "https://jira.example.com/browse/ENG-1",
+  external_key: "ENG-1",
+  title: "Segment sync fails",
+  status: "open",
+  notes: "",
+  source_created_at: "2026-03-01T10:00:00Z",
+  source_updated_at: "2026-03-02T11:30:00Z",
+  resolved_at: null,
+  created_at: "2026-03-03T00:00:00Z",
+  updated_at: "2026-03-03T00:00:00Z",
+  created_by_username: "alice",
+  found_by_username: "",
+  review_state: "confirmed",
+  source_subject: "",
+  source_sender: "",
+  source_snippet: "",
+};
+
+export const mockTicketToReview: AccountTicket = {
+  ...mockTicket,
+  id: 502,
+  account: null,
+  account_name: "",
+  kind: "zendesk",
+  url: "https://support.example.com/tickets/77",
+  external_key: "77",
+  title: "Login broken",
+  review_state: "needs_review",
+  found_by_username: "alice",
+  source_subject: "[Zendesk] Ticket 77",
+  source_sender: "support@example.com",
+  source_snippet: "A customer reports login errors",
+};
+
 export const accountHandlers = [
+  // Tickets: default is an empty list so pages that mount the sections need no override.
+  http.get("/api/v1/accounts/tickets/", () => HttpResponse.json({ count: 0, next: null, previous: null, results: [] })),
+  http.post("/api/v1/accounts/tickets/", async ({ request }) => {
+    const body = (await request.json()) as Partial<AccountTicket>;
+    return HttpResponse.json({ ...mockTicket, id: 503, ...body }, { status: 201 });
+  }),
+  http.post("/api/v1/accounts/tickets/:id/assign/", async ({ request, params }) => {
+    const body = (await request.json()) as Partial<AccountTicket>;
+    return HttpResponse.json({ ...mockTicketToReview, id: Number(params.id), account: body.account ?? null, review_state: "confirmed" });
+  }),
+  http.patch("/api/v1/accounts/tickets/:id/", async ({ request, params }) => {
+    const body = (await request.json()) as Partial<AccountTicket>;
+    return HttpResponse.json({ ...mockTicket, id: Number(params.id), ...body });
+  }),
+  http.delete("/api/v1/accounts/tickets/:id/", () => new HttpResponse(null, { status: 204 })),
   http.get("/api/v1/accounts/accounts/:id/activity-log/", () => HttpResponse.json(activityLogResponse())),
   http.get("/api/v1/accounts/accounts/", () =>
     HttpResponse.json({ count: 1, next: null, previous: null, results: [mockAccount] })
@@ -203,6 +260,11 @@ export const accountHandlers = [
   ),
   http.get("/api/v1/accounts/accounts/:id/calendar-events/", () =>
     HttpResponse.json([])
+  ),
+  // 404 = "no server timeline": the page falls back to its per-account fetches. Tests of
+  // the Mine/Team timeline override this.
+  http.get("/api/v1/accounts/accounts/:id/timeline/", () =>
+    new HttpResponse(null, { status: 404 })
   ),
   http.get("/api/v1/accounts/accounts/:id/reminders/", () =>
     HttpResponse.json([])

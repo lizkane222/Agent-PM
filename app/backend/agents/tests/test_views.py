@@ -205,6 +205,28 @@ class AgentSendStreamTest(APITestCase):
             body = _consume(resp).decode()
         self.assertIn('"model": "bedrock-opus"', body)
 
+    def test_sentinel_reports_the_cost_of_the_turn(self):
+        self.client.force_authenticate(user=self.user)
+        items = ["x", _usage(input_tokens=1_000_000, output_tokens=0)]
+        with patch("agents.views.AgentOrchestrator", _fake_orchestrator(items=items)):
+            resp = self.client.post(SEND_URL, {"message": "hi"}, format="json")
+            body = _consume(resp).decode()
+        from agents import token_budget
+        expected = token_budget.usage_usd(1_000_000, 0)
+        self.assertIn(f'"cost_usd": "{expected}"', body)
+
+    def test_session_messages_carry_a_cost(self):
+        self.client.force_authenticate(user=self.user)
+        s = _make_session(self.user, "priced")
+        AgentMessage.objects.create(session=s, role="assistant", content="a",
+                                    input_tokens=1_000_000, output_tokens=1_000_000)
+        AgentMessage.objects.create(session=s, role="user", content="q")
+        resp = self.client.get(SESSIONS_URL)
+        msgs = {m["role"]: m for r in resp.data["results"] if r["id"] == s.id for m in r["messages"]}
+        from agents import token_budget
+        self.assertEqual(msgs["assistant"]["cost_usd"], str(token_budget.usage_usd(1_000_000, 1_000_000)))
+        self.assertEqual(msgs["user"]["cost_usd"], "0.0000")
+
     def test_session_id_header_and_persisted_messages(self):
         self.client.force_authenticate(user=self.user)
         items = ["All ", "done", _usage(input_tokens=3, output_tokens=4)]

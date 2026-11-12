@@ -8,11 +8,54 @@ import {
   CALENDAR_DRAG_EVENT_KEY,
 } from "./calendarHelpers";
 
+/** How long the two recurring-meeting buttons glow after the sidebar opens. */
+export const OPTION_GLOW_MS = 2000;
+
+/** A radio-style on/off switch whose label is part of the click target. `radioFirst` puts the dot before the text. */
+function OptionToggle({ label, text, on, glow, radioFirst, onChange }: {
+  label: string; text: string; on: boolean; glow: boolean; radioFirst: boolean; onChange?: (on: boolean) => void;
+}) {
+  const radio = (
+    <span
+      aria-hidden="true"
+      className={[
+        "h-3.5 w-3.5 shrink-0 rounded-full border-2 flex items-center justify-center transition-colors",
+        on ? "border-indigo-600" : "border-gray-400",
+      ].join(" ")}
+    >
+      {on && <span className="h-1.5 w-1.5 rounded-full bg-indigo-600" />}
+    </span>
+  );
+  return (
+    <button
+      type="button"
+      role="checkbox"
+      aria-checked={on}
+      aria-label={label}
+      data-glow={glow ? "true" : "false"}
+      onClick={() => onChange?.(!on)}
+      className={[
+        "flex items-center gap-1.5 rounded-full px-2 py-1 transition-all duration-500",
+        on ? "text-indigo-700" : "text-[var(--twilio-navy)] hover:text-indigo-600",
+        glow ? "ring-2 ring-indigo-400 shadow-[0_0_12px_3px_rgba(99,102,241,0.55)]" : "",
+      ].join(" ")}
+    >
+      {radioFirst && radio}
+      <span>{text}</span>
+      {!radioFirst && radio}
+    </button>
+  );
+}
+
 export default function AccountsSidebar({
   open,
   onToggle,
   eventAccountLinks: _eventAccountLinks,
   onLink,
+  updateHistorical = false,
+  onUpdateHistoricalChange,
+  updateSubsequent = false,
+  onUpdateSubsequentChange,
   selectedAccountName,
   onSelectAccount,
   logTimeModeAccount,
@@ -26,6 +69,11 @@ export default function AccountsSidebar({
   onToggle: () => void;
   eventAccountLinks: Map<string, { accountName: string; accountId: number }>;
   onLink: (accountId: number, accountName: string, eventUid?: string) => void;
+  /** Recurring meetings: also link earlier / later synced instances when an account is assigned. */
+  updateHistorical?: boolean;
+  onUpdateHistoricalChange?: (on: boolean) => void;
+  updateSubsequent?: boolean;
+  onUpdateSubsequentChange?: (on: boolean) => void;
   selectedAccountName: string | null;
   onSelectAccount: (name: string | null) => void;
   logTimeModeAccount: string | null;
@@ -39,6 +87,14 @@ export default function AccountsSidebar({
   const [accounts, setAccounts] = useState<AirtableAccount[]>([]);
   const [dropTargetId, setDropTargetId] = useState<number | null>(null);
   const [draggingId, setDraggingId] = useState<number | null>(null);
+  // A brief glow each time the panel opens, so the two recurring-meeting options get noticed.
+  const [glow, setGlow] = useState(false);
+  useEffect(() => {
+    if (!open) return;
+    setGlow(true);
+    const t = window.setTimeout(() => setGlow(false), OPTION_GLOW_MS);
+    return () => window.clearTimeout(t);
+  }, [open]);
 
   useEffect(() => {
     Promise.all([
@@ -148,6 +204,11 @@ export default function AccountsSidebar({
         <p className="px-4 pb-2 text-[11px] text-[var(--twilio-gray-60)]">
           Drag an account onto a calendar event · or drag an event onto an account
         </p>
+        <div className="flex items-center justify-between px-1.5 pb-2 text-[11px] font-semibold" role="group" aria-label="Recurring meetings">
+          <OptionToggle label="update historical" text="historical" radioFirst on={updateHistorical} glow={glow} onChange={onUpdateHistoricalChange} />
+          <span className="text-[var(--twilio-gray-60)] whitespace-nowrap" aria-hidden="true">← recurring →</span>
+          <OptionToggle label="update subsequent recurring" text="future" radioFirst={false} on={updateSubsequent} glow={glow} onChange={onUpdateSubsequentChange} />
+        </div>
         <div className="flex-1 overflow-y-auto px-3 pb-3 space-y-2">
           {accounts.filter((acct) => !!acct.name).map((acct) => {
             const isSelected = selectedAccountName === acct.name;

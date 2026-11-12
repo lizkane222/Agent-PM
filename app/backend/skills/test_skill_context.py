@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from rest_framework.test import APITestCase
 
 from accounts.models import Account
@@ -509,3 +509,192 @@ class GenericVoiceLaunchTests(APITestCase):
         self.assertIn("Call Recordings", got["script"])
         self.assertEqual(got["skill_name"], "")
         self.assertEqual(got["allowed_tools"], [])
+
+
+GEN_CSAT_LIKE = (
+    "Meeting notes: @#--all-meeting-notes-${account_name}-${date_range}\n"
+    "Action items: @#--all-action-items-${account_name}\n"
+    "Artifacts: @#--all-artifacts-${account_name}\n"
+)
+
+
+class PlaceholderKeywordTests(TestCase):
+    def test_account_and_range_placeholders_are_flagged(self):
+        [kw] = keywords.find_keywords("@#--all-meeting-notes-${account_name}-${date_range}")
+        self.assertTrue(kw["account_placeholder"])
+        self.assertTrue(kw["range_placeholder"])
+
+    def test_the_pickers_own_markers_count_too(self):
+        [kw] = keywords.find_keywords("@#--all-account-notes-${account_name}-${date-range}")
+        self.assertTrue(kw["account_placeholder"])
+        self.assertTrue(kw["range_placeholder"])
+
+    def test_a_braced_real_value_is_not_a_placeholder(self):
+        [kw] = keywords.find_keywords("@#--all-meeting-notes-${Acme}-${october}")
+        self.assertFalse(kw["account_placeholder"])
+        self.assertFalse(kw["range_placeholder"])
+
+    def test_an_unbraced_value_is_not_a_placeholder(self):
+        [kw] = keywords.find_keywords("@#--all-meeting-notes-acme-last-30-days")
+        self.assertFalse(kw["account_placeholder"])
+
+
+class PlaceholderRunTests(APITestCase):
+    """The reported bug: running a skill whose instructions use ${account_name} / ${date_range} on a chosen
+    account said "No account of yours matches 'account_name'" and "Could not read the date range 'date_range'"."""
+
+    def setUp(self):
+        self.owner = User.objects.create_user("ph_owner", password="x")
+        member = TeamMember.objects.create(user=self.owner, full_name="O", email="po@example.com")
+        self.acme = Account.objects.create(company_name="Acme Corp")
+        self.globex = Account.objects.create(company_name="Globex")
+        self.hidden = Account.objects.create(company_name="Hidden Inc")
+        self.acme.team_members.add(member)
+        self.globex.team_members.add(member)
+        self.client.force_authenticate(self.owner)
+        self.skill = _skill(self.owner, name="gen-csat", instructions=GEN_CSAT_LIKE,
+                            context_defaults={"needs_accounts": True})
+
+    def _run(self, body, skill=None):
+        return self.client.post(f"{URL}{(skill or self.skill).pk}/run/", body, format="json")
+
+    def test_no_unresolved_placeholder_warnings_for_a_chosen_account(self):
+        r = self._run({"account_ids": [self.acme.pk]})
+        self.assertEqual(r.status_code, 200, r.data)
+        text = " ".join(r.data["warnings"])
+        self.assertNotIn("account_name", text)
+        self.assertNotIn("date_range", text)
+        self.assertEqual(r.data["warnings"], [])
+
+    def test_the_lookups_run_for_the_chosen_account(self):
+        p = self._run({"account_ids": [self.acme.pk]}).data["prompt"]
+        self.assertIn("Meeting notes for Acme Corp", p)
+        self.assertIn("Action items for Acme Corp", p)
+        self.assertIn("Artifacts for Acme Corp", p)
+
+    def test_the_range_defaults_to_the_last_30_days_and_says_so(self):
+        p = self._run({"account_ids": [self.acme.pk]}).data["prompt"]
+        start, end = keywords.parse_date_range(keywords.DEFAULT_RANGE)
+        self.assertEqual((end - start).days, 30)
+        self.assertIn(f"Meeting notes for Acme Corp ({start.isoformat()} to {end.isoformat()})", p)
+
+    def test_a_range_the_runner_gives_is_used(self):
+        p = self._run({"account_ids": [self.acme.pk], "date_range": "2026-10-01..2026-10-31"}).data["prompt"]
+        self.assertIn("Meeting notes for Acme Corp (2026-10-01 to 2026-10-31)", p)
+
+    def test_a_range_by_month_name(self):
+        p = self._run({"account_ids": [self.acme.pk], "date_range": "october"}).data["prompt"]
+        self.assertIn("-10-01 to ", p)
+
+    def test_an_unreadable_range_is_refused_with_help(self):
+        r = self._run({"account_ids": [self.acme.pk], "date_range": "whenever"})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("Could not read the date range 'whenever'", str(r.data))
+
+    def test_several_accounts_each_get_their_own_lookup(self):
+        p = self._run({"account_ids": [self.acme.pk, self.globex.pk]}).data["prompt"]
+        for name in ("Acme Corp", "Globex"):
+            self.assertIn(f"Meeting notes for {name}", p)
+            self.assertIn(f"Artifacts for {name}", p)
+
+    def test_an_account_the_runner_is_not_on_is_never_looked_up(self):
+        r = self._run({"account_ids": [self.acme.pk, self.hidden.pk]})
+        self.assertNotIn("Hidden Inc", r.data["prompt"])
+
+    def test_without_an_account_the_placeholder_lookup_says_to_choose_one(self):
+        s = _skill(self.owner, name="no-need", instructions="@#--all-artifacts-${account_name}")
+        r = self._run({}, skill=s)
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(any("Choose an account" in w for w in r.data["warnings"]))
+
+    def test_a_literal_account_in_a_keyword_still_works_as_before(self):
+        s = _skill(self.owner, name="literal", instructions="@#--all-artifacts-acme")
+        r = self._run({}, skill=s)
+        self.assertIn("Artifacts for Acme Corp", r.data["prompt"])
+
+    def test_a_literal_range_in_a_keyword_is_not_overridden_by_the_runner(self):
+        s = _skill(self.owner, name="fixedrange", instructions="@#--all-meeting-notes-${account_name}-${2026-10}")
+        p = self._run({"account_ids": [self.acme.pk], "date_range": "2025-01"}, skill=s).data["prompt"]
+        self.assertIn("(2026-10-01 to 2026-10-31)", p)
+
+    def test_voice_start_gets_the_same_substitution(self):
+        r = self.client.post(f"{URL}{self.skill.pk}/voice-start/", {"account_ids": [self.acme.pk]}, format="json")
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertEqual([w for w in r.data.get("warnings", []) if "account_name" in w or "date_range" in w], [])
+
+
+class ArtifactLookupOnARealServerTests(APITestCase):
+    """The reported 400: running a skill whose lookups include an account's artifacts failed for any account that
+    had an uploaded file (the bridge asked for a host the server does not allow)."""
+
+    def setUp(self):
+        from accounts.models import AccountArtifact
+
+        self.owner = User.objects.create_user("host_owner", password="x")
+        member = TeamMember.objects.create(user=self.owner, full_name="H", email="h@example.com")
+        self.account = Account.objects.create(company_name="Files Inc")
+        self.account.team_members.add(member)
+        AccountArtifact.objects.create(
+            account=self.account, artifact_type="file", name="deck.pdf", uploaded_by=self.owner,
+            file=SimpleUploadedFile("deck.pdf", b"%PDF-1.4 test", content_type="application/pdf"))
+        self.skill = _skill(self.owner, name="uses-artifacts", instructions="@#--all-artifacts-${account_name}",
+                            context_defaults={"needs_accounts": True})
+        self.client.force_authenticate(self.owner)
+
+    @override_settings(ALLOWED_HOSTS=["localhost", "127.0.0.1"])
+    def test_run_succeeds_and_lists_the_file(self):
+        r = self.client.post(f"{URL}{self.skill.pk}/run/", {"account_ids": [self.account.pk]}, format="json",
+                             HTTP_HOST="localhost")
+        self.assertEqual(r.status_code, 200, getattr(r, "content", b"")[:200])
+        self.assertEqual(r.data["warnings"], [])
+        self.assertIn("Artifacts for Files Inc — 1 found", r.data["prompt"])
+        self.assertIn("name: deck.pdf", r.data["prompt"])
+
+    @override_settings(ALLOWED_HOSTS=["localhost", "127.0.0.1"])
+    def test_voice_start_succeeds_too(self):
+        r = self.client.post(f"{URL}{self.skill.pk}/voice-start/", {"account_ids": [self.account.pk]}, format="json",
+                             HTTP_HOST="localhost")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.data["warnings"], [])
+
+    def test_one_failing_lookup_is_reported_not_fatal(self):
+        s = _skill(self.owner, name="two-lookups", instructions="@#--all-artifacts-${Files Inc}\n@#--all-account-notes-${Files Inc}")
+        real = keywords.rest_bridge.call
+
+        def flaky(user, method, path, **kw):
+            if path.endswith("/artifacts/"):
+                raise RuntimeError("boom with a secret: sk-12345")
+            return real(user, method, path, **kw)
+
+        with patch("skills.keywords.rest_bridge.call", side_effect=flaky):
+            r = self.client.post(f"{URL}{s.pk}/run/", {}, format="json")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("Notes for Files Inc", r.data["prompt"].replace("Account notes", "Notes"))
+        self.assertTrue(any("Couldn't look up artifacts" in w for w in r.data["warnings"]))
+        # No exception text reaches the person or the prompt.
+        self.assertNotIn("sk-12345", str(r.data))
+
+
+class QuarterAndYearRangeTests(TestCase):
+    def span(self, text, today):
+        return keywords.parse_date_range(text, today)
+
+    def test_this_quarter(self):
+        self.assertEqual(self.span("this-quarter", date(2026, 11, 11)), (date(2026, 10, 1), date(2026, 12, 31)))
+        self.assertEqual(self.span("this quarter", date(2026, 1, 15)), (date(2026, 1, 1), date(2026, 3, 31)))
+        self.assertEqual(self.span("this-quarter", date(2026, 3, 31)), (date(2026, 1, 1), date(2026, 3, 31)))
+        self.assertEqual(self.span("this-quarter", date(2026, 4, 1)), (date(2026, 4, 1), date(2026, 6, 30)))
+
+    def test_last_quarter_including_across_a_year(self):
+        self.assertEqual(self.span("last-quarter", date(2026, 11, 11)), (date(2026, 7, 1), date(2026, 9, 30)))
+        self.assertEqual(self.span("last-quarter", date(2026, 1, 15)), (date(2025, 10, 1), date(2025, 12, 31)))
+
+    def test_this_and_last_year(self):
+        self.assertEqual(self.span("this-year", date(2026, 11, 11)), (date(2026, 1, 1), date(2026, 12, 31)))
+        self.assertEqual(self.span("Last Year", date(2026, 11, 11)), (date(2025, 1, 1), date(2025, 12, 31)))
+
+    def test_the_existing_ranges_still_read(self):
+        today = date(2026, 11, 11)
+        for text in ("last-7-days", "last 14 days", "last 30 days", "last 90 days", "this-week", "last-week",
+                     "this-month", "last-month", "october", "2026-10", "2026-10-01..2026-10-31"):
+            self.assertIsNotNone(self.span(text, today), text)

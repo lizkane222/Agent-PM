@@ -105,7 +105,7 @@ export default function PublicSection({ memberId, personName, personEmail, isSel
       </div>
 
       {loading && <p style={{ fontSize: "0.8125rem", color: "var(--text-secondary, #888)" }}>Loading…</p>}
-      {error && <p style={{ fontSize: "0.8125rem", color: "#b91c1c" }}>Could not load the public section.</p>}
+      {error && <p style={{ fontSize: "0.8125rem", color: "var(--ink-red)" }}>Could not load the public section.</p>}
       {!loading && !error && data.length === 0 && (
         <div style={{ ...card, borderStyle: "dashed", fontSize: "0.8125rem", color: "var(--text-secondary, #888)" }}>
           {isSelf ? "Nothing public yet. Add something others can see on your profile." : `${first} hasn't shared anything yet.`}
@@ -129,7 +129,7 @@ export default function PublicSection({ memberId, personName, personEmail, isSel
               </div>
               <div style={{ fontSize: "0.875rem", overflowWrap: "anywhere" }}>{open(item)}</div>
               {item.item_type === "note" && item.body && (
-                <div style={{ fontSize: "0.8125rem", maxHeight: 120, overflow: "hidden" }} dangerouslySetInnerHTML={{ __html: sanitizeHtml(plainToHtml(item.body)) }} />
+                <div className="rich-text" style={{ fontSize: "0.8125rem", maxHeight: 120, overflow: "hidden" }} dangerouslySetInnerHTML={{ __html: sanitizeHtml(plainToHtml(item.body)) }} />
               )}
             </div>
           ))}

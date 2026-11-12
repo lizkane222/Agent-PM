@@ -111,7 +111,13 @@ class UserPageNoteViewSet(viewsets.ModelViewSet):
     serializer_class = UserPageNoteSerializer
 
     def get_queryset(self):
-        return UserPageNote.objects.filter(owner=self.request.user)
+        qs = UserPageNote.objects.filter(owner=self.request.user).select_related("account")
+        account = self.request.query_params.get("account")
+        if account:
+            # Notes the caller linked to one account (shown under that account's Account Notes).
+            # Always owner-scoped above; a non-numeric value narrows to nothing, not everything.
+            qs = qs.filter(account_id=int(account)) if account.isdigit() else qs.none()
+        return qs
 
     def perform_create(self, serializer):
         serializer.save(owner=self.request.user)

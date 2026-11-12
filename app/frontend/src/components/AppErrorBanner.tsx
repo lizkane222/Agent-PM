@@ -30,7 +30,7 @@ export default function AppErrorBanner({ errors, onDismiss }: Props) {
           role="alert"
           style={{
             pointerEvents: "auto",
-            background: "#fff",
+            background: "var(--surface-card)",
             border: "1px solid #fca5a5",
             borderLeft: "4px solid #ef4444",
             borderRadius: "0.5rem",
@@ -52,8 +52,8 @@ export default function AppErrorBanner({ errors, onDismiss }: Props) {
                   fontSize: "0.625rem",
                   fontWeight: 600,
                   lineHeight: "1.5rem",
-                  background: "#fee2e2",
-                  color: "#b91c1c",
+                  background: "var(--tint-red-100)",
+                  color: "var(--ink-red)",
                   textTransform: "uppercase",
                   letterSpacing: "0.05em",
                 }}
@@ -74,7 +74,7 @@ export default function AppErrorBanner({ errors, onDismiss }: Props) {
               border: "none",
               cursor: "pointer",
               padding: "0.125rem 0.25rem",
-              color: "#9ca3af",
+              color: "var(--text-gray-400)",
               lineHeight: 1,
               fontSize: "1.125rem",
             }}

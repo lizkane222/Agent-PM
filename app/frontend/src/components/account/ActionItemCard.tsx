@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { useStatusLabels } from "../../hooks/useStatusLabels";
 import { ASSIGN_MEMBER_DRAG_TYPE, assignActionItemToMember, readMemberDragData } from "../../lib/actionItemAssign";
 import type { AirtableActionItem, AirtableMeeting, TeamMember } from "../../types";
 import { airtableApi } from "../../lib/api";
@@ -56,6 +57,7 @@ export function ActionItemCard({
   onMeetingClick?: () => void;
   contextMenuItems?: ContextMenuItem[];
 }) {
+  const { label: statusLabel } = useStatusLabels();
   const [modalOpen, setModalOpen] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [dropFlash, setDropFlash] = useState(false);
@@ -164,7 +166,7 @@ export function ActionItemCard({
         className="rounded-lg select-none flex flex-col gap-1.5 cursor-pointer hover:shadow-md transition-shadow shrink-0"
         style={{
           position: "relative",
-          background: dropFlash || assignFlash ? "#f0fdf4" : dragOver ? "#eef2ff" : "#F4F4F6",
+          background: dropFlash || assignFlash ? "var(--tint-green-50)" : dragOver ? "var(--tint-indigo-50)" : "var(--surface-subtle-4)",
           borderLeft: `3px solid ${accent}`,
           outline: dragOver ? "2px solid #6366f1" : "none",
           outlineOffset: "-1px",
@@ -183,7 +185,7 @@ export function ActionItemCard({
           </p>
         )}
         <div className="flex flex-wrap gap-1">
-          <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${STATUS_PILLS[item.status] ?? "bg-gray-100 text-gray-700"}`}>{item.status}</span>
+          <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${STATUS_PILLS[item.status] ?? "bg-gray-100 text-gray-700"}`}>{statusLabel(item.status)}</span>
           <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${PRIORITY_COLORS[item.priority] ?? ""}`}>{item.priority}</span>
           {item.due_date && (
             <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-amber-50 text-amber-700">

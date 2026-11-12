@@ -13,6 +13,8 @@ export interface TeamMember {
   username?: string | null;
   full_name: string;
   email: string;
+  /** Other addresses (Segment, SendGrid…). `email` stays the primary. */
+  additional_emails?: string[];
   title: string;
   department: string;
   tags: Tag[];
@@ -21,6 +23,11 @@ export interface TeamMember {
   slack_handle: string;
   avatar_url: string;
   joined_at: string | null;
+  /** Effective IANA zone: the person's own setting if set, else one someone assigned, else "". */
+  timezone?: string;
+  timezone_source?: "self" | "assigned" | "";
+  /** Username of whoever assigned the zone; only present while the assignment is in force. */
+  assigned_by_username?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -58,11 +65,15 @@ export interface UserProfile {
   notify_default_slack: boolean;
   notify_default_push: boolean;
   notify_default_sms: boolean;
+  /** Whether teammates may add me as a recipient of their reminders. */
+  allow_reminders_from_others: boolean;
   push_subscription_active: boolean;
   staff_view_override: boolean;
   /** Authorisation tier. Read-only on /me/; Admins change it via teamApi.setAccessLevel. */
   access_level?: "basic" | "pm" | "admin";
   calendar_colors?: CalendarColorPrefs;
+  /** Display-name preference per action-item status (display only). */
+  status_labels?: Partial<Record<"Open" | "In Progress" | "Blocked" | "Done" | "Backlogged", string>>;
   gmail_watch_config?: GmailWatchConfig;
 }
 
@@ -101,6 +112,12 @@ export interface AppNotification {
   status: "sent" | "failed" | "skipped";
   read_at: string | null;
   created_at: string;
+  /** For a reminder notification: the reminder that fired (null once it is deleted)… */
+  reminder: number | null;
+  /** …the moment that fired it (its due time, or the start of one of its calendar blocks)… */
+  fired_for: string | null;
+  /** …and whether this person owns it. Someone notified through a teammate's reminder can only acknowledge. */
+  can_snooze: boolean;
 }
 
 export type PublicItemType = "artifact_link" | "artifact_file" | "note" | "record_ref";

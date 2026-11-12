@@ -215,6 +215,10 @@ class AgentOrchestrator:
         # The saved workflow active in this turn, if `load_skill` has run (see
         # _dispatch_in_scope). One orchestrator handles one user turn.
         self.skill_scope = None
+        # The skills.SkillRun this turn belongs to, when a saved skill launched it. Like
+        # skill_scope it lives here and is set around each dispatch, because each tool runs in
+        # its own task with a copied context.
+        self.skill_run_id: str | None = None
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -260,6 +264,7 @@ class AgentOrchestrator:
         user_message: str,
         conversation_history: list[dict] | None = None,
         user=None,
+        skill_run_id: str | None = None,
     ) -> AsyncIterator[str]:
         """
         Async generator that yields text chunks as Claude streams them.
@@ -277,6 +282,7 @@ class AgentOrchestrator:
         user:
             Django User instance for Sync feed publishing (optional).
         """
+        self.skill_run_id = skill_run_id
         history = self._sanitize_history(list(conversation_history or []))
         messages: list[dict] = history
         messages.append({"role": "user", "content": user_message})
@@ -474,12 +480,14 @@ class AgentOrchestrator:
         asyncio task with a copied context, so a value set inside one would vanish the
         moment that task finished.
         """
-        from .tool_policy import SkillScope, active_skill
+        from .tool_policy import SkillScope, active_skill, active_skill_run
 
         token = active_skill.set(self.skill_scope)
+        run_token = active_skill_run.set(self.skill_run_id)
         try:
             result = await mcp_server.dispatch(name, arguments, user=user)
         finally:
+            active_skill_run.reset(run_token)
             active_skill.reset(token)
         if name == "load_skill" and isinstance(result, dict) and result.get("instructions"):
             self.skill_scope = SkillScope(

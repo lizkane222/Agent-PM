@@ -25,6 +25,7 @@ const TYPE_LABELS: Record<CommentResourceType, string> = {
   claude_skill: "Skills",
   goal: "Goals",
   project: "Projects",
+  account_ticket: "Tickets",
 };
 
 // Meetings first, then the containers, then the work — the order the account page

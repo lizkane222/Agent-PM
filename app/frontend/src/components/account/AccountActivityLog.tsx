@@ -86,7 +86,7 @@ export default function AccountActivityLog({ accountId }: { accountId: number })
           {rows.map((r) => (
             <div key={r.id} className="flex items-start gap-2.5 rounded-lg border border-gray-100 bg-white px-3 py-2 shadow-sm">
               <div className="flex-1 min-w-0">
-                <p className="text-xs leading-snug font-medium" style={{ color: "var(--twilio-navy)" }}>{r.title}</p>
+                <p className="text-xs leading-snug font-medium" style={{ color: "var(--text-ink)" }}>{r.title}</p>
                 {r.body && <p className="text-[11px] mt-0.5 text-gray-500 break-words">{r.body}</p>}
                 <div className="flex flex-wrap gap-2 mt-1 items-center">
                   {r.actor && <span className="text-[10px] text-gray-500">by {r.actor}</span>}

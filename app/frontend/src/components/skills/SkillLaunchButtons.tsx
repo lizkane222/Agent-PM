@@ -13,60 +13,93 @@ function errorText(e: unknown, fallback: string): string {
   return (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? fallback;
 }
 
-export function injectToChat(text: string) {
-  window.dispatchEvent(new CustomEvent("chat-inject", { detail: { text } }));
+/** Where the launch happened, so the skill runs for the thing the user is looking at. */
+export interface LaunchContext {
+  /** A pinned-skills page key; recorded on the run in the Console. */
+  page?: string;
+  /** Accounts to run for (e.g. the account page being viewed). */
+  accountIds?: number[];
+}
+
+/** chat = put the prompt in the chat box; run = also send it; voice = start a voice session. */
+export type LaunchMode = "chat" | "run" | "voice";
+
+export function injectToChat(text: string, runId?: string | null, send = false) {
+  window.dispatchEvent(new CustomEvent("chat-inject", { detail: { text, run_id: runId ?? undefined, ...(send ? { send: true } : {}) } }));
 }
 export function launchVoice(detail: VoiceLaunchDetail) {
   window.dispatchEvent(new CustomEvent(VOICE_LAUNCH_EVENT, { detail }));
 }
 
 /**
- * "Use in Chat" + "Use in Voice Session", identical on every Claude Skills tab.
+ * The launch logic shared by the Use in Chat / Use in Voice buttons and the pinned-skill chips.
  *
- * An Agent PM skill that needs input (accounts, free text, templates) opens the run dialog
- * first; one that doesn't launches straight away. Text sources launch immediately.
+ * An Agent PM skill that needs input (templates, or accounts the page didn't supply) opens the run
+ * dialog first; one that doesn't launches straight away. Text sources launch immediately.
  */
-export default function SkillLaunchButtons({
-  source, compact, disabled, disabledReason,
-}: {
-  source: LaunchSource;
-  compact?: boolean;
-  disabled?: boolean;
-  disabledReason?: string;
-}) {
-  const [dialog, setDialog] = useState<"chat" | "voice" | null>(null);
-  const [busy, setBusy] = useState<"chat" | "voice" | null>(null);
+export function useSkillLauncher(source: LaunchSource, context?: LaunchContext) {
+  const [dialog, setDialog] = useState<LaunchMode | null>(null);
+  const [busy, setBusy] = useState<LaunchMode | null>(null);
   const [message, setMessage] = useState<{ text: string; ok: boolean } | null>(null);
 
+  const suppliedAccounts = (context?.accountIds?.length ?? 0) > 0;
   const needsInput = source.kind === "agent-skill" && (
-    !!source.skill.context_defaults?.needs_accounts ||
-    (source.skill.templates?.length ?? 0) > 0
+    (source.skill.templates?.length ?? 0) > 0 ||
+    (!!source.skill.context_defaults?.needs_accounts && !suppliedAccounts)
   );
+  const runInput = {
+    ...(context?.page ? { page: context.page } : {}),
+    ...(suppliedAccounts ? { account_ids: context!.accountIds } : {}),
+  };
 
-  async function go(mode: "chat" | "voice") {
+  async function go(mode: LaunchMode) {
     setMessage(null);
     if (needsInput) { setDialog(mode); return; }
     setBusy(mode);
     try {
       if (source.kind === "text") {
-        if (mode === "chat") { injectToChat(source.chatText); setMessage({ text: "Sent to chat.", ok: true }); }
+        if (mode !== "voice") { injectToChat(source.chatText, null, mode === "run"); setMessage({ text: "Sent to chat.", ok: true }); }
         else {
           const text = source.voiceText ?? source.chatText;
           const { data } = await agentSkillsApi.voiceLaunch(source.title, text);
           launchVoice({ key: data.key, script: data.script, title: source.title });
         }
-      } else if (mode === "chat") {
-        const { data } = await agentSkillsApi.run(source.skill.id);
-        injectToChat(data.prompt);
-        setMessage({ text: "Sent to chat.", ok: true });
+      } else if (mode !== "voice") {
+        const { data } = await agentSkillsApi.run(source.skill.id, runInput);
+        injectToChat(data.prompt, data.run_id, mode === "run");
+        const staged = data.data_staged;
+        setMessage({
+          text: staged
+            ? `Sent to chat. ${staged.characters.toLocaleString()} characters of data are stored for the agent to read in ${staged.parts} part${staged.parts === 1 ? "" : "s"}.`
+            : "Sent to chat.",
+          ok: true,
+        });
       } else {
-        const { data } = await agentSkillsApi.voiceStart(source.skill.id);
+        const { data } = await agentSkillsApi.voiceStart(source.skill.id, runInput);
         launchVoice({ key: data.key, script: data.script, title: source.skill.name });
       }
     } catch (e) {
-      setMessage({ text: errorText(e, mode === "chat" ? "Couldn't send to chat." : "Couldn't start the voice session."), ok: false });
+      setMessage({ text: errorText(e, mode !== "voice" ? "Couldn't send to chat." : "Couldn't start the voice session."), ok: false });
     } finally { setBusy(null); }
   }
+
+  const dialogNode = dialog && source.kind === "agent-skill"
+    ? <SkillRunDialog skill={source.skill} mode={dialog} context={context} onClose={() => setDialog(null)} />
+    : null;
+  return { go, busy, message, dialogNode };
+}
+
+/** "Use in Chat" + "Use in Voice Session", identical on every Claude Skills tab. */
+export default function SkillLaunchButtons({
+  source, compact, disabled, disabledReason, context,
+}: {
+  source: LaunchSource;
+  compact?: boolean;
+  disabled?: boolean;
+  disabledReason?: string;
+  context?: LaunchContext;
+}) {
+  const { go, busy, message, dialogNode } = useSkillLauncher(source, context);
 
   const base: React.CSSProperties = {
     display: "inline-flex", alignItems: "center", gap: "6px", fontFamily: "var(--font-base)", fontWeight: 600,
@@ -87,9 +120,7 @@ export default function SkillLaunchButtons({
         </button>
       </div>
       {message && <span role="status" style={{ fontSize: "0.75rem", color: message.ok ? "#16a34a" : "#dc2626" }}>{message.text}</span>}
-      {dialog && source.kind === "agent-skill" && (
-        <SkillRunDialog skill={source.skill} mode={dialog} onClose={() => setDialog(null)} />
-      )}
+      {dialogNode}
     </div>
   );
 }

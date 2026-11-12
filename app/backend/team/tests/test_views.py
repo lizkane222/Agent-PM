@@ -1,5 +1,7 @@
 """Tests for team.TeamMemberViewSet — _staff_sees_all scoping and CRUD."""
 
+from unittest import mock
+
 from django.contrib.auth import get_user_model
 from rest_framework.test import APITestCase
 
@@ -125,6 +127,56 @@ class TeamMemberWriteTest(APITestCase):
         self.assertEqual(resp.status_code, 200)
         self.member.refresh_from_db()
         self.assertEqual(self.member.title, "Senior Engineer")
+
+    def test_additional_emails_are_saved_lowercased_and_deduped(self):
+        self.client.force_authenticate(user=self.staff)
+        resp = self.client.patch(member_detail_url(self.member.id), {
+            "additional_emails": ["Seg@segment.com", "seg@segment.com", "x@sendgrid.com", "existing@example.com"],
+        }, format="json")
+        self.assertEqual(resp.status_code, 200)
+        self.member.refresh_from_db()
+        # The primary address is not repeated in the list.
+        self.assertEqual(self.member.additional_emails, ["seg@segment.com", "x@sendgrid.com"])
+
+    def test_additional_email_used_by_another_member_is_refused(self):
+        TeamMember.objects.create(full_name="Other", email="other@example.com")
+        self.client.force_authenticate(user=self.staff)
+        resp = self.client.patch(member_detail_url(self.member.id),
+                                 {"additional_emails": ["other@example.com"]}, format="json")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_invalid_additional_email_is_refused(self):
+        self.client.force_authenticate(user=self.staff)
+        resp = self.client.patch(member_detail_url(self.member.id),
+                                 {"additional_emails": ["not-an-email"]}, format="json")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_member_can_edit_own_personal_fields(self):
+        own = TeamMember.objects.create(full_name="Me", email="me@example.com", user=self.regular)
+        self.client.force_authenticate(user=self.regular)
+        resp = self.client.patch(member_detail_url(own.id), {"slack_handle": "me"}, format="json")
+        self.assertEqual(resp.status_code, 200)
+        own.refresh_from_db()
+        self.assertEqual(own.slack_handle, "me")
+
+    def test_member_cannot_change_own_title_or_manager(self):
+        own = TeamMember.objects.create(full_name="Me", email="me@example.com", user=self.regular)
+        self.client.force_authenticate(user=self.regular)
+        for body in ({"title": "CEO"}, {"manager": self.member.id}, {"slack_handle": "x", "department": "d"}):
+            resp = self.client.patch(member_detail_url(own.id), body, format="json")
+            self.assertEqual(resp.status_code, 403, body)
+        own.refresh_from_db()
+        self.assertEqual(own.title, "")
+
+    def test_member_cannot_edit_someone_else(self):
+        self.client.force_authenticate(user=self.regular)
+        resp = self.client.patch(member_detail_url(self.member.id), {"slack_handle": "x"}, format="json")
+        self.assertEqual(resp.status_code, 403)
+
+    def test_member_cannot_delete_own_record(self):
+        own = TeamMember.objects.create(full_name="Me", email="me@example.com", user=self.regular)
+        self.client.force_authenticate(user=self.regular)
+        self.assertEqual(self.client.delete(member_detail_url(own.id)).status_code, 403)
 
     def test_non_staff_delete_returns_403(self):
         self.client.force_authenticate(user=self.regular)
@@ -557,3 +609,250 @@ class PhoneNumberE164Test(APITestCase):
     def test_blank_clears(self):
         self._save("+14155550123")
         self.assertEqual(self._save("").data["phone_number"], "")
+
+
+class StatusLabelsTest(APITestCase):
+    """`UserProfile.status_labels` — per-user DISPLAY names for action-item statuses."""
+
+    def setUp(self):
+        self.user = _make_user("labels_user")
+        self.client.force_authenticate(user=self.user)
+
+    def _patch(self, labels, user=None):
+        return self.client.patch(PROFILE_ME_URL, {"status_labels": labels}, format="json")
+
+    def test_defaults_to_empty_dict(self):
+        self.assertEqual(self.client.get(PROFILE_ME_URL).data["status_labels"], {})
+
+    def test_patch_round_trips(self):
+        resp = self._patch({"Open": "Not Started", "Done": "Completed", "Backlogged": "Not Going To Do"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            self.client.get(PROFILE_ME_URL).data["status_labels"],
+            {"Open": "Not Started", "Done": "Completed", "Backlogged": "Not Going To Do"},
+        )
+
+    def test_unknown_status_key_is_400(self):
+        self.assertEqual(self._patch({"Ready": "Ready"}).status_code, 400)
+
+    def test_invalid_value_is_400(self):
+        self.assertEqual(self._patch({"Open": "Done"}).status_code, 400)
+        self.assertEqual(self._patch({"Blocked": "blocked"}).status_code, 400)
+
+    def test_non_object_is_400(self):
+        self.assertEqual(self._patch(["Open"]).status_code, 400)
+
+    def test_requires_auth(self):
+        self.client.force_authenticate(user=None)
+        self.assertEqual(self.client.patch(PROFILE_ME_URL, {"status_labels": {}}, format="json").status_code, 401)
+
+    def test_preferences_are_per_user(self):
+        self._patch({"Open": "Not Started"})
+        other = _make_user("labels_other")
+        self.client.force_authenticate(user=other)
+        self.assertEqual(self.client.get(PROFILE_ME_URL).data["status_labels"], {})
+
+
+def assign_tz_url(pk):
+    return f"/api/v1/team/members/{pk}/assign-timezone/"
+
+
+class TeamMemberAssignedTimezoneTests(APITestCase):
+    """Own zone always wins; an assignment is only a fallback with a narrow edit rule."""
+
+    def setUp(self):
+        self.a = _make_user("tza")
+        self.b = _make_user("tzb")
+        self.admin = _make_user("tzadmin", is_staff=True)
+        self.person_user = _make_user("tzperson")
+        self.person = TeamMember.objects.create(
+            full_name="Tz Person", email="tzperson-m@example.com", user=self.person_user
+        )
+        UserProfile.objects.get_or_create(user=self.person_user)
+        self.person_user.profile.timezone = "UTC"  # the model default = never chose one
+        self.person_user.profile.save()
+        self.unlinked = TeamMember.objects.create(full_name="No Account", email="noacct@example.com")
+
+    def _get(self, member):
+        # Staff (with the view override) lists every member; other users are team-scoped.
+        self.client.force_authenticate(self.admin)
+        results = self.client.get(MEMBERS_URL + "?page_size=100").data["results"]
+        row = next(r for r in results if r["id"] == member.id)
+        self.client.force_authenticate(self.a)
+        return row
+
+    def test_unauthenticated_401(self):
+        self.assertEqual(self.client.post(assign_tz_url(self.person.id), {"timezone": "Europe/Paris"}).status_code, 401)
+
+    def test_assign_when_missing(self):
+        self.client.force_authenticate(self.a)
+        resp = self.client.post(assign_tz_url(self.person.id), {"timezone": "Europe/Paris"}, format="json")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["timezone"], "Europe/Paris")
+        self.assertEqual(resp.data["timezone_source"], "assigned")
+        self.assertEqual(resp.data["assigned_by_username"], "tza")
+
+    def test_assign_to_unlinked_member(self):
+        self.client.force_authenticate(self.a)
+        resp = self.client.post(assign_tz_url(self.unlinked.id), {"timezone": "Asia/Tokyo"}, format="json")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["timezone_source"], "assigned")
+
+    def test_default_shape_without_zone(self):
+        row = self._get(self.unlinked)
+        self.assertEqual((row["timezone"], row["timezone_source"], row["assigned_by_username"]), ("", "", None))
+
+    def test_invalid_zone_400(self):
+        self.client.force_authenticate(self.a)
+        for bad in ("Mars/Olympus", "../etc/passwd", "garbage"):
+            self.assertEqual(self.client.post(assign_tz_url(self.person.id), {"timezone": bad}, format="json").status_code, 400)
+        self.assertEqual(self.client.post(assign_tz_url(self.person.id), {}, format="json").status_code, 400)
+
+    def test_refused_when_someone_else_assigned(self):
+        self.client.force_authenticate(self.a)
+        self.client.post(assign_tz_url(self.person.id), {"timezone": "Europe/Paris"}, format="json")
+        self.client.force_authenticate(self.b)
+        resp = self.client.post(assign_tz_url(self.person.id), {"timezone": "Asia/Tokyo"}, format="json")
+        self.assertEqual(resp.status_code, 409)
+        self.person.refresh_from_db()
+        self.assertEqual(self.person.assigned_timezone, "Europe/Paris")
+
+    def test_assigner_can_change_and_clear_own_assignment(self):
+        self.client.force_authenticate(self.a)
+        self.client.post(assign_tz_url(self.person.id), {"timezone": "Europe/Paris"}, format="json")
+        resp = self.client.post(assign_tz_url(self.person.id), {"timezone": "Asia/Tokyo"}, format="json")
+        self.assertEqual(resp.data["timezone"], "Asia/Tokyo")
+        resp = self.client.post(assign_tz_url(self.person.id), {"timezone": ""}, format="json")
+        self.assertEqual((resp.data["timezone"], resp.data["timezone_source"]), ("", ""))
+        # Cleared, so anyone may assign again.
+        self.client.force_authenticate(self.b)
+        self.assertEqual(self.client.post(assign_tz_url(self.person.id), {"timezone": "Asia/Tokyo"}, format="json").status_code, 200)
+
+    def test_admin_can_change_others_assignment(self):
+        self.client.force_authenticate(self.a)
+        self.client.post(assign_tz_url(self.person.id), {"timezone": "Europe/Paris"}, format="json")
+        self.client.force_authenticate(self.admin)
+        resp = self.client.post(assign_tz_url(self.person.id), {"timezone": "Asia/Tokyo"}, format="json")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["timezone"], "Asia/Tokyo")
+
+    def test_self_set_wins_and_blocks_assignment(self):
+        self.person_user.profile.timezone = "America/Chicago"
+        self.person_user.profile.save()
+        self.client.force_authenticate(self.a)
+        resp = self.client.post(assign_tz_url(self.person.id), {"timezone": "Europe/Paris"}, format="json")
+        self.assertEqual(resp.status_code, 409)
+        row = self._get(self.person)
+        self.assertEqual((row["timezone"], row["timezone_source"], row["assigned_by_username"]), ("America/Chicago", "self", None))
+
+    def test_assigned_then_self_set_then_cleared_falls_back(self):
+        self.client.force_authenticate(self.a)
+        self.client.post(assign_tz_url(self.person.id), {"timezone": "Europe/Paris"}, format="json")
+        self.person_user.profile.timezone = "America/Chicago"
+        self.person_user.profile.save()
+        row = self._get(self.person)
+        self.assertEqual((row["timezone"], row["timezone_source"]), ("America/Chicago", "self"))
+        # Assigner cannot overwrite while the person's own value is set.
+        self.assertEqual(self.client.post(assign_tz_url(self.person.id), {"timezone": "Asia/Tokyo"}, format="json").status_code, 409)
+        self.person_user.profile.timezone = "UTC"
+        self.person_user.profile.save()
+        row = self._get(self.person)
+        self.assertEqual((row["timezone"], row["timezone_source"], row["assigned_by_username"]), ("Europe/Paris", "assigned", "tza"))
+
+    def test_cannot_assign_to_self(self):
+        self.client.force_authenticate(self.person_user)
+        resp = self.client.post(assign_tz_url(self.person.id), {"timezone": "Europe/Paris"}, format="json")
+        self.assertEqual(resp.status_code, 403)
+
+    def test_unknown_member_404(self):
+        self.client.force_authenticate(self.a)
+        self.assertEqual(self.client.post(assign_tz_url(99999), {"timezone": "Europe/Paris"}, format="json").status_code, 404)
+
+    def test_generic_patch_cannot_write_assignment(self):
+        self.client.force_authenticate(self.admin)
+        self.client.patch(member_detail_url(self.person.id), {"timezone": "Asia/Tokyo", "assigned_timezone": "Asia/Tokyo"}, format="json")
+        self.person.refresh_from_db()
+        self.assertEqual(self.person.assigned_timezone, "")
+
+
+class TeamMemberAddEmailTest(APITestCase):
+    """POST /team/members/<id>/add-email/ — link a guest's address to a team member."""
+
+    def setUp(self):
+        self.pm = _make_user("pmuser")
+        UserProfile.objects.update_or_create(user=self.pm, defaults={"access_level": "pm"})
+        self.basic = _make_user("basicuser")
+        self.member = TeamMember.objects.create(full_name="Sam Seg", email="sam@twilio.com")
+        self.other = TeamMember.objects.create(full_name="Olly", email="olly@twilio.com", additional_emails=["o@segment.com"])
+        self.url = member_detail_url(self.member.id) + "add-email/"
+
+    def test_pm_adds_address_lowercased(self):
+        self.client.force_authenticate(user=self.pm)
+        with mock.patch("airtable_sync.team_push.push_member") as push:
+            resp = self.client.post(self.url, {"email": " Sam@Segment.com "}, format="json")
+        self.assertEqual(resp.status_code, 200)
+        self.member.refresh_from_db()
+        self.assertEqual(self.member.additional_emails, ["sam@segment.com"])
+        self.assertEqual(resp.data["additional_emails"], ["sam@segment.com"])
+        push.assert_called_once()
+
+    def test_repeat_and_primary_are_noops(self):
+        self.client.force_authenticate(user=self.pm)
+        for addr in ("sam@twilio.com", "SAM@twilio.com"):
+            self.assertEqual(self.client.post(self.url, {"email": addr}, format="json").status_code, 200)
+        self.member.refresh_from_db()
+        self.assertEqual(self.member.additional_emails, [])
+
+    def test_basic_user_cannot_add_to_someone_else(self):
+        self.client.force_authenticate(user=self.basic)
+        resp = self.client.post(self.url, {"email": "x@segment.com"}, format="json")
+        self.assertEqual(resp.status_code, 403)
+        self.member.refresh_from_db()
+        self.assertEqual(self.member.additional_emails, [])
+
+    def test_member_can_add_their_own(self):
+        self.member.user = self.basic
+        self.member.save()
+        self.client.force_authenticate(user=self.basic)
+        with mock.patch("airtable_sync.team_push.push_member"):
+            resp = self.client.post(self.url, {"email": "me@sendgrid.com"}, format="json")
+        self.assertEqual(resp.status_code, 200)
+
+    def test_address_used_by_another_member_is_refused(self):
+        self.client.force_authenticate(user=self.pm)
+        for addr in ("olly@twilio.com", "o@segment.com"):
+            resp = self.client.post(self.url, {"email": addr}, format="json")
+            self.assertEqual(resp.status_code, 409, addr)
+        self.member.refresh_from_db()
+        self.assertEqual(self.member.additional_emails, [])
+
+    def test_invalid_address_is_refused(self):
+        self.client.force_authenticate(user=self.pm)
+        self.assertEqual(self.client.post(self.url, {"email": "nope"}, format="json").status_code, 400)
+
+    def test_unauthenticated_is_401(self):
+        self.assertEqual(self.client.post(self.url, {"email": "a@b.com"}, format="json").status_code, 401)
+
+    def test_airtable_failure_is_swallowed(self):
+        from airtable_sync.team_push import push_member
+        with self.settings(AIRTABLE_TABLE_TEAM_MEMBERS="tblX", AIRTABLE_API_KEY="k"), \
+                mock.patch("airtable_sync.airtable_client.get_api", side_effect=RuntimeError("down")):
+            self.assertFalse(push_member(self.member))
+
+
+class TeamEmailPreferenceTest(APITestCase):
+    def test_twilio_address_is_preferred_and_the_other_goes_second(self):
+        from team.emails import preferred_email, second_email
+        from airtable_sync.management.commands.push_team_members import _member_fields
+        m = TeamMember.objects.create(full_name="A", email="a@segment.com", additional_emails=["a@sendgrid.com", "a@twilio.com"])
+        self.assertEqual(preferred_email(m), "a@twilio.com")
+        self.assertEqual(second_email(m), "a@segment.com")
+        f = _member_fields(m)
+        self.assertEqual((f["Email"], f["Second Email"]), ("a@twilio.com", "a@segment.com"))
+
+    def test_single_address_leaves_second_email_clear(self):
+        from airtable_sync.management.commands.push_team_members import _member_fields
+        m = TeamMember.objects.create(full_name="B", email="b@twilio.com")
+        f = _member_fields(m)
+        self.assertEqual(f["Email"], "b@twilio.com")
+        self.assertIsNone(f["Second Email"])

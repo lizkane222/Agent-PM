@@ -148,18 +148,18 @@ export default function TeamMemberPicker({ onConfirm, onClose }: Props) {
       onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
     >
       <div style={{
-        background: "#fff", borderRadius: 12, boxShadow: "0 8px 32px rgba(0,0,0,0.18)",
+        background: "var(--surface-card)", borderRadius: 12, boxShadow: "0 8px 32px rgba(0,0,0,0.18)",
         width: 520, maxHeight: "80vh", display: "flex", flexDirection: "column", overflow: "hidden",
       }}>
         {/* Header */}
-        <div style={{ padding: "14px 16px 10px", borderBottom: "1px solid #F3F4F6", display: "flex", alignItems: "center", gap: 8 }}>
-          <span style={{ fontSize: 15, fontWeight: 700, color: "#121C2D", flex: 1 }}>Import Team Members</span>
-          <button onClick={onClose} style={{ border: "none", background: "none", cursor: "pointer", fontSize: 16, color: "#9CA3AF" }}>✕</button>
+        <div style={{ padding: "14px 16px 10px", borderBottom: "1px solid var(--border-subtle-3)", display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 15, fontWeight: 700, color: "var(--text-ink)", flex: 1 }}>Import Team Members</span>
+          <button onClick={onClose} style={{ border: "none", background: "none", cursor: "pointer", fontSize: 16, color: "var(--text-gray-400)" }}>✕</button>
         </div>
 
         {/* Account lookup */}
         <div style={{ padding: "10px 16px 0", position: "relative" }}>
-          <label style={{ fontSize: 11, fontWeight: 600, color: "#6B7280", textTransform: "uppercase", letterSpacing: "0.06em", display: "block", marginBottom: 4 }}>
+          <label style={{ fontSize: 11, fontWeight: 600, color: "var(--text-gray-500)", textTransform: "uppercase", letterSpacing: "0.06em", display: "block", marginBottom: 4 }}>
             Import from account
           </label>
           <div style={{ position: "relative" }}>
@@ -170,18 +170,18 @@ export default function TeamMemberPicker({ onConfirm, onClose }: Props) {
               placeholder="Search accounts…"
               style={{
                 width: "100%", boxSizing: "border-box", padding: "6px 10px",
-                border: "1px solid #D1D5DB", borderRadius: 6, fontSize: 13,
+                border: "1px solid var(--border-subtle-2)", borderRadius: 6, fontSize: 13,
                 outline: "none",
               }}
             />
             {loadingAccounts && (
-              <span style={{ position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)", fontSize: 10, color: "#9CA3AF" }}>…</span>
+              <span style={{ position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)", fontSize: 10, color: "var(--text-gray-400)" }}>…</span>
             )}
           </div>
           {accountSuggestions.length > 0 && (
             <div style={{
               position: "absolute", left: 16, right: 16, top: "100%", zIndex: 10,
-              background: "#fff", border: "1px solid #E5E7EB", borderRadius: 6,
+              background: "var(--surface-card)", border: "1px solid var(--border-subtle)", borderRadius: 6,
               boxShadow: "0 4px 12px rgba(0,0,0,0.1)", overflow: "hidden",
             }}>
               {accountSuggestions.map((a) => (
@@ -190,16 +190,16 @@ export default function TeamMemberPicker({ onConfirm, onClose }: Props) {
                   onClick={() => pickAccount(a)}
                   style={{
                     display: "block", width: "100%", textAlign: "left",
-                    padding: "7px 12px", fontSize: 13, color: "#121C2D",
+                    padding: "7px 12px", fontSize: 13, color: "var(--text-ink)",
                     border: "none", background: "none", cursor: "pointer",
-                    borderBottom: "1px solid #F3F4F6",
+                    borderBottom: "1px solid var(--border-subtle-3)",
                   }}
                   onMouseEnter={(e) => (e.currentTarget.style.background = "#F9FAFB")}
                   onMouseLeave={(e) => (e.currentTarget.style.background = "none")}
                 >
                   <span style={{ fontWeight: 600 }}>{a.company_name}</span>
                   {a.team_members?.length > 0 && (
-                    <span style={{ marginLeft: 6, fontSize: 11, color: "#6B7280" }}>
+                    <span style={{ marginLeft: 6, fontSize: 11, color: "var(--text-gray-500)" }}>
                       {a.team_members.length} member{a.team_members.length !== 1 ? "s" : ""}
                     </span>
                   )}
@@ -218,8 +218,8 @@ export default function TeamMemberPicker({ onConfirm, onClose }: Props) {
             placeholder="Filter by name, email, title…"
             style={{
               width: "100%", boxSizing: "border-box", padding: "6px 10px",
-              border: "1px solid #E5E7EB", borderRadius: 6, fontSize: 13,
-              background: "#F9FAFB", outline: "none",
+              border: "1px solid var(--border-subtle)", borderRadius: 6, fontSize: 13,
+              background: "var(--surface-subtle)", outline: "none",
             }}
           />
         </div>
@@ -227,7 +227,7 @@ export default function TeamMemberPicker({ onConfirm, onClose }: Props) {
         {/* List */}
         <div style={{ flex: 1, overflowY: "auto", padding: "0 8px 8px" }}>
           {loading ? (
-            <div style={{ padding: 24, textAlign: "center", color: "#9CA3AF", fontSize: 13 }}>Loading…</div>
+            <div style={{ padding: 24, textAlign: "center", color: "var(--text-gray-400)", fontSize: 13 }}>Loading…</div>
           ) : (
             <>
               {[
@@ -237,9 +237,9 @@ export default function TeamMemberPicker({ onConfirm, onClose }: Props) {
                 <div key={label}>
                   <div style={{
                     display: "flex", alignItems: "center", gap: 6,
-                    padding: "6px 8px 2px", position: "sticky", top: 0, background: "#fff", zIndex: 1,
+                    padding: "6px 8px 2px", position: "sticky", top: 0, background: "var(--surface-card)", zIndex: 1,
                   }}>
-                    <span style={{ fontSize: 10, fontWeight: 700, color: "#9CA3AF", textTransform: "uppercase", letterSpacing: "0.07em", flex: 1 }}>
+                    <span style={{ fontSize: 10, fontWeight: 700, color: "var(--text-gray-400)", textTransform: "uppercase", letterSpacing: "0.07em", flex: 1 }}>
                       {label}
                     </span>
                     <button
@@ -280,15 +280,15 @@ export default function TeamMemberPicker({ onConfirm, onClose }: Props) {
                           {initials}
                         </div>
                         <div style={{ flex: 1, minWidth: 0 }}>
-                          <div style={{ fontSize: 13, fontWeight: 600, color: "#121C2D", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                          <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-ink)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                             {row.fullName}
                           </div>
-                          <div style={{ fontSize: 11, color: "#6B7280", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                          <div style={{ fontSize: 11, color: "var(--text-gray-500)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                             {[row.title, row.email].filter(Boolean).join(" · ")}
                           </div>
                         </div>
                         {row.source !== "Team" && (
-                          <span style={{ fontSize: 10, color: "#6B7280", background: "#F3F4F6", padding: "1px 5px", borderRadius: 99, flexShrink: 0 }}>
+                          <span style={{ fontSize: 10, color: "var(--text-gray-500)", background: "var(--surface-subtle-2)", padding: "1px 5px", borderRadius: 99, flexShrink: 0 }}>
                             {row.source}
                           </span>
                         )}
@@ -298,7 +298,7 @@ export default function TeamMemberPicker({ onConfirm, onClose }: Props) {
                 </div>
               ))}
               {allVisible.length === 0 && (
-                <div style={{ padding: 24, textAlign: "center", color: "#9CA3AF", fontSize: 13 }}>No results</div>
+                <div style={{ padding: 24, textAlign: "center", color: "var(--text-gray-400)", fontSize: 13 }}>No results</div>
               )}
             </>
           )}
@@ -306,16 +306,16 @@ export default function TeamMemberPicker({ onConfirm, onClose }: Props) {
 
         {/* Footer */}
         <div style={{
-          padding: "10px 16px", borderTop: "1px solid #F3F4F6",
+          padding: "10px 16px", borderTop: "1px solid var(--border-subtle-3)",
           display: "flex", alignItems: "center", justifyContent: "space-between",
         }}>
-          <span style={{ fontSize: 12, color: "#6B7280" }}>
+          <span style={{ fontSize: 12, color: "var(--text-gray-500)" }}>
             {selectedKeys.size > 0 ? `${selectedKeys.size} selected` : "Select members to add"}
           </span>
           <div style={{ display: "flex", gap: 8 }}>
             <button
               onClick={onClose}
-              style={{ padding: "6px 14px", borderRadius: 6, border: "1px solid #E5E7EB", background: "#fff", fontSize: 13, cursor: "pointer", color: "#374151" }}
+              style={{ padding: "6px 14px", borderRadius: 6, border: "1px solid var(--border-subtle)", background: "var(--surface-card)", fontSize: 13, cursor: "pointer", color: "var(--text-gray-700)" }}
             >
               Cancel
             </button>
@@ -325,7 +325,7 @@ export default function TeamMemberPicker({ onConfirm, onClose }: Props) {
               style={{
                 padding: "6px 14px", borderRadius: 6, border: "none",
                 background: selectedKeys.size > 0 ? "#0263E0" : "#E5E7EB",
-                color: selectedKeys.size > 0 ? "#fff" : "#9CA3AF",
+                color: selectedKeys.size > 0 ? "#fff" : "var(--text-gray-400)",
                 fontSize: 13, fontWeight: 600, cursor: selectedKeys.size > 0 ? "pointer" : "not-allowed",
               }}
             >

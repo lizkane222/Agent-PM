@@ -80,9 +80,11 @@ export function readScheduledReminders(): ScheduledReminder[] {
 
 // ── CalPill helpers ───────────────────────────────────────────────────────────
 
-export function CalPillSelect<T extends string>({ value, options, colorMap, placeholder, onChange }: {
+export function CalPillSelect<T extends string>({ value, options, colorMap, placeholder, onChange, format }: {
   value: T | undefined; options: readonly T[]; colorMap: Record<string, string>; placeholder: string;
   onChange: (v: T) => void;
+  /** Display-only text for a value (e.g. status names); the option VALUE stays canonical. */
+  format?: (v: string) => string;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLSelectElement>(null);
@@ -92,12 +94,12 @@ export function CalPillSelect<T extends string>({ value, options, colorMap, plac
     <select ref={ref} value={value ?? ""} onChange={(e) => { onChange(e.target.value as T); setOpen(false); }}
       onBlur={() => setOpen(false)} onClick={(e) => e.stopPropagation()}
       className="rounded-full border border-indigo-400 bg-white px-2.5 py-0.5 text-[12px] font-semibold focus:outline-none cursor-pointer"
-    >{options.map((o) => <option key={o} value={o}>{o}</option>)}</select>
+    >{options.map((o) => <option key={o} value={o}>{format ? format(o) : o}</option>)}</select>
   );
   return (
     <button type="button" onClick={(e) => { e.stopPropagation(); setOpen(true); }}
       className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[12px] font-semibold cursor-pointer hover:opacity-75 transition-opacity ${cls}`}
-    >{value ?? placeholder}<svg viewBox="0 0 8 5" fill="currentColor" className="w-1.5 h-1.5 opacity-50"><path d="M0 0l4 5 4-5z"/></svg></button>
+    >{value != null ? (format ? format(value) : value) : placeholder}<svg viewBox="0 0 8 5" fill="currentColor" className="w-1.5 h-1.5 opacity-50"><path d="M0 0l4 5 4-5z"/></svg></button>
   );
 }
 
