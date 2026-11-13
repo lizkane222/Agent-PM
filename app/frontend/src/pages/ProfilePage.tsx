@@ -1,6 +1,21 @@
 import {
-  useCallback, useEffect, useRef, useState, type CSSProperties, type ReactNode,
+  useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode,
 } from "react";
+import SkillRunDialog from "../components/skills/SkillRunDialog";
+import { reminderTimes } from "../lib/reminderSections";
+import { ArtifactBrowseBar } from "../components/account/ArtifactBrowseBar";
+import {
+  ExpandableSection, CardList, fieldsOf, fmtDateTime, type FullCard,
+} from "../components/profile/fullscreen";
+import { NotificationsFull, PublicFull, NotepadFull, MiniCanvasFull, TicketsFull } from "../components/profile/FullViews";
+import ProfileTicketsSection from "../components/profile/ProfileTicketsSection";
+import PageSectionsPanel from "../components/profile/PageSectionsPanel";
+import { loadIdList, revealSection } from "../components/profile/sectionLayout";
+import { TICKET_KIND_TITLE } from "../lib/tickets";
+import type { TicketKind } from "../types";
+import { useQuickLinks } from "../hooks/useQuickLinks";
+import { DEFAULT_ARTIFACT_BROWSE, browseArtifacts, type ArtifactBrowseState } from "../lib/artifactBrowse";
+import { ACTION_ITEMS_UPDATED_KEY } from "../lib/actionItemEvents";
 import { useParams, Navigate, Link, useNavigate } from "react-router-dom";
 import {
   DndContext,
@@ -13,7 +28,6 @@ import {
   type DragEndEvent,
 } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { GetMeetingNotesButton } from "../components/shared/GetMeetingNotesButton";
 import RichTextMentionEditor from "../components/shared/RichTextMentionEditor";
 import { htmlToPreviewText } from "../lib/noteHelpers";
 import {
@@ -23,16 +37,18 @@ import {
 } from "../lib/api";
 import type {
   AgentSkill, ClaudeSkill, Account, AccountArtifact,
-  ActionItem, Reminder, Comment, PageLayout, AirtableActionItem, TeamMember,
+  Reminder, Comment, PageLayout, AirtableActionItem, TeamMember,
   UserPageNote, WorkingSession, ExportItemSnapshot,
 } from "../types";
 import { acceptExportItemDragOver, readExportItem } from "../lib/exportDrop";
+import { EXPORT_ITEM_DRAG_KEY } from "../components/ExportBar";
 import { ROLE_META, getTitleRole } from "../lib/titleRoles";
 import type { TitleRole } from "../lib/titleRoles";
 import { useLogGlow } from "../hooks/useLogGlow";
 import { useCurrentUser } from "../context/CurrentUserContext";
 import TimeAllocationPanel from "../components/TimeAllocationPanel";
 import NotificationsSection from "../components/profile/NotificationsSection";
+import TicketsToReview from "../components/profile/TicketsToReview";
 import PublicSection from "../components/profile/PublicSection";
 import { memberProfileApi } from "../lib/api";
 import type { MemberPublicProfile } from "../types/team";
@@ -307,17 +323,18 @@ function EditArtifactModal({
 }
 import { COMPONENT_REGISTRY } from "../components/pagebuilder/registry";
 import { MINI_CANVAS_HANDOFF_KEY } from "../components/pagebuilder/useCanvasState";
-import MiniNodePreview from "../components/profile/MiniNodePreview";
+import MiniNodePreview, { resolveProps } from "../components/profile/MiniNodePreview";
+import { MINI_FIELD_CATALOG } from "../components/profile/miniFields";
 import QuickLinks from "../components/profile/QuickLinks";
 import {
   ARTIFACT_ICON_CATALOG, ArtifactIcon, ArtifactIconImg, CATALOG_BY_KEY, getAutoIconKey,
 } from "../components/account/ArtifactIcon";
 import { ActionItemModal } from "../components/account/ActionItemModal";
 import { useCommentContext } from "../components/comments/CommentContext";
-import { useAppError } from "../context/AppErrorContext";
 import {
-  defaultPropsFor, defaultSizeFor, isInlineTextType, isPreviewType, miniNodesToCanvasNodes,
-  type MiniNode,
+  canvasNodesFromSnapshot, defaultPropsFor, defaultSizeFor, filledFields, isInlineTextType, isPreviewType,
+  isRichEditType, MAX_SAVED_CANVASES, MINI_CANVAS_ITEM_TYPE, miniNodesToCanvasNodes, parseMiniNodes,
+  parseSavedCanvases, savedCanvasToSnapshot, type MiniNode, type SavedCanvas,
 } from "../components/profile/miniCanvas";
 import SkillLaunchButtons from "../components/skills/SkillLaunchButtons";
 
@@ -325,109 +342,34 @@ import SkillLaunchButtons from "../components/skills/SkillLaunchButtons";
 // Mini-canvas — a self-contained pared-down page builder embedded in the role page
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ── Mini-canvas field catalog (spans all entity types in the app) ─────────────
 
-interface MiniFieldDef {
-  key: string;
-  label: string;
-  fieldType: "text" | "textarea" | "date" | "select" | "number" | "url";
-  options?: string[];
-}
-interface MiniFieldCategory { category: string; icon: string; fields: MiniFieldDef[]; }
-
-const MINI_FIELD_CATALOG: MiniFieldCategory[] = [
-  {
-    category: "General", icon: "📝",
-    fields: [
-      { key: "g_title",       label: "Title",       fieldType: "text" },
-      { key: "g_description", label: "Description", fieldType: "textarea" },
-      { key: "g_notes",       label: "Notes",       fieldType: "textarea" },
-      { key: "g_url",         label: "URL",         fieldType: "url" },
-      { key: "g_date",        label: "Date",        fieldType: "date" },
-      { key: "g_tags",        label: "Tags",        fieldType: "text" },
-      { key: "g_status",      label: "Status",      fieldType: "text" },
-      { key: "g_priority",    label: "Priority",    fieldType: "select", options: ["urgent", "high", "normal", "low"] },
-    ],
-  },
-  {
-    category: "Action Item", icon: "✅",
-    fields: [
-      { key: "ai_title",    label: "Title",    fieldType: "text" },
-      { key: "ai_notes",    label: "Notes",    fieldType: "textarea" },
-      { key: "ai_priority", label: "Priority", fieldType: "select", options: ["urgent", "high", "normal", "low"] },
-      { key: "ai_status",   label: "Status",   fieldType: "select", options: ["open", "in_progress", "done", "dismissed"] },
-      { key: "ai_due_date", label: "Due Date", fieldType: "date" },
-      { key: "ai_assignee", label: "Assignee", fieldType: "text" },
-      { key: "ai_account",  label: "Account",  fieldType: "text" },
-      { key: "ai_est_time", label: "Est. Time (h)", fieldType: "number" },
-    ],
-  },
-  {
-    category: "Meeting", icon: "🗓",
-    fields: [
-      { key: "m_title",       label: "Title",          fieldType: "text" },
-      { key: "m_date",        label: "Date",           fieldType: "date" },
-      { key: "m_duration",    label: "Duration (min)", fieldType: "number" },
-      { key: "m_location",    label: "Location",       fieldType: "text" },
-      { key: "m_description", label: "Description",    fieldType: "textarea" },
-      { key: "m_attendees",   label: "Attendees",      fieldType: "text" },
-      { key: "m_status",      label: "Status",         fieldType: "select", options: ["confirmed", "tentative", "cancelled"] },
-      { key: "m_meet_link",   label: "Meet Link",      fieldType: "url" },
-      { key: "m_account",     label: "Account",        fieldType: "text" },
-    ],
-  },
-  {
-    category: "Account", icon: "🏢",
-    fields: [
-      { key: "acct_name",     label: "Company Name", fieldType: "text" },
-      { key: "acct_website",  label: "Website",      fieldType: "url" },
-      { key: "acct_industry", label: "Industry",     fieldType: "text" },
-      { key: "acct_status",   label: "Status",       fieldType: "select", options: ["prospect", "active", "inactive", "churned"] },
-      { key: "acct_arr",      label: "ARR ($)",      fieldType: "number" },
-      { key: "acct_owner",    label: "Owner",        fieldType: "text" },
-    ],
-  },
-  {
-    category: "Task", icon: "📋",
-    fields: [
-      { key: "t_title",       label: "Title",       fieldType: "text" },
-      { key: "t_description", label: "Description", fieldType: "textarea" },
-      { key: "t_priority",    label: "Priority",    fieldType: "select", options: ["urgent", "high", "normal", "low"] },
-      { key: "t_status",      label: "Status",      fieldType: "select", options: ["backlog", "todo", "in_progress", "review", "done", "archived"] },
-      { key: "t_due_date",    label: "Due Date",    fieldType: "date" },
-      { key: "t_tags",        label: "Tags",        fieldType: "text" },
-      { key: "t_assignee",    label: "Assignee",    fieldType: "text" },
-    ],
-  },
-  {
-    category: "Reminder", icon: "🔔",
-    fields: [
-      { key: "r_title",  label: "Title",  fieldType: "text" },
-      { key: "r_body",   label: "Body",   fieldType: "textarea" },
-      { key: "r_due_at", label: "Due At", fieldType: "date" },
-      { key: "r_status", label: "Status", fieldType: "select", options: ["pending", "sent", "dismissed", "snoozed"] },
-    ],
-  },
-  {
-    category: "Calendar Event", icon: "📅",
-    fields: [
-      { key: "ce_title",       label: "Title",         fieldType: "text" },
-      { key: "ce_start",       label: "Start",         fieldType: "date" },
-      { key: "ce_end",         label: "End",           fieldType: "date" },
-      { key: "ce_location",    label: "Location",      fieldType: "text" },
-      { key: "ce_description", label: "Description",   fieldType: "textarea" },
-      { key: "ce_attendees",   label: "Attendees",     fieldType: "text" },
-      { key: "ce_status",      label: "Status",        fieldType: "select", options: ["confirmed", "tentative", "cancelled"] },
-      { key: "ce_meet_link",   label: "Meet Link",     fieldType: "url" },
-      { key: "ce_account",     label: "Account",       fieldType: "text" },
-    ],
-  },
-];
-
-const ALL_FIELD_DEFS: MiniFieldDef[] = MINI_FIELD_CATALOG.flatMap(c => c.fields);
 
 let _miniId = 0;
-function mkMiniId() { return `mini-${++_miniId}`; }
+// A canvas now survives page loads, so a counter that restarts at 1 would hand out ids that
+// already belong to restored nodes. The random part makes ids unique across loads.
+function mkMiniId() { return `mini-${(++_miniId).toString(36)}${Math.random().toString(36).slice(2, 7)}`; }
+
+/** Extra drag type set only by a saved-canvas button, so the mini-canvas can refuse its own snapshot. */
+const MINI_CANVAS_DRAG_KEY = "application/x-mini-canvas";
+const MINI_CANVAS_KEY = "profileMiniCanvas-v1";
+const MINI_SAVED_KEY = "profileMiniCanvasSaved-v1";
+
+function readJson(key: string): unknown {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null; // unreadable or corrupt: start empty rather than crash the page
+  }
+}
+
+/** Write a list, or remove the key when it is empty so storage does not keep "[]" around. */
+function writeList(key: string, list: unknown[]): void {
+  try {
+    if (list.length) localStorage.setItem(key, JSON.stringify(list));
+    else localStorage.removeItem(key);
+  } catch { /* storage full or blocked — the canvas still works for this session */ }
+}
 
 function addChildToMiniTree(nodes: MiniNode[], parentId: string, child: MiniNode): MiniNode[] {
   return nodes.map(n => {
@@ -765,8 +707,14 @@ function MiniCanvasNode({
   depth?: number;
 }) {
   const [editingText, setEditingText] = useState(false);
+  const [editingRich, setEditingRich] = useState(false);
   const typed = !node.record && isPreviewType(node.type);
   const inlineText = typed && isInlineTextType(node.type);
+  const richEdit = typed && isRichEditType(node.type);
+  // Leaving the node (selecting something else) ends rich editing; it is saved as you type.
+  useEffect(() => { if (!selected) setEditingRich(false); }, [selected]);
+  // A component with fields takes its height from them (like a record card), so none are clipped.
+  const hasFields = typed && filledFields(node).length > 0;
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: `mini-canvas:${node.id}`,
     data: { kind: "mini-canvas", nodeId: node.id },
@@ -797,8 +745,7 @@ function MiniCanvasNode({
     window.addEventListener("pointerup", onUp);
   };
 
-  const filledFields = Object.entries(node.fields ?? {}).filter(([, v]) => v !== "");
-  const fieldLabels = filledFields.map(([k]) => ALL_FIELD_DEFS.find(f => f.key === k)?.label ?? k);
+  const fieldLabels = filledFields(node).map(f => f.label);
 
   return (
     <div
@@ -810,9 +757,10 @@ function MiniCanvasNode({
         left: node.x,
         top: node.y,
         width: node.w,
-        // A record card grows with its text; a sketch box keeps its exact size.
-        height: node.record ? undefined : node.h,
-        minHeight: node.record ? node.h : undefined,
+        // A record card (or a component with fields) grows with its content; a sketch box keeps
+        // its exact size.
+        height: node.record || hasFields ? undefined : node.h,
+        minHeight: node.record || hasFields ? node.h : undefined,
         transform: CSS.Translate.toString(transform),
         zIndex: isDragging ? 50 : selected ? 10 : (1 + (depth ?? 0)),
         opacity: isDragging ? 0.5 : 1,
@@ -822,8 +770,10 @@ function MiniCanvasNode({
       onClick={e => { e.stopPropagation(); onSelect(); }}
       onDoubleClick={e => {
         e.stopPropagation();
-        // Text components are edited where they sit; everything else opens the field picker.
-        if (inlineText) setEditingText(true); else onOpenEdit(node.id);
+        // Text and Rich Text are edited where they sit; everything else opens the field picker.
+        if (inlineText) setEditingText(true);
+        else if (richEdit) setEditingRich(true);
+        else onOpenEdit(node.id);
       }}
       onContextMenu={e => { e.preventDefault(); e.stopPropagation(); onOpenEdit(node.id); }}
     >
@@ -832,8 +782,8 @@ function MiniCanvasNode({
           data-mini-typed={node.type}
           style={{
             width: "100%",
-            height: inlineText ? "auto" : "100%",
-            minHeight: inlineText ? node.h : undefined,
+            height: inlineText || hasFields ? "auto" : "100%",
+            minHeight: inlineText || hasFields ? node.h : undefined,
             boxSizing: "border-box",
             // No card chrome: a heading is just text. A selection outline is the only frame.
             outline: selected ? "2px solid #0263E0" : "1px dashed transparent",
@@ -841,7 +791,36 @@ function MiniCanvasNode({
             borderRadius: 3,
           }}
         >
-          {editingText ? (
+          {editingRich ? (
+            // Same editor the notes use, with an Underline button added. It is wider than the node
+            // (a toolbar does not fit in 200px) and floats over the canvas while editing. Every
+            // pointer/key event stops here so typing and selecting never drag the node.
+            <div
+              data-mini-rich-editor
+              onPointerDown={e => e.stopPropagation()}
+              onClick={e => e.stopPropagation()}
+              onDoubleClick={e => e.stopPropagation()}
+              onContextMenu={e => e.stopPropagation()}
+              onKeyDown={e => { if (e.key === "Escape") { e.stopPropagation(); setEditingRich(false); } }}
+              style={{ position: "relative", zIndex: 30, width: Math.max(node.w, 340), background: "var(--surface-card)", border: "1px solid #0263E0", borderRadius: 6, boxShadow: "0 6px 20px rgba(15,23,42,0.18)" }}
+            >
+              <RichTextMentionEditor
+                value={String(resolveProps(node).html ?? "")}
+                onChange={html => onChangeProps(node.id, { html })}
+                placeholder="Type here…"
+                minHeightClassName="min-h-[60px]"
+                showUnderline
+                autoFocus
+              />
+              <div style={{ display: "flex", justifyContent: "flex-end", padding: "4px 6px", borderTop: "1px solid var(--border, rgba(0,0,0,0.08))" }}>
+                <button
+                  type="button"
+                  onClick={() => setEditingRich(false)}
+                  style={{ fontSize: "0.6875rem", fontWeight: 600, padding: "2px 10px", borderRadius: 6, border: "1px solid #0263E0", background: "#0263E0", color: "#fff", cursor: "pointer" }}
+                >Done</button>
+              </div>
+            </div>
+          ) : editingText ? (
             <textarea
               autoFocus
               aria-label={`Edit ${node.label} text`}
@@ -856,18 +835,10 @@ function MiniCanvasNode({
               style={{ width: "100%", minHeight: Math.max(node.h, 28), boxSizing: "border-box", font: "inherit", border: "1px solid #0263E0", borderRadius: 3, padding: 2, resize: "none" }}
             />
           ) : (
-            <MiniNodePreview
-              node={node}
-              chips={fieldLabels.length > 0 ? (
-                <div style={{ position: "absolute", top: 3, left: 4, right: 4, display: "flex", flexWrap: "wrap", gap: 2, pointerEvents: "none" }}>
-                  {fieldLabels.slice(0, 6).map(label => (
-                    <span key={label} style={{ fontSize: "0.5rem", fontWeight: 500, background: "rgba(2,99,224,0.08)", color: "#0263E0", borderRadius: 3, padding: "1px 4px", whiteSpace: "nowrap" }}>{label}</span>
-                  ))}
-                </div>
-              ) : undefined}
+            <MiniNodePreview node={node}
             >
               {(node.children ?? []).map(child => (
-                <div key={child.id} style={{ position: "absolute", left: child.x - node.x, top: child.y - node.y, width: child.w, height: child.h, pointerEvents: "none" }}>
+                <div key={child.id} style={{ position: "absolute", left: child.x - node.x, top: child.y - node.y, width: child.w, minHeight: child.h, pointerEvents: "none" }}>
                   <MiniNodePreview node={child} />
                 </div>
               ))}
@@ -950,6 +921,23 @@ function MiniCanvasNode({
       </div>
       )}
 
+      {/* Text components edit their text on double-click, which leaves no obvious way into the
+          field picker (right-click only). A selected one offers it as a button. */}
+      {selected && (inlineText || richEdit) && !editingText && !editingRich && (
+        <button
+          type="button"
+          onPointerDown={e => e.stopPropagation()}
+          onClick={e => { e.stopPropagation(); onOpenEdit(node.id); }}
+          title="Add data fields to this component"
+          style={{
+            position: "absolute", top: -9, left: 0, zIndex: 20,
+            padding: "1px 7px", borderRadius: 8, border: "1px solid #0263E0",
+            background: "var(--surface-card)", color: "#0263E0", cursor: "pointer",
+            fontSize: "0.5625rem", fontWeight: 700, lineHeight: 1.4,
+          }}
+        >Fields</button>
+      )}
+
       {/* Delete button */}
       {selected && (
         <button
@@ -1012,8 +1000,12 @@ function MiniCanvasDropArea({
   return (
     <div
       ref={mergedRef}
+      data-no-fullscreen
       onClick={() => onSelect(null)}
       onDragOver={(e) => {
+        // A saved canvas is a snapshot of this very canvas; dropping it back would nest it in itself.
+        // Not calling preventDefault is what tells the browser this is not a drop target.
+        if (Array.from(e.dataTransfer.types).includes(MINI_CANVAS_DRAG_KEY)) return;
         if (acceptExportItemDragOver(e)) setIsPillOver(true);
       }}
       onDragLeave={(e) => {
@@ -1022,7 +1014,7 @@ function MiniCanvasDropArea({
       onDrop={(e) => {
         const item = readExportItem(e);
         setIsPillOver(false);
-        if (!item) return;
+        if (!item || (item.type as string) === MINI_CANVAS_ITEM_TYPE) return;
         e.preventDefault();
         e.stopPropagation();
         // Drop where the cursor is, in canvas coordinates.
@@ -1072,12 +1064,45 @@ function MiniCanvasDropArea({
   );
 }
 
+/** Full-screen view of the mini canvas, read from where the canvas keeps its state. */
+function MiniCanvasFullView({ accent }: { accent: string }) {
+  const user = useCurrentUser();
+  const uid = user?.id ?? null;
+  const nodes = useMemo(() => (uid != null ? parseMiniNodes(readJson(`${MINI_CANVAS_KEY}:${uid}`)) : []), [uid]);
+  const saved = useMemo(() => (uid != null ? parseSavedCanvases(readJson(`${MINI_SAVED_KEY}:${uid}`)) : []), [uid]);
+  return <MiniCanvasFull nodes={nodes} saved={saved} accent={accent} />;
+}
+
 function MiniCanvasPanel({ accentColor, textColor }: { accentColor: string; textColor: string }) {
   const [nodes, setNodes] = useState<MiniNode[]>([]);
+  const [saved, setSaved] = useState<SavedCanvas[]>([]);
+  const [restored, setRestored] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [editNodeId, setEditNodeId] = useState<string | null>(null);
   const canvasRef = useRef<HTMLDivElement | null>(null);
   const navigate = useNavigate();
+  const currentUser = useCurrentUser();
+
+  // Per user, so two people sharing a browser do not see each other's canvas (it can hold record
+  // titles). Nothing is read or written until the user is known.
+  const userId = currentUser?.id ?? null;
+  const canvasKey = userId != null ? `${MINI_CANVAS_KEY}:${userId}` : null;
+  const savedKey = userId != null ? `${MINI_SAVED_KEY}:${userId}` : null;
+
+  // Restore. Merged in front of anything already dropped, never replacing it.
+  useEffect(() => {
+    if (!canvasKey || !savedKey) return;
+    const stored = parseMiniNodes(readJson(canvasKey));
+    if (stored.length) setNodes(prev => [...stored, ...prev]);
+    setSaved(parseSavedCanvases(readJson(savedKey)));
+    setRestored(true);
+  }, [canvasKey, savedKey]);
+
+  // Persist on every change (no debounce: the payload is small, and a debounced write would be lost
+  // if "Open full builder" navigates away immediately after an edit). Only after the restore has
+  // run, or the first render's empty list would erase what is in storage.
+  useEffect(() => { if (restored && canvasKey) writeList(canvasKey, nodes); }, [nodes, restored, canvasKey]);
+  useEffect(() => { if (restored && savedKey) writeList(savedKey, saved); }, [saved, restored, savedKey]);
 
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
 
@@ -1146,6 +1171,29 @@ function MiniCanvasPanel({ accentColor, textColor }: { accentColor: string; text
     ));
   }, []);
 
+  const handleClear = useCallback(() => {
+    // The canvas now persists, so Clear is no longer undone by a refresh: ask first.
+    if (!window.confirm(`Remove all ${nodes.length} component${nodes.length === 1 ? "" : "s"} from the mini-canvas?`)) return;
+    setNodes([]);
+    setSelectedId(null);
+  }, [nodes.length]);
+
+  const handleSave = useCallback(() => {
+    if (nodes.length === 0) return;
+    const at = new Date();
+    const label = `Canvas · ${at.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}`;
+    const snapshot: SavedCanvas = {
+      id: `sv-${at.getTime().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+      label,
+      savedAt: at.getTime(),
+      // A deep copy: the button must keep what was saved even as the canvas keeps changing.
+      nodes: JSON.parse(JSON.stringify(nodes)) as MiniNode[],
+    };
+    setSaved(prev => [snapshot, ...prev].slice(0, MAX_SAVED_CANVASES));
+  }, [nodes]);
+
+  const removeSaved = useCallback((id: string) => setSaved(prev => prev.filter(c => c.id !== id)), []);
+
   const handleChangeProps = useCallback((id: string, props: Record<string, unknown>) => {
     setNodes(prev => updateMiniNodeProps(prev, id, props));
   }, []);
@@ -1203,18 +1251,65 @@ function MiniCanvasPanel({ accentColor, textColor }: { accentColor: string; text
                 Canvas
               </span>
               <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                {nodes.length > 0 && (
-                  <button
-                    onClick={() => { setNodes([]); setSelectedId(null); }}
-                    style={{ fontSize: "0.6875rem", color: "#ef4444", background: "none", border: "none", cursor: "pointer" }}
-                  >Clear</button>
-                )}
+                <button
+                  type="button"
+                  onClick={handleClear}
+                  disabled={nodes.length === 0}
+                  title="Remove every component from the mini-canvas"
+                  style={{ fontSize: "0.6875rem", color: "#ef4444", background: "none", border: "none", cursor: nodes.length ? "pointer" : "default", opacity: nodes.length ? 1 : 0.4 }}
+                >Clear</button>
+                <button
+                  type="button"
+                  onClick={handleSave}
+                  disabled={nodes.length === 0}
+                  title="Save this canvas as a button you can drag into a working session"
+                  style={{ fontSize: "0.6875rem", fontWeight: 600, color: accentColor, background: "none", border: `1px solid ${accentColor}`, borderRadius: 6, padding: "1px 9px", cursor: nodes.length ? "pointer" : "default", opacity: nodes.length ? 1 : 0.4 }}
+                >Save</button>
                 <button
                   onClick={handleOpenFullBuilder}
                   style={{ fontSize: "0.6875rem", color: accentColor, background: "none", border: "none", cursor: "pointer", fontWeight: 600, padding: 0 }}
                 >Open full builder →</button>
               </div>
             </div>
+
+            <p data-testid="mini-canvas-note" style={{ margin: "0 0 6px", fontSize: "0.625rem", lineHeight: 1.45, color: "var(--text-secondary, #888)" }}>
+              <strong>Save</strong> turns this canvas into a button below. Drag that button into a working
+              session (further down) to attach it there. Your canvas is kept in this browser between visits.
+            </p>
+
+            {saved.length > 0 && (
+              <div data-testid="saved-canvases" style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 6 }}>
+                {saved.map(c => {
+                  const snapshot = savedCanvasToSnapshot(c);
+                  return (
+                    <span
+                      key={c.id}
+                      draggable
+                      title="Drag into a working session"
+                      onDragStart={e => {
+                        // The same payload an export-tray pill carries, so a working session's canvas
+                        // accepts it with no new drop code.
+                        e.dataTransfer.setData(EXPORT_ITEM_DRAG_KEY, JSON.stringify(snapshot));
+                        // Marks it as a saved canvas so the mini-canvas itself can refuse it.
+                        e.dataTransfer.setData(MINI_CANVAS_DRAG_KEY, c.id);
+                        e.dataTransfer.effectAllowed = "copy";
+                      }}
+                      style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "3px 6px 3px 9px", borderRadius: 14, border: `1px solid ${accentColor}`, background: "var(--surface, #fff)", color: textColor, fontSize: "0.6875rem", fontWeight: 600, cursor: "grab" }}
+                    >
+                      <span aria-hidden>🗂</span>
+                      <span>{c.label} <span style={{ fontWeight: 400, opacity: 0.7 }}>({c.nodes.length})</span></span>
+                      <button
+                        type="button"
+                        aria-label={`Remove saved canvas ${c.label}`}
+                        onClick={() => removeSaved(c.id)}
+                        style={{ background: "none", border: "none", cursor: "pointer", color: "var(--text-secondary, #999)", fontSize: "0.6875rem", padding: "0 2px" }}
+                      >✕</button>
+                    </span>
+                  );
+                })}
+              </div>
+            )}
+
             <MiniCanvasDropArea
               nodes={nodes}
               selectedId={selectedId}
@@ -1289,6 +1384,7 @@ export function nextFreeSlot(refs: AnnotatedRef[]): { _x: number; _y: number } {
 }
 
 const TYPE_COLORS: Record<string, string> = {
+  mini_canvas: "#6366f1",
   action_item: "#f97316", account: "#3b82f6", meeting: "#8b5cf6",
   artifact: "#06b6d4", reminder: "#f59e0b", calendar_event: "#10b981",
 };
@@ -1307,7 +1403,10 @@ function SessionRecordCard({
     data: { kind: "sess-card", refId: item.id },
   });
   const [note, setNote] = useState(item._note ?? "");
+  const navigate = useNavigate();
   const color = TYPE_COLORS[item.type] ?? (item.accent ?? "#9ca3af");
+  // A saved mini-canvas carries its full contents; offer to reopen it in the builder.
+  const savedCanvasNodes = canvasNodesFromSnapshot(item);
   const x = item._x ?? 0;
   const y = item._y ?? 0;
 
@@ -1364,6 +1463,19 @@ function SessionRecordCard({
               <p style={{ margin: "2px 0 0", fontSize: "0.6875rem", color: "var(--text-secondary, #aaa)", overflowWrap: "anywhere" }}>
                 {item.accountName}
               </p>
+            )}
+            {savedCanvasNodes && (
+              <button
+                type="button"
+                onMouseDown={e => e.stopPropagation()}
+                onClick={e => {
+                  e.stopPropagation();
+                  // The same single-use handoff the mini-canvas's "Open full builder" uses.
+                  try { sessionStorage.setItem(MINI_CANVAS_HANDOFF_KEY, JSON.stringify(savedCanvasNodes)); } catch { /* storage blocked */ }
+                  navigate("/edit-preview");
+                }}
+                style={{ marginTop: 4, fontSize: "0.6875rem", fontWeight: 600, color, background: "none", border: `1px solid ${color}`, borderRadius: 6, padding: "1px 8px", cursor: "pointer" }}
+              >Open in builder →</button>
             )}
             {/* The summary was carried on every ref and never rendered. */}
             {item.summary && (
@@ -1454,6 +1566,7 @@ function SessionCanvas({
       ref={setNodeRef}
       onClick={() => setSelectedId(null)}
       data-session-canvas
+      data-no-fullscreen
       onDragOver={(e) => {
         if (acceptExportItemDragOver(e)) setIsPillOver(true);
       }}
@@ -1857,17 +1970,29 @@ function WorkingSessionsArea({
 const ALL_SECTION_TILES = [
   { id: "skills",          label: "My Skills",       icon: "⚡" },
   { id: "accounts",        label: "My Accounts",     icon: "🏢" },
+  { id: "jira_tickets",    label: "JIRAs / Engineering Tickets", icon: "🛠" },
+  { id: "zendesk_tickets", label: "Zendesk / Support Tickets",   icon: "🎧" },
+  { id: "product_gaps",    label: "Product Gaps",    icon: "🧩" },
   { id: "artifacts",       label: "My Artifacts",    icon: "📎" },
   { id: "time_allocation", label: "Time Allocation", icon: "📊" },
   { id: "notepad",         label: "Notepad",         icon: "📝" },
   { id: "mini_canvas",     label: "Mini Canvas",     icon: "⬜" },
-  { id: "action_items",    label: "Action Items",    icon: "✅" },
-  { id: "reminders",       label: "Reminders",       icon: "🔔" },
-  { id: "comments",        label: "Comments",        icon: "💬" },
   { id: "notifications",   label: "Notifications",   icon: "🔔" },
   { id: "public",          label: "Public",          icon: "🌐" },
 ] as const;
 type SectionTileId = typeof ALL_SECTION_TILES[number]["id"];
+
+/** The cards in the narrow column beside the sections. Orderable and removable like the main ones. */
+const SIDE_TILES = [
+  { id: "side_action_items", label: "Action Items",        icon: "✅" },
+  { id: "side_reminders",    label: "Reminders",           icon: "🔔" },
+  { id: "side_comments",     label: "Comments",            icon: "💬" },
+  { id: "side_layouts",      label: "Layouts",             icon: "🧱" },
+  { id: "side_quick_links",  label: "Quick create & links", icon: "🔗" },
+] as const;
+type SideSectionId = typeof SIDE_TILES[number]["id"];
+const SIDE_KEY = "profileSideSections-v1";
+const DEFAULT_SIDE: SideSectionId[] = SIDE_TILES.map(t => t.id);
 
 /**
  * A border on all four edges, optionally with different edges.
@@ -1889,24 +2014,41 @@ function borderSides(
 }
 
 const SECTIONS_KEY = "profileVisibleSections-v1";
-const DEFAULT_SECTIONS: SectionTileId[] = ["skills", "accounts", "artifacts", "time_allocation", "notifications", "public"];
+const DEFAULT_SECTIONS: SectionTileId[] = ["skills", "accounts", "jira_tickets", "zendesk_tickets", "product_gaps", "artifacts", "time_allocation", "notifications", "public"];
+
+/** The three ticket sections are new; add them once for people who already have a saved layout. */
+const TICKET_SECTIONS_SEEN_KEY = "profileTicketSectionsAdded-v1";
+const TICKET_SECTION_IDS: SectionTileId[] = ["jira_tickets", "zendesk_tickets", "product_gaps"];
+const TICKET_SECTION_KINDS: [SectionTileId, TicketKind][] = [["jira_tickets", "jira"], ["zendesk_tickets", "zendesk"], ["product_gaps", "product_gap"]];
 
 function loadVisibleSections(): SectionTileId[] {
   try {
     const raw = JSON.parse(localStorage.getItem(SECTIONS_KEY) ?? "null");
     if (Array.isArray(raw)) {
       const valid = new Set<string>(ALL_SECTION_TILES.map(t => t.id));
-      return raw.filter((id): id is SectionTileId => typeof id === "string" && valid.has(id));
+      const ids = raw.filter((id): id is SectionTileId => typeof id === "string" && valid.has(id));
+      if (!localStorage.getItem(TICKET_SECTIONS_SEEN_KEY)) {
+        // Once only: a person who later removes one of them keeps it removed.
+        localStorage.setItem(TICKET_SECTIONS_SEEN_KEY, "1");
+        const at = ids.indexOf("accounts");
+        const missing = TICKET_SECTION_IDS.filter(id => !ids.includes(id));
+        ids.splice(at >= 0 ? at + 1 : ids.length, 0, ...missing);
+      }
+      return ids;
     }
   } catch { /* corrupt value — fall back to defaults */ }
   return DEFAULT_SECTIONS;
 }
 
 function CollapsibleSection({
-  title, accentColor, textColor, defaultOpen = true, headerRight, children,
+  title, accentColor, textColor, defaultOpen = true, headerRight, children, full, sectionId,
 }: {
   title: string; accentColor: string; textColor: string;
+  /** Lets the Page Sections panel find this section to scroll to and glow it. */
+  sectionId?: string;
   defaultOpen?: boolean; headerRight?: ReactNode; children: ReactNode;
+  /** The full-screen view of this section (double-click the body, or the expand icon at its bottom-right). */
+  full?: () => ReactNode;
 }) {
   const [open, setOpen] = useState(defaultOpen);
   const toggle = () => setOpen(v => !v);
@@ -1915,7 +2057,7 @@ function CollapsibleSection({
   // and browsers disagree about which one a click reaches). The title still takes all the spare
   // width, so the whole left side of the header toggles as before.
   return (
-    <section style={{ marginBottom: 28 }}>
+    <section data-section-id={sectionId} style={{ marginBottom: 28 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: open ? 10 : 0, width: "100%" }}>
         <button
           type="button"
@@ -1941,7 +2083,9 @@ function CollapsibleSection({
           </svg>
         </button>
       </div>
-      {open && children}
+      {open && (full
+        ? <ExpandableSection title={title} accent={accentColor} renderFull={full}>{children}</ExpandableSection>
+        : children)}
     </section>
   );
 }
@@ -2047,33 +2191,41 @@ function NotepadSection({ meta, accounts }: { meta: typeof ROLE_META[TitleRole];
   const [notes, setNotes] = useState<UserPageNote[]>([]);
   const [activeNoteId, setActiveNoteId] = useState<number | "new">("new");
   const [content, setContent] = useState("");
-  const [accountContext, setAccountContext] = useState("");
+  // The account this note is filed under (null = a general note). A linked note also appears under
+  // that account's "Account Notes" on its detail page, visible only to its owner.
+  const [accountId, setAccountId] = useState<number | null>(null);
   const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved">("idle");
 
   useEffect(() => {
     userPageNoteApi.list().then(r => {
       setNotes(r.data);
-      if (r.data.length > 0) { setActiveNoteId(r.data[0].id); setContent(r.data[0].content); setAccountContext(r.data[0].account_ref_label ?? ""); }
+      if (r.data.length > 0) { setActiveNoteId(r.data[0].id); setContent(r.data[0].content); setAccountId(r.data[0].account ?? null); }
     }).catch(() => {});
   }, []);
 
-  function selectNote(note: UserPageNote) { setActiveNoteId(note.id); setContent(note.content); setAccountContext(note.account_ref_label ?? ""); }
-  function startNew() { setActiveNoteId("new"); setContent(""); setAccountContext(""); }
+  function selectNote(note: UserPageNote) { setActiveNoteId(note.id); setContent(note.content); setAccountId(note.account ?? null); }
+  function startNew() { setActiveNoteId("new"); setContent(""); setAccountId(null); }
 
-  async function handleBlur() {
+  /** Save the note as it is now; `nextAccountId` lets the account picker save its own change at once. */
+  async function persist(nextAccountId: number | null = accountId) {
     if (!content.trim() && activeNoteId === "new") return;
     setSaveStatus("saving");
+    const link = {
+      account: nextAccountId,
+      account_ref_label: accounts.find(a => a.id === nextAccountId)?.company_name ?? "",
+    };
     try {
       if (activeNoteId === "new") {
-        const { data } = await userPageNoteApi.create({ content, account_ref_label: accountContext });
+        const { data } = await userPageNoteApi.create({ content, ...link });
         setNotes(prev => [data, ...prev]); setActiveNoteId(data.id);
       } else {
-        const { data } = await userPageNoteApi.update(activeNoteId as number, { content, account_ref_label: accountContext });
+        const { data } = await userPageNoteApi.update(activeNoteId as number, { content, ...link });
         setNotes(prev => prev.map(n => n.id === data.id ? data : n));
       }
       setSaveStatus("saved"); setTimeout(() => setSaveStatus("idle"), 2000);
     } catch { setSaveStatus("idle"); }
   }
+  const handleBlur = () => persist();
 
   async function deleteNote(id: number) {
     await userPageNoteApi.destroy(id);
@@ -2106,11 +2258,23 @@ function NotepadSection({ meta, accounts }: { meta: typeof ROLE_META[TitleRole];
           <button onClick={startNew} style={{ padding: "3px 8px", borderRadius: 4, border: `1px dashed ${activeNoteId === "new" ? meta.border : "var(--border, rgba(0,0,0,0.1))"}`, background: activeNoteId === "new" ? `${meta.border}08` : "transparent", color: "var(--text-secondary, #aaa)", fontSize: "0.75rem", fontFamily: "var(--font-base)", cursor: "pointer" }}>+ new</button>
         </div>
       )}
-      <select value={accountContext} onChange={e => setAccountContext(e.target.value)}
-        style={{ padding: "5px 8px", borderRadius: 6, border: "1px solid var(--border, rgba(0,0,0,0.1))", background: "var(--bg, #f9f9f9)", fontFamily: "var(--font-base)", fontSize: "0.75rem", color: accountContext ? "var(--text-primary, #111)" : "var(--text-secondary, #aaa)", marginBottom: 8, outline: "none" }}>
+      <select
+        aria-label="Link this note to an account"
+        value={accountId ?? ""}
+        onChange={e => {
+          const next = e.target.value ? Number(e.target.value) : null;
+          setAccountId(next);
+          void persist(next);
+        }}
+        style={{ padding: "5px 8px", borderRadius: 6, border: "1px solid var(--border, rgba(0,0,0,0.1))", background: "var(--bg, #f9f9f9)", fontFamily: "var(--font-base)", fontSize: "0.75rem", color: accountId ? "var(--text-primary, #111)" : "var(--text-secondary, #aaa)", marginBottom: 4, outline: "none" }}>
         <option value="">For my page (general note)</option>
-        {accounts.map(a => <option key={a.id} value={a.company_name}>{a.company_name}</option>)}
+        {accounts.map(a => <option key={a.id} value={a.id}>{a.company_name}</option>)}
       </select>
+      <p data-testid="notepad-link-hint" style={{ margin: "0 0 8px", fontSize: "0.6875rem", color: "var(--text-secondary, #888)" }}>
+        {accountId
+          ? <>Also shown under <strong>Account Notes</strong> on {accounts.find(a => a.id === accountId)?.company_name ?? "that account"}'s page. Only you can see it.</>
+          : "Link this note to an account and it also appears under that account's Account Notes."}
+      </p>
       {/* Rich text so the notepad gets the same @mention / @#record picker the
           rest of the app's note fields have. Still autosaves on blur. */}
       <RichTextMentionEditor
@@ -2128,40 +2292,6 @@ function NotepadSection({ meta, accounts }: { meta: typeof ROLE_META[TitleRole];
 // Mini-layouts sidebar (toggle panel)
 // ─────────────────────────────────────────────────────────────────────────────
 
-function PageSectionsSidebar({
-  open, onClose, accentColor, textColor, onAddSection,
-}: {
-  open: boolean; onClose: () => void; accentColor: string; textColor: string;
-  onAddSection: (id: SectionTileId) => void;
-}) {
-  if (!open) return null;
-  return (
-    <div style={{ position: "absolute", top: 0, right: 0, height: "100%", width: 240, background: "var(--surface, #fff)", borderLeft: "1px solid var(--border, rgba(0,0,0,0.08))", boxShadow: "-4px 0 24px rgba(0,0,0,0.07)", display: "flex", flexDirection: "column", zIndex: 30 }}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 16px 12px", borderBottom: "1px solid var(--border, rgba(0,0,0,0.08))" }}>
-        <span style={{ fontSize: "0.6875rem", fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: textColor }}>Page Sections</span>
-        <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--text-secondary, #888)", padding: 2 }}>
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-        </button>
-      </div>
-      <p style={{ margin: "10px 16px 8px", fontSize: "0.75rem", color: "var(--text-secondary, #888)", lineHeight: 1.5 }}>
-        Click + to add a section to your page.
-      </p>
-      <div style={{ flex: 1, overflowY: "auto", padding: "0 12px 12px", display: "flex", flexDirection: "column", gap: 5 }}>
-        {ALL_SECTION_TILES.map(tile => (
-          <div key={tile.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 10px", borderRadius: 8, background: "var(--bg, #f9f9f9)", border: "1px solid var(--border, rgba(0,0,0,0.07))" }}>
-            <span style={{ fontSize: "0.9rem", flexShrink: 0 }}>{tile.icon}</span>
-            <span style={{ flex: 1, fontSize: "0.8125rem", fontFamily: "var(--font-base)", color: "var(--text-primary, #111)" }}>{tile.label}</span>
-            <button onClick={() => onAddSection(tile.id)} title={`Add ${tile.label}`}
-              style={{ width: 24, height: 24, borderRadius: 5, border: `1px solid ${accentColor}44`, background: `${accentColor}12`, color: accentColor, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "1rem", fontWeight: 700, flexShrink: 0 }}>
-              +
-            </button>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // RolePageInner
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2174,9 +2304,15 @@ function RolePageInner({ titleRole }: { titleRole: TitleRole }) {
   const [skills, setSkills] = useState<ClaudeSkill[]>([]);
   const [openSkill, setOpenSkill] = useState<ClaudeSkill | null>(null);
   const [agentSkills, setAgentSkills] = useState<AgentSkill[]>([]);
+  // The saved skill picked in My Skills; the Run Skill bar acts on it.
+  const [runSkillId, setRunSkillId] = useState<number | null>(null);
+  const runSkill = agentSkills.find(sk => sk.id === runSkillId) ?? null;
+  const [runDialogOpen, setRunDialogOpen] = useState(false);
   const [myAccounts, setMyAccounts] = useState<Account[]>([]);
   const [artifacts, setArtifacts] = useState<AccountArtifact[]>([]);
-  const [actionItems, setActionItems] = useState<ActionItem[]>([]);
+  // Same search / sort / category / creator / linked-to-action-item controls as an account's artifacts.
+  const [artifactBrowse, setArtifactBrowse] = useState<ArtifactBrowseState>(DEFAULT_ARTIFACT_BROWSE);
+  const [actionItems, setActionItems] = useState<AirtableActionItem[]>([]);
   const [reminders, setReminders] = useState<Reminder[]>([]);
   const [comments, setComments] = useState<Comment[]>([]);
   const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
@@ -2184,13 +2320,27 @@ function RolePageInner({ titleRole }: { titleRole: TitleRole }) {
   // Bumped after the modal changes something, so the left-column lists show it.
   const [reloadTick, setReloadTick] = useState(0);
   const { openComments } = useCommentContext();
-  const { reportError } = useAppError();
   const [pinnedLayouts, setPinnedLayouts] = useState<PageLayout[]>([]);
   const [sessions, setSessions] = useState<WorkingSession[]>([]);
   const [layoutSidebarOpen, setLayoutSidebarOpen] = useState(false);
   const [showNewArtifact, setShowNewArtifact] = useState(false);
   const [editArtifact, setEditArtifact] = useState<AccountArtifact | null>(null);
   const [visibleSections, setVisibleSections] = useState<SectionTileId[]>(loadVisibleSections);
+  const [sideSections, setSideSections] = useState<SideSectionId[]>(
+    () => loadIdList<SideSectionId>(SIDE_KEY, DEFAULT_SIDE) ?? DEFAULT_SIDE,
+  );
+  useEffect(() => {
+    try { localStorage.setItem(SIDE_KEY, JSON.stringify(sideSections)); } catch { /* storage full or blocked */ }
+  }, [sideSections]);
+  // A section just added from the panel: scroll to it and glow it once it has rendered.
+  const pendingReveal = useRef<string | null>(null);
+  useEffect(() => {
+    const id = pendingReveal.current;
+    if (!id) return;
+    pendingReveal.current = null;
+    const frame = requestAnimationFrame(() => { revealSection(id); });
+    return () => cancelAnimationFrame(frame);
+  }, [visibleSections, sideSections]);
   useEffect(() => {
     try { localStorage.setItem(SECTIONS_KEY, JSON.stringify(visibleSections)); } catch { /* storage full or blocked */ }
   }, [visibleSections]);
@@ -2216,10 +2366,8 @@ function RolePageInner({ titleRole }: { titleRole: TitleRole }) {
     Promise.all([
       teamApi.listMembers({ page_size: "200" }),
       accountsApi.listAccounts({ page_size: "500" }),
-      schedulerApi.listActionItems({ status: "in_progress", assigned_to_me: "true", page_size: "20" }),
-      schedulerApi.listReminders({ status: "pending", page_size: "20" }),
       commentsApi.listAll(),
-    ]).then(([membersRes, accountsRes, aiRes, remRes, comRes]) => {
+    ]).then(([membersRes, accountsRes, comRes]) => {
       const member = membersRes.data.results.find(m => m.user === currentUser.id) ?? null;
       const accounts = member
         ? accountsRes.data.results.filter(a => (a.team_members ?? []).some((m: { id: number }) => m.id === member.id))
@@ -2227,8 +2375,6 @@ function RolePageInner({ titleRole }: { titleRole: TitleRole }) {
       setMyAccounts(accounts);
       setMyMemberId(member?.id ?? null);
       setTeamMembers(membersRes.data.results);
-      setActionItems(aiRes.data.results);
-      setReminders(remRes.data.results);
       setComments(comRes.data.results.slice(0, 5));
       // One batched request rather than one per account — a user on many accounts
       // used to fan out enough requests here to trip the backend's 200/min throttle.
@@ -2238,28 +2384,44 @@ function RolePageInner({ titleRole }: { titleRole: TitleRole }) {
     }).catch(() => {});
   }, [currentUser, reloadTick]);
 
+  // Action items and reminders change all the time (here, on other pages, from the agent), so they
+  // are loaded by their own effect rather than with the one-shot load above, and re-read when the tab
+  // regains focus, when any action item is written anywhere in this tab or another, and every 30s.
+  // They read the SAME records the rest of the app shows: every In Progress Airtable action item the
+  // caller can see (what the Action Items page's In Progress column lists - not only ones assigned to
+  // them, and not the agent's separate `scheduler` follow-ups) and reminders by due date (a reminder that has already fired is
+  // "sent", so asking only for "pending" dropped everything due earlier today).
+  useEffect(() => {
+    if (!currentUser) return;
+    let alive = true;
+    const refresh = () => {
+      airtableApi.listActionItems({ status: "In Progress", page_size: "500" })
+        .then(r => { if (alive) setActionItems(r.data); }).catch(() => {});
+      const { from, to } = reminderWindow(new Date());
+      schedulerApi.listReminders({ due_before: to.toISOString(), ordering: "-due_at" })
+        .then(r => { if (alive) setReminders(r.data.results.filter(x => visibleReminder(x, from, to))); })
+        .catch(() => {});
+    };
+    refresh();
+    const onStorage = (e: StorageEvent) => { if (e.key === ACTION_ITEMS_UPDATED_KEY) refresh(); };
+    const onVisible = () => { if (document.visibilityState === "visible") refresh(); };
+    window.addEventListener("storage", onStorage);
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", onVisible);
+    const timer = window.setInterval(() => { if (document.visibilityState === "visible") refresh(); }, PROFILE_REFRESH_MS);
+    return () => {
+      alive = false;
+      window.removeEventListener("storage", onStorage);
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.clearInterval(timer);
+    };
+  }, [currentUser]);
+
   useEffect(() => { setOpenSkill(null); }, [titleRole]);
 
-  function addSection(id: SectionTileId) {
-    setVisibleSections(prev => prev.includes(id) ? prev : [...prev, id]);
-  }
   function removeSection(id: SectionTileId) {
     setVisibleSections(prev => prev.filter(s => s !== id));
-  }
-
-  // The list rows are scheduler records; the modal edits the Airtable record behind them.
-  async function openActionItem(ai: ActionItem) {
-    if (!ai.airtable_record_id) {
-      reportError("This action item isn't linked to Airtable yet, so it can't be opened here.");
-      return;
-    }
-    try {
-      const { data } = await airtableApi.listActionItems({ airtable_id: ai.airtable_record_id });
-      if (!data[0]) throw new Error("not found");
-      setModalItem(data[0]);
-    } catch {
-      reportError("Could not open that action item.");
-    }
   }
 
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
@@ -2285,9 +2447,13 @@ function RolePageInner({ titleRole }: { titleRole: TitleRole }) {
     }
   }, []);
 
-  const now = new Date();
-  const tomorrow = new Date(now); tomorrow.setDate(now.getDate() + 1);
-  const nearReminders = reminders.filter(r => new Date(r.due_at) <= tomorrow);
+  const nearReminders = reminders;
+  const accountNameOf = (a: AccountArtifact) => myAccounts.find(x => x.id === a.account)?.company_name ?? "";
+  const artifactGroups = useMemo(
+    () => browseArtifacts(artifacts, artifactBrowse, accountNameOf),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [artifacts, artifactBrowse, myAccounts],
+  );
 
   const initials = currentUser
     ? (currentUser.display_name || currentUser.username || currentUser.email || "?")
@@ -2306,6 +2472,116 @@ function RolePageInner({ titleRole }: { titleRole: TitleRole }) {
   const notionIcon = qIcon("notion");
   const lucidIcon = qIcon("lucidchart");
 
+  // ── Full-screen content ────────────────────────────────────────────────────
+  // Each section can open full screen (double-click, or the icon at its bottom-right). The panel is a
+  // list of cards, one per record; a card opens to show everything about the record.
+  const accent = meta.border;
+  const quickLinks = useQuickLinks();
+  const cardBtn: CSSProperties = { fontSize: "0.8125rem", fontWeight: 600, color: accent, background: "none", border: `1px solid ${accent}55`, borderRadius: 6, padding: "4px 10px", cursor: "pointer", textDecoration: "none" };
+
+  const actionItemCards: FullCard[] = actionItems.map(ai => ({
+    id: ai.id,
+    title: ai.task,
+    subtitle: [ai.account_name, ai.priority, ai.due_date ? `Due ${fmtDateTime(ai.due_date)}` : ""].filter(Boolean).join(" · "),
+    fields: fieldsOf(ai, {
+      html: ["task_details"],
+      seconds: ["estimated_time", "time_spent", "tracked_time", "prep_time"],
+      hide: ["id", "account", "reminder", "reminder_id", "linked_meeting"],
+    }),
+    actions: <button type="button" style={cardBtn} onClick={() => setModalItem(ai)}>Open action item</button>,
+  }));
+  const reminderCards: FullCard[] = nearReminders.map(r => ({
+    id: r.id,
+    title: r.title,
+    subtitle: [r.due_at ? fmtDateTime(r.due_at) : "", r.status].filter(Boolean).join(" · "),
+    fields: fieldsOf(r, { html: ["body"], hide: ["id", "created_by", "recipients", "links", "occurrences", "resource_id"] }),
+  }));
+  const commentCards: FullCard[] = comments.map(c => ({
+    id: c.id,
+    title: c.author_display,
+    subtitle: c.resource_label,
+    fields: fieldsOf(c, { hide: ["id", "author", "resource_id", "replies", "references", "mentions"] }),
+    actions: (
+      <button type="button" style={cardBtn}
+        onClick={e => openComments({ resourceType: c.resource_type, resourceId: c.resource_id, resourceLabel: c.resource_label, x: e.clientX, y: e.clientY })}>
+        Open conversation
+      </button>
+    ),
+  }));
+  const layoutCards: FullCard[] = pinnedLayouts.map(l => ({
+    id: l.id,
+    title: l.name,
+    subtitle: l.is_public ? "Public layout" : "Private layout",
+    fields: fieldsOf(l, { hide: ["id", "nodes", "creator", "forked_from"] }),
+    actions: <Link to={`/edit-preview?layout=${l.id}`} style={cardBtn}>Open in Page Builder</Link>,
+  }));
+  const accountCards: FullCard[] = myAccounts.map(a => ({
+    id: a.id,
+    title: a.company_name,
+    subtitle: a.industry ?? undefined,
+    fields: fieldsOf(a, { hide: ["id"] }),
+    actions: <Link to={`/accounts/${a.id}`} style={cardBtn}>Open account</Link>,
+  }));
+  const skillCards: FullCard[] = [
+    ...skills.map(sk => ({
+      id: `s-${sk.id}`, title: sk.name, subtitle: sk.status.replace("_", " "),
+      fields: fieldsOf(sk, { hide: ["id"] }),
+    })),
+    ...agentSkills.map(sk => ({
+      id: `a-${sk.id}`, title: sk.name.replace(/-/g, " ").replace(/\b\w/g, ch => ch.toUpperCase()), subtitle: sk.description,
+      fields: fieldsOf(sk, { hide: ["id"] }),
+    })),
+  ];
+  const BUILT_IN_LINKS = [
+    ["Google Doc", "https://docs.google.com/document/create"], ["Google Sheet", "https://sheets.google.com/create"],
+    ["Google Slides", "https://slides.google.com/create"], ["JIRA", "https://jira.atlassian.com"],
+    ["Figma", "https://www.figma.com"], ["Notion", "https://www.notion.so"], ["Lucidchart", "https://lucid.app/documents"],
+  ] as const;
+  const quickLinkCards: FullCard[] = [
+    ...BUILT_IN_LINKS.map(([label, url]) => ({
+      id: `b-${label}`, title: `+ ${label}`, subtitle: "Creates a new file",
+      fields: [{ label: "Kind", value: "Built-in" }, { label: "URL", value: url }],
+      actions: <a href={url} target="_blank" rel="noopener noreferrer" style={cardBtn}>Open</a>,
+    })),
+    ...quickLinks.links.map(l => ({
+      id: `u-${l.id}`, title: l.label, subtitle: "Your link",
+      fields: [{ label: "Kind", value: "Your link" }, { label: "URL", value: l.url }],
+      actions: <a href={l.url} target="_blank" rel="noopener noreferrer" style={cardBtn}>Open</a>,
+    })),
+  ];
+  const sessionCards: FullCard[] = sessions.map(sess => ({
+    id: sess.id,
+    title: sess.name,
+    subtitle: `${sess.record_refs?.length ?? 0} record${(sess.record_refs?.length ?? 0) === 1 ? "" : "s"} · updated ${fmtDateTime(sess.updated_at)}`,
+    fields: [
+      ...fieldsOf(sess, { hide: ["id", "owner", "canvas_nodes", "record_refs"] }),
+      { label: "Records", value: (sess.record_refs ?? []).length ? (sess.record_refs ?? []).map(r => r.label).join(", ") : "—" },
+      { label: "Canvas components", value: String((sess.canvas_nodes ?? []).length) },
+    ],
+  }));
+  const artifactFull = () => (
+    <>
+      <ArtifactBrowseBar artifacts={artifacts} state={artifactBrowse} onChange={setArtifactBrowse} />
+      <CardList
+        accent={accent}
+        empty={artifacts.length ? "No artifacts match your search." : "No artifacts yet."}
+        cards={artifactGroups.flatMap(g => g.items).map(a => ({
+          id: a.id,
+          title: a.name,
+          subtitle: [accountNameOf(a) || "No account", a.uploaded_by_username].filter(Boolean).join(" · "),
+          fields: fieldsOf(a, { html: ["description"], hide: ["id", "account", "uploaded_by", "references"], labels: { uploaded_by_username: "Added by" } }),
+          actions: (
+            <>
+              {(a.url ?? a.file_url) && <a href={(a.url ?? a.file_url) as string} target="_blank" rel="noopener noreferrer" style={cardBtn}>Open</a>}
+              <button type="button" style={cardBtn} onClick={() => setEditArtifact(a)}>Edit</button>
+            </>
+          ),
+        }))}
+      />
+    </>
+  );
+  const listFull = (cards: FullCard[], empty: string) => () => <CardList cards={cards} accent={accent} empty={empty} />;
+
   function renderSection(id: SectionTileId) {
     const removeBtn = (
       <button onClick={() => removeSection(id)} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--text-secondary, #ccc)", fontSize: "0.75rem", padding: "2px 4px" }}>✕</button>
@@ -2313,13 +2589,8 @@ function RolePageInner({ titleRole }: { titleRole: TitleRole }) {
 
     switch (id) {
       case "skills": return (
-        <CollapsibleSection key="skills" title="My Skills" accentColor={meta.border} textColor={meta.text} headerRight={
+        <CollapsibleSection key="skills" sectionId="skills" title="My Skills" accentColor={meta.border} textColor={meta.text} full={listFull(skillCards, "No skills yet.")} headerRight={
           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-            {/* In the header, not the body: the body is gated on skills.length and would
-                hide this for a role with no Claude skills. Unscoped on purpose — a role
-                page covers the whole book of business, so the useful run is every account
-                the user is on. The account detail page runs the scoped version. */}
-            <GetMeetingNotesButton />
             <button
               onClick={() => navigate("/skills")}
               style={{ fontSize: "0.6rem", fontWeight: 700, letterSpacing: "0.06em", padding: "2px 8px", borderRadius: 20, background: meta.bg, color: meta.text, border: `1px solid ${meta.border}44`, cursor: "pointer", textTransform: "uppercase" }}
@@ -2329,7 +2600,7 @@ function RolePageInner({ titleRole }: { titleRole: TitleRole }) {
             {removeBtn}
           </div>
         }>
-          {skills.length === 0 ? (
+          {skills.length === 0 && agentSkills.length === 0 ? (
             <div style={{ padding: "16px 20px", borderRadius: 10, background: "var(--surface, #fff)", border: "1.5px dashed var(--border, rgba(0,0,0,0.12))", fontSize: "0.8125rem", color: "var(--text-secondary, #888)" }}>
               No skills assigned to this role yet. Open a skill on the <a href="/skills" style={{ color: meta.border }}>Claude Skills page</a> and select <strong>{meta.label}</strong>.
             </div>
@@ -2346,22 +2617,53 @@ function RolePageInner({ titleRole }: { titleRole: TitleRole }) {
                   </button>
                 );
               })}
-              {agentSkills.map(skill => (
-                <div key={`a-${skill.id}`} style={{ display: "inline-flex", alignItems: "center", gap: 8, padding: "6px 8px 6px 14px", borderRadius: 8, border: "2px solid var(--border, rgba(0,0,0,0.10))", background: "var(--bg, #f9f9f9)" }}
-                  title={skill.description}>
-                  <span style={{ fontSize: "0.8125rem", fontWeight: 600, fontFamily: "var(--font-base)", color: "var(--text-primary, #111)" }}>
+              {agentSkills.map(skill => {
+                const picked = runSkillId === skill.id;
+                return (
+                  <button
+                    key={`a-${skill.id}`}
+                    type="button"
+                    aria-pressed={picked}
+                    title={skill.description}
+                    onClick={() => setRunSkillId(picked ? null : skill.id)}
+                    style={{ display: "inline-flex", alignItems: "center", gap: 8, padding: "8px 16px", borderRadius: 8, fontSize: "0.8125rem", fontWeight: 600, fontFamily: "var(--font-base)", cursor: "pointer", transition: "all 0.12s", border: picked ? `2px solid ${meta.border}` : "2px solid var(--border, rgba(0,0,0,0.10))", background: picked ? meta.bg : "var(--bg, #f9f9f9)", color: picked ? meta.text : "var(--text-primary, #111)" }}
+                  >
                     {skill.name.replace(/-/g, " ").replace(/\b\w/g, c => c.toUpperCase())}
+                  </button>
+                );
+              })}
+              {/* Skill first, then the action: pick a skill above, then use it in chat or a voice session. */}
+              {agentSkills.length > 0 && (
+                <div role="group" aria-label="Run Skill" data-testid="run-skill-bar"
+                  style={{ flexBasis: "100%", display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginTop: 6, paddingTop: 12, borderTop: "1px solid var(--border, rgba(0,0,0,0.08))" }}>
+                  <button
+                    type="button"
+                    disabled={!runSkill}
+                    title={runSkill ? "Choose accounts and add a request, then run it in chat" : "Select a skill first"}
+                    onClick={() => setRunDialogOpen(true)}
+                    style={{ display: "inline-flex", alignItems: "center", gap: 6, fontFamily: "var(--font-base)", fontWeight: 700, fontSize: "0.875rem", padding: "7px 18px", borderRadius: 7, border: "none", cursor: runSkill ? "pointer" : "not-allowed", background: runSkill ? meta.border : "rgba(0,0,0,0.07)", color: runSkill ? "#fff" : "var(--text-secondary, #aaa)" }}
+                  >
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden><polygon points="5 3 19 12 5 21 5 3" /></svg>
+                    Run Skill
+                  </button>
+                  <span data-testid="run-skill-selected" style={{ fontSize: "0.75rem", color: "var(--text-secondary, #888)" }}>
+                    {runSkill ? runSkill.name.replace(/-/g, " ").replace(/\b\w/g, c => c.toUpperCase()) : "Select a skill above"}
                   </span>
-                  <SkillLaunchButtons compact source={{ kind: "agent-skill", skill }} />
+                  <SkillLaunchButtons
+                    source={runSkill ? { kind: "agent-skill", skill: runSkill } : { kind: "text", title: "", chatText: "" }}
+                    disabled={!runSkill}
+                    disabledReason="Select a skill first"
+                  />
                 </div>
-              ))}
+              )}
+              {runDialogOpen && runSkill && <SkillRunDialog skill={runSkill} mode="chat" onClose={() => setRunDialogOpen(false)} />}
             </div>
           )}
         </CollapsibleSection>
       );
 
       case "accounts": return (
-        <CollapsibleSection key="accounts" title={`My Accounts${myAccounts.length ? ` (${myAccounts.length})` : ""}`} accentColor={meta.border} textColor={meta.text} headerRight={removeBtn}>
+        <CollapsibleSection key="accounts" sectionId="accounts" title={`My Accounts${myAccounts.length ? ` (${myAccounts.length})` : ""}`} accentColor={meta.border} textColor={meta.text} full={listFull(accountCards, "No accounts linked to your profile yet.")} headerRight={removeBtn}>
           {myAccounts.length === 0 ? (
             <div style={{ padding: "16px 20px", borderRadius: 10, background: "var(--surface, #fff)", border: "1.5px dashed var(--border, rgba(0,0,0,0.12))", fontSize: "0.8125rem", color: "var(--text-secondary, #888)" }}>No accounts linked to your profile yet.</div>
           ) : (
@@ -2381,8 +2683,20 @@ function RolePageInner({ titleRole }: { titleRole: TitleRole }) {
         </CollapsibleSection>
       );
 
+      case "jira_tickets":
+      case "zendesk_tickets":
+      case "product_gaps": {
+        const kind: TicketKind = id === "jira_tickets" ? "jira" : id === "zendesk_tickets" ? "zendesk" : "product_gap";
+        return (
+          <CollapsibleSection key={id} sectionId={id} title={TICKET_KIND_TITLE[kind]} accentColor={meta.border} textColor={meta.text}
+            full={() => <TicketsFull kind={kind} accent={meta.border} />} headerRight={removeBtn}>
+            <ProfileTicketsSection kind={kind} accounts={myAccounts} />
+          </CollapsibleSection>
+        );
+      }
+
       case "artifacts": return (
-        <CollapsibleSection key="artifacts" title={`My Artifacts${artifacts.length ? ` (${artifacts.length})` : ""}`} accentColor={meta.border} textColor={meta.text} defaultOpen={false} headerRight={
+        <CollapsibleSection key="artifacts" sectionId="artifacts" title={`My Artifacts${artifacts.length ? ` (${artifacts.length})` : ""}`} accentColor={meta.border} textColor={meta.text} defaultOpen={false} full={artifactFull} headerRight={
           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
             <button
               onClick={() => setShowNewArtifact(true)}
@@ -2401,8 +2715,24 @@ function RolePageInner({ titleRole }: { titleRole: TitleRole }) {
               </button>
             </div>
           ) : (
-            <div style={{ background: "var(--surface, #fff)", border: "1px solid var(--border, rgba(0,0,0,0.08))", borderRadius: 10, padding: 12, display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: 8 }}>
-              {artifacts.map(artifact => {
+            <div style={{ background: "var(--surface, #fff)", border: "1px solid var(--border, rgba(0,0,0,0.08))", borderRadius: 10, padding: 12 }}>
+              <ArtifactBrowseBar artifacts={artifacts} state={artifactBrowse} onChange={setArtifactBrowse} />
+              {artifactGroups.length === 0 && (
+                <p data-testid="artifact-no-match" style={{ margin: 0, fontSize: "0.75rem", fontStyle: "italic", color: "var(--text-secondary, #888)" }}>No artifacts match your search.</p>
+              )}
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: 8 }}>
+              {artifactGroups.flatMap(g => [
+                ...(g.label ? [{ heading: g.label, count: g.items.length } as const] : []),
+                ...g.items,
+              ]).map(row => {
+                if ("heading" in row) {
+                  return (
+                    <p key={`h-${row.heading}`} data-testid="artifact-group-heading" style={{ gridColumn: "1 / -1", margin: "6px 0 0", fontSize: "0.75rem", fontWeight: 600, color: "var(--text-secondary, #666)" }}>
+                      {row.heading} <span style={{ fontWeight: 400 }}>({row.count})</span>
+                    </p>
+                  );
+                }
+                const artifact = row;
                 const account = myAccounts.find(a => a.id === artifact.account);
                 return (
                   <a
@@ -2431,13 +2761,14 @@ function RolePageInner({ titleRole }: { titleRole: TitleRole }) {
                   </a>
                 );
               })}
+              </div>
             </div>
           )}
         </CollapsibleSection>
       );
 
       case "time_allocation": return (
-        <CollapsibleSection key="time_allocation" title="Time Allocation" accentColor={meta.border} textColor={meta.text} headerRight={removeBtn}>
+        <CollapsibleSection key="time_allocation" sectionId="time_allocation" title="Time Allocation" accentColor={meta.border} textColor={meta.text} full={() => <TimeAllocationPanel showCards accent={meta.border} />} headerRight={removeBtn}>
           <div style={{ background: "var(--surface, #fff)", borderRadius: 10, border: "1px solid var(--border, rgba(0,0,0,0.08))", padding: "4px 20px 16px" }}>
             <TimeAllocationPanel />
           </div>
@@ -2445,64 +2776,33 @@ function RolePageInner({ titleRole }: { titleRole: TitleRole }) {
       );
 
       case "notepad": return (
-        <div key="notepad" style={{ marginBottom: 28 }}>
+        <ExpandableSection key="notepad" sectionId="notepad" title="Notepad" accent={accent} style={{ marginBottom: 28 }} renderFull={() => <NotepadFull accent={accent} />}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
             <span style={{ fontSize: "0.6875rem", fontWeight: 700, letterSpacing: "0.08em", color: meta.text, textTransform: "uppercase" }}>Notepad</span>
             {removeBtn}
           </div>
           <NotepadSection meta={meta} accounts={myAccounts} />
-        </div>
+        </ExpandableSection>
       );
 
       case "mini_canvas": return (
-        <div key="mini_canvas" style={{ marginBottom: 28 }}>
+        <ExpandableSection key="mini_canvas" sectionId="mini_canvas" title="Mini Canvas" accent={accent} style={{ marginBottom: 28 }} renderFull={() => <MiniCanvasFullView accent={accent} />}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
             <span style={{ fontSize: "0.6875rem", fontWeight: 700, letterSpacing: "0.08em", color: meta.text, textTransform: "uppercase" }}>Mini Canvas</span>
             {removeBtn}
           </div>
           <MiniCanvasPanel accentColor={meta.border} textColor={meta.text} />
-        </div>
-      );
-
-      case "action_items": return (
-        <CollapsibleSection key="action_items" title="Action Items (In Progress)" accentColor={meta.border} textColor={meta.text} headerRight={removeBtn}>
-          <div style={{ background: "var(--surface, #fff)", border: "1px solid var(--border, rgba(0,0,0,0.08))", borderRadius: 10, padding: "10px 12px" }}>
-            {actionItems.length === 0 ? <p style={{ margin: 0, fontSize: "0.75rem", color: "var(--text-secondary, #aaa)", fontStyle: "italic" }}>No action items in progress.</p>
-              : actionItems.slice(0, 8).map(ai => <div key={ai.id} style={{ padding: "7px 10px", borderRadius: 7, marginBottom: 5, background: "var(--bg, #f9f9f9)", border: "1px solid var(--border, rgba(0,0,0,0.06))", fontSize: "0.8125rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={ai.title}>{ai.title}</div>)}
-          </div>
-        </CollapsibleSection>
-      );
-
-      case "reminders": return (
-        <CollapsibleSection key="reminders" title="Reminders (Today / Tomorrow)" accentColor={meta.border} textColor={meta.text} headerRight={removeBtn}>
-          <div style={{ background: "var(--surface, #fff)", border: "1px solid var(--border, rgba(0,0,0,0.08))", borderRadius: 10, padding: "10px 12px" }}>
-            {nearReminders.length === 0 ? <p style={{ margin: 0, fontSize: "0.75rem", color: "var(--text-secondary, #aaa)", fontStyle: "italic" }}>No reminders due soon.</p>
-              : nearReminders.slice(0, 5).map(r => <div key={r.id} style={{ padding: "7px 10px", borderRadius: 7, marginBottom: 5, background: "var(--bg, #f9f9f9)", border: "1px solid var(--border, rgba(0,0,0,0.06))", fontSize: "0.8125rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={r.title}>{r.title}</div>)}
-          </div>
-        </CollapsibleSection>
-      );
-
-      case "comments": return (
-        <CollapsibleSection key="comments" title="Comments" accentColor={meta.border} textColor={meta.text} headerRight={removeBtn}>
-          <div style={{ background: "var(--surface, #fff)", border: "1px solid var(--border, rgba(0,0,0,0.08))", borderRadius: 10, padding: "10px 12px" }}>
-            {comments.length === 0 ? <p style={{ margin: 0, fontSize: "0.75rem", color: "var(--text-secondary, #aaa)", fontStyle: "italic" }}>No recent comments.</p>
-              : comments.map(c => (
-                <div key={c.id} style={{ padding: "7px 10px", borderRadius: 7, marginBottom: 5, background: "var(--bg, #f9f9f9)", border: "1px solid var(--border, rgba(0,0,0,0.06))", fontSize: "0.75rem", color: "var(--text-secondary, #555)", overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>
-                  <span style={{ fontWeight: 600, color: "var(--text-primary, #111)", marginRight: 4 }}>{c.author_display}:</span>{c.content}
-                </div>
-              ))}
-          </div>
-        </CollapsibleSection>
+        </ExpandableSection>
       );
 
       case "notifications": return (
-        <CollapsibleSection key="notifications" title="Notifications" accentColor={meta.border} textColor={meta.text} headerRight={removeBtn}>
+        <CollapsibleSection key="notifications" sectionId="notifications" title="Notifications" accentColor={meta.border} textColor={meta.text} full={() => <NotificationsFull accent={meta.border} />} headerRight={removeBtn}>
           <NotificationsSection accent={meta} />
         </CollapsibleSection>
       );
 
       case "public": return (
-        <CollapsibleSection key="public" title="Public" accentColor={meta.border} textColor={meta.text} headerRight={removeBtn}>
+        <CollapsibleSection key="public" sectionId="public" title="Public" accentColor={meta.border} textColor={meta.text} full={myMemberId === null ? listFull([], "Your profile isn't linked to a team member yet.") : () => <PublicFull memberId={myMemberId} accent={meta.border} />} headerRight={removeBtn}>
           <p style={{ margin: "0 0 10px", fontSize: "0.75rem", color: "var(--text-secondary, #888)" }}>What others see when they open your profile from the Team page.</p>
           {myMemberId === null
             ? <p style={{ fontSize: "0.8125rem", color: "var(--text-secondary, #888)" }}>Your profile isn't linked to a team member yet, so it can't have a public page.</p>
@@ -2513,6 +2813,103 @@ function RolePageInner({ titleRole }: { titleRole: TitleRole }) {
       default: return null;
     }
   }
+
+  // The side-column cards, keyed by id so the page can show them in the user's order.
+  const sideBlocks: Record<SideSectionId, ReactNode> = {
+    side_action_items: (
+                <ExpandableSection key="side_action_items" sectionId="side_action_items" title="Action Items (In Progress)" accent={accent} renderFull={listFull(actionItemCards, "No action items in progress.")} style={{ background: "var(--surface, #fff)", border: "1px solid var(--border, rgba(0,0,0,0.08))", borderRadius: 12, padding: 14, marginBottom: 12 }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+                    <span style={{ fontSize: "0.6875rem", fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: meta.text }}>
+                      ACTION ITEMS <span style={{ fontWeight: 400, color: "var(--text-secondary, #888)", textTransform: "none", letterSpacing: 0 }}>In Progress</span>
+                    </span>
+                    <NewBadge onClick={() => window.dispatchEvent(new CustomEvent("open-new-action-item"))} />
+                  </div>
+                  {actionItems.length === 0
+                    ? <p style={{ margin: 0, fontSize: "0.75rem", color: "var(--text-secondary, #aaa)", fontStyle: "italic" }}>No action items in progress.</p>
+                    : (
+                      // Five rows in view; the rest scroll.
+                      <div data-testid="action-items-scroll" style={{ maxHeight: ACTION_ITEMS_VISIBLE * (ACTION_ROW_PX + ACTION_ROW_GAP_PX) - ACTION_ROW_GAP_PX, overflowY: "auto" }}>
+                        {actionItems.map(ai => (
+                          <button key={ai.id} type="button" onClick={() => setModalItem(ai)} title={ai.task}
+                            style={{ display: "block", width: "100%", boxSizing: "border-box", height: ACTION_ROW_PX, textAlign: "left", cursor: "pointer", fontFamily: "inherit", color: "inherit", padding: "0 10px", borderRadius: 8, marginBottom: ACTION_ROW_GAP_PX, background: "var(--bg, #f9f9f9)", border: "1px solid var(--border, rgba(0,0,0,0.06))", fontSize: "0.8125rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {ai.task}
+                          </button>
+                        ))}
+                      </div>
+                    )
+                  }
+                </ExpandableSection>
+
+                
+    ),
+    side_reminders: (
+                <ExpandableSection key="side_reminders" sectionId="side_reminders" title="Reminders (Today / Tomorrow)" accent={accent} renderFull={listFull(reminderCards, "No reminders due soon.")} style={{ background: "var(--surface, #fff)", border: "1px solid var(--border, rgba(0,0,0,0.08))", borderRadius: 12, padding: 14, marginBottom: 12 }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+                    <span style={{ fontSize: "0.6875rem", fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: meta.text }}>
+                      REMINDERS <span style={{ fontWeight: 400, color: "var(--text-secondary, #888)", textTransform: "none", letterSpacing: 0 }}>Today / Tomorrow</span>
+                    </span>
+                    <NewBadge onClick={() => window.dispatchEvent(new CustomEvent("open-new-reminder"))} />
+                  </div>
+                  {nearReminders.length === 0
+                    ? <p style={{ margin: 0, fontSize: "0.75rem", color: "var(--text-secondary, #aaa)", fontStyle: "italic" }}>No reminders due soon.</p>
+                    : <div data-testid="reminders-scroll" style={{ maxHeight: ACTION_ITEMS_VISIBLE * 42, overflowY: "auto" }}>{nearReminders.map(r => <div key={r.id} style={{ padding: "7px 10px", borderRadius: 8, marginBottom: 6, background: "var(--bg, #f9f9f9)", border: "1px solid var(--border, rgba(0,0,0,0.06))", fontSize: "0.8125rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={r.title}>{r.title}</div>)}</div>
+                  }
+                </ExpandableSection>
+
+                
+    ),
+    side_comments: (
+                <ExpandableSection key="side_comments" sectionId="side_comments" title="Comments" accent={accent} renderFull={listFull(commentCards, "No recent comments.")} style={{ background: "var(--surface, #fff)", border: "1px solid var(--border, rgba(0,0,0,0.08))", borderRadius: 12, padding: 14, marginBottom: 12 }}>
+                  <div style={{ marginBottom: 10 }}>
+                    <span style={{ fontSize: "0.6875rem", fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: meta.text }}>COMMENTS</span>
+                  </div>
+                  {comments.length === 0
+                    ? <p style={{ margin: 0, fontSize: "0.75rem", color: "var(--text-secondary, #aaa)", fontStyle: "italic" }}>No recent comments.</p>
+                    : comments.slice(0, 3).map(c => (
+                      <button key={c.id} type="button"
+                        title={c.resource_label ? `Open the conversation on ${c.resource_label}` : "Open this conversation"}
+                        onClick={e => openComments({ resourceType: c.resource_type, resourceId: c.resource_id, resourceLabel: c.resource_label, x: e.clientX, y: e.clientY })}
+                        style={{ display: "-webkit-box", width: "100%", textAlign: "left", cursor: "pointer", fontFamily: "inherit", padding: "7px 10px", borderRadius: 8, marginBottom: 6, background: "var(--bg, #f9f9f9)", border: "1px solid var(--border, rgba(0,0,0,0.06))", fontSize: "0.75rem", color: "var(--text-secondary, #555)", overflow: "hidden", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>
+                        <span style={{ fontWeight: 600, color: "var(--text-primary, #111)", marginRight: 4 }}>{c.author_display}:</span>{c.content}
+                      </button>
+                    ))
+                  }
+                </ExpandableSection>
+
+                
+    ),
+    side_layouts: (
+                <ExpandableSection key="side_layouts" sectionId="side_layouts" title="Layouts" accent={accent} renderFull={listFull(layoutCards, "No pinned layouts.")} style={{ background: "var(--surface, #fff)", border: "1px solid var(--border, rgba(0,0,0,0.08))", borderRadius: 12, padding: 14, marginBottom: 24 }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+                    <span style={{ fontSize: "0.6875rem", fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: meta.text }}>LAYOUTS</span>
+                    <Link to="/edit-preview" style={{ fontSize: "0.6875rem", color: meta.border, textDecoration: "none", fontWeight: 600 }}>View all →</Link>
+                  </div>
+                  {pinnedLayouts.length === 0
+                    ? <p style={{ margin: 0, fontSize: "0.75rem", color: "var(--text-secondary, #aaa)", fontStyle: "italic" }}>Pin from <Link to="/edit-preview" style={{ color: meta.border }}>Page Builder</Link>.</p>
+                    : pinnedLayouts.slice(0, 4).map(l => (
+                      <Link key={l.id} to={`/edit-preview?layout=${l.id}`} style={{ textDecoration: "none", display: "block", marginBottom: 5 }}>
+                        <div style={{ padding: "7px 10px", borderRadius: 8, background: "var(--bg, #f9f9f9)", border: "1px solid var(--border, rgba(0,0,0,0.06))", fontSize: "0.8125rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{l.name}</div>
+                      </Link>
+                    ))
+                  }
+                </ExpandableSection>
+
+                
+    ),
+    side_quick_links: (
+                <ExpandableSection key="side_quick_links" sectionId="side_quick_links" title="Quick create & links" accent={accent} renderFull={listFull(quickLinkCards, "No links.")} style={{ background: "var(--surface, #fff)", border: "1px solid var(--border, rgba(0,0,0,0.08))", borderRadius: 12, padding: "10px 4px" }}>
+                  <QuickCreateRow icon={gdocsIcon}  label="+ Google Doc"    href="https://docs.google.com/document/create" />
+                  <QuickCreateRow icon={sheetIcon}  label="+ Google Sheet"  href="https://sheets.google.com/create" />
+                  <QuickCreateRow icon={slidesIcon} label="+ Google Slides" href="https://slides.google.com/create" />
+                  <QuickCreateRow icon={jiraIcon}   label="+ JIRA"          href="https://jira.atlassian.com" />
+                  <QuickCreateRow icon={figmaIcon}  label="+ Figma"         href="https://www.figma.com" />
+                  <QuickCreateRow icon={notionIcon} label="+ Notion"        href="https://www.notion.so" />
+                  <QuickCreateRow icon={lucidIcon}  label="+ Lucidchart"    href="https://lucid.app/documents" />
+                  {/* The user's own links and the input to add one — kept at the bottom of this list. */}
+                  <QuickLinks accent={meta.border} />
+                </ExpandableSection>
+    ),
+  };
 
   return (
     <DndContext sensors={sensors} collisionDetection={pointerWithin} onDragEnd={handleDragEnd}>
@@ -2550,91 +2947,17 @@ function RolePageInner({ titleRole }: { titleRole: TitleRole }) {
               </div>
             </div>
 
+            <TicketsToReview kinds={TICKET_SECTION_KINDS.filter(([sid]) => !visibleSections.includes(sid)).map(([, k]) => k)} />
+
             {/* Two-column layout */}
             <div style={{ display: "flex", gap: 24, alignItems: "flex-start" }}>
 
-              {/* LEFT column */}
-              <div style={{ width: 260, flexShrink: 0 }}>
-                {/* Action items */}
-                <div style={{ background: "var(--surface, #fff)", border: "1px solid var(--border, rgba(0,0,0,0.08))", borderRadius: 12, padding: 14, marginBottom: 12 }}>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
-                    <span style={{ fontSize: "0.6875rem", fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: meta.text }}>
-                      ACTION ITEMS <span style={{ fontWeight: 400, color: "var(--text-secondary, #888)", textTransform: "none", letterSpacing: 0 }}>In Progress</span>
-                    </span>
-                    <NewBadge onClick={() => window.dispatchEvent(new CustomEvent("open-new-action-item"))} />
-                  </div>
-                  {actionItems.length === 0
-                    ? <p style={{ margin: 0, fontSize: "0.75rem", color: "var(--text-secondary, #aaa)", fontStyle: "italic" }}>No action items in progress.</p>
-                    : actionItems.slice(0, 5).map(ai => (
-                      <button key={ai.id} type="button" onClick={() => void openActionItem(ai)} title={ai.title}
-                        style={{ display: "block", width: "100%", textAlign: "left", cursor: "pointer", fontFamily: "inherit", color: "inherit", padding: "8px 10px", borderRadius: 8, marginBottom: 6, background: "var(--bg, #f9f9f9)", border: "1px solid var(--border, rgba(0,0,0,0.06))", fontSize: "0.8125rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {ai.title}
-                      </button>
-                    ))
-                  }
+              {/* Side column: cards in the order chosen in the Page Sections panel; hidden when empty. */}
+              {sideSections.length > 0 && (
+                <div style={{ width: 260, flexShrink: 0 }}>
+                  {sideSections.map(id => sideBlocks[id])}
                 </div>
-
-                {/* Reminders */}
-                <div style={{ background: "var(--surface, #fff)", border: "1px solid var(--border, rgba(0,0,0,0.08))", borderRadius: 12, padding: 14, marginBottom: 12 }}>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
-                    <span style={{ fontSize: "0.6875rem", fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: meta.text }}>
-                      REMINDERS <span style={{ fontWeight: 400, color: "var(--text-secondary, #888)", textTransform: "none", letterSpacing: 0 }}>Today / Tomorrow</span>
-                    </span>
-                    <NewBadge onClick={() => window.dispatchEvent(new CustomEvent("open-new-reminder"))} />
-                  </div>
-                  {nearReminders.length === 0
-                    ? <p style={{ margin: 0, fontSize: "0.75rem", color: "var(--text-secondary, #aaa)", fontStyle: "italic" }}>No reminders due soon.</p>
-                    : nearReminders.slice(0, 4).map(r => <div key={r.id} style={{ padding: "7px 10px", borderRadius: 8, marginBottom: 6, background: "var(--bg, #f9f9f9)", border: "1px solid var(--border, rgba(0,0,0,0.06))", fontSize: "0.8125rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={r.title}>{r.title}</div>)
-                  }
-                </div>
-
-                {/* Comments */}
-                <div style={{ background: "var(--surface, #fff)", border: "1px solid var(--border, rgba(0,0,0,0.08))", borderRadius: 12, padding: 14, marginBottom: 12 }}>
-                  <div style={{ marginBottom: 10 }}>
-                    <span style={{ fontSize: "0.6875rem", fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: meta.text }}>COMMENTS</span>
-                  </div>
-                  {comments.length === 0
-                    ? <p style={{ margin: 0, fontSize: "0.75rem", color: "var(--text-secondary, #aaa)", fontStyle: "italic" }}>No recent comments.</p>
-                    : comments.slice(0, 3).map(c => (
-                      <button key={c.id} type="button"
-                        title={c.resource_label ? `Open the conversation on ${c.resource_label}` : "Open this conversation"}
-                        onClick={e => openComments({ resourceType: c.resource_type, resourceId: c.resource_id, resourceLabel: c.resource_label, x: e.clientX, y: e.clientY })}
-                        style={{ display: "-webkit-box", width: "100%", textAlign: "left", cursor: "pointer", fontFamily: "inherit", padding: "7px 10px", borderRadius: 8, marginBottom: 6, background: "var(--bg, #f9f9f9)", border: "1px solid var(--border, rgba(0,0,0,0.06))", fontSize: "0.75rem", color: "var(--text-secondary, #555)", overflow: "hidden", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>
-                        <span style={{ fontWeight: 600, color: "var(--text-primary, #111)", marginRight: 4 }}>{c.author_display}:</span>{c.content}
-                      </button>
-                    ))
-                  }
-                </div>
-
-                {/* Pinned layouts */}
-                <div style={{ background: "var(--surface, #fff)", border: "1px solid var(--border, rgba(0,0,0,0.08))", borderRadius: 12, padding: 14, marginBottom: 24 }}>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
-                    <span style={{ fontSize: "0.6875rem", fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: meta.text }}>LAYOUTS</span>
-                    <Link to="/edit-preview" style={{ fontSize: "0.6875rem", color: meta.border, textDecoration: "none", fontWeight: 600 }}>View all →</Link>
-                  </div>
-                  {pinnedLayouts.length === 0
-                    ? <p style={{ margin: 0, fontSize: "0.75rem", color: "var(--text-secondary, #aaa)", fontStyle: "italic" }}>Pin from <Link to="/edit-preview" style={{ color: meta.border }}>Page Builder</Link>.</p>
-                    : pinnedLayouts.slice(0, 4).map(l => (
-                      <Link key={l.id} to={`/edit-preview?layout=${l.id}`} style={{ textDecoration: "none", display: "block", marginBottom: 5 }}>
-                        <div style={{ padding: "7px 10px", borderRadius: 8, background: "var(--bg, #f9f9f9)", border: "1px solid var(--border, rgba(0,0,0,0.06))", fontSize: "0.8125rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{l.name}</div>
-                      </Link>
-                    ))
-                  }
-                </div>
-
-                {/* Quick-create links */}
-                <div style={{ background: "var(--surface, #fff)", border: "1px solid var(--border, rgba(0,0,0,0.08))", borderRadius: 12, padding: "10px 4px" }}>
-                  <QuickCreateRow icon={gdocsIcon}  label="+ Google Doc"    href="https://docs.google.com/document/create" />
-                  <QuickCreateRow icon={sheetIcon}  label="+ Google Sheet"  href="https://sheets.google.com/create" />
-                  <QuickCreateRow icon={slidesIcon} label="+ Google Slides" href="https://slides.google.com/create" />
-                  <QuickCreateRow icon={jiraIcon}   label="+ JIRA"          href="https://jira.atlassian.com" />
-                  <QuickCreateRow icon={figmaIcon}  label="+ Figma"         href="https://www.figma.com" />
-                  <QuickCreateRow icon={notionIcon} label="+ Notion"        href="https://www.notion.so" />
-                  <QuickCreateRow icon={lucidIcon}  label="+ Lucidchart"    href="https://lucid.app/documents" />
-                  {/* The user's own links and the input to add one — kept at the bottom of this list. */}
-                  <QuickLinks accent={meta.border} />
-                </div>
-              </div>
+              )}
 
               {/* RIGHT column */}
               <div style={{ flex: 1, minWidth: 0 }}>
@@ -2659,30 +2982,39 @@ function RolePageInner({ titleRole }: { titleRole: TitleRole }) {
             {/* Notepad + Mini canvas (default always-visible row if not in visibleSections) */}
             {!visibleSections.includes("notepad") && !visibleSections.includes("mini_canvas") && (
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 28, marginTop: 4 }}>
-                <NotepadSection meta={meta} accounts={myAccounts} />
-                <MiniCanvasPanel accentColor={meta.border} textColor={meta.text} />
+                <ExpandableSection title="Notepad" accent={accent} renderFull={() => <NotepadFull accent={accent} />}>
+                  <NotepadSection meta={meta} accounts={myAccounts} />
+                </ExpandableSection>
+                <ExpandableSection title="Mini Canvas" accent={accent} renderFull={() => <MiniCanvasFullView accent={accent} />}>
+                  <MiniCanvasPanel accentColor={meta.border} textColor={meta.text} />
+                </ExpandableSection>
               </div>
             )}
 
             {/* Working sessions */}
-            <WorkingSessionsArea
-              sessions={sessions}
-              setSessions={setSessions}
-              accentColor={meta.border}
-              textColor={meta.text}
-              currentUser={currentUser}
-            />
+            <ExpandableSection title="Working Sessions" accent={accent} renderFull={listFull(sessionCards, "No working sessions yet.")}>
+              <WorkingSessionsArea
+                sessions={sessions}
+                setSessions={setSessions}
+                accentColor={meta.border}
+                textColor={meta.text}
+                currentUser={currentUser}
+              />
+            </ExpandableSection>
           </div>
         </div>
 
         {openSkill && <SkillRunSidebar skill={openSkill} meta={meta} onClose={() => setOpenSkill(null)} />}
 
-        <PageSectionsSidebar
+        <PageSectionsPanel
           open={layoutSidebarOpen}
           onClose={() => setLayoutSidebarOpen(false)}
-          accentColor={meta.border}
-          textColor={meta.text}
-          onAddSection={addSection}
+          accent={meta.border}
+          text={meta.text}
+          main={{ tiles: ALL_SECTION_TILES, order: visibleSections, onChange: next => setVisibleSections(next as SectionTileId[]) }}
+          side={{ tiles: SIDE_TILES, order: sideSections, onChange: next => setSideSections(next as SideSectionId[]) }}
+          onReveal={id => { revealSection(id); }}
+          onAdded={id => { pendingReveal.current = id; }}
         />
       </div>
 
@@ -2768,13 +3100,42 @@ function OtherProfile({ memberId }: { memberId: number }) {
             </p>
           </div>
         </div>
-        <CollapsibleSection title="Public" accentColor={meta.border} textColor={meta.text}>
+        <CollapsibleSection title="Public" accentColor={meta.border} textColor={meta.text} full={() => <PublicFull memberId={profile.id} accent={meta.border} />}>
           <PublicSection memberId={profile.id} personName={profile.full_name} personEmail={profile.email} isSelf={false} accent={meta} />
         </CollapsibleSection>
       </div>
     </div>
   );
 }
+
+/** Local start of today through the end of tomorrow: what "Today / Tomorrow" means. */
+export function reminderWindow(now: Date): { from: Date; to: Date } {
+  const from = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const to = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 2);
+  to.setMilliseconds(-1);
+  return { from, to };
+}
+
+/**
+ * On the list when the reminder is due, or on the calendar, today or tomorrow (fired or not). A
+ * reminder due last month with a calendar block today counts - it is on today's calendar. Anything
+ * still waiting (pending/snoozed) that is overdue stays too. Dismissed ones never show.
+ */
+export function visibleReminder(
+  r: Pick<Reminder, "status" | "due_at" | "occurrences">, from: Date, to: Date = new Date(8.64e15),
+): boolean {
+  if (r.status === "dismissed") return false;
+  if (reminderTimes(r as Reminder).some(t => t >= from && t <= to)) return true;
+  return (r.status === "pending" || r.status === "snoozed") && !!r.due_at && new Date(r.due_at) < from;
+}
+
+/** Action items in view before the list scrolls, and the pixel size of a row. */
+const ACTION_ITEMS_VISIBLE = 5;
+const ACTION_ROW_PX = 36;
+const ACTION_ROW_GAP_PX = 6;
+
+/** How often the action-item and reminder lists re-read while the tab is visible. */
+const PROFILE_REFRESH_MS = 30_000;
 
 export default function ProfilePage() {
   const { memberId } = useParams<{ memberId: string }>();

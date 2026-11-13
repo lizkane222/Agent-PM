@@ -466,3 +466,50 @@ describe("MeetingDetail — no WebSocket for synthetic overlay events", () => {
     expect(sockets).toHaveLength(0);
   });
 });
+
+describe("MeetingDetail — account Projects & Goals", () => {
+  const proj = (over: Record<string, unknown>) => ({
+    id: 1, account: 1, name: "P", description: "", url: "", position: 0, action_ids: [], meeting_ids: [],
+    goal_ids: [], resources: [], sf_data: {}, sf_project_id: "", kind: "project", created_at: "2026-01-01T00:00:00Z", ...over,
+  });
+
+  function setup(projects: unknown[], salesforce: unknown[] = [{ id: 9, sf_id: "a0X", name: "Manager Tasks", account_name: "Acme Corp", status: "Active" }]) {
+    server.use(
+      http.post("/api/v1/airtable/match/", () => HttpResponse.json({
+        needs_categorization: false, account: { id: 4, airtable_id: "recACME001", name: "Acme Corp" }, action_items: [],
+      })),
+      http.get("/api/v1/accounts/accounts/", () => HttpResponse.json({ results: [{ id: 1, company_name: "Acme Corp", team_members: [] }] })),
+      http.get("/api/v1/accounts/projects/", () => HttpResponse.json({ results: projects })),
+      http.get("/api/v1/salesforce/projects/", () => HttpResponse.json({ results: salesforce })),
+    );
+  }
+
+  beforeEach(() => {
+    localStorage.clear();
+    vi.stubGlobal("WebSocket", FakeSocket);
+    registerHandlers();
+  });
+
+  it("lists the account's projects with goals beneath and ignores the Salesforce mirror", async () => {
+    setup([
+      proj({ id: 1, name: "Segment Rollout", sf_project_id: "a0P1", goal_ids: ["2"] }),
+      proj({ id: 2, name: "Hit 90% adoption", kind: "goal" }),
+      proj({ id: 3, account: 99, name: "Other Account Project" }),
+    ]);
+    renderDetail();
+    fireEvent.click(await screen.findByRole("button", { name: /Salesforce Projects/ }));
+    expect(await screen.findByText("Segment Rollout")).toBeInTheDocument();
+    expect(screen.getByText("Hit 90% adoption")).toBeInTheDocument();
+    expect(screen.queryByText("Other Account Project")).toBeNull();
+    expect(screen.queryByText("Manager Tasks")).toBeNull();
+    expect(screen.getAllByTestId("account-project")).toHaveLength(1);
+  });
+
+  it("shows an empty state when the account has no projects", async () => {
+    setup([]);
+    renderDetail();
+    fireEvent.click(await screen.findByRole("button", { name: /Salesforce Projects/ }));
+    expect(await screen.findByText(/No projects or goals on this account yet/)).toBeInTheDocument();
+    expect(screen.queryByText("Manager Tasks")).toBeNull();
+  });
+});

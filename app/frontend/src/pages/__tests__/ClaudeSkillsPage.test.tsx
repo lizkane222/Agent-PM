@@ -550,3 +550,86 @@ describe("New Agent PM skill — Recommend tools with Claude", () => {
     await waitFor(() => expect(created.allowed_tools).toEqual(["search_records"]));
   });
 });
+
+// ── Generate instructions: it must never fail silently ────────────────────────────────
+
+describe("New Agent PM skill — Generate instructions", () => {
+  const GEN = "/api/v1/skills/agent-skills/generate/";
+  const CODE_BLOCK = "Use this shape:\n```\n## [Account] — Weekly Update\n```\nDone.";
+
+  async function openFormWithDescription() {
+    renderPage();
+    fireEvent.click(screen.getAllByRole("button", { name: "+ New" })[0]);
+    await screen.findByTestId("tool-recommender");
+    fireEvent.change(screen.getByPlaceholderText(/Use when the user asks for a weekly summary/), { target: { value: "Weekly account update" } });
+  }
+  const generate = () => fireEvent.click(screen.getByRole("button", { name: /Generate instructions with Claude/i }));
+  const instructionsBox = () => screen.getByPlaceholderText(/Search for all accounts with status Active/) as HTMLTextAreaElement;
+
+  it("fills the Instructions box — including instructions that contain code blocks", async () => {
+    server.use(http.post(GEN, () => HttpResponse.json({
+      name: "weekly-update", description: "Use for weekly updates.", instructions: CODE_BLOCK,
+      allowed_tools: ["search_records"], needs_script: false, script: "",
+    })));
+    await openFormWithDescription();
+    generate();
+    await waitFor(() => expect(instructionsBox().value).toBe(CODE_BLOCK));
+    expect(screen.queryByTestId("generate-error")).not.toBeInTheDocument();
+  });
+
+  it("shows the server's reason beside the button, and leaves the form as it was", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    server.use(http.post(GEN, () => HttpResponse.json(
+      { detail: "Claude's reply was missing the skill's instructions. Please try again." }, { status: 502 })));
+    await openFormWithDescription();
+    generate();
+    const err = await screen.findByTestId("generate-error");
+    expect(err).toHaveTextContent("missing the skill's instructions");
+    expect(instructionsBox().value).toBe("");
+    expect(screen.getByRole("button", { name: /Generate instructions with Claude/i })).toBeEnabled();
+    expect(consoleError).toHaveBeenCalled();           // a failure is visible in the console too
+    consoleError.mockRestore();
+  });
+
+  it("falls back to a generic message when the server gives no reason", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    server.use(http.post(GEN, () => HttpResponse.json({}, { status: 500 })));
+    await openFormWithDescription();
+    generate();
+    expect(await screen.findByTestId("generate-error")).toHaveTextContent("Generation failed");
+    consoleError.mockRestore();
+  });
+
+  it("treats a 200 with no instructions as a failure instead of silently doing nothing", async () => {
+    server.use(http.post(GEN, () => HttpResponse.json({ name: "weekly-update", description: "A different description." })));
+    await openFormWithDescription();
+    generate();
+    expect(await screen.findByTestId("generate-error")).toHaveTextContent("didn't include any instructions");
+    // …and it must not have half-applied the reply (the description is the author's, untouched).
+    expect((screen.getByPlaceholderText(/Use when the user asks for a weekly summary/) as HTMLTextAreaElement).value).toBe("Weekly account update");
+  });
+
+  it("clears an old error when the author tries again", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    server.use(http.post(GEN, () => HttpResponse.json({ detail: "Try again." }, { status: 502 })));
+    await openFormWithDescription();
+    generate();
+    await screen.findByTestId("generate-error");
+    server.use(http.post(GEN, () => HttpResponse.json({ name: "n", description: "d", instructions: "Step one", allowed_tools: [], needs_script: false, script: "" })));
+    generate();
+    await waitFor(() => expect(instructionsBox().value).toBe("Step one"));
+    expect(screen.queryByTestId("generate-error")).not.toBeInTheDocument();
+    consoleError.mockRestore();
+  });
+
+  it("tells the author how long to expect while it works", async () => {
+    server.use(http.post(GEN, async () => {
+      await new Promise((r) => setTimeout(r, 150));
+      return HttpResponse.json({ name: "n", description: "d", instructions: "Step", allowed_tools: [], needs_script: false, script: "" });
+    }));
+    await openFormWithDescription();
+    generate();
+    expect(await screen.findByText(/usually takes 15–25 seconds/)).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByText(/usually takes/)).not.toBeInTheDocument());
+  });
+});

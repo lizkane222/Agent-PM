@@ -56,7 +56,8 @@ def account_for_user_by_name(user, name):
         return None
 
 
-def record_notification(user, channel, kind, title, body="", link="", status="sent", account=None):
+def record_notification(user, channel, kind, title, body="", link="", status="sent", account=None,
+                        reminder=None, fired_for=None):
     """Persist one notification row. Never raises: history must not break a send."""
     if user is None:
         return None
@@ -72,6 +73,8 @@ def record_notification(user, channel, kind, title, body="", link="", status="se
             link=(link or "")[:500],
             status=status,
             account=account,
+            reminder=reminder,
+            fired_for=fired_for,
         )
     except Exception:
         logger.exception("Could not record %s/%s notification for user %s", kind, channel, getattr(user, "pk", "?"))

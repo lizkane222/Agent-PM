@@ -31,12 +31,12 @@ export default function LeaveNoteModal({ memberId, personName, onClose }: Props)
 
   return (
     <div role="dialog" aria-label={`Leave a note for ${personName}`} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center" }} onClick={onClose}>
-      <div style={{ background: "#fff", borderRadius: 12, padding: 20, width: 420, maxWidth: "92vw" }} onClick={(e) => e.stopPropagation()}>
+      <div style={{ background: "var(--surface-card)", borderRadius: 12, padding: 20, width: 420, maxWidth: "92vw" }} onClick={(e) => e.stopPropagation()}>
         <h2 style={{ margin: 0, fontSize: "1.0625rem" }}>Leave a note for {first}</h2>
         {sent ? (
           <>
             <p style={{ fontSize: "0.875rem" }}>Sent. {first} has been notified.</p>
-            <button onClick={onClose} style={{ padding: "8px 14px", borderRadius: 8, border: "1px solid var(--border, rgba(0,0,0,0.15))", background: "#fff", cursor: "pointer", fontWeight: 600 }}>Close</button>
+            <button onClick={onClose} style={{ padding: "8px 14px", borderRadius: 8, border: "1px solid var(--border, rgba(0,0,0,0.15))", background: "var(--surface-card)", cursor: "pointer", fontWeight: 600 }}>Close</button>
           </>
         ) : (
           <>
@@ -51,7 +51,7 @@ export default function LeaveNoteModal({ memberId, personName, onClose }: Props)
               style={{ width: "100%", padding: 10, borderRadius: 8, border: "1px solid var(--border, rgba(0,0,0,0.15))", fontFamily: "var(--font-base)", fontSize: "0.875rem", boxSizing: "border-box", resize: "vertical" }}
             />
             <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 10 }}>
-              <button onClick={onClose} style={{ padding: "8px 14px", borderRadius: 8, border: "1px solid var(--border, rgba(0,0,0,0.15))", background: "#fff", cursor: "pointer" }}>Cancel</button>
+              <button onClick={onClose} style={{ padding: "8px 14px", borderRadius: 8, border: "1px solid var(--border, rgba(0,0,0,0.15))", background: "var(--surface-card)", cursor: "pointer" }}>Cancel</button>
               <button onClick={() => void send()} disabled={!body.trim() || saving} style={{ padding: "8px 14px", borderRadius: 8, border: "none", background: "var(--twilio-navy, #0d1b2e)", color: "#fff", fontWeight: 600, cursor: "pointer", opacity: body.trim() && !saving ? 1 : 0.5 }}>
                 {saving ? "Sending…" : "Send note"}
               </button>

@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { http, HttpResponse } from "msw";
 import { server } from "../../test/msw-server";
+import { mockAgentSkill, mockPagePin, pagePinsFor } from "../../test/handlers/skills";
 
 // ResizeObserver is not available in jsdom
 global.ResizeObserver = class ResizeObserver {
@@ -13,9 +14,10 @@ global.ResizeObserver = class ResizeObserver {
 
 // TipTap's Placeholder extension calls elementFromPoint which jsdom lacks
 vi.mock("../../components/shared/RichTextMentionEditor", () => ({
-  default: ({ value, onChange, placeholder, onSubmit }: { value: string; onChange: (v: string) => void; placeholder?: string; onSubmit?: () => void }) => (
+  default: ({ value, onChange, placeholder, onSubmit, minHeightClassName }: { value: string; onChange: (v: string) => void; placeholder?: string; onSubmit?: () => void; minHeightClassName?: string }) => (
     <textarea
       data-testid="description-editor"
+      data-height-class={minHeightClassName}
       value={value}
       onChange={(e) => onChange(e.target.value)}
       placeholder={placeholder}
@@ -257,11 +259,14 @@ describe("ActionItemsPage", () => {
     expect(screen.getByText("Unstaged")).toBeInTheDocument();
   });
 
-  it("renders the accounts kanban with the loaded item in the Accounts zone", async () => {
-    await renderPage();
-    await waitFor(() => expect(screen.getByText("Accounts")).toBeInTheDocument());
-    // "Acme Corp" appears as both the account group header and the item badge.
-    expect(screen.getAllByText("Acme Corp").length).toBeGreaterThan(0);
+  it("opens on the Accounts view: one group per account, with its item on a status board", async () => {
+    await renderPageStable();
+    const group = await screen.findByTestId("project-group-acme corp");
+    // The name is both the group header and the card's account badge.
+    expect(within(group).getAllByText("Acme Corp").length).toBeGreaterThan(0);
+    expect(within(group).getByText("Fix billing issue")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Accounts" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Projects" })).toBeInTheDocument();
   });
 
   it("StatusBoardView: export overlay appears on items when exportMode is on", async () => {
@@ -570,7 +575,8 @@ describe("ActionItemsPage", () => {
     // unsaved form state can't be duplicated across two mounted cards.
     expect(within(pinnedSection()).getByText("Fix billing issue")).toBeInTheDocument();
     expect(within(stageTodayPanel()).queryByDisplayValue("Fix billing issue")).not.toBeInTheDocument();
-    expect(screen.getByTitle("Pinned to Focus")).toBeInTheDocument();
+    // The badge shows on the pinned card (and on its copy in the Accounts view, if it has an account).
+    expect(screen.getAllByTitle("Pinned to Focus").length).toBeGreaterThan(0);
   });
 
   it("pinned cards are card-width and laid out in a wrapping row", async () => {
@@ -756,12 +762,37 @@ describe("ActionItemsPage", () => {
     await waitFor(() => expect(screen.getByText("Fix billing issue")).toBeInTheDocument());
 
     fireEvent.click(screen.getByText("Fix billing issue"));
-    await waitFor(() => expect(screen.getByText("Edit Action Item")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText("Est. Time (min)")).toBeInTheDocument());
+    // Standard shared modal: attachment buttons are present.
+    for (const name of ["Upload", "Add Link", "+ Artifact"]) {
+      expect(screen.getByRole("button", { name: new RegExp(name.replace("+", "\\+")) })).toBeInTheDocument();
+    }
 
     expect(screen.getByText("Checklist")).toBeInTheDocument();
     expect(screen.getByText("Step one")).toBeInTheDocument();
     expect(screen.getByText("1/2")).toBeInTheDocument();
     expect(screen.getByText("50%")).toBeInTheDocument();
+  });
+
+  it("Save in the standard modal PATCHes /airtable/action-items/<id>/fields/", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    let patchedUrl = "";
+    server.use(
+      http.patch("/api/v1/airtable/action-items/:id/fields/", async ({ request }) => {
+        patchedUrl = new URL(request.url).pathname;
+        bodies.push((await request.json()) as Record<string, unknown>);
+        return HttpResponse.json({ ...mockItem, task: "Renamed" });
+      })
+    );
+    await renderPageStable();
+    await waitFor(() => expect(screen.getByText("Fix billing issue")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Fix billing issue"));
+    await waitFor(() => expect(screen.getByLabelText("Est. Time (min)")).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText("Task"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByRole("button", { name: /^Save changes$/ }));
+    await waitFor(() => expect(bodies).toHaveLength(1));
+    expect(patchedUrl).toMatch(/\/airtable\/action-items\/[^/]+\/fields\/$/);
+    expect(bodies[0]).toMatchObject({ task: "Renamed" });
   });
 
   it("puts the checklist in its own section right below the description", async () => {
@@ -770,9 +801,9 @@ describe("ActionItemsPage", () => {
     await waitFor(() => expect(screen.getByText("Fix billing issue")).toBeInTheDocument());
 
     fireEvent.click(screen.getByText("Fix billing issue"));
-    await waitFor(() => expect(screen.getByText("Edit Action Item")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText("Est. Time (min)")).toBeInTheDocument());
 
-    const modal = screen.getByText("Edit Action Item").closest("div.bg-white") as HTMLElement;
+    const modal = screen.getByTestId("action-item-modal-panel");
     const description = within(modal).getAllByTestId("description-editor")[0];
     const checklist = within(modal).getByText("Checklist");
 
@@ -913,15 +944,6 @@ describe("ActionItemsPage", () => {
     expect(within(pinned).getByTitle("Expand card")).toBeInTheDocument();
   });
 
-  it("Views grid cards have no collapse toggle", async () => {
-    await renderPageStable();
-    await waitFor(() => expect(screen.getByText("Fix billing issue")).toBeInTheDocument());
-
-    // Per-card collapse is scoped to the staging columns and the pinned row; the Views grid
-    // collapses by account row instead.
-    const viewsPanel = zonePanel("Views");
-    expect(within(viewsPanel).queryByTitle("Collapse card")).not.toBeInTheDocument();
-  });
 
   // ── Collapse all ──────────────────────────────────────────────────────────────
 
@@ -940,7 +962,6 @@ describe("ActionItemsPage", () => {
 
     // Headers stay, bodies go.
     expect(screen.getByTitle(/Expand Acme Corp/i)).toBeInTheDocument();
-    expect(screen.getByTitle(/Expand No Account/i)).toBeInTheDocument();
     expect(screen.queryByText("Fix billing issue")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /expand all/i })).toBeInTheDocument();
   });
@@ -1218,17 +1239,19 @@ describe("ActionItemsPage", () => {
     expect(JSON.parse(localStorage.getItem("actionItemZones") ?? "{}").recAAA001).toBe("accounts");
   });
 
-  it("shows items whose account matches no known account under an Unmatched row", async () => {
+  it("shows items whose account matches no known account in a group of their own", async () => {
     server.use(
       http.get("/api/v1/airtable/action-items/", () =>
         HttpResponse.json([{ ...mockItem, account: 99, account_name: "Ghost Industries" }])
       )
     );
     await renderPageStable();
-    await waitFor(() => expect(screen.getByText("Unmatched account")).toBeInTheDocument());
+    const group = await screen.findByTestId("project-group-ghost industries");
 
-    // Without the catch-all row this card would render nowhere at all.
-    expect(screen.getByText("Fix billing issue")).toBeInTheDocument();
+    // Without the catch-all group this card would render nowhere at all.
+    expect(within(group).getByText("Fix billing issue")).toBeInTheDocument();
+    // It is not a place a card can be filed into, so no star either.
+    expect(within(group).queryByRole("button", { name: /auto-assign/i })).not.toBeInTheDocument();
   });
 
   it("requests both account lists with a widened page_size", async () => {
@@ -1307,77 +1330,21 @@ describe("ActionItemsPage", () => {
       return card as HTMLElement;
     }
 
-    /**
-     * Dispatch a dragleave that actually carries `relatedTarget`.
-     *
-     * The same trap as `dragOverAt`: jsdom has no `DragEvent`, so RTL falls back to a plain
-     * `Event` and silently drops `relatedTarget` — every dragleave would then read as
-     * "the pointer left", which is precisely the behaviour under test. `MouseEvent` keeps it.
-     */
-    function dragLeaveTo(target: HTMLElement, relatedTarget: Node | null) {
-      const ev = new MouseEvent("dragleave", { bubbles: true, cancelable: true, relatedTarget });
-      Object.defineProperty(ev, "dataTransfer", { value: DT() });
-      fireEvent(target, ev);
-    }
-
     function dragCardOnto(card: HTMLElement, target: HTMLElement) {
       fireEvent.dragStart(card, { dataTransfer: DT() });
       fireEvent.dragOver(target, { dataTransfer: DT() });
       fireEvent.drop(target, { dataTransfer: DT() });
     }
 
-    /**
-     * Switch to the Projects view.
-     *
-     * The Views grid's account rows carry a `title` on their collapse toggle and the
-     * Projects headers do not, so its absence is the signal that the swap has happened.
-     */
-    async function switchToProjects() {
-      fireEvent.click(screen.getByRole("button", { name: "Projects" }));
-      await waitFor(() => {
-        expect(screen.queryByTitle(/Collapse Acme Corp/i)).not.toBeInTheDocument();
-        expect(screen.queryByTitle(/Expand Beta Inc/i)).not.toBeInTheDocument();
-      });
-    }
+    // ── Accounts view (default) ─────────────────────────────────────────────────
 
-    // ── Views grid ──────────────────────────────────────────────────────────────
 
-    it("files a card under a collapsed account row in the Views grid", async () => {
-      await collapseGroups("beta inc");
-      await renderPageStable();
-      await waitFor(() => expect(screen.getByTitle(/Expand Beta Inc/i)).toBeInTheDocument());
-
-      const betaRow = rowContaining(screen.getByTitle(/Expand Beta Inc/i), "border-b border-gray-100");
-      dragCardOnto(gridCardFor("Fix billing issue"), betaRow);
-
-      await waitFor(() => expect(fieldPatches).toHaveLength(1));
-      expect(fieldPatches[0]).toMatchObject({ account_name: "Beta Inc", account: 2, __id: "recAAA001" });
-    });
-
-    it("shows a drop hint on a collapsed row only while a card is in the air", async () => {
-      await collapseGroups("beta inc");
-      await renderPageStable();
-      await waitFor(() => expect(screen.getByTitle(/Expand Beta Inc/i)).toBeInTheDocument());
-
-      // A collapsed row has always accepted drops but said nothing about it. The hint is
-      // drag-only, so the resting grid is unchanged.
-      expect(screen.queryAllByTestId("collapsed-drop-hint")).toHaveLength(0);
-
-      fireEvent.dragStart(gridCardFor("Fix billing issue"), { dataTransfer: DT() });
-      await waitFor(() => expect(screen.getAllByTestId("collapsed-drop-hint").length).toBeGreaterThan(0));
-
-      const betaRow = rowContaining(screen.getByTitle(/Expand Beta Inc/i), "border-b border-gray-100");
-      fireEvent.dragOver(betaRow, { dataTransfer: DT() });
-      await waitFor(() =>
-        expect(within(betaRow).getByTestId("collapsed-drop-hint")).toHaveTextContent("Drop to file under Beta Inc")
-      );
-    });
 
     it("does not PATCH when a card is dropped on the account it is already filed under", async () => {
       await renderPageStable();
       await waitFor(() => expect(screen.getByTitle(/Collapse Acme Corp/i)).toBeInTheDocument());
 
-      const acmeRow = rowContaining(screen.getByTitle(/Collapse Acme Corp/i), "border-b border-gray-100");
+      const acmeRow = screen.getByTestId("project-group-acme corp");
       dragCardOnto(gridCardFor("Fix billing issue"), acmeRow);
 
       // Airtable answers `""` where the app writes null, so a strict field compare would
@@ -1386,45 +1353,7 @@ describe("ActionItemsPage", () => {
       expect(fieldPatches).toHaveLength(0);
     });
 
-    it("dragging from Stage Today onto another account's row in the Views grid does not reassign it", async () => {
-      localStorage.setItem("actionItemZones", JSON.stringify({ recAAA001: "today" }));
-      await renderPageStable();
-      await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
 
-      // Acme owns this card; drop it on Beta's row instead — an easy accident, since
-      // unstaging and re-filing land on the same grid.
-      const betaRow = rowContaining(screen.getByTitle(/Collapse Beta Inc/i), "border-b border-gray-100");
-      dragCardOnto(cardFor("Fix billing issue"), betaRow);
-
-      await new Promise((r) => setTimeout(r, 20));
-      expect(fieldPatches).toHaveLength(0);
-      // It must actually leave Stage Today — a ghost placeholder in the Views grid renders
-      // the same task text as the real card, so checking only for text in the Acme row
-      // would pass even if the zone update silently failed and the item stayed in Stage
-      // Today (rendered there for real, and as a ghost in Views).
-      await waitFor(() => expect(screen.queryByDisplayValue("Fix billing issue")).not.toBeInTheDocument());
-      // Unstaged into Views — it lands under its own account (Acme) as a real card, not the
-      // row it was dropped on. The account picker in the modal is the only way to reassign it.
-      const acmeRow = rowContaining(screen.getByTitle(/Collapse Acme Corp/i), "border-b border-gray-100");
-      expect(within(acmeRow).getByText("Fix billing issue")).toBeInTheDocument();
-      expect(within(betaRow).queryByText("Fix billing issue")).not.toBeInTheDocument();
-      expect(JSON.parse(localStorage.getItem("actionItemZones") ?? "{}").recAAA001).toBe("accounts");
-    });
-
-    it("dragging from Currently Tracking onto another account's row in the Views grid does not reassign it", async () => {
-      localStorage.setItem("actionItemZones", JSON.stringify({ recAAA001: "active" }));
-      await renderPageStable();
-      await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
-
-      const betaRow = rowContaining(screen.getByTitle(/Collapse Beta Inc/i), "border-b border-gray-100");
-      dragCardOnto(cardFor("Fix billing issue"), betaRow);
-
-      await new Promise((r) => setTimeout(r, 20));
-      expect(fieldPatches).toHaveLength(0);
-      const acmeRow = rowContaining(screen.getByTitle(/Collapse Acme Corp/i), "border-b border-gray-100");
-      await waitFor(() => expect(within(acmeRow).getByText("Fix billing issue")).toBeInTheDocument());
-      expect(JSON.parse(localStorage.getItem("actionItemZones") ?? "{}").recAAA001).toBe("accounts");
-    });
 
     it("dropping on the Views panel itself (not a specific row) still moves the card out of Stage Today", async () => {
       // Every row/deck in the panel calls stopPropagation on its own drop — this is the
@@ -1439,7 +1368,7 @@ describe("ActionItemsPage", () => {
       dragCardOnto(cardFor("Fix billing issue"), viewsPanel);
 
       expect(fieldPatches).toHaveLength(0);
-      const acmeRow = rowContaining(screen.getByTitle(/Collapse Acme Corp/i), "border-b border-gray-100");
+      const acmeRow = screen.getByTestId("project-group-acme corp");
       await waitFor(() => expect(within(acmeRow).getByText("Fix billing issue")).toBeInTheDocument());
       expect(JSON.parse(localStorage.getItem("actionItemZones") ?? "{}").recAAA001).toBe("accounts");
     });
@@ -1450,7 +1379,7 @@ describe("ActionItemsPage", () => {
       await renderPageStable();
       await waitFor(() => expect(screen.getByTitle(/Collapse Acme Corp/i)).toBeInTheDocument());
 
-      const betaRow = rowContaining(screen.getByTitle(/Collapse Beta Inc/i), "border-b border-gray-100");
+      const betaRow = screen.getByTestId("project-group-beta inc");
       dragCardOnto(gridCardFor("Fix billing issue"), betaRow);
 
       await waitFor(() => expect(fieldPatches).toHaveLength(1));
@@ -1458,28 +1387,6 @@ describe("ActionItemsPage", () => {
       expect(fieldPatches).toHaveLength(1);
     });
 
-    it("keeps the row highlight while the cursor crosses the row's own children", async () => {
-      await collapseGroups("beta inc");
-      await renderPageStable();
-      await waitFor(() => expect(screen.getByTitle(/Expand Beta Inc/i)).toBeInTheDocument());
-
-      fireEvent.dragStart(gridCardFor("Fix billing issue"), { dataTransfer: DT() });
-      const label = screen.getByTitle(/Expand Beta Inc/i);
-      const betaRow = rowContaining(label, "border-b border-gray-100");
-
-      const hint = () => within(betaRow).getByTestId("collapsed-drop-hint");
-      fireEvent.dragOver(betaRow, { dataTransfer: DT() });
-      await waitFor(() => expect(hint()).toHaveTextContent("Drop to file under Beta Inc"));
-
-      // dragleave bubbles from every child. Clearing the shared dragOverZone on each
-      // crossing re-renders the whole page mid-drag, which reads as a dead drop target.
-      dragLeaveTo(label, betaRow);
-      expect(hint()).toHaveTextContent("Drop to file under Beta Inc");
-
-      // Genuinely leaving the row still clears it.
-      dragLeaveTo(betaRow, document.body);
-      await waitFor(() => expect(hint()).toHaveTextContent("Drop here"));
-    });
 
     it("never blanks the grid to a loading screen after a drop", async () => {
       // The post-drop refetch is held open so the loading window is genuinely observable.
@@ -1495,12 +1402,12 @@ describe("ActionItemsPage", () => {
       );
       await collapseGroups("beta inc");
       await renderPageStable();
-      await waitFor(() => expect(screen.getByTitle(/Expand Beta Inc/i)).toBeInTheDocument());
+      await waitFor(() => expect(screen.getByTestId("project-group-beta inc")).toBeInTheDocument());
 
       // lib/api.ts broadcasts actionItemsUpdated from a response interceptor after every
       // action-item mutation, and this page listens to its own broadcast — so the PATCH
       // used to trigger a full reload that replaced the whole board with "Loading…".
-      const betaRow = rowContaining(screen.getByTitle(/Expand Beta Inc/i), "border-b border-gray-100");
+      const betaRow = screen.getByTestId("project-group-beta inc");
       dragCardOnto(gridCardFor("Fix billing issue"), betaRow);
 
       await waitFor(() => expect(fieldPatches).toHaveLength(1));
@@ -1510,9 +1417,9 @@ describe("ActionItemsPage", () => {
       expect(screen.queryByText(/loading/i)).not.toBeInTheDocument();
       // The board is still there, and it already shows the result: the card is now counted
       // under Beta Inc, whose collapsed row hides the card itself.
-      const collapsedBeta = rowContaining(screen.getByTitle(/Expand Beta Inc/i), "border-b border-gray-100");
+      const collapsedBeta = screen.getByTestId("project-group-beta inc");
       expect(within(collapsedBeta).getByText("1 open")).toBeInTheDocument();
-      expect(screen.getByTitle(/Collapse Acme Corp/i)).toBeInTheDocument();
+      expect(screen.getByTestId("project-group-acme corp")).toBeInTheDocument();
     });
 
     it("coalesces the reload broadcasts from a single two-field drop", async () => {
@@ -1531,8 +1438,7 @@ describe("ActionItemsPage", () => {
         })
       );
       await renderPageStable();
-      await waitFor(() => expect(screen.getByTitle(/Collapse Beta Inc/i)).toBeInTheDocument());
-      await switchToProjects();
+      await waitFor(() => expect(screen.getByTestId("project-group-beta inc")).toBeInTheDocument());
       await waitFor(() => expect(screen.getByText("Beta chore")).toBeInTheDocument());
       const afterMount = itemFetches;
 
@@ -1549,12 +1455,9 @@ describe("ActionItemsPage", () => {
       expect(itemFetches - afterMount).toBe(1);
     });
 
-    // ── Projects view ───────────────────────────────────────────────────────────
-
     it("gives every known account a group in the Projects view, even with no items", async () => {
       await renderPageStable();
       await waitFor(() => expect(screen.getByTitle(/Collapse Acme Corp/i)).toBeInTheDocument());
-      await switchToProjects();
 
       // Groups used to be derived from the items alone, so an account with no work on it
       // had no header — and therefore no way to receive the first card filed under it.
@@ -1573,8 +1476,7 @@ describe("ActionItemsPage", () => {
     it("files a card under a collapsed account group in the Projects view", async () => {
       await collapseGroups("beta inc");
       await renderPageStable();
-      await waitFor(() => expect(screen.getByTitle(/Expand Beta Inc/i)).toBeInTheDocument());
-      await switchToProjects();
+      await waitFor(() => expect(screen.getByTestId("project-group-beta inc")).toBeInTheDocument());
       await waitFor(() => expect(screen.getByText("Beta Inc")).toBeInTheDocument());
 
       const betaGroup = screen.getByTestId("project-group-beta inc");
@@ -1588,7 +1490,6 @@ describe("ActionItemsPage", () => {
       localStorage.setItem("actionItemZones", JSON.stringify({ recAAA001: "accounts" }));
       await renderPageStable();
       await waitFor(() => expect(screen.getByTitle(/Collapse Acme Corp/i)).toBeInTheDocument());
-      await switchToProjects();
       await waitFor(() => expect(screen.getByText("Beta Inc")).toBeInTheDocument());
 
       const betaGroup = screen.getByTestId("project-group-beta inc");
@@ -1604,7 +1505,6 @@ describe("ActionItemsPage", () => {
       localStorage.setItem("actionItemZones", JSON.stringify({ recAAA001: "today" }));
       await renderPageStable();
       await waitFor(() => expect(screen.getByTitle(/Collapse Acme Corp/i)).toBeInTheDocument());
-      await switchToProjects();
       await waitFor(() => expect(screen.getByText("Beta Inc")).toBeInTheDocument());
 
       const betaGroup = screen.getByTestId("project-group-beta inc");
@@ -1623,7 +1523,6 @@ describe("ActionItemsPage", () => {
       localStorage.setItem("actionItemZones", JSON.stringify({ recAAA001: "active" }));
       await renderPageStable();
       await waitFor(() => expect(screen.getByTitle(/Collapse Acme Corp/i)).toBeInTheDocument());
-      await switchToProjects();
       await waitFor(() => expect(screen.getByText("Beta Inc")).toBeInTheDocument());
 
       const betaGroup = screen.getByTestId("project-group-beta inc");
@@ -1638,7 +1537,6 @@ describe("ActionItemsPage", () => {
       localStorage.setItem("actionItemZones", JSON.stringify({ recAAA001: "unstaged" }));
       await renderPageStable();
       await waitFor(() => expect(screen.getByTitle(/Collapse Acme Corp/i)).toBeInTheDocument());
-      await switchToProjects();
       await waitFor(() => expect(screen.getByText("Beta Inc")).toBeInTheDocument());
 
       const betaGroup = screen.getByTestId("project-group-beta inc");
@@ -1665,8 +1563,7 @@ describe("ActionItemsPage", () => {
         })
       );
       await renderPageStable();
-      await waitFor(() => expect(screen.getByTitle(/Collapse Beta Inc/i)).toBeInTheDocument());
-      await switchToProjects();
+      await waitFor(() => expect(screen.getByTestId("project-group-beta inc")).toBeInTheDocument());
       await waitFor(() => expect(screen.getByText("Beta chore")).toBeInTheDocument());
 
       const betaGroup = screen.getByTestId("project-group-beta inc");
@@ -1686,5 +1583,457 @@ describe("ActionItemsPage", () => {
         ])
       );
     });
+  });
+
+  // ── Accounts view (star) and the Projects view ────────────────────────────────
+
+  describe("Accounts view: the star", () => {
+    it("puts the star in the account's header, and clicking it sets the auto-assign account", async () => {
+      await renderPageStable();
+      const group = await screen.findByTestId("project-group-acme corp");
+      const star = within(group).getByRole("button", { name: /auto-assign blank cards to acme corp/i });
+      // In the header, not in the board below it.
+      expect(within(screen.getByTestId("account-header-acme corp")).getByRole("button", { name: /auto-assign/i })).toBe(star);
+      expect(star).toHaveAttribute("aria-pressed", "false");
+
+      fireEvent.click(star);
+
+      expect(localStorage.getItem("actionItemStarredAccount")).toBe("at-1");
+      expect(within(group).getByRole("button", { name: /remove auto-assign from acme corp/i })).toHaveAttribute("aria-pressed", "true");
+
+      fireEvent.click(within(group).getByRole("button", { name: /remove auto-assign/i }));
+      expect(localStorage.getItem("actionItemStarredAccount")).toBeNull();
+    });
+
+    it("starring is not nested inside the collapse toggle (no button in a button)", async () => {
+      await renderPageStable();
+      const header = await screen.findByTestId("account-header-acme corp");
+      for (const b of within(header).getAllByRole("button")) {
+        expect(b.querySelector("button")).toBeNull();
+      }
+    });
+
+    it("the old Mine/Team toggle and Views-grid decks are gone", async () => {
+      await renderPageStable();
+      await screen.findByTestId("project-group-acme corp");
+      expect(screen.queryByRole("button", { name: /^mine$/i })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /^team$/i })).not.toBeInTheDocument();
+    });
+  });
+
+  describe("saved view", () => {
+    it.each([["projects"], ["kanban"]])("the old '%s' id opens the Accounts view", async (legacy) => {
+      localStorage.setItem("actionItemsView", legacy);
+      await renderPageStable();
+      await screen.findByTestId("project-group-acme corp");
+      expect(screen.queryByTestId("projects-account-acme corp")).not.toBeInTheDocument();
+    });
+
+    it("an old 'status' or 'due' id is kept", async () => {
+      localStorage.setItem("actionItemsView", "due");
+      await renderPageStable();
+      await waitFor(() => expect(screen.queryByTestId("project-group-acme corp")).not.toBeInTheDocument());
+      expect(screen.queryByText("Stage Today")).toBeInTheDocument();
+    });
+
+    it("remembers the chosen view under the new key", async () => {
+      await renderPageStable();
+      await screen.findByTestId("project-group-acme corp");
+      fireEvent.click(screen.getByRole("button", { name: "Projects" }));
+      expect(localStorage.getItem("actionItemsView-v2")).toBe("projects");
+    });
+  });
+
+  describe("Projects view", () => {
+    const ITEMS = [
+      { ...mockItem, id: 1, airtable_id: "recAAA001", task: "In project", status: "Open" },
+      { ...mockItem, id: 2, airtable_id: "recBBB002", task: "In goal", status: "In Progress" },
+      { ...mockItem, id: 3, airtable_id: "recCCC003", task: "On both", status: "Done" },
+      { ...mockItem, id: 4, airtable_id: "recDDD004", task: "No project yet", status: "Open" },
+    ];
+    const proj = (over: Record<string, unknown>) => ({
+      id: 1, account: 10, name: "", description: "", url: "", position: 0, action_ids: [], meeting_ids: [],
+      goal_ids: [], resources: [], sf_data: {}, sf_project_id: "", kind: "project", created_at: "", ...over,
+    });
+    let projectPatches: Array<{ id: string; body: Record<string, unknown> }>;
+    let projects: ReturnType<typeof proj>[];
+
+    beforeEach(() => {
+      projectPatches = [];
+      projects = [
+        proj({ id: 1, name: "Rollout", goal_ids: ["2"], action_ids: ["recAAA001", "recCCC003"] }),
+        proj({ id: 2, name: "Hit 90% adoption", kind: "goal", action_ids: ["recBBB002", "recCCC003"] }),
+        proj({ id: 3, name: "Second project", position: 1 }),
+      ];
+      server.use(
+        http.get("/api/v1/airtable/action-items/", () => HttpResponse.json(ITEMS)),
+        http.get("/api/v1/accounts/accounts/", () =>
+          HttpResponse.json({ results: [{ id: 10, company_name: "Acme Corp" }], count: 1 })
+        ),
+        http.get("/api/v1/accounts/projects/", () =>
+          HttpResponse.json({ results: projects, count: projects.length })
+        ),
+        http.patch("/api/v1/accounts/projects/:id/", async ({ request, params }) => {
+          const body = (await request.json()) as Record<string, unknown>;
+          projectPatches.push({ id: String(params.id), body });
+          const row = projects.find((p) => String(p.id) === params.id)!;
+          Object.assign(row, body);
+          return HttpResponse.json(row);
+        })
+      );
+    });
+
+    async function openProjects() {
+      await renderPageStable();
+      await screen.findByTestId("project-group-acme corp");
+      fireEvent.click(screen.getByRole("button", { name: "Projects" }));
+      return await screen.findByTestId("projects-account-acme corp");
+    }
+
+    it("nests account > project > goal > action items, listing an item once", async () => {
+      const acme = await openProjects();
+      const project = await within(acme).findByTestId("project-1");
+      const goal = within(project).getByTestId("goal-2");
+
+      expect(within(project).getByText("Rollout")).toBeInTheDocument();
+      expect(within(goal).getByText("Hit 90% adoption")).toBeInTheDocument();
+      expect(within(goal).getByText("In goal")).toBeInTheDocument();
+      // On the project's own list too, but shown once — under the goal.
+      expect(within(goal).getByText("On both")).toBeInTheDocument();
+      expect(within(acme).getAllByText("On both")).toHaveLength(1);
+      expect(within(project).getByText("In project")).toBeInTheDocument();
+      // A project with nothing on it still has its row.
+      expect(within(acme).getByTestId("project-3")).toBeInTheDocument();
+      // Not on any project: its own bucket.
+      expect(within(within(acme).getByTestId("no-project-acme corp")).getByText("No project yet")).toBeInTheDocument();
+    });
+
+    it("gives every account a row, and loads all projects in one request", async () => {
+      const urls: string[] = [];
+      server.use(http.get("/api/v1/accounts/projects/", ({ request }) => {
+        urls.push(request.url);
+        return HttpResponse.json({ results: projects, count: projects.length });
+      }));
+      await openProjects();
+      expect(urls).toHaveLength(1);
+      expect(urls[0]).toContain("page_size=500");
+    });
+
+    it("clicking an item opens the usual modal", async () => {
+      const acme = await openProjects();
+      fireEvent.click(within(acme).getByText("In project"));
+      await waitFor(() => expect(screen.getByLabelText("Est. Time (min)")).toBeInTheDocument());
+    });
+
+    it("'Project > Status' groups each project's, goal's and 'No project' items under status headings", async () => {
+      const acme = await openProjects();
+      // By project (default): no status headings.
+      expect(within(acme).queryByTestId("status-group-project:1-Open")).not.toBeInTheDocument();
+
+      fireEvent.click(within(acme).getByRole("button", { name: "Project > Status" }));
+
+      expect(within(acme).getByTestId("status-group-project:1-Open")).toHaveTextContent("Open");
+      expect(within(within(acme).getByTestId("status-group-project:1-Open")).getByText("In project")).toBeInTheDocument();
+      expect(within(within(acme).getByTestId("status-group-goal:2-In Progress")).getByText("In goal")).toBeInTheDocument();
+      expect(within(within(acme).getByTestId("status-group-goal:2-Done")).getByText("On both")).toBeInTheDocument();
+      expect(within(within(acme).getByTestId("status-group-noproject:acme corp-Open")).getByText("No project yet")).toBeInTheDocument();
+      // Still deduplicated.
+      expect(within(acme).getAllByText("On both")).toHaveLength(1);
+      // The choice is remembered per account.
+      expect(JSON.parse(localStorage.getItem("actionItemsProjectsLayout-v1") ?? "{}")["acme corp"]).toBe("project-status");
+
+      fireEvent.click(within(acme).getByRole("button", { name: "By project" }));
+      expect(within(acme).queryByTestId("status-group-project:1-Open")).not.toBeInTheDocument();
+    });
+
+    function dragRow(taskText: string) {
+      const row = screen.getByText(taskText).closest("[draggable='true']") as HTMLElement;
+      fireEvent.dragStart(row, { dataTransfer: DT() });
+      return row;
+    }
+    const DT = () => ({ setDragImage: vi.fn(), setData: vi.fn(), getData: vi.fn(() => ""), effectAllowed: "", dropEffect: "", types: [] });
+
+    it("dragging an item onto another project moves it: added there, removed from where it was", async () => {
+      const acme = await openProjects();
+      dragRow("In project");
+      const target = within(within(acme).getByTestId("project-3")).getByText("Second project").closest("[role='button']") as HTMLElement;
+      fireEvent.dragOver(target, { dataTransfer: DT() });
+      fireEvent.drop(target, { dataTransfer: DT() });
+
+      await waitFor(() => expect(projectPatches).toHaveLength(2));
+      expect(projectPatches).toEqual(expect.arrayContaining([
+        { id: "3", body: { action_ids: ["recAAA001"] } },
+        { id: "1", body: { action_ids: ["recCCC003"] } },
+      ]));
+      // The view re-reads and shows it under its new project.
+      await waitFor(() => expect(within(within(acme).getByTestId("project-3")).getByText("In project")).toBeInTheDocument());
+    });
+
+    it("a project drop is handled by the row alone: the panel's catch-all drop does not also run", async () => {
+      // The Accounts panel has a native capture-phase listener that unstages any card dropped
+      // outside a "specific" target. In a real browser that listener ran first on a project
+      // row, cleared the drag, and the row's own handler never fired — the move silently did
+      // nothing. (jsdom doesn't flush React between listeners, so the visible symptom can't be
+      // reproduced here; the side effect — the card being unstaged — can.)
+      localStorage.setItem("actionItemZones", JSON.stringify({ recAAA001: "today" }));
+      const acme = await openProjects();
+      dragRow("In project");
+      const target = within(within(acme).getByTestId("project-3")).getByText("Second project").closest("[role='button']") as HTMLElement;
+      fireEvent.dragOver(target, { dataTransfer: DT() });
+      fireEvent.drop(target, { dataTransfer: DT() });
+
+      await waitFor(() => expect(projectPatches.length).toBeGreaterThan(0));
+      expect(JSON.parse(localStorage.getItem("actionItemZones") ?? "{}").recAAA001).toBe("today");
+    });
+
+    it("a drop anywhere inside a project's section counts, and the whole section highlights", async () => {
+      const acme = await openProjects();
+      dragRow("No project yet");
+      const project = within(acme).getByTestId("project-1");
+      // Over one of the project's own item rows — nowhere near the title row.
+      const insideRow = within(project).getByText("In project");
+      fireEvent.dragOver(insideRow, { dataTransfer: DT() });
+
+      // The outer section is outlined, not just its title row.
+      expect(project.style.outline).toContain("solid");
+      expect(project.style.outline).toContain("#818cf8");
+      expect(within(project).getByText("Drop to move here")).toBeInTheDocument();
+
+      fireEvent.drop(insideRow, { dataTransfer: DT() });
+      await waitFor(() => expect(projectPatches).toEqual([
+        { id: "1", body: { action_ids: ["recAAA001", "recCCC003", "recDDD004"] } },
+      ]));
+    });
+
+    it("inside a goal, the goal (not its parent project) is the target and the only section highlighted", async () => {
+      const acme = await openProjects();
+      dragRow("No project yet");
+      const project = within(acme).getByTestId("project-1");
+      const goal = within(project).getByTestId("goal-2");
+      const insideGoal = within(goal).getByText("In goal");
+      fireEvent.dragOver(insideGoal, { dataTransfer: DT() });
+
+      expect(goal.style.outline).toContain("solid");
+      expect(project.style.outline).toBe("");
+
+      fireEvent.drop(insideGoal, { dataTransfer: DT() });
+      await waitFor(() => expect(projectPatches).toEqual([
+        { id: "2", body: { action_ids: ["recBBB002", "recCCC003", "recDDD004"] } },
+      ]));
+    });
+
+    it("leaving a section clears its highlight", async () => {
+      const acme = await openProjects();
+      dragRow("No project yet");
+      const project = within(acme).getByTestId("project-3");
+      fireEvent.dragOver(project, { dataTransfer: DT() });
+      expect(project.style.outline).toContain("solid");
+      fireEvent.dragLeave(project, { relatedTarget: document.body });
+      expect(project.style.outline).toBe("");
+    });
+
+    it("dropping on the 'No project' row takes the item off every project and goal", async () => {
+      const acme = await openProjects();
+      dragRow("On both");
+      const none = within(acme).getByTestId("no-project-acme corp").querySelector("[role='button']") as HTMLElement;
+      fireEvent.dragOver(none, { dataTransfer: DT() });
+      fireEvent.drop(none, { dataTransfer: DT() });
+
+      await waitFor(() => expect(projectPatches).toHaveLength(2));
+      expect(projectPatches).toEqual(expect.arrayContaining([
+        { id: "1", body: { action_ids: ["recAAA001"] } },
+        { id: "2", body: { action_ids: ["recBBB002"] } },
+      ]));
+    });
+
+    it("a project of another account is not a drop target for this item", async () => {
+      projects.push(proj({ id: 9, account: 77, name: "Elsewhere" }));
+      server.use(
+        http.get("/api/v1/accounts/accounts/", () =>
+          HttpResponse.json({ results: [{ id: 10, company_name: "Acme Corp" }, { id: 77, company_name: "Beta Inc" }], count: 2 })
+        ),
+        http.get("/api/v1/airtable/accounts/", () =>
+          HttpResponse.json({ results: [{ id: 1, airtable_id: "recACCT1", name: "Acme Corp" }, { id: 2, airtable_id: "recACCT2", name: "Beta Inc" }], count: 2 })
+        ),
+      );
+      const acme = await openProjects();
+      dragRow("In project");
+      // Acme's rows offer a drop; Beta's project (a different account) does not.
+      expect(within(acme).getAllByText("Drop here").length).toBeGreaterThan(0);
+      const beta = screen.getByTestId("projects-account-beta inc");
+      expect(within(beta).getByText("Elsewhere")).toBeInTheDocument();
+      expect(within(beta).queryByText(/drop here/i)).not.toBeInTheDocument();
+      const elsewhere = within(beta).getByText("Elsewhere").closest("[role='button']") as HTMLElement;
+      fireEvent.dragOver(elsewhere, { dataTransfer: DT() });
+      fireEvent.drop(elsewhere, { dataTransfer: DT() });
+      await new Promise((r) => setTimeout(r, 30));
+      expect(projectPatches).toHaveLength(0);
+    });
+
+    it("a failed move says so and changes nothing", async () => {
+      server.use(http.patch("/api/v1/accounts/projects/:id/", () => new HttpResponse(null, { status: 403 })));
+      const acme = await openProjects();
+      dragRow("In project");
+      const target = within(within(acme).getByTestId("project-3")).getByText("Second project").closest("[role='button']") as HTMLElement;
+      fireEvent.dragOver(target, { dataTransfer: DT() });
+      fireEvent.drop(target, { dataTransfer: DT() });
+      await new Promise((r) => setTimeout(r, 50));
+      expect(within(within(acme).getByTestId("project-1")).getByText("In project")).toBeInTheDocument();
+    });
+  });
+
+  describe("dragging a card out of Pinned In Progress", () => {
+    const DT = () => ({ setDragImage: vi.fn(), setData: vi.fn(), getData: vi.fn(() => ""), effectAllowed: "", dropEffect: "", types: [] });
+
+    async function pinFixBilling() {
+      await renderPageStable();
+      await waitFor(() => expect(screen.getByText("Stage Today")).toBeInTheDocument());
+      fireEvent.click(screen.getByRole("button", { name: /^Focus$/i }));
+      fireEvent.contextMenu(screen.getByText("Fix billing issue"));
+      fireEvent.click(screen.getByText("Pin to Focus"));
+      await waitFor(() => expect(screen.getByText("1 pinned")).toBeInTheDocument());
+    }
+
+    it.each([["Stage Today"], ["Currently Tracking"]])(
+      "a pinned card dropped on %s shows up there and leaves the Pinned section",
+      async (panel) => {
+        await pinFixBilling();
+        fireEvent.dragStart(pinnedCardFor("Fix billing issue"), { dataTransfer: DT() });
+        fireEvent.drop(zonePanel(panel), { dataTransfer: DT() });
+
+        await waitFor(() =>
+          expect(within(zonePanel(panel)).getByDisplayValue("Fix billing issue")).toBeInTheDocument()
+        );
+        expect(within(pinnedSection()).queryByText("Fix billing issue")).not.toBeInTheDocument();
+        // Still pinned, and still mounted exactly once.
+        expect(screen.getByText(/1 pinned/)).toBeInTheDocument();
+        expect(screen.getAllByDisplayValue("Fix billing issue")).toHaveLength(1);
+      }
+    );
+
+    it("dragging it back to Views returns it to the Pinned section", async () => {
+      await pinFixBilling();
+      fireEvent.dragStart(pinnedCardFor("Fix billing issue"), { dataTransfer: DT() });
+      fireEvent.drop(stageTodayPanel(), { dataTransfer: DT() });
+      await waitFor(() =>
+        expect(within(stageTodayPanel()).getByDisplayValue("Fix billing issue")).toBeInTheDocument()
+      );
+
+      fireEvent.dragStart(cardFor("Fix billing issue"), { dataTransfer: DT() });
+      fireEvent.drop(zonePanel("Views"), { dataTransfer: DT() });
+      await waitFor(() =>
+        expect(within(pinnedSection()).getByText("Fix billing issue")).toBeInTheDocument()
+      );
+    });
+  });
+
+  describe("long descriptions on cards", () => {
+    it("caps the description height and scrolls inside it, in a column card and an Unstaged card", async () => {
+      const long = "<ul>" + Array.from({ length: 60 }, (_, i) => `<li>line ${i}</li>`).join("") + "</ul>";
+      server.use(
+        http.get("/api/v1/airtable/action-items/", () =>
+          HttpResponse.json([{ ...mockItem, account: null, account_name: null, task_details: long }])
+        )
+      );
+      await renderPageStable();
+      await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
+      // Every description editor on a card (Stage Today's compact card and Unstaged's
+      // full card) must cap its height; the stub exposes the class the page passes.
+      const editors = screen.getAllByTestId("description-editor");
+      expect(editors.length).toBeGreaterThan(0);
+      for (const e of editors) {
+        expect(e.getAttribute("data-height-class")).toContain("max-h-40");
+        expect(e.getAttribute("data-height-class")).toContain("overflow-y-auto");
+      }
+    });
+  });
+
+  describe("export tray open, and the Unstaged column", () => {
+    it("shows exactly one New card under Unstaged, even on a wide window", async () => {
+      // jsdom is 1024px wide; the old code showed two blanks from 1100px up.
+      const prev = window.innerWidth;
+      Object.defineProperty(window, "innerWidth", { value: 1600, configurable: true });
+      try {
+        await assertOneBlank();
+      } finally {
+        Object.defineProperty(window, "innerWidth", { value: prev, configurable: true });
+      }
+    });
+
+    async function assertOneBlank() {
+      await renderPageStable();
+      await waitFor(() =>
+        expect(screen.getAllByPlaceholderText("Name or short description").length).toBeGreaterThan(0)
+      );
+      const blanks = screen.getAllByPlaceholderText("Name or short description")
+        .filter((el) => (el as HTMLInputElement).value === "");
+      expect(blanks).toHaveLength(1);
+    }
+
+    it("keeps a select control on each staged card but never covers the card with a button", async () => {
+      mockExportMode = true;
+      await renderPageStable();
+      const controls = await screen.findAllByTestId("export-select");
+      expect(controls.length).toBeGreaterThan(0);
+      for (const c of controls) {
+        // A small non-<button> corner control: a full-card <button> blocks dragging and
+        // is an unreliable drop target.
+        expect(c.tagName).not.toBe("BUTTON");
+        expect(c.style.inset).toBe("");
+        expect(c.style.width).toBe("18px");
+      }
+    });
+
+    it("selecting does not paint a highlight over the card, and toggles via the control", async () => {
+      mockExportMode = true;
+      mockIsSelected.mockReturnValue(true);
+      try {
+        await renderPageStable();
+        const controls = await screen.findAllByTestId("export-select");
+        expect(controls[0]).toHaveTextContent("✓");
+        expect(controls[0].parentElement?.style.background ?? "").toBe("");
+        fireEvent.click(controls[0]);
+        expect(mockToggleItem).toHaveBeenCalled();
+      } finally {
+        mockIsSelected.mockReturnValue(false);
+      }
+    });
+  });
+});
+
+describe("ActionItemsPage — pinned Claude skills", () => {
+  const pinned = () => server.use(pagePinsFor("action-items", [
+    mockPagePin({ id: 1, page: "action-items", skill: mockAgentSkill({ id: 1, name: "weekly-update" }) }),
+  ]));
+
+  it("shows them in a row at the top, between the title and the existing buttons", async () => {
+    pinned();
+    await renderPageStable();
+    const row = await screen.findByTestId("action-items-skills-row");
+    await within(row).findByRole("button", { name: /^Weekly Update/ });
+    const title = screen.getByRole("heading", { name: /Action Items/ });
+    const refresh = screen.getByRole("button", { name: /Refresh/ });
+    expect(title.compareDocumentPosition(row) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(row.compareDocumentPosition(refresh) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(row.parentElement).toBe(title.closest("div")!.parentElement);           // same header row as the title
+  });
+
+  it("takes the free space between them and scrolls when the buttons are wider than it", async () => {
+    await renderPageStable();
+    const row = await screen.findByTestId("action-items-skills-row");
+    expect(row).toHaveClass("flex-1", "min-w-0", "overflow-x-auto");
+  });
+
+  it("centres the buttons when they fit, without clipping the first one when they don't", async () => {
+    pinned();
+    await renderPageStable();
+    const list = await screen.findByTestId("pinned-skills-action-items");
+    expect(list).toHaveStyle({ width: "max-content", margin: "0 auto" });
+  });
+
+  it("keeps the title from being squeezed", async () => {
+    await renderPageStable();
+    const title = await screen.findByRole("heading", { name: /Action Items/ });
+    expect(title.parentElement).toHaveClass("shrink-0");
   });
 });

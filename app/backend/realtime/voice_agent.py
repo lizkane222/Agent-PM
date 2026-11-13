@@ -274,6 +274,8 @@ class VoiceAgent:
         # allowed_tools (agents.tool_policy). Lives here, not in the tool's context,
         # because each tool runs in its own task with a copied context.
         self.skill_scope = None
+        # The skills.SkillRun this call belongs to, when a saved skill launched it (Console).
+        self.skill_run_id: str | None = (active_workflow or {}).get("run_id")
         if active_workflow and active_workflow.get("skill_name"):
             # Enforce the skill's tool allowlist from turn 1, as load_skill would have.
             from agents.tool_policy import SkillScope
@@ -496,9 +498,10 @@ class VoiceAgent:
         timeout = min(per_tool, max(0.1, deadline - loop.time()))
 
         start = loop.time()
-        from agents.tool_policy import SkillScope, active_skill
+        from agents.tool_policy import SkillScope, active_skill, active_skill_run
 
         scope_token = active_skill.set(self.skill_scope)
+        run_token = active_skill_run.set(self.skill_run_id)
         try:
             result = await asyncio.wait_for(
                 mcp_server.dispatch(name, arguments, user=self._user), timeout=timeout
@@ -525,6 +528,7 @@ class VoiceAgent:
                                error_message=type(exc).__name__, duration_ms=duration),
             )
         finally:
+            active_skill_run.reset(run_token)
             active_skill.reset(scope_token)
 
         duration = int((loop.time() - start) * 1000)
@@ -552,7 +556,7 @@ class VoiceAgent:
 
 
 async def dispatch_confirmed(
-    tool_name: str, arguments: dict, user
+    tool_name: str, arguments: dict, user, skill_run_id: str | None = None
 ) -> tuple[Any, ToolCallRecord]:
     """
     Run a tool the caller confirmed out loud, bypassing the model entirely.
@@ -564,6 +568,9 @@ async def dispatch_confirmed(
     loop = asyncio.get_running_loop()
     start = loop.time()
     timeout = float(getattr(settings, "VOICE_TOOL_TIMEOUT_SECONDS", 8))
+    from agents.tool_policy import active_skill_run
+
+    run_token = active_skill_run.set(skill_run_id)
     try:
         # confirmed=True: the caller has just said yes (or pressed 1) to these exact
         # arguments, which is voice's equivalent of chat's confirmation token.
@@ -577,6 +584,8 @@ async def dispatch_confirmed(
             tool_name, arguments, status="error",
             error_message=type(exc).__name__, duration_ms=duration,
         )
+    finally:
+        active_skill_run.reset(run_token)
     duration = int((loop.time() - start) * 1000)
     return result, ToolCallRecord(
         tool_name, arguments, result=result, status="success", duration_ms=duration

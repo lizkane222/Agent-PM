@@ -1,9 +1,11 @@
 import React, { useCallback, useEffect, useRef, useState, type MutableRefObject } from "react";
+import { useStatusLabels } from "../../hooks/useStatusLabels";
+import { useColumnSort } from "../../hooks/useStatusArrivalOrder";
+import ColumnSortButton from "../account/ColumnSortButton";
 import { createPortal } from "react-dom";
 import type {
   Account,
   AccountTeamMember,
-  ActionItemAttachment,
   AirtableAccount,
   AirtableActionItem,
   AirtableMeeting,
@@ -13,23 +15,26 @@ import type {
   MeetingNote,
   Reminder,
   SalesforceProject,
+  AccountProject,
   TeamMember,
 } from "../../types";
-import { accountsApi, airtableApi, integrationsApi, salesforceApi, schedulerApi, teamApi } from "../../lib/api";
+import { accountsApi, airtableApi, integrationsApi, schedulerApi, teamApi } from "../../lib/api";
 import { getAccessToken } from "../../lib/auth";
 import { useCurrentUser } from "../../context/CurrentUserContext";
-import CommentTrigger from "../comments/CommentTrigger";
-import CommentPreviewList from "../comments/CommentPreviewList";
 import InlineCommentThread from "../comments/InlineCommentThread";
 import KanbanCard from "./KanbanCard";
+import { ActionItemModal } from "../account/ActionItemModal";
 import LogTimeModal from "./LogTimeModal";
 import ActivityLogSection from "../ActivityLogSection";
-import { convertActionItemToEvent, convertEventToActionItem, restoreConversion } from "../../hooks/useConvert";
+import { convertEventToActionItem, restoreConversion } from "../../hooks/useConvert";
 import { logActionItemUpdate } from "../../lib/actionItemLog";
+import { addLog } from "../../lib/appLog";
 import RichTextMentionEditor, { type RichTextMentionEditorHandle } from "../shared/RichTextMentionEditor";
 import { sanitizeHtml, plainToHtml, htmlToPreviewText, renderMeetingNoteText } from "../../lib/noteHelpers";
 import { MeetingSummarySourceToggle, preferredMeetingSource } from "../account/MeetingSummarySourceToggle";
 import type { MeetingNotesSource } from "../../lib/api";
+import { toLocalDatetimeValue } from "../../lib/datetimeLocal";
+import { localDateKey } from "../../lib/timelineDay";
 
 interface Props {
   event: CalendarEvent;
@@ -52,408 +57,6 @@ function formatDuration(seconds: number): string {
   const m = Math.floor((seconds % 3600) / 60);
   if (h > 0) return `${h}h ${m}m`;
   return `${m}m`;
-}
-
-// ── Attachments Section (reused inside ActionItemEditModal) ──────────────────
-
-function AttachmentsSection({ item }: { item: AirtableActionItem }) {
-  const [attachments, setAttachments] = useState<ActionItemAttachment[]>(item.attachments ?? []);
-  const [linkName, setLinkName] = useState("");
-  const [linkUrl, setLinkUrl] = useState("");
-  const [addingLink, setAddingLink] = useState(false);
-
-  useEffect(() => {
-    airtableApi.listAttachments(item.id)
-      .then(({ data }) => setAttachments((data as { results?: ActionItemAttachment[] }).results ?? (data as ActionItemAttachment[])))
-      .catch(() => {});
-  }, [item.id]);
-
-  async function handleAddLink() {
-    if (!linkName.trim() || !linkUrl.trim()) return;
-    try {
-      const { data } = await airtableApi.addAttachmentLink(item.id, linkName.trim(), linkUrl.trim());
-      setAttachments(prev => [...prev, data]);
-      setLinkName(""); setLinkUrl(""); setAddingLink(false);
-    } catch { /* keep form open */ }
-  }
-
-  async function handleUpload(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    try {
-      const { data } = await airtableApi.uploadAttachmentFile(item.id, file);
-      setAttachments(prev => [...prev, data]);
-    } catch { /* silent */ }
-    e.target.value = "";
-  }
-
-  async function handleDelete(attachmentId: number) {
-    try {
-      await airtableApi.deleteAttachment(item.id, attachmentId);
-      setAttachments(prev => prev.filter(a => a.id !== attachmentId));
-    } catch { /* silent */ }
-  }
-
-  return (
-    <div>
-      <label className="text-[11px] uppercase tracking-wide text-[var(--twilio-gray-60)] font-semibold mb-2 block">Attachments</label>
-      {attachments.length > 0 && (
-        <ul className="space-y-1 mb-2">
-          {attachments.map(a => (
-            <li key={a.id} className="flex items-center gap-2 text-sm">
-              <a href={a.url ?? undefined} target="_blank" rel="noreferrer" className="flex-1 truncate text-indigo-600 hover:underline text-xs">{a.name || a.url}</a>
-              <button
-                type="button"
-                onClick={() => void handleDelete(a.id)}
-                className="shrink-0 text-gray-300 hover:text-red-400 transition-colors text-sm leading-none"
-                title="Remove"
-              >×</button>
-            </li>
-          ))}
-        </ul>
-      )}
-      {attachments.length === 0 && <p className="text-xs text-gray-400 italic mb-2">No attachments.</p>}
-      <div className="flex gap-2">
-        <label className="flex-1 flex items-center justify-center gap-1 px-2 py-1.5 rounded-lg border border-dashed border-gray-300 text-xs text-gray-500 hover:border-indigo-300 hover:text-indigo-600 cursor-pointer transition-colors">
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-3.5 h-3.5 shrink-0"><path d="M8 2v8M5 5l3-3 3 3" strokeLinecap="round" strokeLinejoin="round"/><path d="M2 12h12" strokeLinecap="round"/></svg>
-          Upload
-          <input type="file" className="sr-only" onChange={handleUpload} />
-        </label>
-        <button
-          type="button"
-          onClick={() => setAddingLink(v => !v)}
-          className="flex-1 flex items-center justify-center gap-1 px-2 py-1.5 rounded-lg border border-dashed border-gray-300 text-xs text-gray-500 hover:border-indigo-300 hover:text-indigo-600 transition-colors"
-        >
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-3.5 h-3.5 shrink-0"><path d="M6 9a3 3 0 0 0 4.5.4l1.5-1.5a3 3 0 0 0-4.2-4.2L6.5 5" strokeLinecap="round"/><path d="M10 7a3 3 0 0 0-4.5-.4L4 8.1a3 3 0 0 0 4.2 4.2l1.3-1.3" strokeLinecap="round"/></svg>
-          Add link
-        </button>
-      </div>
-      {addingLink && (
-        <div className="mt-2 space-y-1.5">
-          <input
-            value={linkName}
-            onChange={e => setLinkName(e.target.value)}
-            placeholder="Label"
-            className="w-full text-xs rounded border border-gray-200 px-2 py-1 focus:outline-none focus:ring-1 focus:ring-indigo-300"
-          />
-          <input
-            value={linkUrl}
-            onChange={e => setLinkUrl(e.target.value)}
-            placeholder="https://…"
-            type="url"
-            className="w-full text-xs rounded border border-gray-200 px-2 py-1 focus:outline-none focus:ring-1 focus:ring-indigo-300"
-          />
-          <div className="flex gap-1.5 justify-end">
-            <button type="button" onClick={() => setAddingLink(false)} className="text-xs px-2 py-1 rounded border border-gray-200 text-gray-500">Cancel</button>
-            <button type="button" onClick={() => void handleAddLink()} disabled={!linkName.trim() || !linkUrl.trim()} className="text-xs px-2 py-1 rounded bg-indigo-600 text-white disabled:opacity-40">Add</button>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ── Action Item Edit Modal ────────────────────────────────────────────────────
-
-const STATUSES: AirtableActionItem["status"][] = ["Open", "In Progress", "Blocked", "Backlogged", "Done"];
-const PRIORITIES = ["Critical", "High", "Medium", "Low"] as const;
-
-const STATUS_COLORS: Record<string, string> = {
-  Open: "bg-blue-100 text-blue-700 border-blue-200",
-  "In Progress": "bg-yellow-100 text-yellow-700 border-yellow-200",
-  Blocked: "bg-red-100 text-red-700 border-red-200",
-  Backlogged: "bg-slate-100 text-slate-600 border-slate-200",
-  Done: "bg-emerald-100 text-emerald-700 border-emerald-200",
-};
-const PRIORITY_COLORS_EDIT: Record<string, string> = {
-  Critical: "bg-red-100 text-red-700 border-red-200",
-  High: "bg-orange-100 text-orange-700 border-orange-200",
-  Medium: "bg-yellow-100 text-yellow-700 border-yellow-200",
-  Low: "bg-gray-100 text-gray-600 border-gray-200",
-};
-
-function ActionItemEditModal({
-  item,
-  onClose,
-  onSaved,
-  onConverted,
-  onDeleted,
-}: {
-  item: AirtableActionItem;
-  onClose: () => void;
-  onSaved: (updated: AirtableActionItem) => void;
-  onConverted?: () => void;
-  onDeleted?: (id: number) => void;
-}) {
-  const [form, setForm] = useState({
-    task: item.task,
-    task_details: item.task_details ?? "",
-    status: item.status,
-    priority: item.priority,
-    due_date: item.due_date ?? "",
-    assignee_name: item.assignee_name ?? "",
-    estimated_time: item.estimated_time ?? 0,
-    time_spent: item.time_spent ?? 0,
-  });
-  const [saving, setSaving] = useState(false);
-  const [converting, setConverting] = useState(false);
-  const [deleting, setDeleting] = useState(false);
-
-  async function handleDelete() {
-    if (!window.confirm("Delete this action item? This cannot be undone.")) return;
-    setDeleting(true);
-    try {
-      await airtableApi.deleteActionItem(item.id);
-      onDeleted?.(item.id);
-      onClose();
-    } catch { /* silent */ } finally {
-      setDeleting(false);
-    }
-  }
-
-  async function handleSave() {
-    setSaving(true);
-    try {
-      const patch: Partial<AirtableActionItem> = {};
-      if (form.task !== item.task) patch.task = form.task;
-      if (form.task_details !== (item.task_details ?? "")) patch.task_details = form.task_details;
-      if (form.status !== item.status) patch.status = form.status as AirtableActionItem["status"];
-      if (form.priority !== item.priority) patch.priority = form.priority as AirtableActionItem["priority"];
-      if ((form.due_date || null) !== item.due_date) patch.due_date = form.due_date || null;
-      if ((form.assignee_name || "") !== item.assignee_name) patch.assignee_name = form.assignee_name || "";
-      if (form.estimated_time !== item.estimated_time) patch.estimated_time = form.estimated_time;
-      if (form.time_spent !== item.time_spent) patch.time_spent = form.time_spent;
-      if (Object.keys(patch).length > 0) {
-        const { data } = await airtableApi.updateActionItemFields(item.airtable_id, patch);
-        logActionItemUpdate(item, patch);
-        onSaved({ ...item, ...data });
-      } else {
-        onClose();
-      }
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function handleConvertToEvent() {
-    if (converting) return;
-    setConverting(true);
-    try {
-      await convertActionItemToEvent(item);
-      onConverted?.();
-      onClose();
-    } catch { /* best effort */ } finally {
-      setConverting(false);
-    }
-  }
-
-  return (
-    <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/40" onClick={onClose}>
-      <div
-        className="bg-white rounded-2xl shadow-2xl w-full max-w-md mx-4 flex flex-col max-h-[90vh]"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {/* Header */}
-        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
-          <h2 className="text-sm font-semibold text-[var(--twilio-navy)]">Edit Action Item</h2>
-          <div className="flex items-center gap-1.5">
-            <CommentTrigger
-              resourceType="action_item"
-              resourceId={item.id}
-              resourceLabel={item.task ?? ""}
-              disabled={item.airtable_id.startsWith("local-")}
-            />
-            <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-lg leading-none">✕</button>
-          </div>
-        </div>
-
-        {/* Body */}
-        <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
-          {/* Existing comments, in place — the header icon opens the full thread. */}
-          <CommentPreviewList
-            resourceType="action_item"
-            resourceId={item.id}
-            resourceLabel={item.task ?? ""}
-            variant="panel"
-          />
-
-          {/* Task name */}
-          <div>
-            <label className="text-[11px] uppercase tracking-wide text-[var(--twilio-gray-60)] font-semibold mb-1 block">Task</label>
-            <input
-              autoFocus
-              value={form.task}
-              onChange={(e) => setForm((f) => ({ ...f, task: e.target.value }))}
-              className="w-full text-sm text-[var(--twilio-navy)] rounded-lg border border-gray-200 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-300"
-            />
-          </div>
-
-          {/* Details */}
-          <div>
-            <label className="text-[11px] uppercase tracking-wide text-[var(--twilio-gray-60)] font-semibold mb-1 block">Details</label>
-            <RichTextMentionEditor
-              value={form.task_details}
-              onChange={(html) => setForm((f) => ({ ...f, task_details: html }))}
-              placeholder="Optional notes…"
-              minHeightClassName="min-h-[60px]"
-            />
-          </div>
-
-          {/* Status + Priority */}
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="text-[11px] uppercase tracking-wide text-[var(--twilio-gray-60)] font-semibold mb-1 block">Status</label>
-              <div className="flex flex-wrap gap-1">
-                {STATUSES.map((s) => (
-                  <button
-                    key={s}
-                    type="button"
-                    onClick={() => setForm((f) => ({ ...f, status: s }))}
-                    className={[
-                      "px-2 py-0.5 rounded-full border text-[11px] font-semibold transition-colors",
-                      form.status === s ? STATUS_COLORS[s] : "bg-white border-gray-200 text-gray-400 hover:border-gray-300",
-                    ].join(" ")}
-                  >{s}</button>
-                ))}
-              </div>
-            </div>
-            <div>
-              <label className="text-[11px] uppercase tracking-wide text-[var(--twilio-gray-60)] font-semibold mb-1 block">Priority</label>
-              <div className="flex flex-wrap gap-1">
-                {PRIORITIES.map((p) => (
-                  <button
-                    key={p}
-                    type="button"
-                    onClick={() => setForm((f) => ({ ...f, priority: p }))}
-                    className={[
-                      "px-2 py-0.5 rounded-full border text-[11px] font-semibold transition-colors",
-                      form.priority === p ? PRIORITY_COLORS_EDIT[p] : "bg-white border-gray-200 text-gray-400 hover:border-gray-300",
-                    ].join(" ")}
-                  >{p}</button>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          {/* Due date + Assignee */}
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="text-[11px] uppercase tracking-wide text-[var(--twilio-gray-60)] font-semibold mb-1 block">Due date</label>
-              <input
-                type="date"
-                value={form.due_date}
-                onChange={(e) => setForm((f) => ({ ...f, due_date: e.target.value }))}
-                className="w-full text-sm rounded-lg border border-gray-200 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-300 [color-scheme:light]"
-              />
-            </div>
-            <div>
-              <label className="text-[11px] uppercase tracking-wide text-[var(--twilio-gray-60)] font-semibold mb-1 block">Assignee</label>
-              <input
-                value={form.assignee_name}
-                onChange={(e) => setForm((f) => ({ ...f, assignee_name: e.target.value }))}
-                placeholder="Name…"
-                className="w-full text-sm rounded-lg border border-gray-200 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-300"
-              />
-            </div>
-          </div>
-
-          {/* Time */}
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="text-[11px] uppercase tracking-wide text-[var(--twilio-gray-60)] font-semibold mb-1 block">Est. time (min)</label>
-              <input
-                type="number"
-                min="0"
-                value={form.estimated_time ? Math.round(form.estimated_time / 60) : ""}
-                onChange={(e) => setForm((f) => ({ ...f, estimated_time: Math.round((parseFloat(e.target.value) || 0) * 60) }))}
-                placeholder="0"
-                className="w-full text-sm rounded-lg border border-gray-200 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-300"
-              />
-            </div>
-            <div>
-              <label className="text-[11px] uppercase tracking-wide text-[var(--twilio-gray-60)] font-semibold mb-1 block">Time spent (min)</label>
-              <input
-                type="number"
-                min="0"
-                value={form.time_spent ? Math.round(form.time_spent / 60) : ""}
-                onChange={(e) => setForm((f) => ({ ...f, time_spent: Math.round((parseFloat(e.target.value) || 0) * 60) }))}
-                placeholder="0"
-                className="w-full text-sm rounded-lg border border-gray-200 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-300"
-              />
-            </div>
-          </div>
-
-          {/* Attachments */}
-          {!item.airtable_id.startsWith("local-") && <AttachmentsSection item={item} />}
-
-          {/* Activity log */}
-          <div>
-            <label className="text-[11px] uppercase tracking-wide text-[var(--twilio-gray-60)] font-semibold mb-2 block">Activity</label>
-            <ActivityLogSection
-              resourceType="action_item"
-              resourceId={item.airtable_id}
-              variant="inline"
-              onRestore={async (rd) => { await restoreConversion(rd); onConverted?.(); onClose(); }}
-            />
-          </div>
-
-          {/* Timestamps */}
-          {!item.airtable_id.startsWith("local-") && (
-            <div className="pt-3 border-t border-gray-100 flex flex-wrap gap-x-5 gap-y-1">
-              <span className="text-[11px] text-[var(--twilio-gray-60)]">
-                <span className="font-semibold uppercase tracking-wide">Created</span>{" "}
-                {item.created_at ? new Date(item.created_at).toLocaleString(undefined, { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" }) : "—"}
-              </span>
-              {item.marked_done_at && (
-                <span className="text-[11px] text-emerald-600">
-                  <span className="font-semibold uppercase tracking-wide">Completed</span>{" "}
-                  {new Date(item.marked_done_at).toLocaleString(undefined, { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" })}
-                </span>
-              )}
-            </div>
-          )}
-        </div>
-
-        {/* Footer */}
-        <div className="px-5 py-4 border-t border-gray-100 space-y-2">
-          <button
-            type="button"
-            disabled={converting}
-            onClick={() => void handleConvertToEvent()}
-            className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border border-amber-300 bg-amber-50 text-amber-800 hover:bg-amber-100 disabled:opacity-50 transition-colors"
-          >
-            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-3.5 h-3.5 shrink-0">
-              <rect x="2" y="3" width="12" height="11" rx="1.5"/>
-              <path d="M5 2v2M11 2v2M2 7h12" strokeLinecap="round"/>
-            </svg>
-            {converting ? "Converting…" : "Convert to Event"}
-          </button>
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => void handleDelete()}
-              disabled={deleting}
-              title="Delete action item"
-              className="p-2 rounded-lg text-gray-400 hover:text-red-500 hover:bg-red-50 disabled:opacity-40 transition-colors"
-            >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/></svg>
-            </button>
-            <button
-              type="button"
-              onClick={onClose}
-              className="flex-1 py-2 rounded-xl border border-gray-200 text-sm text-gray-600 hover:bg-gray-50 transition-colors"
-            >Cancel</button>
-            <button
-              type="button"
-              onClick={() => void handleSave()}
-              disabled={saving || !form.task.trim()}
-              className="flex-1 py-2 rounded-xl bg-[var(--twilio-navy)] text-white text-sm font-semibold hover:opacity-90 disabled:opacity-40 transition-colors"
-            >{saving ? "Saving…" : "Save"}</button>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -546,7 +149,6 @@ function EventRemindersSection({
         resource_id: event.id,
         resource_label: event.title,
         due_at: due.toISOString(),
-        notify_in_app: true,
       } as Parameters<typeof schedulerApi.createReminder>[0]);
       setEventReminders((prev) => [...prev, data]);
       setRemTitle(""); setRemDate(""); setRemTime("09:00"); setShowForm(false);
@@ -651,12 +253,21 @@ function EventRemindersSection({
 }
 
 export default function MeetingDetail({ event, attended = true, onToggleAttendance, reloadTrigger }: Props) {
+  const { label: statusLabel } = useStatusLabels();
+  const { sortDirection, toggleSort, applySort } = useColumnSort();
   const [result, setResult] = useState<EventMatchResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [actionItems, setActionItems] = useState<AirtableActionItem[]>([]);
   const [actionItemDropOver, setActionItemDropOver] = useState(false);
   const [dragOverCol, setDragOverCol] = useState<AirtableActionItem["status"] | null>(null);
-  const [sfProjects, setSfProjects] = useState<SalesforceProject[]>([]);
+  // A kanban card from the Action Items section is in the air. It can be dropped on the
+  // Meeting Notes (links it to this meeting) or on the calendar grid, so both glow.
+  const [cardDragging, setCardDragging] = useState(false);
+  const [notesDropOver, setNotesDropOver] = useState(false);
+  const [linkNote, setLinkNote] = useState<{ text: string; ok: boolean } | null>(null);
+  // The meeting row created for a calendar-only event the first time something is linked to it.
+  const [ensuredMeetingPk, setEnsuredMeetingPk] = useState<number | null>(null);
+  const [acctProjects, setAcctProjects] = useState<AccountProject[]>([]);
   const [logTimeProject, setLogTimeProject] = useState<SalesforceProject | null>(null);
   const [notes, setNotes] = useState<MeetingNote[]>([]);
   const [eventReminders, setEventReminders] = useState<Reminder[]>([]);
@@ -762,7 +373,7 @@ export default function MeetingDetail({ event, attended = true, onToggleAttendan
     prevUidRef.current = eventUid;
     setResult(null);
     setActionItems([]);
-    setSfProjects([]);
+    setAcctProjects([]);
     setAccountTeamMembers([]);
     setWorkSessions([]);
   }, [eventUid]);
@@ -780,21 +391,7 @@ export default function MeetingDetail({ event, attended = true, onToggleAttendan
       setResult(data);
       setActionItems(data.action_items ?? []);
 
-      // Load Salesforce projects for the matched account (by name match)
       if (!data.needs_categorization && data.account) {
-        try {
-          const { data: sfData } = await salesforceApi.listProjects();
-          const accountName = data.account.name.toLowerCase();
-          const allProjects = sfData.results ?? [];
-          const matched = allProjects.filter(
-            (p) => p.account_name?.toLowerCase().includes(accountName) ||
-                   accountName.includes(p.account_name?.toLowerCase() ?? "____")
-          );
-          console.log("[MeetingDetail] SF projects:", { total: allProjects.length, matched: matched.length, accountName });
-          setSfProjects(matched);
-        } catch (sfErr) {
-          console.log("[MeetingDetail] SF projects fetch failed:", sfErr);
-        }
         // Fetch Django account team members for smart mention tagging
         try {
           const { data: acctData } = await accountsApi.listAccounts({ search: data.account.name, page_size: "5" });
@@ -811,6 +408,16 @@ export default function MeetingDetail({ event, attended = true, onToggleAttendan
             teamMembers: acct?.team_members?.map((m) => m.full_name),
           });
           if (acct?.team_members) setAccountTeamMembers(acct.team_members);
+          // Projects/goals come from the account page's own records (AccountProject, keyed by
+          // Django Account.id) — never from the Salesforce mirror or any fixed list.
+          if (acct) {
+            try {
+              const { data: pj } = await accountsApi.listAllProjects();
+              setAcctProjects((pj.results ?? []).filter((p) => p.account === acct.id));
+            } catch (pErr) {
+              console.warn("[MeetingDetail] account projects fetch failed:", pErr);
+            }
+          }
         } catch (e) {
           console.warn("[MeetingDetail] account team lookup failed:", e);
         }
@@ -875,6 +482,60 @@ export default function MeetingDetail({ event, attended = true, onToggleAttendan
     } catch { /* best effort */ }
   }
 
+  // Window-level so a cancelled drag (Esc, dropped outside) always clears the glow: the
+  // source card's own dragend can't be relied on once the list re-renders mid-drag.
+  useEffect(() => {
+    const onStart = (e: DragEvent) => { if (e.dataTransfer?.types.includes("kanbancardid")) setCardDragging(true); };
+    const onEnd = () => { setCardDragging(false); setNotesDropOver(false); };
+    window.addEventListener("dragstart", onStart);
+    window.addEventListener("dragend", onEnd);
+    window.addEventListener("drop", onEnd);
+    return () => {
+      window.removeEventListener("dragstart", onStart);
+      window.removeEventListener("dragend", onEnd);
+      window.removeEventListener("drop", onEnd);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!linkNote) return;
+    const t = setTimeout(() => setLinkNote(null), 4000);
+    return () => clearTimeout(t);
+  }, [linkNote]);
+
+  const thisMeetingPk = result?.this_meeting?.id ?? ensuredMeetingPk;
+  const linkedHere = thisMeetingPk == null ? [] : actionItems.filter((i) => i.linked_meeting === thisMeetingPk);
+
+  /** Drop on the Meeting Notes: link the action item to this meeting. */
+  async function linkActionItemToMeeting(airtableId: string) {
+    const item = actionItems.find((i) => i.airtable_id === airtableId);
+    if (!item || airtableId.startsWith("local-")) return;
+    try {
+      // A calendar-only event has no meeting row yet; make the same local stub the notes use.
+      let meetingPk = result?.this_meeting?.id ?? ensuredMeetingPk;
+      if (meetingPk == null) {
+        const { data } = await airtableApi.ensureMeetingForEvent(event.id);
+        meetingPk = data.id;
+        setEnsuredMeetingPk(meetingPk);
+      }
+      if (item.linked_meeting === meetingPk) {
+        setLinkNote({ text: `"${item.task}" is already linked to this meeting.`, ok: true });
+        return;
+      }
+      await airtableApi.updateActionItemFields(airtableId, { linked_meeting: meetingPk });
+      setActionItems((prev) => prev.map((i) =>
+        i.airtable_id === airtableId ? { ...i, linked_meeting: meetingPk, linked_meeting_name: event.title } : i));
+      addLog({
+        category: "action_item",
+        message: `"${item.task}" linked to meeting "${event.title}"`,
+        resource: { type: "action_item", id: airtableId },
+      });
+      setLinkNote({ text: `Linked "${item.task}" to this meeting. It now shows under the meeting on the account's timeline.`, ok: true });
+    } catch {
+      setLinkNote({ text: `Could not link "${item.task}" to this meeting. Please try again.`, ok: false });
+    }
+  }
+
   const durationSecs =
     (new Date(event.end_datetime).getTime() - new Date(event.start_datetime).getTime()) / 1000;
 
@@ -911,7 +572,7 @@ export default function MeetingDetail({ event, attended = true, onToggleAttendan
           </section>
 
           {/* Salesforce Projects — collapsible */}
-          {sfProjects.length > 0 && (
+          {result?.account && (
             <section>
               <button
                 onClick={() => setShowSfProjects((v) => !v)}
@@ -922,7 +583,7 @@ export default function MeetingDetail({ event, attended = true, onToggleAttendan
                     <path d="M2 4h12M2 8h8M2 12h5"/>
                   </svg>
                   Salesforce Projects
-                  <span className="text-[11px] font-normal text-[var(--twilio-gray-60)]">({sfProjects.length})</span>
+                  <span className="text-[11px] font-normal text-[var(--twilio-gray-60)]">({acctProjects.length})</span>
                 </span>
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"
                   className={`w-3.5 h-3.5 text-[var(--twilio-gray-60)] transition-transform ${showSfProjects ? "rotate-180" : ""}`}>
@@ -930,24 +591,35 @@ export default function MeetingDetail({ event, attended = true, onToggleAttendan
                 </svg>
               </button>
               {showSfProjects && (
-                <div className="mt-3 grid gap-2" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))" }}>
-                  {sfProjects.map((project) => {
-                    const desc = ADMIN_PROJECT_DESCRIPTIONS[project.name];
-                    return (
-                      <div key={project.sf_id} className="bg-white rounded-xl border border-gray-200 px-3 py-2 flex flex-col gap-1.5" title={desc ? `${project.name}\n\n${desc}` : undefined}>
+                acctProjects.length === 0 ? (
+                  <p className="mt-3 text-xs text-[var(--twilio-gray-60)]">No projects or goals on this account yet.</p>
+                ) : (
+                  <div className="mt-3 grid gap-2" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))" }}>
+                    {topLevelProjects(acctProjects).map(({ project, goals }) => (
+                      <div key={project.id} className="bg-white rounded-xl border border-gray-200 px-3 py-2 flex flex-col gap-1.5" data-testid="account-project">
                         <div className="min-w-0">
                           <p className="text-xs font-medium text-[var(--twilio-navy)] leading-snug line-clamp-2">{project.name}</p>
-                          {project.status && (
-                            <span className="text-[10px] font-medium text-indigo-600">{project.status}</span>
+                          {(project.sf_data?.projectStatus) && (
+                            <span className="text-[10px] font-medium text-indigo-600">{project.sf_data.projectStatus}</span>
+                          )}
+                          {project.sf_project_id && (
+                            <span className="block text-[10px] text-[var(--twilio-gray-60)]">{project.sf_project_id}</span>
                           )}
                         </div>
-                        <button onClick={() => setLogTimeProject(project)} className="w-full flex items-center justify-center gap-1 px-2 py-1 rounded-lg text-[10px] font-medium text-white mt-auto" style={{ background: "#0263E0" }}>
-                          + Log Time
-                        </button>
+                        {goals.length > 0 && (
+                          <ul className="text-[11px] text-[var(--twilio-navy)] list-disc pl-4 space-y-0.5">
+                            {goals.map((g) => <li key={g.id}>{g.name}</li>)}
+                          </ul>
+                        )}
+                        {project.sf_project_id && project.kind === "project" && (
+                          <button onClick={() => setLogTimeProject({ id: project.id, sf_id: project.sf_project_id, account: null, account_name: result?.account?.name ?? "", name: project.name, status: "", description: "", start_date: null, end_date: null, owner_name: "", members: [], tasks: [] })} className="w-full flex items-center justify-center gap-1 px-2 py-1 rounded-lg text-[10px] font-medium text-white mt-auto" style={{ background: "#0263E0" }}>
+                            + Log Time
+                          </button>
+                        )}
                       </div>
-                    );
-                  })}
-                </div>
+                    ))}
+                  </div>
+                )
               )}
             </section>
           )}
@@ -1033,8 +705,37 @@ export default function MeetingDetail({ event, attended = true, onToggleAttendan
         </div>{/* end col 1 */}
 
         {/* ── Col 2: Meeting Notes ─────────────────────────────────────────── */}
-        <div className="rounded-2xl border border-gray-200 bg-gray-50 p-5">
+        <div
+          data-testid="meeting-notes-column"
+          data-drag-glow={cardDragging ? (notesDropOver ? "over" : "ready") : undefined}
+          className={[
+            "rounded-2xl border p-5 transition-all",
+            notesDropOver ? "border-indigo-400 bg-indigo-50 shadow-[0_0_22px_rgba(99,102,241,0.6)]"
+              : cardDragging ? "border-indigo-300 bg-indigo-50/60 shadow-[0_0_16px_rgba(99,102,241,0.35)]"
+              : "border-gray-200 bg-gray-50",
+          ].join(" ")}
+          // Capture phase on purpose: the note editor inside this column is a contenteditable,
+          // and ProseMirror would otherwise insert the dragged text/plain (the record id) as text.
+          onDragOverCapture={(e) => {
+            if (!e.dataTransfer.types.includes("kanbancardid")) return;
+            e.preventDefault();
+            e.stopPropagation();
+            e.dataTransfer.dropEffect = "move";
+            setNotesDropOver(true);
+          }}
+          onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setNotesDropOver(false); }}
+          onDropCapture={(e) => {
+            const id = e.dataTransfer.getData("kanbanCardId");
+            if (!id) return;
+            e.preventDefault();
+            e.stopPropagation();
+            setNotesDropOver(false);
+            setCardDragging(false);
+            void linkActionItemToMeeting(id);
+          }}
+        >
           <SectionHeading>Meeting Notes</SectionHeading>
+          {notesDropOver && <p className="text-[11px] text-indigo-600 font-medium mb-2">Drop to link this action item to the meeting</p>}
           <MeetingNotesSection
             eventId={event.id}
             eventTitle={event.title}
@@ -1044,6 +745,19 @@ export default function MeetingDetail({ event, attended = true, onToggleAttendan
             locallyCreatedNoteIds={locallyCreatedNoteIds}
             onActionItemCreated={(item) => setActionItems((prev) => [...prev, item])}
           />
+          {linkNote && (
+            <p role="status" className={["mt-3 text-xs", linkNote.ok ? "text-emerald-700" : "text-red-600"].join(" ")}>{linkNote.text}</p>
+          )}
+          {linkedHere.length > 0 && (
+            <div data-testid="linked-action-items" className="mt-4">
+              <p className="text-[11px] uppercase tracking-wide text-[var(--twilio-gray-60)] mb-1">Action items from this meeting</p>
+              <ul className="space-y-1">
+                {linkedHere.map((i) => (
+                  <li key={i.airtable_id} className="text-xs rounded-md border border-violet-200 bg-violet-50 px-2 py-1 text-violet-900">{i.task}</li>
+                ))}
+              </ul>
+            </div>
+          )}
         </div>
 
         {/* ── Col 3: Meeting Summary ───────────────────────────────────────── */}
@@ -1067,8 +781,12 @@ export default function MeetingDetail({ event, attended = true, onToggleAttendan
         <div
           className={[
             "rounded-2xl border p-5 transition-colors",
-            actionItemDropOver ? "border-indigo-300 bg-indigo-50" : "border-gray-200 bg-gray-50",
+            actionItemDropOver ? "border-indigo-300 bg-indigo-50"
+              : cardDragging ? "border-indigo-300 bg-indigo-50/60 shadow-[0_0_18px_rgba(99,102,241,0.45)]"
+              : "border-gray-200 bg-gray-50",
           ].join(" ")}
+          data-testid="meeting-action-items-section"
+          data-drag-glow={cardDragging ? "ready" : undefined}
           onDragOver={(e) => {
             if (e.dataTransfer.types.includes("kanbancardid")) return; // handled by columns
             e.preventDefault();
@@ -1079,13 +797,14 @@ export default function MeetingDetail({ event, attended = true, onToggleAttendan
         >
           <h2 className="text-sm font-semibold uppercase tracking-widest text-[var(--twilio-gray-60)] mb-4 flex items-center gap-2">
             Action Items
+            <span className="text-[11px] text-[var(--twilio-gray-60)] font-normal normal-case tracking-normal">Drag Action Item to Meeting Notes or Calendar</span>
             {actionItemDropOver && <span className="text-[11px] text-indigo-500 font-medium normal-case tracking-normal">Drop to associate</span>}
           </h2>
 
           {/* 4-column kanban */}
           <div className="grid grid-cols-4 gap-4">
             {KANBAN_COLUMNS.map((col) => {
-              const colItems = actionItems.filter((i) => i.status === col);
+              const colItems = applySort(actionItems.filter((i) => i.status === col), col);
               const isOver = dragOverCol === col;
               return (
                 <div
@@ -1122,8 +841,9 @@ export default function MeetingDetail({ event, attended = true, onToggleAttendan
                   }}
                 >
                   <div className="flex items-center gap-1.5 mb-3">
-                    <p className="text-sm font-semibold text-[var(--twilio-navy)]">{col}</p>
+                    <p className="text-sm font-semibold text-[var(--twilio-navy)]">{statusLabel(col)}</p>
                     <span className="text-xs bg-gray-100 text-[var(--twilio-navy)] rounded-full px-1.5 py-0.5">{colItems.length}</span>
+                    <ColumnSortButton status={col} direction={sortDirection(col)} onToggle={toggleSort} className="ml-auto" />
                   </div>
                   <div className="space-y-2">
                     {colItems.map((item) => (
@@ -1256,12 +976,16 @@ export default function MeetingDetail({ event, attended = true, onToggleAttendan
       )}
 
       {editingItem && (
-        <ActionItemEditModal
+        <ActionItemModal
           item={editingItem}
+          teamMembers={accountTeamMembers as unknown as TeamMember[]}
           onClose={() => setEditingItem(null)}
-          onSaved={(updated) => {
-            setActionItems((prev) => prev.map((i) => i.airtable_id === updated.airtable_id ? updated : i));
+          onUpdated={(updated) => {
+            setActionItems((prev) => prev.map((i) => i.airtable_id === updated.airtable_id ? { ...i, ...updated } : i));
             setEditingItem(null);
+          }}
+          onAutosaved={(updated) => {
+            setActionItems((prev) => prev.map((i) => i.airtable_id === updated.airtable_id ? { ...i, ...updated } : i));
           }}
           onConverted={() => {
             setActionItems((prev) => prev.filter((i) => i.airtable_id !== editingItem.airtable_id));
@@ -1280,19 +1004,18 @@ export default function MeetingDetail({ event, attended = true, onToggleAttendan
 // ── Meeting Notes ─────────────────────────────────────────────────────────────
 
 // Strip @mention tokens from display text for action payloads
-const ADMIN_PROJECT_DESCRIPTIONS: Record<string, string> = {
-  "Manager Tasks": "Managers / Team Leads Only: Resource/capacity planning, development planning and tracking, 1:1's, HR issues, employee coaching, customer project support and review, etc",
-  "General Business Tasks": "General business overhead tasks such as non customer related emails, Workday peer reviews, writing GCS Newsletter stories, travel to customer visits. (Please add a \"Comment\").\n\nLogging your time to Cloud Coach should be logged as a General Business Task, however the time that you're entering into the timesheet (like customer work) should be categorized accordingly.",
-  "Presales Support": "Participating in a pre-sales call, work on customer SoW, effort estimates, technical presales discussions",
-  "Industry Thought Leadership": "Subject Matter Expert initiatives such as preparing for and attending Signal, attending job related conferences, taking an online learning course, writing a whitepaper or blog post, serving as Product Liaison",
-  "Training": "Preparing, giving and/or receiving Twilio specific training. e.g. new hire training, Shadowing, QEP's, etc.",
-  "Internal Meetings": "All Hands, 1:1 with your manager or other Twilion and team status meetings, PS offsites and meetings",
-  "OOO/Vacation/PTO": "PTO, corporate holidays, bereavement leave or out sick",
-  "ERG/Volunteer": "Time spent focused on volunteer efforts and/or ERG events and initiatives",
-  "Partner Enablement/Assist": "Non project related work to enable or help our partners",
-  "Practice Development": "Internal Projects, COE, developing and enhancing services offerings, developing marketing content, creating reusable assets, writing/assembling customer stories",
-  "Recruiting / Hiring": "Recruiting, prepping, conducting or submitting notes for interviews",
-};
+/** Projects (with their nested goals) of an account; goals no project references stay visible. */
+function topLevelProjects(all: AccountProject[]): { project: AccountProject; goals: AccountProject[] }[] {
+  const byId = new Map(all.map((p) => [String(p.id), p]));
+  const claimed = new Set<string>();
+  const rows = all.filter((p) => p.kind !== "goal").map((project) => {
+    const goals = (project.goal_ids ?? []).map((id) => byId.get(String(id))).filter((g): g is AccountProject => !!g);
+    goals.forEach((g) => claimed.add(String(g.id)));
+    return { project, goals };
+  });
+  const orphans = all.filter((p) => p.kind === "goal" && !claimed.has(String(p.id))).map((project) => ({ project, goals: [] as AccountProject[] }));
+  return [...rows, ...orphans];
+}
 
 function stripMentions(html: string) {
   return htmlToPreviewText(html).replace(/@\S+/g, "").replace(/\s{2,}/g, " ").trim();
@@ -1511,7 +1234,6 @@ function NoteRow({
       resource_id: eventId,
       resource_label: eventTitle,
       due_at: due.toISOString(),
-      notify_in_app: true,
     } as Parameters<typeof schedulerApi.createReminder>[0])
       .then(() => { setRemSaved(true); markNoteDone("reminder"); setTimeout(() => { setRemSaved(false); setOpenTooltip(null); }, 1400); })
       .catch(() => {});
@@ -1551,7 +1273,7 @@ function NoteRow({
           </div>
         ) : (
           <div
-            className="text-sm text-[var(--twilio-navy)] leading-relaxed cursor-text prose prose-sm max-w-none"
+            className="text-sm text-[var(--twilio-navy)] leading-relaxed cursor-text prose prose-sm max-w-none rich-text"
             onClick={() => { setEditing(true); setEditText(note.html); }}
             dangerouslySetInnerHTML={{ __html: sanitizeHtml(plainToHtml(note.html)) }}
           />
@@ -1866,11 +1588,11 @@ function GongActionTooltip({ kind, noteText, eventId, accountName, airtableAccou
   const currentUser = useCurrentUser();
   const [priority, setPriority] = useState<"Low"|"Medium"|"High"|"Critical">("Medium");
   const [due, setDue] = useState("");
-  const [remDate, setRemDate] = useState(() => { const d = new Date(); d.setDate(d.getDate() + 1); return d.toISOString().slice(0,10); });
+  const [remDate, setRemDate] = useState(() => { const d = new Date(); d.setDate(d.getDate() + 1); return localDateKey(d); });
   const [remTime, setRemTime] = useState("09:00");
   const [calTitle, setCalTitle] = useState(noteText.slice(0, 80));
-  const [calStart, setCalStart] = useState(() => { const d = new Date(); d.setDate(d.getDate() + 1); d.setHours(10,0,0,0); return d.toISOString().slice(0,16); });
-  const [calEnd, setCalEnd] = useState(() => { const d = new Date(); d.setDate(d.getDate() + 1); d.setHours(11,0,0,0); return d.toISOString().slice(0,16); });
+  const [calStart, setCalStart] = useState(() => { const d = new Date(); d.setDate(d.getDate() + 1); d.setHours(10,0,0,0); return toLocalDatetimeValue(d.toISOString()); });
+  const [calEnd, setCalEnd] = useState(() => { const d = new Date(); d.setDate(d.getDate() + 1); d.setHours(11,0,0,0); return toLocalDatetimeValue(d.toISOString()); });
   const [done, setDone] = useState(false);
   const tooltipElRef = useRef<HTMLDivElement>(null);
   // Compute fixed position from anchor: prefer below, flip above if too close to viewport bottom
@@ -1896,7 +1618,7 @@ function GongActionTooltip({ kind, noteText, eventId, accountName, airtableAccou
       localStorage.setItem("actionItemsUpdated", String(Date.now()));
       window.dispatchEvent(new StorageEvent("storage", { key: "actionItemsUpdated", newValue: String(Date.now()) }));
     } else if (kind === "reminder") {
-      await schedulerApi.createReminder({ title: stripped.slice(0, 200) || "Note reminder", body: noteText, resource_type: "calendar_event", resource_id: eventId, due_at: new Date(`${remDate}T${remTime}:00`).toISOString(), notify_in_app: true } as Parameters<typeof schedulerApi.createReminder>[0]);
+      await schedulerApi.createReminder({ title: stripped.slice(0, 200) || "Note reminder", body: noteText, resource_type: "calendar_event", resource_id: eventId, due_at: new Date(`${remDate}T${remTime}:00`).toISOString() } as Parameters<typeof schedulerApi.createReminder>[0]);
     } else {
       await schedulerApi.createEvent({ title: calTitle, description: `From meeting note: ${noteText}`, start_datetime: new Date(calStart).toISOString(), end_datetime: new Date(calEnd).toISOString() } as Parameters<typeof schedulerApi.createEvent>[0]);
     }
@@ -1908,35 +1630,35 @@ function GongActionTooltip({ kind, noteText, eventId, accountName, airtableAccou
   const label = kind === "action" ? "Create Action Item" : kind === "reminder" ? "Set Reminder" : "Create Meeting";
 
   return (
-    <div ref={tooltipElRef} style={{ position: "fixed", top: fixedTop, right: fixedRight, zIndex: 9999, background: "#fff", border: "1px solid #e5e7eb", borderRadius: "10px", padding: "10px 12px", width: "240px", boxShadow: "0 4px 16px rgba(0,0,0,0.12)", display: "flex", flexDirection: "column", gap: "8px" }}>
-      <p style={{ fontSize: "0.6875rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", color: "#6b7280", margin: 0 }}>{label}</p>
-      <div style={{ fontSize: "0.75rem", background: "#f9fafb", borderRadius: "5px", padding: "4px 7px", color: "#374151", lineHeight: 1.4, maxHeight: "40px", overflow: "hidden" }}>{stripped}</div>
+    <div ref={tooltipElRef} style={{ position: "fixed", top: fixedTop, right: fixedRight, zIndex: 9999, background: "var(--surface-card)", border: "1px solid var(--border-subtle)", borderRadius: "10px", padding: "10px 12px", width: "240px", boxShadow: "0 4px 16px rgba(0,0,0,0.12)", display: "flex", flexDirection: "column", gap: "8px" }}>
+      <p style={{ fontSize: "0.6875rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", color: "var(--text-gray-500)", margin: 0 }}>{label}</p>
+      <div style={{ fontSize: "0.75rem", background: "var(--surface-subtle)", borderRadius: "5px", padding: "4px 7px", color: "var(--text-gray-700)", lineHeight: 1.4, maxHeight: "40px", overflow: "hidden" }}>{stripped}</div>
       {kind === "action" && (
         <div style={{ display: "flex", gap: "6px" }}>
           <div style={{ flex: 1 }}>
-            <p style={{ fontSize: "0.6875rem", color: "#9ca3af", marginBottom: "3px" }}>Priority</p>
-            <select value={priority} onChange={(e) => setPriority(e.target.value as typeof priority)} style={{ width: "100%", fontSize: "0.75rem", border: "1px solid #e5e7eb", borderRadius: "5px", padding: "3px 6px", outline: "none" }}>
+            <p style={{ fontSize: "0.6875rem", color: "var(--text-gray-400)", marginBottom: "3px" }}>Priority</p>
+            <select value={priority} onChange={(e) => setPriority(e.target.value as typeof priority)} style={{ width: "100%", fontSize: "0.75rem", border: "1px solid var(--border-subtle)", borderRadius: "5px", padding: "3px 6px", outline: "none" }}>
               {(["Low","Medium","High","Critical"] as const).map((p) => <option key={p}>{p}</option>)}
             </select>
           </div>
           <div style={{ flex: 1 }}>
-            <p style={{ fontSize: "0.6875rem", color: "#9ca3af", marginBottom: "3px" }}>Due date</p>
-            <input type="date" value={due} onChange={(e) => setDue(e.target.value)} style={{ width: "100%", fontSize: "0.75rem", border: "1px solid #e5e7eb", borderRadius: "5px", padding: "3px 6px", outline: "none" }} />
+            <p style={{ fontSize: "0.6875rem", color: "var(--text-gray-400)", marginBottom: "3px" }}>Due date</p>
+            <input type="date" value={due} onChange={(e) => setDue(e.target.value)} style={{ width: "100%", fontSize: "0.75rem", border: "1px solid var(--border-subtle)", borderRadius: "5px", padding: "3px 6px", outline: "none" }} />
           </div>
         </div>
       )}
       {kind === "reminder" && (
         <div style={{ display: "flex", gap: "6px" }}>
-          <div style={{ flex: 1 }}><p style={{ fontSize: "0.6875rem", color: "#9ca3af", marginBottom: "3px" }}>Date</p><input type="date" value={remDate} onChange={(e) => setRemDate(e.target.value)} style={{ width: "100%", fontSize: "0.75rem", border: "1px solid #e5e7eb", borderRadius: "5px", padding: "3px 6px", outline: "none" }} /></div>
-          <div style={{ flex: 1 }}><p style={{ fontSize: "0.6875rem", color: "#9ca3af", marginBottom: "3px" }}>Time</p><input type="time" value={remTime} onChange={(e) => setRemTime(e.target.value)} style={{ width: "100%", fontSize: "0.75rem", border: "1px solid #e5e7eb", borderRadius: "5px", padding: "3px 6px", outline: "none" }} /></div>
+          <div style={{ flex: 1 }}><p style={{ fontSize: "0.6875rem", color: "var(--text-gray-400)", marginBottom: "3px" }}>Date</p><input type="date" value={remDate} onChange={(e) => setRemDate(e.target.value)} style={{ width: "100%", fontSize: "0.75rem", border: "1px solid var(--border-subtle)", borderRadius: "5px", padding: "3px 6px", outline: "none" }} /></div>
+          <div style={{ flex: 1 }}><p style={{ fontSize: "0.6875rem", color: "var(--text-gray-400)", marginBottom: "3px" }}>Time</p><input type="time" value={remTime} onChange={(e) => setRemTime(e.target.value)} style={{ width: "100%", fontSize: "0.75rem", border: "1px solid var(--border-subtle)", borderRadius: "5px", padding: "3px 6px", outline: "none" }} /></div>
         </div>
       )}
       {kind === "calendar" && (
         <>
-          <div><p style={{ fontSize: "0.6875rem", color: "#9ca3af", marginBottom: "3px" }}>Title</p><input value={calTitle} onChange={(e) => setCalTitle(e.target.value)} style={{ width: "100%", fontSize: "0.75rem", border: "1px solid #e5e7eb", borderRadius: "5px", padding: "3px 6px", outline: "none", boxSizing: "border-box" }} /></div>
+          <div><p style={{ fontSize: "0.6875rem", color: "var(--text-gray-400)", marginBottom: "3px" }}>Title</p><input value={calTitle} onChange={(e) => setCalTitle(e.target.value)} style={{ width: "100%", fontSize: "0.75rem", border: "1px solid var(--border-subtle)", borderRadius: "5px", padding: "3px 6px", outline: "none", boxSizing: "border-box" }} /></div>
           <div style={{ display: "flex", gap: "6px" }}>
-            <div style={{ flex: 1 }}><p style={{ fontSize: "0.6875rem", color: "#9ca3af", marginBottom: "3px" }}>Start</p><input type="datetime-local" value={calStart} onChange={(e) => setCalStart(e.target.value)} style={{ width: "100%", fontSize: "0.6875rem", border: "1px solid #e5e7eb", borderRadius: "5px", padding: "3px 6px", outline: "none" }} /></div>
-            <div style={{ flex: 1 }}><p style={{ fontSize: "0.6875rem", color: "#9ca3af", marginBottom: "3px" }}>End</p><input type="datetime-local" value={calEnd} onChange={(e) => setCalEnd(e.target.value)} style={{ width: "100%", fontSize: "0.6875rem", border: "1px solid #e5e7eb", borderRadius: "5px", padding: "3px 6px", outline: "none" }} /></div>
+            <div style={{ flex: 1 }}><p style={{ fontSize: "0.6875rem", color: "var(--text-gray-400)", marginBottom: "3px" }}>Start</p><input type="datetime-local" value={calStart} onChange={(e) => setCalStart(e.target.value)} style={{ width: "100%", fontSize: "0.6875rem", border: "1px solid var(--border-subtle)", borderRadius: "5px", padding: "3px 6px", outline: "none" }} /></div>
+            <div style={{ flex: 1 }}><p style={{ fontSize: "0.6875rem", color: "var(--text-gray-400)", marginBottom: "3px" }}>End</p><input type="datetime-local" value={calEnd} onChange={(e) => setCalEnd(e.target.value)} style={{ width: "100%", fontSize: "0.6875rem", border: "1px solid var(--border-subtle)", borderRadius: "5px", padding: "3px 6px", outline: "none" }} /></div>
           </div>
         </>
       )}
@@ -1979,15 +1701,15 @@ function GongBulletRow({ text, eventId, accountName, airtableAccountId, isLast, 
   return (
     <div className="group" style={{ display: "flex", alignItems: "flex-start", gap: "6px", padding: "6px 10px", borderBottom: isLast ? undefined : "1px solid rgba(0,0,0,0.05)", position: "relative" }}>
       <span style={{ width: "5px", height: "5px", borderRadius: "50%", background: "#9ca3af", flexShrink: 0, marginTop: "7px" }} />
-      <p style={{ flex: 1, fontSize: "0.8125rem", color: "var(--twilio-navy)", lineHeight: 1.5, margin: 0 }}>{renderWithMentions(text)}</p>
+      <p style={{ flex: 1, fontSize: "0.8125rem", color: "var(--text-ink)", lineHeight: 1.5, margin: 0 }}>{renderWithMentions(text)}</p>
       <div ref={tooltipRef} style={{ display: "flex", alignItems: "center", gap: "2px", flexShrink: 0 }}>
-        <button title="Create action item" onClick={(e) => openWith("action", e)} style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("action") ? "#2563eb" : "#9ca3af" }} className={doneActions.has("action") ? "transition-opacity" : "opacity-0 group-hover:opacity-100 transition-opacity"}>
+        <button title="Create action item" onClick={(e) => openWith("action", e)} style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("action") ? "#2563eb" : "var(--text-gray-400)" }} className={doneActions.has("action") ? "transition-opacity" : "opacity-0 group-hover:opacity-100 transition-opacity"}>
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" style={{ width: "12px", height: "12px" }}><path d="M8 5h9M8 10h9M8 15h9" strokeLinecap="round"/><path d="M3 5l1.5 1.5L7 3M3 10l1.5 1.5L7 8M3 15l1.5 1.5L7 13" strokeLinecap="round" strokeLinejoin="round"/></svg>
         </button>
-        <button title="Set reminder" onClick={(e) => openWith("reminder", e)} style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("reminder") ? "#2563eb" : "#9ca3af" }} className={doneActions.has("reminder") ? "transition-opacity" : "opacity-0 group-hover:opacity-100 transition-opacity"}>
+        <button title="Set reminder" onClick={(e) => openWith("reminder", e)} style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("reminder") ? "#2563eb" : "var(--text-gray-400)" }} className={doneActions.has("reminder") ? "transition-opacity" : "opacity-0 group-hover:opacity-100 transition-opacity"}>
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" style={{ width: "12px", height: "12px" }}><circle cx="10" cy="10" r="7"/><path d="M10 6v4l3 2" strokeLinecap="round" strokeLinejoin="round"/></svg>
         </button>
-        <button title="Create meeting" onClick={(e) => openWith("calendar", e)} style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("calendar") ? "#2563eb" : "#9ca3af" }} className={doneActions.has("calendar") ? "transition-opacity" : "opacity-0 group-hover:opacity-100 transition-opacity"}>
+        <button title="Create meeting" onClick={(e) => openWith("calendar", e)} style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("calendar") ? "#2563eb" : "var(--text-gray-400)" }} className={doneActions.has("calendar") ? "transition-opacity" : "opacity-0 group-hover:opacity-100 transition-opacity"}>
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" style={{ width: "12px", height: "12px" }}><rect x="2" y="4" width="16" height="14" rx="2"/><path d="M2 8h16M6 2v4M14 2v4" strokeLinecap="round"/></svg>
         </button>
         {openAction && anchorRect && (
@@ -2184,7 +1906,7 @@ function MeetingSummarySection({ eventId, meetingId, existingNotes, existingZoom
     <div>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "6px" }}>
         <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-          {saveState === "saving" && <span style={{ fontSize: "0.6875rem", color: "#9ca3af" }}>Saving…</span>}
+          {saveState === "saving" && <span style={{ fontSize: "0.6875rem", color: "var(--text-gray-400)" }}>Saving…</span>}
           {saveState === "saved" && <span style={{ fontSize: "0.6875rem", color: "#16a34a" }}>✓ Saved</span>}
           {saveState === "error" && <span style={{ fontSize: "0.6875rem", color: "#dc2626" }}>Save failed</span>}
         </div>
@@ -2196,7 +1918,7 @@ function MeetingSummarySection({ eventId, meetingId, existingNotes, existingZoom
             hasZoom={!!notesBySource.zoom.trim()}
           />
           {items.length > 0 && (
-            <button onClick={() => void handleClear()} style={{ fontSize: "0.6875rem", color: "#9ca3af", background: "none", border: "none", cursor: "pointer", padding: 0 }}>
+            <button onClick={() => void handleClear()} style={{ fontSize: "0.6875rem", color: "var(--text-gray-400)", background: "none", border: "none", cursor: "pointer", padding: 0 }}>
               Clear
             </button>
           )}
@@ -2217,7 +1939,7 @@ function MeetingSummarySection({ eventId, meetingId, existingNotes, existingZoom
             placeholder={source === "zoom"
               ? "Paste your Zoom AI Companion summary or any bulleted text here…"
               : "Paste your Gong AI summary, meeting notes, or any bulleted text here…"}
-            style={{ width: "100%", fontSize: "0.8125rem", border: "1px solid #e5e7eb", borderRadius: "7px", padding: "8px 10px", outline: "none", resize: "vertical", lineHeight: 1.5, boxSizing: "border-box", color: "var(--twilio-navy)" }}
+            style={{ width: "100%", fontSize: "0.8125rem", border: "1px solid var(--border-subtle)", borderRadius: "7px", padding: "8px 10px", outline: "none", resize: "vertical", lineHeight: 1.5, boxSizing: "border-box", color: "var(--text-ink)" }}
           />
           <button onClick={() => void handleParse()} disabled={!raw.trim()} style={{ marginTop: "5px", width: "100%", padding: "5px 0", fontSize: "0.75rem", fontWeight: 700, background: "#6366f1", color: "#fff", border: "none", borderRadius: "6px", cursor: raw.trim() ? "pointer" : "not-allowed", opacity: raw.trim() ? 1 : 0.4 }}>
             Parse & Save
@@ -2226,12 +1948,12 @@ function MeetingSummarySection({ eventId, meetingId, existingNotes, existingZoom
       )}
 
       {items.length > 0 && (
-        <div style={{ border: "1px solid rgba(0,0,0,0.08)", borderRadius: "8px", background: "#fff", overflow: "hidden" }}>
+        <div style={{ border: "1px solid rgba(0,0,0,0.08)", borderRadius: "8px", background: "var(--surface-card)", overflow: "hidden" }}>
           {items.map((item, i) => {
             if (item.kind === "heading") {
               return (
                 <div key={i} style={{ padding: "6px 10px 3px", borderBottom: "1px solid rgba(0,0,0,0.05)" }}>
-                  <p style={{ fontSize: "0.6875rem", fontWeight: 700, textTransform: "capitalize", color: "var(--twilio-navy)", margin: 0, letterSpacing: "0.01em" }}>{item.text}</p>
+                  <p style={{ fontSize: "0.6875rem", fontWeight: 700, textTransform: "capitalize", color: "var(--text-ink)", margin: 0, letterSpacing: "0.01em" }}>{item.text}</p>
                 </div>
               );
             }

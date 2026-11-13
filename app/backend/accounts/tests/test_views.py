@@ -79,6 +79,17 @@ class AccountProjectScopingTest(APITestCase):
         self.assertIn("Project Alpha", names)
         self.assertIn("Project Beta", names)
 
+    def test_page_size_is_honoured_and_scoping_still_applies(self):
+        # The Action Items page loads every visible project in one request.
+        for i in range(55):
+            _make_project(self.acct1, f"Extra {i}")
+        self.client.force_authenticate(user=self.user1)
+        resp = self.client.get(PROJECTS_URL, {"page_size": 500})
+        self.assertEqual(resp.status_code, 200)
+        names = [p["name"] for p in resp.data["results"]]
+        self.assertEqual(len(names), 56)  # all of acct1's, past the default page of 50
+        self.assertNotIn("Project Beta", names)
+
 
 class AccountProjectCreateTest(APITestCase):
     def setUp(self):
@@ -1468,6 +1479,52 @@ class AccountFieldHistoryTest(APITestCase):
     def test_unchanged_fields_are_not_logged(self):
         self.client.patch(f"{ACCOUNTS_URL}{self.account.id}/", {"industry": "Retail"}, format="json")
         self.assertEqual(self._events(), [])
+
+
+class AccountPrimaryContactTextTest(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.user = _make_user("pct_member")
+        self.outsider = _make_user("pct_outsider")
+        self.account = Account.objects.create(company_name="Text Co")
+        self.account.team_members.add(_make_team_member(self.user))
+        self.url = f"{ACCOUNTS_URL}{self.account.id}/"
+
+    def _events(self):
+        from realtime.models import AgentActivityEvent
+        return list(AgentActivityEvent.objects.filter(event_type="account.field_changed").order_by("pk"))
+
+    def test_unauthenticated_is_401(self):
+        self.assertEqual(self.client.patch(self.url, {"primary_contact_text": "x"}, format="json").status_code, 401)
+
+    def test_member_can_save_and_it_is_returned(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.patch(self.url, {"primary_contact_text": "Jane Doe"}, format="json")
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(resp.data["primary_contact_text"], "Jane Doe")
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.primary_contact_text, "Jane Doe")
+
+    def test_non_member_cannot_edit(self):
+        self.client.force_authenticate(user=self.outsider)
+        self.assertIn(self.client.patch(self.url, {"primary_contact_text": "x"}, format="json").status_code, (403, 404))
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.primary_contact_text, "")
+
+    def test_change_is_logged_with_old_and_new(self):
+        self.client.force_authenticate(user=self.user)
+        self.client.patch(self.url, {"primary_contact_text": "Jane"}, format="json")
+        self.client.patch(self.url, {"primary_contact_text": "Joe"}, format="json")
+        e = [x.metadata for x in self._events() if x.metadata["field"] == "primary_contact_text"]
+        self.assertEqual([(m["action"], m["from"], m["to"], m["label"]) for m in e],
+                         [("set", "", "Jane", "Primary contact"), ("updated", "Jane", "Joe", "Primary contact")])
+
+    def test_whitespace_is_stripped_and_long_values_rejected(self):
+        self.client.force_authenticate(user=self.user)
+        resp = self.client.patch(self.url, {"primary_contact_text": "  Jane  "}, format="json")
+        self.assertEqual(resp.data["primary_contact_text"], "Jane")
+        too_long = self.client.patch(self.url, {"primary_contact_text": "a" * 256}, format="json")
+        self.assertEqual(too_long.status_code, 400)
 
 
 import shutil

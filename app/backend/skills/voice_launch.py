@@ -14,13 +14,15 @@ TTL = timedelta(minutes=2)
 MAX_VOICE_CONTEXT_CHARS = 6000
 
 
-def create_launch_context(user, skill, run_result: dict) -> str:
+def create_launch_context(user, skill, run_result: dict, run_id: str | None = None) -> str:
     VoiceLaunchContext.objects.filter(created_at__lt=timezone.now() - TTL).delete()
     key = secrets.token_urlsafe(24)
     VoiceLaunchContext.objects.create(
         key=key, user=user, skill=skill,
         payload={"script": run_result["script"][:MAX_VOICE_CONTEXT_CHARS],
-                 "allowed_tools": list(skill.allowed_tools or []) if skill else []},
+                 "allowed_tools": list(skill.allowed_tools or []) if skill else [],
+                 # The Console run this call belongs to (skills.SkillRun), if one was opened.
+                 "run_id": run_id},
     )
     return key
 

@@ -62,7 +62,8 @@ describe("TokenBudgetsPanel — the token ↔ dollar rate", () => {
 
   it("recomputes the blend live as prices are typed, and only enables Save when changed", async () => {
     render(<TokenBudgetsPanel />);
-    await screen.findByTestId("blended-rate");
+    // The element exists before the pricing loads; typing before then gets overwritten.
+    await waitFor(() => expect(screen.getByTestId("blended-rate")).toHaveTextContent("$5.40"), { timeout: 5000 });
     const save = screen.getByRole("button", { name: "Save rate" });
     expect(save).toBeDisabled();
     fireEvent.change(screen.getByLabelText("Input price per million"), { target: { value: "10" } });

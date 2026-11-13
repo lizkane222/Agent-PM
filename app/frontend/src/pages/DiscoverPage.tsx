@@ -55,7 +55,7 @@ function AppletCard({ item, canEdit, canDelete, onEdit, onDelete }: {
           {/* Icon */}
           <div
             className="shrink-0 flex items-center justify-center rounded-lg"
-            style={{ width: 36, height: 36, background: isRepo ? "#f0fdf4" : "#eff6ff" }}
+            style={{ width: 36, height: 36, background: isRepo ? "var(--tint-green-50)" : "#eff6ff" }}
           >
             {isRepo ? (
               <svg viewBox="0 0 16 16" fill="currentColor" style={{ width: 18, height: 18, color: "#16a34a" }}>
@@ -86,7 +86,7 @@ function AppletCard({ item, canEdit, canDelete, onEdit, onDelete }: {
       {item.tags.length > 0 && (
         <div className="flex flex-wrap gap-1">
           {item.tags.map((t) => (
-            <span key={t} className="text-[10px] px-1.5 py-0.5 rounded-md font-medium" style={{ background: "#f3f4f6", color: "#6b7280" }}>
+            <span key={t} className="text-[10px] px-1.5 py-0.5 rounded-md font-medium" style={{ background: "var(--surface-subtle-2)", color: "var(--text-gray-500)" }}>
               {t}
             </span>
           ))}
@@ -219,7 +219,7 @@ function CreatorCombobox({
               <button
                 type="button"
                 className="w-full text-left px-3 py-2 text-sm hover:bg-gray-50 flex items-center gap-2"
-                style={{ color: "var(--twilio-navy)" }}
+                style={{ color: "var(--text-ink)" }}
                 onClick={() => {
                   onChange(m.full_name);
                   setQuery(m.full_name);
@@ -509,7 +509,7 @@ export default function DiscoverPage() {
         <div>
           <p className="text-[10px] font-bold uppercase tracking-widest mb-2" style={{ color: "var(--text-secondary, #9ca3af)" }}>Search</p>
           <div className="relative">
-            <svg viewBox="0 0 16 16" fill="currentColor" className="absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" style={{ width: 12, height: 12, color: "#9ca3af" }}>
+            <svg viewBox="0 0 16 16" fill="currentColor" className="absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" style={{ width: 12, height: 12, color: "var(--text-gray-400)" }}>
               <path d="M11.742 10.344a6.5 6.5 0 10-1.397 1.398h-.001c.03.04.062.078.098.115l3.85 3.85a1 1 0 001.415-1.414l-3.85-3.85a1.007 1.007 0 00-.115-.099zm-5.242 1.156a5.5 5.5 0 110-11 5.5 5.5 0 010 11z"/>
             </svg>
             <input
@@ -696,7 +696,7 @@ export default function DiscoverPage() {
                       <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
                     </svg>
                     <h2 className="text-sm font-bold uppercase tracking-widest text-[var(--twilio-navy)]">GitHub Repos</h2>
-                    <span className="text-xs font-semibold px-2 py-0.5 rounded-full" style={{ background: "#f0fdf4", color: "#16a34a" }}>{repos.length}</span>
+                    <span className="text-xs font-semibold px-2 py-0.5 rounded-full" style={{ background: "var(--tint-green-50)", color: "#16a34a" }}>{repos.length}</span>
                   </div>
                   <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
                     {repos.map((item) => (

@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from "react";
+import { useStatusLabels } from "../../hooks/useStatusLabels";
 import { airtableApi } from "../../lib/api";
 import { logActionItemUpdate, changedActionItemFields } from "../../lib/actionItemLog";
 import type { AirtableActionItem, ActionItemAttachment, TeamMember } from "../../types";
@@ -42,6 +43,7 @@ export function ActionItemSidePanelContent({
   onUpdated?: (updated: AirtableActionItem) => void;
 }) {
   const { status: statusOptions } = useActionItemFieldOptions();
+  const { label: statusLabel } = useStatusLabels();
   const [form, setForm] = useState<Partial<AirtableActionItem>>({ ...item });
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -173,6 +175,7 @@ export function ActionItemSidePanelContent({
         <AccPillSelect
           value={form.status}
           options={statusOptions as AirtableActionItem["status"][]}
+          format={statusLabel}
           colorMap={NEW_AI_STATUS_COLORS}
           placeholder="Status"
           onChange={(v) => set({ status: v })}

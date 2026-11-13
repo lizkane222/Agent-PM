@@ -7,6 +7,7 @@ import {
   readScheduledReminders,
 } from "./calendarHelpers";
 import ReminderCard_Cal from "./ReminderCard_Cal";
+import { fromLocalDatetimeValue, toLocalDatetimeValue } from "../../lib/datetimeLocal";
 
 export default function RemindersTabContent(_props: { onDropToast: (msg: string, type: "success" | "warn") => void }) {
   const [reminders, setReminders] = useState<Reminder[]>([]);
@@ -16,7 +17,7 @@ export default function RemindersTabContent(_props: { onDropToast: (msg: string,
   const [newBody, setNewBody] = useState("");
   const [newDueAt, setNewDueAt] = useState(() => {
     const d = new Date(); d.setMinutes(0, 0, 0); d.setHours(d.getHours() + 1);
-    return d.toISOString().slice(0, 16);
+    return toLocalDatetimeValue(d.toISOString());
   });
   const [saving, setSaving] = useState(false);
   const [filterTerm, setFilterTerm] = useState("");
@@ -71,7 +72,7 @@ export default function RemindersTabContent(_props: { onDropToast: (msg: string,
     if (!newTitle.trim()) return;
     setSaving(true);
     try {
-      const due_at = newDueAt.length === 16 ? `${newDueAt}:00` : newDueAt;
+      const due_at = fromLocalDatetimeValue(newDueAt);
       const { data } = await schedulerApi.createReminder({
         title: newTitle.trim(),
         body: newBody.trim(),
@@ -82,7 +83,7 @@ export default function RemindersTabContent(_props: { onDropToast: (msg: string,
       setReminders((prev) => [data, ...prev]);
       setNewTitle(""); setNewBody("");
       const d = new Date(); d.setMinutes(0, 0, 0); d.setHours(d.getHours() + 1);
-      setNewDueAt(d.toISOString().slice(0, 16));
+      setNewDueAt(toLocalDatetimeValue(d.toISOString()));
       setCreating(false);
       window.dispatchEvent(new StorageEvent("storage", { key: "remindersUpdated", newValue: "1" }));
     } finally {
@@ -134,7 +135,7 @@ export default function RemindersTabContent(_props: { onDropToast: (msg: string,
       {/* Create form */}
       {creating && (
         <div className="shrink-0 border-t border-gray-100">
-          <div className="rounded-xl flex flex-col overflow-hidden m-3" style={{ background: "#FFFBEB", border: "1px solid #fde68a" }}>
+          <div className="rounded-xl flex flex-col overflow-hidden m-3" style={{ background: "var(--tint-amber-50)", border: "1px solid #fde68a" }}>
             <div className="px-4 pt-3 pb-2 flex flex-col gap-2">
               <input
                 autoFocus

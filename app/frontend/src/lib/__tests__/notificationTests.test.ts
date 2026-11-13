@@ -3,7 +3,7 @@ import { channelsToTest, type NotificationSnapshot } from "../notificationTests"
 
 const off: NotificationSnapshot = {
   notify_default_in_app: false, notify_default_slack: false, notify_default_push: false,
-  notify_default_sms: false, notification_email: false, notification_slack: false,
+  notify_default_sms: false, notification_slack: false,
 };
 
 describe("channelsToTest", () => {

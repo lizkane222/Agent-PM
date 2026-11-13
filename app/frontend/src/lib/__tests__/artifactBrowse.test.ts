@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import type { AccountArtifact } from "../../types/accounts";
 import {
-  DEFAULT_ARTIFACT_BROWSE, availableTypes, browseArtifacts, fileTypeOf, linkTypeOf, matchesQuery, sortArtifacts, typeKey,
+  DEFAULT_ARTIFACT_BROWSE, SORT_OPTIONS, availableTypes, browseArtifacts, fileTypeOf, linkTypeOf, matchesQuery, sortArtifacts, typeKey,
 } from "../artifactBrowse";
 
 const mk = (o: Partial<AccountArtifact>): AccountArtifact => ({
@@ -85,5 +85,47 @@ describe("artifactBrowse", () => {
     expect(t.map((x) => [x.key, x.count])).toEqual([
       ["link:docs.google.com", 1], ["file:Image", 1], ["link:notion.so", 1], ["file:PDF", 2],
     ]);
+  });
+});
+
+describe("browseArtifacts with extra searchable text (pages that mix accounts)", () => {
+  const mk = (id: number, name: string, account: number): AccountArtifact => ({
+    id, account, name, artifact_type: "link", url: null, secondary_url: "", icon_key: "", file_url: null,
+    image_url: null, mime_type: "", file_size: null, description: "", references: [], used_in: [],
+    uploaded_by: null, uploaded_by_username: null, created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
+  } as AccountArtifact);
+  const list = [mk(1, "Plan", 1), mk(2, "Roadmap", 2)];
+  const acct = (a: AccountArtifact) => (a.account === 1 ? "Acme" : "Globex");
+
+  it("matches the extra text, and without it behaves exactly as before", () => {
+    const state = { ...DEFAULT_ARTIFACT_BROWSE, query: "globex" };
+    expect(browseArtifacts(list, state, acct).flatMap(g => g.items.map(i => i.name))).toEqual(["Roadmap"]);
+    expect(browseArtifacts(list, state)).toEqual([]);
+  });
+});
+
+describe("sort by category", () => {
+  const mkA = (id: number, name: string, over: Partial<AccountArtifact>) => ({ ...mk({ id, name }), ...over } as AccountArtifact);
+  const list = [
+    mkA(1, "Zeta deck", { artifact_type: "file", name: "Zeta deck", mime_type: "", file_url: "https://x/zeta.pptx" }),
+    mkA(2, "Alpha doc", { artifact_type: "link", url: "https://docs.google.com/document/d/1" }),
+    mkA(3, "Beta pdf", { artifact_type: "file", file_url: "https://x/beta.pdf" }),
+    mkA(4, "Alpha pdf", { artifact_type: "file", file_url: "https://x/alpha.pdf" }),
+  ];
+
+  it("lists the Category option", () => {
+    expect(SORT_OPTIONS.map((o) => o.value)).toContain("category");
+  });
+
+  it("orders by the category label A-Z, then by name within a category", () => {
+    const names = sortArtifacts(list, "category").map((a) => a.name);
+    // categories: "docs.google.com (link)", "PDF", "PDF", "Presentation"
+    expect(names).toEqual(["Alpha doc", "Alpha pdf", "Beta pdf", "Zeta deck"]);
+  });
+
+  it("does not change the input", () => {
+    const copy = [...list];
+    sortArtifacts(list, "category");
+    expect(list).toEqual(copy);
   });
 });

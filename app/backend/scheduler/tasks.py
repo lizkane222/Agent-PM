@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import timedelta
 
 from celery import shared_task
 from django.conf import settings
@@ -63,17 +64,97 @@ def deliver_due_reminders() -> None:
             continue
         _dispatch_reminder(reminder)
 
+    deliver_due_occurrences()
 
-def _dispatch_reminder(reminder) -> None:
-    """Deliver one reminder across all requested channels then mark it sent."""
-    from .models import Reminder
 
-    user = reminder.created_by
+#: An occurrence whose start is older than this is stale (the worker was down, or it was added
+#: to a moment already past): it is marked handled without notifying, so a late worker never
+#: floods someone with reminders for things that are long over.
+OCCURRENCE_STALE_AFTER = timedelta(minutes=10)
 
+
+def deliver_due_occurrences() -> None:
+    """
+    Notify at the start of every calendar occurrence of a reminder.
+
+    A reminder can be on the calendar several times; each is a moment the user asked to be
+    reminded, so each notifies once, at its start, with the reminder's details and over its
+    channels. Called at the end of `deliver_due_reminders`, so it runs on the same
+    every-minute beat. The occurrence at the reminder's own `due_at` is skipped here: `deliver_due_reminders`
+    already notifies for that moment, and doing both would send it twice.
+    """
+    from . import reminder_calendar
+    from .models import CalendarEvent
+
+    now = timezone.now()
+    due = (
+        CalendarEvent.objects.filter(
+            calendar_id=reminder_calendar.REMINDERS_CALENDAR_ID,
+            reminder__isnull=False,
+            reminder_notified_at__isnull=True,
+            start_datetime__lte=now,
+        )
+        .select_related("reminder", "reminder__created_by__profile")
+    )
+    for occ in due:
+        reminder = occ.reminder
+        # Claim first (one conditional UPDATE), exactly as reminders are, so overlapping runs
+        # cannot notify twice.
+        claimed = CalendarEvent.objects.filter(pk=occ.pk, reminder_notified_at__isnull=True).update(
+            reminder_notified_at=now
+        )
+        if not claimed:
+            continue
+        if reminder.status not in reminder_calendar.VISIBLE_STATUSES:
+            continue
+        if reminder_calendar._minute(occ.start_datetime) == reminder_calendar._minute(reminder.due_at):
+            continue  # the reminder itself notifies for its due time
+        if now - occ.start_datetime > OCCURRENCE_STALE_AFTER:
+            logger.info("Reminder %s occurrence %s is stale; not notifying", reminder.pk, occ.pk)
+            continue
+        _dispatch_reminder(reminder, fired_for=occ.start_datetime)
+
+
+def _dispatch_reminder(reminder, fired_for=None) -> None:
+    """Deliver one reminder across all requested channels, to the creator and any recipients.
+
+    `fired_for` is the moment that triggered it (the due time, or the start of a calendar block);
+    it is recorded on each in-app notification so snoozing from the alert moves the right block."""
+    from types import SimpleNamespace
+
+    from . import reminder_recipients
+
+    creator = reminder.created_by
+    fired_for = fired_for or reminder.due_at
+    _deliver_to(creator, reminder, reminder, fired_for=fired_for)
+
+    # Other people the creator chose to notify (approved when they were added). Opt-outs are
+    # re-read here, so someone who switched it off since then is skipped.
+    recipients = reminder_recipients.deliverable_recipients(reminder)
+    if not recipients:
+        return
+    sender = reminder_recipients.display_name(creator)
+    body = f"Set by {sender}" + (f" — {reminder.body}" if reminder.body else "")
+    for person in recipients:
+        # What the channel senders read. It carries the sender's name, since a stranger's SMS or
+        # Slack DM with no "from" would be unintelligible — and the channels are THEIRS: the
+        # creator's "notify me via" boxes are about how the creator wants to be told, not how
+        # everyone else is. Each person is reached the way they chose in their own Settings.
+        shared = SimpleNamespace(
+            pk=reminder.pk, title=reminder.title, body=body,
+            resource_type=reminder.resource_type, resource_id=reminder.resource_id,
+            resource_label=reminder.resource_label, due_at=reminder.due_at,
+            **reminder_recipients.channels_for(person),
+        )
+        _deliver_to(person, shared, reminder, is_recipient=True, fired_for=fired_for)
+
+
+def _deliver_to(user, reminder, original, is_recipient: bool = False, fired_for=None) -> None:
+    """Send `reminder` to one person over the channels it asks for, recording each result."""
     if not _notification_allowed(user):
         logger.info(
             "Reminder %s skipped — %s is not in NOTIFICATION_ALLOWED_EMAILS",
-            reminder.pk, user.email,
+            original.pk, user.email,
         )
         # Already claimed as sent by the caller, so it does not loop forever.
         return
@@ -88,12 +169,13 @@ def _dispatch_reminder(reminder) -> None:
     def _record(channel, status):
         from team.notifications import record_notification
 
-        from team.notifications import account_for_resource
+        from . import reminder_links
 
-        record_notification(
+        return record_notification(
             user, channel, "reminder", f"⏰ {reminder.title}", reminder.body or "",
-            "/reminders", status,
-            account=account_for_resource(reminder.resource_type, reminder.resource_id),
+            "/profile" if is_recipient else "/reminders", status,
+            account=reminder_links.linked_account(original),
+            reminder=original, fired_for=fired_for,
         )
 
     if reminder.notify_in_app:
@@ -103,7 +185,7 @@ def _dispatch_reminder(reminder) -> None:
         except Exception as exc:
             errors.append(f"in_app: {exc}")
             _record("in_app", "failed")
-            logger.warning("Reminder %s in-app delivery failed: %s", reminder.pk, exc)
+            logger.warning("Reminder %s in-app delivery failed: %s", original.pk, exc)
 
     if reminder.notify_slack:
         try:
@@ -111,7 +193,7 @@ def _dispatch_reminder(reminder) -> None:
         except Exception as exc:
             errors.append(f"slack: {exc}")
             _record("slack", "failed")
-            logger.warning("Reminder %s Slack delivery failed: %s", reminder.pk, exc)
+            logger.warning("Reminder %s Slack delivery failed: %s", original.pk, exc)
 
     if reminder.notify_push:
         try:
@@ -119,23 +201,27 @@ def _dispatch_reminder(reminder) -> None:
         except Exception as exc:
             errors.append(f"push: {exc}")
             _record("push", "failed")
-            logger.warning("Reminder %s push delivery failed: %s", reminder.pk, exc)
+            logger.warning("Reminder %s push delivery failed: %s", original.pk, exc)
 
     if reminder.notify_sms:
         try:
-            _record("sms", "sent" if _send_sms(profile, reminder) else "skipped")
+            sms_sid = _send_sms(profile, reminder)
+            row = _record("sms", "sent" if sms_sid else "skipped")
+            # Twilio only *queued* it; the carrier's verdict arrives later.
+            if row is not None and isinstance(sms_sid, str):
+                _schedule_sms_check(row.pk, sms_sid)
         except Exception as exc:
             errors.append(f"sms: {exc}")
             _record("sms", "failed")
-            logger.warning("Reminder %s SMS delivery failed: %s", reminder.pk, exc)
+            logger.warning("Reminder %s SMS delivery failed: %s", original.pk, exc)
 
     # The row was claimed as "sent" before delivery so it cannot be picked up twice. A
     # channel failure does not re-arm it (that would retry every minute forever, and could
     # re-send the channels that did succeed); it is logged at WARNING so it is visible.
     if errors:
-        logger.warning("Reminder %s delivered with channel failures: %s", reminder.pk, errors)
+        logger.warning("Reminder %s delivered to user %s with channel failures: %s", original.pk, user.pk, errors)
     else:
-        logger.info("Reminder %s delivered", reminder.pk)
+        logger.info("Reminder %s delivered to user %s", original.pk, user.pk)
 
 
 # ── Channel implementations ───────────────────────────────────────────────────
@@ -244,9 +330,55 @@ def _send_sms(profile, reminder) -> None:
     message_body = f"Reminder: {reminder.title}{body_text}"
 
     client = Client(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
-    client.messages.create(
+    message = client.messages.create(
         body=message_body,
         from_=settings.TWILIO_PHONE_NUMBER,
         to=phone,
     )
-    return True
+    # The message SID (truthy) so callers can look up the carrier's final verdict.
+    return getattr(message, "sid", None) or True
+
+
+def _schedule_sms_check(notification_id: int, message_sid: str, attempt: int = 0) -> None:
+    """Queue a delivery re-check. Never raises: a missing broker must not fail the reminder."""
+    from . import sms_delivery
+
+    if attempt >= len(sms_delivery.RECHECK_DELAYS):
+        return
+    try:
+        check_sms_delivery.apply_async(
+            args=[notification_id, message_sid, attempt],
+            countdown=sms_delivery.RECHECK_DELAYS[attempt],
+        )
+    except Exception:
+        logger.warning("Could not schedule SMS delivery check for %s", message_sid, exc_info=True)
+
+
+@shared_task(name="scheduler.check_sms_delivery", ignore_result=True)
+def check_sms_delivery(notification_id: int, message_sid: str, attempt: int = 0) -> None:
+    """
+    Read back what the carrier did with a text and correct the Notification if it was refused.
+    A message still in flight is re-checked on a widening schedule; one that never reports
+    (some carriers send no receipt) is left as "sent".
+    """
+    from team.models import Notification
+
+    from . import sms_delivery
+
+    outcome = sms_delivery.fetch_outcome(message_sid)
+    if outcome is None:
+        _schedule_sms_check(notification_id, message_sid, attempt + 1)
+        return
+    status, error_code = outcome
+    if status in sms_delivery.FAILED_STATUSES:
+        note = f"Text not delivered: {sms_delivery.describe_error(error_code)}"
+        if error_code:
+            note += f" (Twilio error {error_code})"
+        row = Notification.objects.filter(pk=notification_id).first()
+        if row is not None:
+            Notification.objects.filter(pk=row.pk).update(
+                status="failed", body=f"{row.body}\n{note}".strip(),
+            )
+        logger.warning("SMS %s not delivered: status=%s code=%s", message_sid, status, error_code)
+    elif status not in sms_delivery.DELIVERED_STATUSES:
+        _schedule_sms_check(notification_id, message_sid, attempt + 1)

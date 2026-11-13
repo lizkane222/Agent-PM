@@ -25,7 +25,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.throttling import UserRateThrottle
 
-from . import tasks
+from . import sms_delivery, tasks
 
 logger = logging.getLogger(__name__)
 
@@ -73,15 +73,16 @@ def _precondition(channel: str, user, profile) -> str | None:
     return None
 
 
-def _send(channel: str, user, profile, reminder) -> None:
+def _send(channel: str, user, profile, reminder):
     if channel == "in_app":
         tasks._send_in_app(user, reminder)
     elif channel == "push":
         tasks._send_push(profile, reminder)
     elif channel == "sms":
-        tasks._send_sms(profile, reminder)
+        return tasks._send_sms(profile, reminder)
     elif channel in ("slack", "slack_general"):
         tasks._send_slack(user, profile, reminder)
+    return None
 
 
 FAILED_MESSAGE = {
@@ -115,8 +116,17 @@ def send_test_notifications(request):
             results.append({"channel": channel, "status": "skipped", "detail": reason})
             continue
         try:
-            _send(channel, request.user, profile, reminder)
-            results.append({"channel": channel, "status": "sent", "detail": ""})
+            sent = _send(channel, request.user, profile, reminder)
+            result = {"channel": channel, "status": "sent", "detail": ""}
+            if channel == "sms" and isinstance(sent, str):
+                # Twilio accepting the text proves nothing; ask for the carrier's verdict.
+                outcome = sms_delivery.wait_for_outcome(sent)
+                if outcome and outcome[0] in sms_delivery.FAILED_STATUSES:
+                    result = {"channel": channel, "status": "failed",
+                              "detail": sms_delivery.describe_error(outcome[1])}
+                elif not outcome or outcome[0] not in sms_delivery.DELIVERED_STATUSES:
+                    result["detail"] = "Handed to Twilio; the carrier hasn't confirmed delivery yet."
+            results.append(result)
         except Exception:
             logger.exception("Test notification failed on %s for user %s", channel, request.user.pk)
             results.append({"channel": channel, "status": "failed", "detail": FAILED_MESSAGE.get(channel, "Delivery failed.")})

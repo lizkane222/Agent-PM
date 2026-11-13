@@ -12,6 +12,12 @@ vi.mock("../../comments/CommentContext", () => ({
   CommentProvider: ({ children }: { children: React.ReactNode }) => <>{children}</>,
 }));
 
+// TipTap's Placeholder needs elementFromPoint; the editor itself is covered by its own suite.
+vi.mock("../../shared/RichTextMentionEditor", () => ({
+  default: ({ value, onChange, placeholder }: { value: string; onChange: (v: string) => void; placeholder?: string }) => (
+    <textarea value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} />
+  ),
+}));
 vi.mock("../ActionItemCardOccurrences", () => ({ ActionItemCardOccurrences: () => null }));
 vi.mock("../../ActivityLogSection", () => ({ default: () => null }));
 vi.mock("../../CommentIcon", () => ({ default: () => null }));
@@ -87,7 +93,7 @@ describe("ActionItemModal attachments", () => {
 
   it("renders the + File control and no attachments initially", async () => {
     renderModal();
-    await waitFor(() => expect(screen.getByText("+ File")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Upload" })).toBeInTheDocument());
     expect(screen.getByText("No attachments yet.")).toBeInTheDocument();
   });
 
@@ -114,7 +120,7 @@ describe("ActionItemModal attachments", () => {
       )
     );
     renderModal();
-    await waitFor(() => expect(screen.getByText("+ File")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Upload" })).toBeInTheDocument());
 
     chooseFile();
 
@@ -156,7 +162,7 @@ describe("ActionItemModal attachments", () => {
       )
     );
     renderModal();
-    await waitFor(() => expect(screen.getByText("+ File")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Upload" })).toBeInTheDocument());
 
     chooseFile();
 
@@ -183,7 +189,7 @@ describe("ActionItemModal attachments", () => {
       )
     );
     renderModal();
-    await waitFor(() => expect(screen.getByText("+ File")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Upload" })).toBeInTheDocument());
 
     chooseFile();
 
@@ -200,7 +206,7 @@ describe("ActionItemModal attachments", () => {
       )
     );
     renderModal();
-    await waitFor(() => expect(screen.getByText("+ File")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Upload" })).toBeInTheDocument());
 
     chooseFile("logo.svg");
 
@@ -212,7 +218,7 @@ describe("ActionItemModal attachments", () => {
   it("falls back to a generic message when the server sends no detail", async () => {
     server.use(http.post(ATTACHMENTS_URL, () => new HttpResponse(null, { status: 500 })));
     renderModal();
-    await waitFor(() => expect(screen.getByText("+ File")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Upload" })).toBeInTheDocument());
 
     chooseFile();
 
@@ -223,7 +229,7 @@ describe("ActionItemModal attachments", () => {
   it("clears a previous error once an upload succeeds", async () => {
     server.use(http.post(ATTACHMENTS_URL, () => new HttpResponse(null, { status: 500 })));
     renderModal();
-    await waitFor(() => expect(screen.getByText("+ File")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Upload" })).toBeInTheDocument());
 
     chooseFile();
     await screen.findByRole("alert");
@@ -258,12 +264,12 @@ describe("ActionItemModal attachments", () => {
     expect(screen.getByText("50%")).toBeInTheDocument();
   });
 
-  it("places the checklist as its own section directly below the description", async () => {
+  it("places the checklist as its own section directly below the details", async () => {
     server.use(http.get("/api/v1/airtable/steps/", () => HttpResponse.json([])));
     renderModal();
     await waitFor(() => expect(screen.getByText("Checklist")).toBeInTheDocument());
 
-    const description = screen.getByText("Description");
+    const description = screen.getByText("Details");
     const checklist = screen.getByText("Checklist");
     const attachments = screen.getByText(/^Attachments/);
 
@@ -276,7 +282,7 @@ describe("ActionItemModal attachments", () => {
 
   it("no longer invites writing steps into the description", async () => {
     renderModal();
-    await waitFor(() => expect(screen.getByText("Description")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("Details")).toBeInTheDocument());
 
     // Steps have a real field now, so the description placeholder must not advertise them.
     expect(screen.getByPlaceholderText("Additional context or notes…")).toBeInTheDocument();
@@ -539,5 +545,93 @@ describe("ActionItemModal — positioning", () => {
     render(<ActionItemModal item={mockItem} accountId={1} onClose={onClose} />);
     fireEvent.click(screen.getByTestId("action-item-modal-panel").parentElement!);
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("ActionItemModal — labelled layout", () => {
+  beforeEach(registerHandlers);
+
+  const LABELS = ["Task", "Priority", "Status", "Due Date", "Prep", "Assignee", "Account", "Est. Time (min)", "Time Spent", "Details", "Created", "Updated"];
+
+  it("gives every field a visible label tied to its control", async () => {
+    render(<ActionItemModal item={mockItem} accountId={1} teamMembers={[{ id: 3, full_name: "Dana Lee" } as never]} onClose={vi.fn()} />);
+    await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
+    for (const l of LABELS) expect(screen.getByLabelText(l)).toBeInTheDocument();
+    expect(screen.getByLabelText("Task")).toHaveValue("Fix billing issue");
+    expect(screen.getByLabelText("Status")).toHaveTextContent("Open");
+    expect(screen.getByLabelText("Account")).toHaveTextContent("Acme Corp");
+    // Activity is a labelled group, not a form control.
+    expect(screen.getByRole("group", { name: "Activity" })).toBeInTheDocument();
+  });
+
+  it("lays the fields out in the requested row order", async () => {
+    render(<ActionItemModal item={mockItem} accountId={1} teamMembers={[{ id: 3, full_name: "Dana Lee" } as never]} onClose={vi.fn()} />);
+    await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("Checklist")).toBeInTheDocument());
+    const order = [
+      screen.getByLabelText("Task"),
+      screen.getByLabelText("Priority"), screen.getByLabelText("Status"), screen.getByLabelText("Due Date"), screen.getByLabelText("Prep"),
+      screen.getByLabelText("Assignee"), screen.getByLabelText("Account"),
+      screen.getByLabelText("Est. Time (min)"), screen.getByLabelText("Time Spent"),
+      screen.getByLabelText("Details"),
+      screen.getByText("Checklist"),
+      screen.getByText(/^Attachments/), screen.getByRole("group", { name: "Activity" }),
+      screen.getByLabelText("Created"), screen.getByLabelText("Updated"),
+    ];
+    for (let i = 1; i < order.length; i++) {
+      expect(order[i - 1].compareDocumentPosition(order[i]) & Node.DOCUMENT_POSITION_FOLLOWING, `element ${i}`).toBeTruthy();
+    }
+    // Rows: grouped controls share a row container.
+    const row = (name: string) => screen.getByLabelText(name).closest("[data-row]")!;
+    expect(row("Priority")).toBe(row("Prep"));
+    expect(row("Assignee")).toBe(row("Account"));
+    expect(row("Est. Time (min)")).toBe(row("Time Spent"));
+    expect(row("Created")).toBe(row("Updated"));
+    expect(screen.getByText(/^Attachments/).closest("[data-row]")).toBe(screen.getByRole("group", { name: "Activity" }).closest("[data-row]"));
+  });
+
+  it("shows the nine task fields as a 3 x 3 grid, with Prep starting the second row", async () => {
+    renderModal();
+    await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
+    const grid = screen.getByLabelText("Priority").closest("[data-row]") as HTMLElement;
+    expect(grid.className).toContain("sm:grid-cols-3");
+    const cells = Array.from(grid.children);
+    expect(cells).toHaveLength(9);
+    const labels = cells.map((c) => c.querySelector("label")?.textContent);
+    expect(labels).toEqual(["Priority", "Status", "Due Date", "Prep", "Assignee", "Account", "Est. Time (min)", "Time Spent", "Slack"]);
+  });
+
+  it("puts the Slack button in the Est. Time / Time Spent row, not the header", async () => {
+    renderModal();
+    await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
+    const slack = screen.getByRole("button", { name: /^Slack$/ });
+    expect(slack.closest("[data-row]")).toBe(screen.getByLabelText("Est. Time (min)").closest("[data-row]"));
+    expect(slack.closest("[data-row]")).toBe(screen.getByLabelText("Time Spent").closest("[data-row]"));
+    expect(screen.getByRole("button", { name: "Close" }).parentElement!.contains(slack)).toBe(false);
+  });
+
+  it("stacks Activity below Attachments instead of beside it", async () => {
+    renderModal();
+    await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
+    const row = screen.getByRole("group", { name: "Activity" }).closest("[data-row]") as HTMLElement;
+    // One column at every width: no `md:grid-cols-2` side-by-side layout.
+    expect(row.className).toContain("grid-cols-1");
+    expect(row.className).not.toMatch(/(^|\s)(sm|md|lg):grid-cols-2/);
+    expect(screen.getByText(/^Attachments/).compareDocumentPosition(screen.getByRole("group", { name: "Activity" })) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("offers Upload, Add Link and + Artifact side by side", async () => {
+    renderModal();
+    await waitFor(() => expect(screen.getByDisplayValue("Fix billing issue")).toBeInTheDocument());
+    const upload = screen.getByRole("button", { name: "Upload" });
+    const link = screen.getByRole("button", { name: "Add Link" });
+    const artifact = screen.getByRole("button", { name: "+ Artifact" });
+    expect(upload.querySelector("svg")).not.toBeNull();
+    expect(link.querySelector("svg")).not.toBeNull();
+    expect(upload.parentElement).toBe(link.parentElement);
+    expect(artifact.parentElement?.parentElement ?? artifact.parentElement).toBeTruthy();
+
+    fireEvent.click(link);
+    expect(screen.getByPlaceholderText("https://…")).toBeInTheDocument();
   });
 });

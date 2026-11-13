@@ -1,5 +1,5 @@
 import { http, HttpResponse } from "msw";
-import type { Reminder, CalendarEvent } from "../../types";
+import type { Reminder, CalendarEvent, ReminderRecipientOption, ReminderLinkOption } from "../../types";
 
 /** Ids for events created during a test. Starts high so it cannot collide with a fixture. */
 let createdEventId = 9000;
@@ -38,6 +38,19 @@ export function blankCalendarEvent(id: number): CalendarEvent {
   };
 }
 
+/** What the link picker offers per record type (already scoped to the user, as the server does). */
+export const mockLinkOptions: Record<string, ReminderLinkOption[]> = {
+  account: [{ id: 1, label: "Acme Corp", detail: "" }, { id: 2, label: "Initech", detail: "" }],
+  action_item: [{ id: 11, label: "Draft QBR deck", detail: "Acme Corp · Open" }, { id: 12, label: "Send renewal quote", detail: "Initech · In Progress" }],
+  calendar_event: [{ id: 21, label: "Acme QBR", detail: "", at: "2026-07-30T16:00:00Z" }],
+  task: [{ id: 31, label: "Send contract", detail: "open" }],
+};
+
+export const mockReminderRecipients: ReminderRecipientOption[] = [
+  { user_id: 2, member_id: 20, name: "Ana Reyes", available: true, reason: "", accounts: ["Acme Corp"] },
+  { user_id: 3, member_id: 30, name: "Ben Ortiz", available: false, reason: "Ben Ortiz has turned off being notified by other users in their Settings.", accounts: ["Acme Corp"] },
+];
+
 export const mockReminders: Reminder[] = [
   {
     id: 1,
@@ -48,11 +61,15 @@ export const mockReminders: Reminder[] = [
     resource_type: "general",
     resource_id: null,
     resource_label: "",
+    links: [],
     due_at: "2026-07-30T09:00:00Z",
     notify_in_app: true,
     notify_slack: false,
     notify_push: false,
     notify_sms: false,
+    recipients: [],
+    recipient_details: [],
+    occurrences: [],
     status: "pending",
     created_at: "2026-07-01T00:00:00Z",
     updated_at: "2026-07-01T00:00:00Z",
@@ -66,11 +83,15 @@ export const mockReminders: Reminder[] = [
     resource_type: "general",
     resource_id: null,
     resource_label: "",
+    links: [],
     due_at: "2026-08-01T09:00:00Z",
     notify_in_app: true,
     notify_slack: false,
     notify_push: false,
     notify_sms: false,
+    recipients: [],
+    recipient_details: [],
+    occurrences: [],
     status: "pending",
     created_at: "2026-07-02T00:00:00Z",
     updated_at: "2026-07-02T00:00:00Z",
@@ -132,13 +153,39 @@ export const schedulerHandlers = [
   http.get("/api/v1/scheduler/reminders/", () =>
     HttpResponse.json({ results: mockReminders, count: mockReminders.length })
   ),
+  // Who on an account could be notified. Registered before the `:id` routes so
+  // `recipients/` is not read as a reminder id.
+  http.get("/api/v1/scheduler/reminders/link-options/", ({ request }) => {
+    const url = new URL(request.url);
+    const type = url.searchParams.get("type") ?? "";
+    const q = (url.searchParams.get("q") ?? "").toLowerCase();
+    return HttpResponse.json({ results: (mockLinkOptions[type] ?? []).filter((o) => o.label.toLowerCase().includes(q)) });
+  }),
+  // No links (or none that lead to an account) means nobody to offer, as on the server.
+  http.get("/api/v1/scheduler/reminders/recipients/", ({ request }) => {
+    const links = new URL(request.url).searchParams.getAll("link");
+    return HttpResponse.json(links.length
+      ? { results: mockReminderRecipients, sources: ["Acme Corp"], accounts: ["Acme Corp"] }
+      : { results: [], sources: [], accounts: [] });
+  }),
   http.post("/api/v1/scheduler/reminders/", async ({ request }) => {
     const body = await request.json() as Partial<Reminder>;
     return HttpResponse.json(
-      { id: 99, created_by: 1, created_by_username: "alice", status: "pending", ...body },
+      { id: 99, created_by: 1, created_by_username: "alice", status: "pending",
+        recipients: [], recipient_details: [], occurrences: [], ...body },
       { status: 201 }
     );
   }),
+  // Added before the generic `:id` routes below, which would not match these longer paths anyway.
+  http.post("/api/v1/scheduler/reminders/:id/occurrences/", async ({ request }) => {
+    const { start } = await request.json() as { start: string };
+    return HttpResponse.json({
+      ...mockReminders[0],
+      occurrences: [{ id: 700, start, end: new Date(new Date(start).getTime() + 15 * 60_000).toISOString() }],
+    }, { status: 201 });
+  }),
+  http.patch("/api/v1/scheduler/reminders/:id/occurrences/:eventId/", () => HttpResponse.json(mockReminders[0])),
+  http.delete("/api/v1/scheduler/reminders/:id/occurrences/:eventId/", () => HttpResponse.json(mockReminders[0])),
   http.patch("/api/v1/scheduler/reminders/:id/", async ({ request }) => {
     const body = await request.json() as Partial<Reminder>;
     return HttpResponse.json({ ...mockReminders[0], ...body });
@@ -149,9 +196,10 @@ export const schedulerHandlers = [
   http.post("/api/v1/scheduler/reminders/:id/dismiss/", () =>
     HttpResponse.json({ ...mockReminders[0], status: "dismissed" })
   ),
-  http.post("/api/v1/scheduler/reminders/:id/snooze/", () =>
-    HttpResponse.json({ ...mockReminders[0], status: "snoozed" })
-  ),
+  http.post("/api/v1/scheduler/reminders/:id/snooze/", async ({ request }) => {
+    const body = await request.json() as { until?: string };
+    return HttpResponse.json({ ...mockReminders[0], status: "pending", ...(body.until ? { due_at: body.until } : {}) });
+  }),
   http.get("/api/v1/scheduler/events/", () =>
     HttpResponse.json(mockCalendarEvents)
   ),

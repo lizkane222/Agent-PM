@@ -95,3 +95,60 @@ describe("MiniNodePreview draws each component as itself", () => {
     expect(c.querySelector("h1")?.textContent).toBe("Heading");
   });
 });
+
+describe("MiniNodePreview shows the data attached to a component", () => {
+  const fields = { g_title: "Test Rich text title", g_description: "test rich text description" };
+
+  it("Rich Text: its own content AND the fields (the reported case)", () => {
+    const c = preview(mk("RichText", {}, { fields }));
+    expect(c.textContent).toContain("Rich text content");
+    expect(c.textContent).toContain("Test Rich text title");
+    expect(c.textContent).toContain("test rich text description");
+  });
+
+  it.each(["Heading", "Text", "Label", "Divider", "RichText", "Card", "Section", "Row", "Column", "Container", "Page"])(
+    "%s draws each filled field as a label over its value", (type) => {
+      const c = preview(mk(type, {}, { fields }));
+      const list = c.querySelector("[data-mini-fields]") as HTMLElement;
+      expect(list, type).toBeTruthy();
+      expect(list.querySelector("[data-mini-field=g_title]")?.textContent).toBe("TitleTest Rich text title");
+      expect(list.querySelector("[data-mini-field=g_description]")?.textContent).toBe("Descriptiontest rich text description");
+    });
+
+  it("a text component keeps its own content above the fields", () => {
+    const c = preview(mk("Heading", { text: "My heading" }, { fields }));
+    const html = c.innerHTML;
+    expect(html.indexOf("My heading")).toBeLessThan(html.indexOf("Test Rich text title"));
+  });
+
+  it("draws nothing for fields that are blank", () => {
+    const c = preview(mk("Card", {}, { fields: { g_title: "", g_notes: "  " } }));
+    expect(c.querySelector("[data-mini-fields]")).toBeNull();
+  });
+
+  it("an empty container with fields no longer shows its 'empty' hint", () => {
+    const c = preview(mk("Row", {}, { fields }));
+    expect(c.querySelector("[data-mini-preview=Row]")?.textContent).not.toMatch(/^Row$/);
+    expect((c.querySelector("[data-mini-preview=Row]") as HTMLElement).style.border).not.toContain("dashed");
+  });
+
+  it("grows to fit the fields instead of clipping them", () => {
+    const withFields = preview(mk("Card", {}, { fields, h: 60 })).querySelector("[data-mini-preview=Card]") as HTMLElement;
+    expect(withFields.style.height).toBe("auto");
+    expect(withFields.style.minHeight).toBe("60px");
+    const plain = preview(mk("Card", {}, { h: 60 })).querySelector("[data-mini-preview=Card]") as HTMLElement;
+    expect(plain.style.height).toBe("100%");
+  });
+
+  it("renders values as text, never as markup", () => {
+    const c = preview(mk("Text", {}, { fields: { g_notes: "<img src=x onerror=alert(1)>" } }));
+    expect(c.querySelector("img")).toBeNull();
+    expect(c.textContent).toContain("<img src=x");
+  });
+
+  it("keeps line breaks in multi-line values", () => {
+    const c = preview(mk("Card", {}, { fields: { g_notes: "line one\nline two" } }));
+    const v = c.querySelector("[data-mini-field=g_notes] div:last-child") as HTMLElement;
+    expect(v.style.whiteSpace).toBe("pre-wrap");
+  });
+});

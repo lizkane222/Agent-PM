@@ -272,6 +272,21 @@ class VoiceTranscriptConsumer(AsyncJsonWebsocketConsumer):
         pass
 
 
+def _finish_console_run(run_id, agent_session_id) -> None:
+    """Close a voice call's skill run, with the tokens the call used. Never raises."""
+    try:
+        from django.db.models import Sum
+
+        from agents.models import AgentMessage
+        from skills.skill_console import finish_run
+
+        agg = AgentMessage.objects.filter(session_id=agent_session_id, role="assistant").aggregate(
+            i=Sum("input_tokens"), o=Sum("output_tokens"))
+        finish_run(run_id, input_tokens=int(agg["i"] or 0), output_tokens=int(agg["o"] or 0))
+    except Exception:
+        logger.exception("Could not close the Console run %s", run_id)
+
+
 class ConversationRelayConsumer(AsyncWebsocketConsumer):
     """
     WebSocket consumer for Twilio ConversationRelay.
@@ -339,6 +354,9 @@ class ConversationRelayConsumer(AsyncWebsocketConsumer):
             await _persist_conversation_sid(self._call_sid, self._conversation_sid)
         if self._agent_session_id:
             await close_agent_session(self._agent_session_id)
+        run_id = (self._active_workflow or {}).get("run_id")
+        if run_id:
+            await database_sync_to_async(_finish_console_run)(run_id, self._agent_session_id)
         logger.info("ConversationRelay disconnected: call_sid=%s code=%s", self._call_sid, close_code)
 
     async def receive(self, text_data=None, bytes_data=None):
@@ -570,8 +588,10 @@ class ConversationRelayConsumer(AsyncWebsocketConsumer):
         The tool is dispatched directly, bypassing the model, so it cannot alter the
         arguments between the question the caller answered and the action taken.
         """
+        run_id = (self._active_workflow or {}).get("run_id")
         result, record = await dispatch_confirmed(
-            pending.tool_name, pending.arguments, self._user
+            pending.tool_name, pending.arguments, self._user,
+            **({"skill_run_id": run_id} if run_id else {}),
         )
         self._state.clear()
         message_id = await record_message(

@@ -29,7 +29,7 @@ export default function NotificationsSection({ accent }: { accent?: { border: st
             key={c.id || "all"}
             onClick={() => setChannel(c.id)}
             aria-pressed={channel === c.id}
-            style={{ padding: "3px 10px", borderRadius: 14, fontSize: "0.75rem", cursor: "pointer", border: `1px solid ${channel === c.id ? border : "var(--border, rgba(0,0,0,0.12))"}`, background: channel === c.id ? (accent?.bg ?? "#eef") : "#fff", color: channel === c.id ? (accent?.text ?? "#111") : "var(--text-secondary, #666)", fontWeight: 600 }}
+            style={{ padding: "3px 10px", borderRadius: 14, fontSize: "0.75rem", cursor: "pointer", border: `1px solid ${channel === c.id ? border : "var(--border, rgba(0,0,0,0.12))"}`, background: channel === c.id ? (accent?.bg ?? "#eef") : "var(--surface-card)", color: channel === c.id ? (accent?.text ?? "#111") : "var(--text-secondary, #666)", fontWeight: 600 }}
           >{c.label}</button>
         ))}
         <span style={{ flex: 1 }} />
@@ -41,7 +41,7 @@ export default function NotificationsSection({ accent }: { accent?: { border: st
       </div>
 
       {loading && <p style={{ fontSize: "0.8125rem", color: "var(--text-secondary, #888)" }}>Loading notifications…</p>}
-      {error && <p style={{ fontSize: "0.8125rem", color: "#b91c1c" }}>Could not load notifications.</p>}
+      {error && <p style={{ fontSize: "0.8125rem", color: "var(--ink-red)" }}>Could not load notifications.</p>}
       {!loading && !error && data.length === 0 && (
         <div style={{ padding: "16px 20px", borderRadius: 10, border: "1.5px dashed var(--border, rgba(0,0,0,0.12))", fontSize: "0.8125rem", color: "var(--text-secondary, #888)" }}>
           No notifications{channel ? ` on ${CHANNEL_LABEL[channel]}` : ""} yet.

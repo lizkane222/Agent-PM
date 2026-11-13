@@ -44,6 +44,26 @@ API_PREFIX = "/api/v1/"
 _factory = APIRequestFactory()
 
 
+def _request_environ() -> dict:
+    """
+    Where the in-process request says it came from.
+
+    `APIRequestFactory` defaults to the host ``testserver``. Django's test runner allows that host
+    but a running server does not, so any view that asks the request for its host (to build an
+    absolute URL for a file, a pagination link, …) raised ``DisallowedHost`` - which surfaced as a
+    bare 400 for a skill run, and as a failed tool call for the agent. Present as the first concrete
+    host the server accepts instead (nothing here leaves the process).
+    """
+    from django.conf import settings
+
+    host = next((h for h in settings.ALLOWED_HOSTS if h and h != "*" and not h.startswith(".")), "localhost")
+    local = host in ("localhost", "127.0.0.1")
+    env = {"SERVER_NAME": host, "SERVER_PORT": "8000" if local else "443"}
+    if not local:
+        env["wsgi.url_scheme"] = "https"
+    return env
+
+
 def call(user, method: str, path: str, *, data: Any = None, params: dict | None = None) -> tuple[int, Any]:
     """
     Run `method path` against the real view as `user`. Returns (status_code, data).
@@ -63,11 +83,12 @@ def call(user, method: str, path: str, *, data: Any = None, params: dict | None 
         raise ToolPolicyError("internal_error", "That action is not available.")
 
     builder = getattr(_factory, method.lower())
+    environ = _request_environ()
     if method in ("GET", "DELETE"):
-        request = builder(full_path + query)
+        request = builder(full_path + query, **environ)
     else:
         request = builder(full_path + query, data=json.dumps(data if data is not None else {}),
-                          content_type="application/json")
+                          content_type="application/json", **environ)
     force_authenticate(request, user=user)
 
     response = match.func(request, *match.args, **match.kwargs)

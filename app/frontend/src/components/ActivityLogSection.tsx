@@ -92,7 +92,7 @@ export default function ActivityLogSection({ resourceType, resourceId, variant =
                 {CATEGORY_LABEL[entry.category] ?? entry.category}
               </span>
               <div className="flex-1 min-w-0">
-                <p className="text-xs leading-snug" style={{ color: "var(--twilio-navy)" }}>
+                <p className="text-xs leading-snug" style={{ color: "var(--text-ink)" }}>
                   {entry.message}
                 </p>
                 {entry.actor && (

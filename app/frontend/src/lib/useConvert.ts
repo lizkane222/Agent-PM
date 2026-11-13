@@ -13,6 +13,7 @@
 import { airtableApi, schedulerApi } from "./api";
 import { addLog, patchLog } from "./appLog";
 import type { AirtableActionItem, CalendarEvent } from "../types";
+import { localDateKey } from "./timelineDay";
 
 // ─── Action Item → Calendar Event ────────────────────────────────────────────
 
@@ -27,10 +28,10 @@ export async function convertActionItemToEvent(
   // Map fields: task → title, task_details → description, due_date → start/end (all-day)
   const startIso = item.due_date
     ? `${item.due_date}T09:00:00`
-    : new Date().toISOString().slice(0, 10) + "T09:00:00";
+    : `${localDateKey(new Date())}T09:00:00`;
   const endIso = item.due_date
     ? `${item.due_date}T10:00:00`
-    : new Date().toISOString().slice(0, 10) + "T10:00:00";
+    : `${localDateKey(new Date())}T10:00:00`;
 
   const { data: event } = await schedulerApi.createEvent({
     title: item.task || "Untitled",

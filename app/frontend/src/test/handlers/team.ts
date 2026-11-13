@@ -21,9 +21,11 @@ export const mockUserProfile: UserProfile = {
   notify_default_slack: false,
   notify_default_push: false,
   notify_default_sms: false,
+  allow_reminders_from_others: true,
   push_subscription_active: false,
   staff_view_override: false,
   calendar_colors: {},
+  status_labels: {},
 };
 
 export const mockTeamMembers: TeamMember[] = [
@@ -106,6 +108,16 @@ export const teamHandlers = [
   ),
   // Default: no docs, so every existing TeamPage test's DOM stays unchanged.
   // Tests that exercise the Linked Docs section override with server.use(...).
+  http.post("/api/v1/team/members/:id/assign-timezone/", async ({ request, params }) => {
+    const body = (await request.json()) as { timezone: string };
+    const member = mockTeamMembers.find((m) => m.id === Number(params.id)) ?? mockTeamMembers[0];
+    return HttpResponse.json({
+      ...member,
+      timezone: body.timezone,
+      timezone_source: body.timezone ? "assigned" : "",
+      assigned_by_username: body.timezone ? "tester" : null,
+    });
+  }),
   http.get("/api/v1/team/members/:id/documents/", () => HttpResponse.json([])),
   http.post("/api/v1/team/members/:id/documents/", async ({ request }) => {
     const body = (await request.json()) as Partial<TeamMemberDocument>;

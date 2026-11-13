@@ -72,10 +72,10 @@ export function AccountNoteRowSimple({
             onPaste={(e) => handleLinkPaste(e, text, setText)}
             onBlur={commit}
             onKeyDown={(e) => { if (e.key === "Enter" && e.shiftKey) return; if (e.key === "Enter") { e.preventDefault(); commit(); } if (e.key === "Escape") { setEditing(false); setText(note.text); } }}
-            style={{ width: "100%", fontSize: "0.8125rem", color: "var(--twilio-navy)", background: "#eef2ff", border: "1px solid #a5b4fc", borderRadius: "4px", padding: "2px 6px", outline: "none", resize: "none", lineHeight: 1.5 }}
+            style={{ width: "100%", fontSize: "0.8125rem", color: "var(--text-ink)", background: "var(--tint-indigo-50)", border: "1px solid #a5b4fc", borderRadius: "4px", padding: "2px 6px", outline: "none", resize: "none", lineHeight: 1.5 }}
           />
         ) : (
-          <div onClick={() => { setEditing(true); setText(note.text); }} style={{ fontSize: "0.8125rem", color: "var(--twilio-navy)", lineHeight: 1.5, cursor: "text" }}>
+          <div onClick={() => { setEditing(true); setText(note.text); }} style={{ fontSize: "0.8125rem", color: "var(--text-ink)", lineHeight: 1.5, cursor: "text" }}>
             {note.text.split("\n").map((line, li) => {
               const isSub = line.startsWith("- ");
               const content = isSub ? line.slice(2) : line;
@@ -95,7 +95,7 @@ export function AccountNoteRowSimple({
           <button
             title="Create action item"
             onClick={(e) => { setTooltipAnchorY(e.currentTarget.getBoundingClientRect().bottom); setOpenAction(openAction === "action" ? null : "action"); }}
-            style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("action") ? "#2563eb" : "#9ca3af" }}
+            style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("action") ? "#2563eb" : "var(--text-gray-400)" }}
             className={doneActions.has("action") ? "transition-opacity" : "opacity-0 group-hover:opacity-100 transition-opacity"}
           >
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" style={{ width: "12px", height: "12px" }}><path d="M8 5h9M8 10h9M8 15h9" strokeLinecap="round"/><path d="M3 5l1.5 1.5L7 3M3 10l1.5 1.5L7 8M3 15l1.5 1.5L7 13" strokeLinecap="round" strokeLinejoin="round"/></svg>
@@ -103,7 +103,7 @@ export function AccountNoteRowSimple({
           <button
             title="Set reminder"
             onClick={(e) => { setTooltipAnchorY(e.currentTarget.getBoundingClientRect().bottom); setOpenAction(openAction === "reminder" ? null : "reminder"); }}
-            style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("reminder") ? "#2563eb" : "#9ca3af" }}
+            style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("reminder") ? "#2563eb" : "var(--text-gray-400)" }}
             className={doneActions.has("reminder") ? "transition-opacity" : "opacity-0 group-hover:opacity-100 transition-opacity"}
           >
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" style={{ width: "12px", height: "12px" }}><circle cx="10" cy="10" r="7"/><path d="M10 6v4l3 2" strokeLinecap="round" strokeLinejoin="round"/></svg>
@@ -111,7 +111,7 @@ export function AccountNoteRowSimple({
           <button
             title="Create meeting"
             onClick={(e) => { setTooltipAnchorY(e.currentTarget.getBoundingClientRect().bottom); setOpenAction(openAction === "calendar" ? null : "calendar"); }}
-            style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("calendar") ? "#2563eb" : "#9ca3af" }}
+            style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("calendar") ? "#2563eb" : "var(--text-gray-400)" }}
             className={doneActions.has("calendar") ? "transition-opacity" : "opacity-0 group-hover:opacity-100 transition-opacity"}
           >
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" style={{ width: "12px", height: "12px" }}><rect x="2" y="4" width="16" height="14" rx="2"/><path d="M2 8h16M6 2v4M14 2v4" strokeLinecap="round"/></svg>
@@ -119,7 +119,7 @@ export function AccountNoteRowSimple({
           <button
             title="Send to agent chat"
             onClick={() => window.dispatchEvent(new CustomEvent("chat-inject", { detail: { text: note.text } }))}
-            style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: "#9ca3af" }}
+            style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: "var(--text-gray-400)" }}
             className="opacity-0 group-hover:opacity-100 transition-opacity"
           >
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" style={{ width: "12px", height: "12px" }}><path d="M3 5a2 2 0 012-2h10a2 2 0 012 2v7a2 2 0 01-2 2H7l-4 3V5z" strokeLinejoin="round"/><path d="M7 9h6M7 12h4" strokeLinecap="round"/></svg>

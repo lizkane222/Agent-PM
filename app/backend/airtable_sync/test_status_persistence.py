@@ -15,7 +15,7 @@ from .models import AirtableActionItem
 class FakeAirtable:
     """Single-select Status with the real base's options; anything else is rejected."""
 
-    OPTIONS = {"Not Started", "In Progress", "Blocked", "Ready", "Completed"}
+    OPTIONS = {"Not Started", "In Progress", "Blocked", "Ready", "Completed", "Backlogged"}
 
     def __init__(self):
         self.records = {}  # id -> fields
@@ -69,6 +69,24 @@ class StatusSurvivesPullTests(APITestCase):
     def test_backlogged_survives_pull(self):
         self.assertEqual(self._set("Backlogged").status_code, 200)
         self._pull()
+        self._pull()
+        self.assertEqual(self.item.status, "Backlogged")
+
+    def test_backlogged_is_written_to_airtable_under_its_own_name(self):
+        self._set("Backlogged")
+        self.assertEqual(self.air.records["recSTAT1"]["Status"], "Backlogged")
+        self.assertFalse(AirtableActionItem.objects.get(pk=self.item.pk).status_locally_modified)
+
+    def test_airtable_backlogged_pulls_back_as_backlogged(self):
+        self.air.records["recSTAT1"]["Status"] = "Backlogged"
+        self._pull()
+        self.assertEqual(self.item.status, "Backlogged")
+
+    def test_backlogged_survives_when_option_missing_in_airtable(self):
+        FakeAirtable.OPTIONS = FakeAirtable.OPTIONS - {"Backlogged"}
+        self.addCleanup(lambda: setattr(FakeAirtable, "OPTIONS", FakeAirtable.OPTIONS | {"Backlogged"}))
+        self._set("Backlogged")
+        self.assertTrue(AirtableActionItem.objects.get(pk=self.item.pk).status_locally_modified)
         self._pull()
         self.assertEqual(self.item.status, "Backlogged")
 

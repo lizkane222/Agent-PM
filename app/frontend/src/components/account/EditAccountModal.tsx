@@ -39,7 +39,7 @@ export function EditAccountModal({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onClose}>
+    <div className="fixed inset-0 z-[9000] flex items-center justify-center bg-black/40" onClick={onClose}>
       <div
         className="rounded-xl shadow-xl w-full max-w-lg mx-4 p-6"
         style={{ background: "var(--surface, #fff)", fontFamily: "var(--font-base)" }}

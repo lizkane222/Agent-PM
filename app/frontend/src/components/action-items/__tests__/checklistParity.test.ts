@@ -54,10 +54,11 @@ describe("action item checklist parity", () => {
     }
   });
 
-  it("AccountDetailPage mounts it in both its modal and its side panel", () => {
-    // It has local copies of each, neither of which uses the shared components.
+  it("AccountDetailPage mounts it only in its side panel (its modal is the shared ActionItemModal now)", () => {
+    // The local modal copy was retired; the shared modal (listed above) renders the checklist.
     const source = read("pages/AccountDetailPage.tsx");
-    expect(source.split("<StepsPanel").length - 1).toBe(2);
+    expect(source.split("<StepsPanel").length - 1).toBe(1);
+    expect(source).not.toContain("function ActionItemModal(");
   });
 
   it.each(DETAIL_SURFACES)("%s no longer invites writing steps into the description", (file) => {
@@ -103,8 +104,8 @@ describe("action item attachment parity", () => {
     expect(source).not.toContain("catch { /* skip */ }");
   });
 
-  it("AccountDetailPage offers it in both its modal and its side panel", () => {
-    expect(read("pages/AccountDetailPage.tsx").split("<ArtifactPicker").length - 1).toBe(2);
+  it("AccountDetailPage offers it only in its side panel (its modal is the shared ActionItemModal now)", () => {
+    expect(read("pages/AccountDetailPage.tsx").split("<ArtifactPicker").length - 1).toBe(1);
   });
 
   it("nobody hand-rolls their own artifact dropdown any more", () => {

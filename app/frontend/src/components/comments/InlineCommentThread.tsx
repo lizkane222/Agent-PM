@@ -55,7 +55,7 @@ function CommentRow({
   return (
     <div
       className="group"
-      style={{ marginLeft: depth > 0 ? "1.5rem" : 0, borderLeft: depth > 0 ? "2px solid #e5e7eb" : undefined, paddingLeft: depth > 0 ? "0.75rem" : 0 }}
+      style={{ marginLeft: depth > 0 ? "1.5rem" : 0, borderLeft: depth > 0 ? "2px solid var(--border-subtle)" : undefined, paddingLeft: depth > 0 ? "0.75rem" : 0 }}
     >
       <div className="py-2">
         <div className="flex items-center gap-2 mb-1">

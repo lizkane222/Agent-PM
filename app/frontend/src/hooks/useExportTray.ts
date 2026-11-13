@@ -8,8 +8,20 @@ export function useExportTray() {
   const { exportMode, toggleItem, isSelected, toggleMode } = useExport();
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const exportModeRef = useRef(exportMode);
+  const userTouchedRef = useRef(false);
+  const ownToggleRef = useRef(false);
 
-  useEffect(() => { exportModeRef.current = exportMode; }, [exportMode]);
+  useEffect(() => {
+    exportModeRef.current = exportMode;
+    // A mode change we did not make while the auto-close is pending means the user
+    // took control of the tray: leave it as they set it.
+    if (ownToggleRef.current) { ownToggleRef.current = false; return; }
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+      userTouchedRef.current = true;
+    }
+  }, [exportMode]);
 
   // Without this the pending auto-close fires after unmount and toggles the tray
   // from a tree that is gone.
@@ -19,6 +31,7 @@ export function useExportTray() {
 
   function addToTray(item: AirtableActionItem) {
     const wasOff = !exportModeRef.current;
+    // Only a tray the add itself opened may auto-close; one the user opened stays.
     toggleItem({
       id: `action_item:${item.airtable_id}`,
       type: "action_item",
@@ -36,10 +49,15 @@ export function useExportTray() {
       accountName: item.account_name ?? undefined,
     });
     if (wasOff) {
+      userTouchedRef.current = false;
+      ownToggleRef.current = true;
       toggleMode();
       if (timerRef.current) clearTimeout(timerRef.current);
       timerRef.current = setTimeout(() => {
-        if (exportModeRef.current) toggleMode();
+        if (exportModeRef.current && !userTouchedRef.current) {
+          ownToggleRef.current = true;
+          toggleMode();
+        }
         timerRef.current = null;
       }, TRAY_AUTO_CLOSE_MS);
     }

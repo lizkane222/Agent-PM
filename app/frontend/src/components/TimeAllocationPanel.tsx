@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { timeAllocationApi } from "../lib/api";
 import type { TimeAllocation, TimeAllocationRow } from "../types/salesforce";
+import { CardList, type FullCard } from "./profile/fullscreen";
 
 type ViewType = "bar" | "table" | "heatmap";
 
@@ -19,6 +20,12 @@ const CALENDAR_NOTE = "From calendar events — not logged yet";
 
 /** Label for entries whose project has no account, so logged time never silently disappears. */
 export const NO_ACCOUNT_LABEL = "No account";
+
+/** The user's own Admin workspace. Always listed so time spent on Admin work is visible, even at zero. */
+export const ADMIN_LABEL = "Admin";
+
+/** Solid so a frozen column hides what scrolls underneath it. */
+const FROZEN_BG = "var(--surface,#fff)";
 
 const PALETTE = [
   "#DB131A", "#2563eb", "#16a34a", "#d97706", "#7c3aed",
@@ -131,117 +138,114 @@ function BarChart({ data, days, accounts, colorMap, calendarCells }: {
   }, [maxMinutes]);
 
   const scrollRef = useScrollToEnd(days.length);
+  // The hours axis is its own SVG outside the scroller, so it stays put while the days scroll.
+  const plotW = chartW + MARGIN.right;
 
   return (
-    <div ref={scrollRef} style={{ position: "relative", overflowX: "auto" }}>
-      <svg
-        viewBox={`0 0 ${W} ${H}`}
-        style={{ width: W, minWidth: "100%", display: "block" }}
-        onMouseLeave={() => setTooltip(null)}
-      >
+    <div style={{ display: "flex", position: "relative" }}>
+      <svg data-testid="bar-y-axis" width={MARGIN.left} height={H} style={{ flexShrink: 0, display: "block", background: FROZEN_BG }}>
         <g transform={`translate(${MARGIN.left},${MARGIN.top})`}>
-          {/* Y grid + labels */}
           {yTicks.map((t) => {
             const y = chartH - (t / (maxMinutes / 60)) * chartH;
             return (
-              <g key={t}>
-                <line x1={0} x2={chartW} y1={y} y2={y} stroke="rgba(0,0,0,0.07)" strokeWidth={1} />
-                <text x={-6} y={y + 4} textAnchor="end" fontSize={10} fill="var(--text-secondary,#888)">
-                  {t % 1 === 0 ? `${t}h` : `${t * 60}m`}
-                </text>
-              </g>
+              <text key={t} x={-6} y={y + 4} textAnchor="end" fontSize={10} fill="var(--text-secondary,#888)">
+                {t % 1 === 0 ? `${t}h` : `${t * 60}m`}
+              </text>
             );
           })}
-
-          {/* Bars */}
-          {days.map((day, di) => {
-            const cx = di * barGroupW + barGroupW / 2;
-            const x0 = cx - barW / 2;
-            let yOffset = chartH;
-            const segments: { account: string; height: number; y: number; fromCalendar: boolean }[] = [];
-            for (const acct of accounts) {
-              const mins = totals[day]?.[acct] ?? 0;
-              if (!mins) continue;
-              const h = (mins / maxMinutes) * chartH;
-              yOffset -= h;
-              segments.push({ account: acct, height: h, y: yOffset, fromCalendar: calendarCells.has(cellKey(day, acct)) });
-            }
-            return (
-              <g key={day}>
-                {segments.map((s) => (
-                  <rect
-                    key={s.account}
-                    x={x0}
-                    y={s.y}
-                    width={barW}
-                    height={s.height}
-                    fill={colorMap[s.account] ?? "#ccc"}
-                    // Lighter and dashed: this time is on the calendar but has not been logged.
-                    opacity={s.fromCalendar ? 0.5 : 1}
-                    stroke={s.fromCalendar ? colorMap[s.account] ?? "#ccc" : undefined}
-                    strokeDasharray={s.fromCalendar ? "3 2" : undefined}
-                    data-source={s.fromCalendar ? "calendar" : "logged"}
-                    rx={2}
-                    style={{ cursor: "pointer" }}
-                    onMouseMove={(e) => {
-                      const svg = (e.currentTarget.closest("svg") as SVGSVGElement);
-                      const rect = svg.getBoundingClientRect();
-                      setTooltip({
-                        x: e.clientX - rect.left,
-                        y: e.clientY - rect.top - 8,
-                        label: `${s.account}: ${fmtMin(totals[day]?.[s.account] ?? 0)} on ${formatLabel(day)}${s.fromCalendar ? " (calendar)" : ""}`,
-                      });
-                    }}
-                  />
-                ))}
-                {/* X label */}
-                <text
-                  x={cx}
-                  y={chartH + 16}
-                  textAnchor="middle"
-                  fontSize={10}
-                  fill="var(--text-secondary,#888)"
-                  transform={`rotate(-35,${cx},${chartH + 16})`}
-                >
-                  {formatLabel(day)}
-                </text>
-              </g>
-            );
-          })}
-
-          {/* Axis lines */}
           <line x1={0} y1={0} x2={0} y2={chartH} stroke="var(--border,rgba(0,0,0,0.12))" />
-          <line x1={0} y1={chartH} x2={chartW} y2={chartH} stroke="var(--border,rgba(0,0,0,0.12))" />
         </g>
-
-        {/* Tooltip */}
-        {tooltip && (
-          <g>
-            <rect
-              x={Math.min(tooltip.x + 8, W - 180)}
-              y={tooltip.y - 22}
-              width={172}
-              height={28}
-              rx={4}
-              fill="var(--twilio-navy,#121C2D)"
-              opacity={0.92}
-            />
-            <text
-              x={Math.min(tooltip.x + 8, W - 180) + 8}
-              y={tooltip.y - 4}
-              fontSize={11}
-              fill="#fff"
-            >
-              {tooltip.label}
-            </text>
-          </g>
-        )}
       </svg>
+      <div ref={scrollRef} style={{ position: "relative", overflowX: "auto", flex: 1, minWidth: 0 }}>
+        <svg
+          viewBox={`0 0 ${plotW} ${H}`}
+          style={{ width: plotW, minWidth: "100%", display: "block" }}
+          onMouseLeave={() => setTooltip(null)}
+        >
+          <g transform={`translate(0,${MARGIN.top})`}>
+            {/* Y grid lines (labels live in the frozen axis) */}
+            {yTicks.map((t) => {
+              const y = chartH - (t / (maxMinutes / 60)) * chartH;
+              return <line key={t} x1={0} x2={chartW} y1={y} y2={y} stroke="rgba(0,0,0,0.07)" strokeWidth={1} />;
+            })}
+
+            {/* Bars */}
+            {days.map((day, di) => {
+              const cx = di * barGroupW + barGroupW / 2;
+              const x0 = cx - barW / 2;
+              let yOffset = chartH;
+              const segments: { account: string; height: number; y: number; fromCalendar: boolean }[] = [];
+              for (const acct of accounts) {
+                const mins = totals[day]?.[acct] ?? 0;
+                if (!mins) continue;
+                const h = (mins / maxMinutes) * chartH;
+                yOffset -= h;
+                segments.push({ account: acct, height: h, y: yOffset, fromCalendar: calendarCells.has(cellKey(day, acct)) });
+              }
+              return (
+                <g key={day}>
+                  {segments.map((s) => (
+                    <rect
+                      key={s.account}
+                      x={x0}
+                      y={s.y}
+                      width={barW}
+                      height={s.height}
+                      fill={colorMap[s.account] ?? "#ccc"}
+                      // Lighter and dashed: this time is on the calendar but has not been logged.
+                      opacity={s.fromCalendar ? 0.5 : 1}
+                      stroke={s.fromCalendar ? colorMap[s.account] ?? "#ccc" : undefined}
+                      strokeDasharray={s.fromCalendar ? "3 2" : undefined}
+                      data-source={s.fromCalendar ? "calendar" : "logged"}
+                      rx={2}
+                      style={{ cursor: "pointer" }}
+                      onMouseMove={(e) => {
+                        const svg = (e.currentTarget.closest("svg") as SVGSVGElement);
+                        const rect = svg.getBoundingClientRect();
+                        setTooltip({
+                          x: e.clientX - rect.left,
+                          y: e.clientY - rect.top - 8,
+                          label: `${s.account}: ${fmtMin(totals[day]?.[s.account] ?? 0)} on ${formatLabel(day)}${s.fromCalendar ? " (calendar)" : ""}`,
+                        });
+                      }}
+                    />
+                  ))}
+                  {/* X label */}
+                  <text
+                    x={cx}
+                    y={chartH + 16}
+                    textAnchor="middle"
+                    fontSize={10}
+                    fill="var(--text-secondary,#888)"
+                    transform={`rotate(-35,${cx},${chartH + 16})`}
+                  >
+                    {formatLabel(day)}
+                  </text>
+                </g>
+              );
+            })}
+
+            <line x1={0} y1={chartH} x2={chartW} y2={chartH} stroke="var(--border,rgba(0,0,0,0.12))" />
+          </g>
+
+          {tooltip && (
+            <g>
+              <rect x={Math.min(tooltip.x + 8, plotW - 180)} y={tooltip.y - 22} width={172} height={28} rx={4} fill="var(--twilio-navy,#121C2D)" opacity={0.92} />
+              <text x={Math.min(tooltip.x + 8, plotW - 180) + 8} y={tooltip.y - 4} fontSize={11} fill="#fff">
+                {tooltip.label}
+              </text>
+            </g>
+          )}
+        </svg>
+      </div>
     </div>
   );
 }
 
 // ── Table view ────────────────────────────────────────────────────────────────
+
+/** The Account column stays at the left edge while the days scroll under it. */
+const FROZEN_COL: React.CSSProperties = { position: "sticky", left: 0, background: FROZEN_BG, zIndex: 1, boxShadow: "1px 0 0 var(--border,rgba(0,0,0,0.1))" };
 
 function TableView({ data, days, accounts, colorMap, calendarCells }: {
   data: DayAccountEntry[];
@@ -293,7 +297,7 @@ function TableView({ data, days, accounts, colorMap, calendarCells }: {
       <table style={{ borderCollapse: "collapse", width: "100%", fontSize: "0.8125rem", fontFamily: "var(--font-base)" }}>
         <thead>
           <tr>
-            <th style={{ textAlign: "left", padding: "6px 10px", borderBottom: "1px solid var(--border,rgba(0,0,0,0.1))", color: "var(--text-secondary,#888)", fontWeight: 500, whiteSpace: "nowrap" }}>
+            <th data-frozen="account" style={{ ...FROZEN_COL, zIndex: 2, textAlign: "left", padding: "6px 10px", borderBottom: "1px solid var(--border,rgba(0,0,0,0.1))", color: "var(--text-secondary,#888)", fontWeight: 500, whiteSpace: "nowrap" }}>
               Account
             </th>
             {days.map(d => (
@@ -309,7 +313,7 @@ function TableView({ data, days, accounts, colorMap, calendarCells }: {
         <tbody>
           {accounts.map((acct, ai) => (
             <tr key={acct} style={{ background: ai % 2 === 0 ? "transparent" : "var(--surface-raised,rgba(0,0,0,0.02))" }}>
-              <td style={{ padding: "5px 10px", whiteSpace: "nowrap", maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis" }}>
+              <td data-frozen="account" style={{ ...FROZEN_COL, padding: "5px 10px", whiteSpace: "nowrap", maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis" }}>
                 <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: colorMap[acct], marginRight: 6, flexShrink: 0 }} />
                 {acct}
               </td>
@@ -348,7 +352,7 @@ function TableView({ data, days, accounts, colorMap, calendarCells }: {
         </tbody>
         <tfoot>
           <tr style={{ borderTop: "1px solid var(--border,rgba(0,0,0,0.1))" }}>
-            <td style={{ padding: "5px 10px", fontWeight: 600, color: "var(--text-secondary,#888)", fontSize: "0.75rem" }}>Total</td>
+            <td data-frozen="account" style={{ ...FROZEN_COL, padding: "5px 10px", fontWeight: 600, color: "var(--text-secondary,#888)", fontSize: "0.75rem" }}>Total</td>
             {days.map(day => (
               <td key={day} style={{ textAlign: "center", padding: "5px 6px", fontWeight: 600, fontSize: "0.75rem" }}>
                 {colTotals[day] ? fmtMin(colTotals[day]) : "—"}
@@ -400,90 +404,87 @@ function HeatmapView({ data, days, accounts, colorMap, calendarCells }: {
   const [tooltip, setTooltip] = useState<{ x: number; y: number; label: string } | null>(null);
 
   const scrollRef = useScrollToEnd(days.length);
+  // Account names are their own SVG outside the scroller, so they stay put while the days scroll.
+  const gridW = W - LEFT;
 
   return (
-    <div ref={scrollRef} style={{ overflowX: "auto" }}>
-      <svg
-        viewBox={`0 0 ${W} ${H}`}
-        style={{ width: W, minWidth: "100%", display: "block" }}
-        onMouseLeave={() => setTooltip(null)}
-      >
-        {/* Column headers */}
-        {days.map((d, di) => (
-          <text
-            key={d}
-            x={LEFT + di * CELL + CELL / 2}
-            y={TOP - 8}
-            textAnchor="middle"
-            fontSize={9}
-            fill="var(--text-secondary,#888)"
-            transform={`rotate(-30,${LEFT + di * CELL + CELL / 2},${TOP - 8})`}
-          >
-            {formatLabel(d)}
+    <div style={{ display: "flex", position: "relative" }}>
+      <svg data-testid="heatmap-accounts" width={LEFT} height={H} style={{ flexShrink: 0, display: "block", background: FROZEN_BG }}>
+        {accounts.map((acct, ai) => (
+          <text key={acct} x={LEFT - 6} y={TOP + ai * CELL + CELL / 2 + 4} textAnchor="end" fontSize={10} fill="var(--text-primary,#333)">
+            {acct.length > 18 ? acct.slice(0, 17) + "…" : acct}
           </text>
         ))}
-
-        {/* Row headers + cells */}
-        {accounts.map((acct, ai) => {
-          const y = TOP + ai * CELL;
-          return (
-            <g key={acct}>
-              <text x={LEFT - 6} y={y + CELL / 2 + 4} textAnchor="end" fontSize={10} fill="var(--text-primary,#333)">
-                {acct.length > 18 ? acct.slice(0, 17) + "…" : acct}
-              </text>
-              {days.map((day, di) => {
-                const mins = totals[acct]?.[day] ?? 0;
-                const intensity = mins / maxCell;
-                const base = colorMap[acct] ?? "#888";
-                return (
-                  <rect
-                    key={day}
-                    x={LEFT + di * CELL + 2}
-                    y={y + 2}
-                    width={CELL - 4}
-                    height={CELL - 4}
-                    rx={4}
-                    fill={mins ? `${base}` : "var(--surface-raised,rgba(0,0,0,0.04))"}
-                    opacity={mins ? 0.15 + intensity * 0.85 : 1}
-                    stroke={mins && calendarCells.has(cellKey(day, acct)) ? base : undefined}
-                    strokeDasharray={mins && calendarCells.has(cellKey(day, acct)) ? "3 2" : undefined}
-                    data-source={mins ? (calendarCells.has(cellKey(day, acct)) ? "calendar" : "logged") : undefined}
-                    style={{ cursor: mins ? "pointer" : "default" }}
-                    onMouseMove={(e) => {
-                      if (!mins) return;
-                      const svg = (e.currentTarget.closest("svg") as SVGSVGElement);
-                      const rect = svg.getBoundingClientRect();
-                      setTooltip({
-                        x: e.clientX - rect.left,
-                        y: e.clientY - rect.top - 8,
-                        label: `${acct}: ${fmtMin(mins)} on ${formatLabel(day)}${calendarCells.has(cellKey(day, acct)) ? " (calendar)" : ""}`,
-                      });
-                    }}
-                  />
-                );
-              })}
-            </g>
-          );
-        })}
-
-        {/* Tooltip */}
-        {tooltip && (
-          <g>
-            <rect
-              x={Math.min(tooltip.x + 8, W - 190)}
-              y={tooltip.y - 22}
-              width={184}
-              height={28}
-              rx={4}
-              fill="var(--twilio-navy,#121C2D)"
-              opacity={0.93}
-            />
-            <text x={Math.min(tooltip.x + 8, W - 190) + 8} y={tooltip.y - 4} fontSize={11} fill="#fff">
-              {tooltip.label}
-            </text>
-          </g>
-        )}
       </svg>
+      <div ref={scrollRef} style={{ overflowX: "auto", flex: 1, minWidth: 0 }}>
+        <svg
+          viewBox={`0 0 ${gridW} ${H}`}
+          style={{ width: gridW, minWidth: "100%", display: "block" }}
+          onMouseLeave={() => setTooltip(null)}
+        >
+          {days.map((d, di) => (
+            <text
+              key={d}
+              x={di * CELL + CELL / 2}
+              y={TOP - 8}
+              textAnchor="middle"
+              fontSize={9}
+              fill="var(--text-secondary,#888)"
+              transform={`rotate(-30,${di * CELL + CELL / 2},${TOP - 8})`}
+            >
+              {formatLabel(d)}
+            </text>
+          ))}
+
+          {accounts.map((acct, ai) => {
+            const y = TOP + ai * CELL;
+            return (
+              <g key={acct}>
+                {days.map((day, di) => {
+                  const mins = totals[acct]?.[day] ?? 0;
+                  const intensity = mins / maxCell;
+                  const base = colorMap[acct] ?? "#888";
+                  return (
+                    <rect
+                      key={day}
+                      x={di * CELL + 2}
+                      y={y + 2}
+                      width={CELL - 4}
+                      height={CELL - 4}
+                      rx={4}
+                      fill={mins ? `${base}` : "var(--surface-raised,rgba(0,0,0,0.04))"}
+                      opacity={mins ? 0.15 + intensity * 0.85 : 1}
+                      stroke={mins && calendarCells.has(cellKey(day, acct)) ? base : undefined}
+                      strokeDasharray={mins && calendarCells.has(cellKey(day, acct)) ? "3 2" : undefined}
+                      data-source={mins ? (calendarCells.has(cellKey(day, acct)) ? "calendar" : "logged") : undefined}
+                      style={{ cursor: mins ? "pointer" : "default" }}
+                      onMouseMove={(e) => {
+                        if (!mins) return;
+                        const svg = (e.currentTarget.closest("svg") as SVGSVGElement);
+                        const rect = svg.getBoundingClientRect();
+                        setTooltip({
+                          x: e.clientX - rect.left,
+                          y: e.clientY - rect.top - 8,
+                          label: `${acct}: ${fmtMin(mins)} on ${formatLabel(day)}${calendarCells.has(cellKey(day, acct)) ? " (calendar)" : ""}`,
+                        });
+                      }}
+                    />
+                  );
+                })}
+              </g>
+            );
+          })}
+
+          {tooltip && (
+            <g>
+              <rect x={Math.min(tooltip.x + 8, gridW - 190)} y={tooltip.y - 22} width={184} height={28} rx={4} fill="var(--twilio-navy,#121C2D)" opacity={0.93} />
+              <text x={Math.min(tooltip.x + 8, gridW - 190) + 8} y={tooltip.y - 4} fontSize={11} fill="#fff">
+                {tooltip.label}
+              </text>
+            </g>
+          )}
+        </svg>
+      </div>
     </div>
   );
 }
@@ -516,7 +517,30 @@ function formatRange(days: string[]) {
   return `${formatLabel(days[0])} – ${formatLabel(days[days.length - 1])}`;
 }
 
-export default function TimeAllocationPanel() {
+/** One card per account: total time, how much was logged vs from the calendar, and every day. */
+function accountCards(data: DayAccountEntry[], accounts: string[]): FullCard[] {
+  return accounts.map(account => {
+    const mine = data.filter(e => e.account === account).sort((a, b) => b.date.localeCompare(a.date));
+    const total = mine.reduce((s, e) => s + e.minutes, 0);
+    const logged = mine.filter(e => e.source === "logged").reduce((s, e) => s + e.minutes, 0);
+    return {
+      id: account,
+      title: account,
+      subtitle: total ? `${fmtMin(total)} total` : "No time in this period",
+      fields: [
+        { label: "Total", value: total ? fmtMin(total) : "—" },
+        { label: "Logged", value: logged ? fmtMin(logged) : "—" },
+        { label: "From calendar", value: total - logged ? fmtMin(total - logged) : "—" },
+        ...mine.map(e => ({
+          label: formatLabel(e.date),
+          value: `${fmtMin(e.minutes)}${e.source === "calendar" ? " (calendar, not logged yet)" : " (logged)"}`,
+        })),
+      ],
+    };
+  });
+}
+
+export default function TimeAllocationPanel({ showCards = false, accent = "#0d1b2e" }: { showCards?: boolean; accent?: string } = {}) {
   const [view, setView] = useState<ViewType>("bar");
   const [result, setResult] = useState<TimeAllocation | null>(null);
   const [loading, setLoading] = useState(true);
@@ -546,7 +570,9 @@ export default function TimeAllocationPanel() {
   const accounts = useMemo(() => {
     const set = new Set<string>();
     for (const e of data) set.add(e.account);
-    return Array.from(set).sort();
+    set.delete(ADMIN_LABEL);
+    // Admin is always first, even with no time, so how much goes to Admin work is always visible.
+    return [ADMIN_LABEL, ...Array.from(set).sort()];
   }, [data]);
 
   const colorMap = useMemo(() => {
@@ -555,6 +581,8 @@ export default function TimeAllocationPanel() {
     return m;
   }, [accounts]);
 
+  // Admin is always listed, so count only the accounts that actually have time.
+  const withTime = useMemo(() => new Set(data.map(e => e.account)).size, [data]);
   const totalMins = useMemo(() => data.reduce((s, e) => s + e.minutes, 0), [data]);
 
   const btnStyle = (active: boolean): React.CSSProperties => ({
@@ -579,7 +607,7 @@ export default function TimeAllocationPanel() {
             Time Allocation
           </p>
           <p style={{ fontSize: "0.6875rem", color: "var(--text-secondary,#888)", fontFamily: "var(--font-base)", margin: "1px 0 0" }}>
-            {loading ? "Loading…" : `${fmtMin(totalMins)} across ${accounts.length} account${accounts.length !== 1 ? "s" : ""}`}
+            {loading ? "Loading…" : `${fmtMin(totalMins)} across ${withTime} account${withTime !== 1 ? "s" : ""}`}
           </p>
           {!loading && !failed && result && (
             <p data-testid="allocation-breakdown" style={{ fontSize: "0.6875rem", color: "var(--text-secondary,#888)", fontFamily: "var(--font-base)", margin: "1px 0 0" }}>
@@ -626,10 +654,10 @@ export default function TimeAllocationPanel() {
           Loading…
         </div>
       ) : failed ? (
-        <div style={{ textAlign: "center", padding: 32, color: "#b91c1c", fontSize: "0.8125rem" }}>
+        <div style={{ textAlign: "center", padding: 32, color: "var(--ink-red)", fontSize: "0.8125rem" }}>
           Could not load your logged time.
         </div>
-      ) : accounts.length === 0 ? (
+      ) : data.length === 0 ? (
         <div style={{ textAlign: "center", padding: 32, color: "var(--text-secondary,#888)", fontSize: "0.8125rem" }}>
           Nothing to show between {formatRange(days)}. Time you log from the Log Time panel, and calendar events linked to an account, show up here.
         </div>
@@ -639,6 +667,11 @@ export default function TimeAllocationPanel() {
           {view === "table" && <TableView data={data} days={days} accounts={accounts} colorMap={colorMap} calendarCells={calendarCells} />}
           {view === "heatmap" && <HeatmapView data={data} days={days} accounts={accounts} colorMap={colorMap} calendarCells={calendarCells} />}
           <Legend accounts={accounts} colorMap={colorMap} hasCalendar={calendarCells.size > 0} />
+          {showCards && (
+            <div style={{ marginTop: 20 }}>
+              <CardList cards={accountCards(data, accounts)} accent={accent} empty="No accounts." />
+            </div>
+          )}
         </>
       )}
     </div>

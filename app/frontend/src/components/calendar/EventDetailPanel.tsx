@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { useStatusLabels } from "../../hooks/useStatusLabels";
 import { useActionItemFieldOptions } from "../../hooks/useActionItemFieldOptions";
 import DOMPurify from "dompurify";
 import { schedulerApi } from "../../lib/api";
@@ -18,6 +19,7 @@ import {
 } from "./calendarHelpers";
 import type { CalCreateForm } from "./calendarHelpers";
 import { DEFAULT_CATEGORY_COLORS, borderFor, readableTextColor } from "../../lib/eventColors";
+import { toLocalDatetimeValue } from "../../lib/datetimeLocal";
 
 // Labels and icons only — the active pill takes the user's chosen color for that
 // event type (lib/eventColors.ts) so it matches the event on the calendar.
@@ -64,6 +66,7 @@ export interface EventDetailPanelProps {
 
 export default function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAccount, onUnlink, onRemove, onDelete, onUpdateReminder, actionItem, onUpdateActionItem, onUpdateScheduleTime, onSaveMeeting, categoryColors = DEFAULT_CATEGORY_COLORS }: EventDetailPanelProps) {
   const { status: statusOptions } = useActionItemFieldOptions();
+  const { label: statusLabel } = useStatusLabels();
   const [dropOver, setDropOver] = useState(false);
   const isWorkSession = event.calendar_id === "work_tracking";
   const isScheduledReminder = !!event.google_event_id?.startsWith("scheduled-reminder-");
@@ -141,7 +144,7 @@ export default function EventDetailPanel({ event, onClose, onCollapse, linkedAcc
     try {
       const t = new Date(event.start_datetime);
       t.setMinutes(t.getMinutes() - 15);
-      return t.toISOString().slice(0, 16);
+      return toLocalDatetimeValue(t.toISOString());
     } catch { return event.start_datetime.slice(0, 16); }
   });
   const [newRemSaving, setNewRemSaving] = useState(false);
@@ -157,7 +160,6 @@ export default function EventDetailPanel({ event, onClose, onCollapse, linkedAcc
         resource_type: "calendar_event",
         resource_id: event.id,
         due_at: new Date(due_at).toISOString(),
-        notify_in_app: true,
       } as Parameters<typeof schedulerApi.createReminder>[0]);
       setNewRemDone(true);
       setTimeout(() => { setNewRemOpen(false); setNewRemDone(false); }, 1500);
@@ -423,7 +425,7 @@ export default function EventDetailPanel({ event, onClose, onCollapse, linkedAcc
                 className="w-full text-sm text-[var(--twilio-navy)] rounded-md border border-gray-200 px-3 py-1.5 focus:outline-none focus:border-indigo-300 resize-none leading-relaxed placeholder:text-gray-400"
               />
               <div className="flex flex-wrap gap-1.5">
-                <CalPillSelect value={aiForm.status} options={statusOptions as AirtableActionItem["status"][]} colorMap={STATUS_COLORS_CAL} placeholder="Status" onChange={(v) => setAiForm((f) => f && ({ ...f, status: v }))} />
+                <CalPillSelect value={aiForm.status} options={statusOptions as AirtableActionItem["status"][]} format={statusLabel} colorMap={STATUS_COLORS_CAL} placeholder="Status" onChange={(v) => setAiForm((f) => f && ({ ...f, status: v }))} />
                 <CalPillSelect value={aiForm.priority} options={["Critical","High","Medium","Low"] as const} colorMap={PRIORITY_COLORS_CAL} placeholder="Priority" onChange={(v) => setAiForm((f) => f && ({ ...f, priority: v }))} />
                 <CalPillDate value={aiForm.due_date} onChange={(v) => setAiForm((f) => f && ({ ...f, due_date: v }))} />
               </div>
@@ -447,7 +449,7 @@ export default function EventDetailPanel({ event, onClose, onCollapse, linkedAcc
                 <p className="text-[var(--twilio-gray-80)] text-[13px] leading-relaxed">{actionItem.task_details}</p>
               )}
               <div className="flex flex-wrap gap-1.5">
-                <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full ${STATUS_COLORS_CAL[actionItem.status] ?? "bg-gray-100 text-gray-700"}`}>{actionItem.status}</span>
+                <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full ${STATUS_COLORS_CAL[actionItem.status] ?? "bg-gray-100 text-gray-700"}`}>{statusLabel(actionItem.status)}</span>
                 <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full ${PRIORITY_COLORS_CAL[actionItem.priority] ?? "bg-gray-100 text-gray-600"}`}>{actionItem.priority}</span>
                 {actionItem.due_date && (
                   <span className="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-amber-50 text-amber-700">
@@ -630,7 +632,7 @@ export default function EventDetailPanel({ event, onClose, onCollapse, linkedAcc
           {descriptionWithLinks && (
             <div>
               <p className="text-sm text-[var(--twilio-gray-60)] uppercase tracking-wide mb-1">Description</p>
-              <div className="text-[var(--twilio-gray-80)] text-sm [&_a]:text-indigo-600 [&_a]:underline [&_a]:break-all hover:[&_a]:text-indigo-800" dangerouslySetInnerHTML={{ __html: descriptionWithLinks }} />
+              <div className="rich-text text-[var(--twilio-gray-80)] text-sm [&_a]:text-indigo-600 [&_a]:underline [&_a]:break-all hover:[&_a]:text-indigo-800" dangerouslySetInnerHTML={{ __html: descriptionWithLinks }} />
             </div>
           )}
           {!isWorkSession && event.attendees.length > 0 && (

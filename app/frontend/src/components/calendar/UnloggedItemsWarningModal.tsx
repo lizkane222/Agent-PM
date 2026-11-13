@@ -89,7 +89,7 @@ export default function UnloggedItemsWarningModal({ report, onClose, autoDismiss
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
+      className="fixed inset-0 z-[9000] flex items-center justify-center bg-black/40"
       onClick={onClose}
       data-testid="unlogged-warning-backdrop"
     >

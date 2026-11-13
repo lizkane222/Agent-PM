@@ -73,6 +73,14 @@ def _norm(title: str) -> str:
     return re.sub(r"\s+", " ", (title or "").strip()).lower()
 
 
+ADMIN_LABEL = "Admin"
+
+
+def display_account(name: str) -> str:
+    """One label for the user's Admin workspace: Django calls it "Admin", the Airtable mirror "ADMIN"."""
+    return ADMIN_LABEL if (name or "").strip().lower() == "admin" else (name or "")
+
+
 def _event_account_names(events, user) -> dict[int, tuple[str, bool]]:
     """{event pk: (account name, inferred)} — linked, else the action item's, else named in the title."""
     from .time_entry_accounts import account_matcher
@@ -81,14 +89,14 @@ def _event_account_names(events, user) -> dict[int, tuple[str, bool]]:
 
     item_ids = {e.agentpm_airtable_id for e in events if not e.account_id and e.agentpm_airtable_id}
     item_account = {
-        i.airtable_id: i.account.name
+        i.airtable_id: display_account(i.account.name)
         for i in AirtableActionItem.objects.filter(airtable_id__in=item_ids, account__isnull=False).select_related("account")
     } if item_ids else {}
     match = account_matcher(user)
     out = {}
     for e in events:
         if e.account_id:
-            out[e.pk] = (e.account.company_name, False)
+            out[e.pk] = (display_account(e.account.company_name), False)
         elif e.agentpm_airtable_id in item_account:
             out[e.pk] = (item_account[e.agentpm_airtable_id], False)
         else:
@@ -164,7 +172,7 @@ def build_allocation(user, start: date, end: date, now: datetime | None = None) 
                 title = _TITLE_SUFFIX_RE.sub("", line)
                 if _norm(title) in dna:
                     minutes -= line_minutes(line)
-        logged[(entry.date, entry_account_name(entry))] += max(0, minutes)
+        logged[(entry.date, display_account(entry_account_name(entry)))] += max(0, minutes)
 
     rows: list[Row] = []
     shown_inferred = 0.0  # inferred minutes in rows actually returned, not masked by logged time
@@ -191,4 +199,6 @@ def build_allocation(user, start: date, end: date, now: datetime | None = None) 
         "inferred_minutes": int(round(shown_inferred)),
         # Calendar time that could not be tied to any account, and so is not in `rows`.
         "unlinked_calendar_minutes": int(round(unlinked)),
+        # The user's own Admin workspace, so the panel can list it even on a day with no Admin time.
+        "admin_account": ADMIN_LABEL,
     }

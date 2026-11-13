@@ -26,6 +26,18 @@ class ToolCallSerializer(serializers.ModelSerializer):
 
 class AgentMessageSerializer(serializers.ModelSerializer):
     tool_calls = ToolCallSerializer(many=True, read_only=True)
+    cost_usd = serializers.SerializerMethodField()
+
+    def get_cost_usd(self, obj):
+        """What this message's real usage cost at the current price (display only)."""
+        if not (obj.input_tokens or obj.output_tokens):
+            return "0.0000"
+        from . import token_budget
+        # One pricing lookup per serialisation pass, not one per message.
+        cache = self.context.setdefault("_pricing_cache", {})
+        if "p" not in cache:
+            cache["p"] = token_budget.get_pricing()
+        return str(token_budget.usage_usd(obj.input_tokens, obj.output_tokens, cache["p"]))
 
     class Meta:
         model = AgentMessage
@@ -35,6 +47,7 @@ class AgentMessageSerializer(serializers.ModelSerializer):
             "content",
             "input_tokens",
             "output_tokens",
+            "cost_usd",
             "tool_calls",
             "created_at",
         ]
@@ -85,6 +98,9 @@ class AgentMessageInputSerializer(serializers.Serializer):
 
     message = serializers.CharField(min_length=1, max_length=10_000)
     session_id = serializers.IntegerField(required=False, allow_null=True)
+    # Set by the app when this message launches a saved skill (see skills.SkillRun). Optional;
+    # an id that isn't the caller's, or is stale, is quietly ignored rather than rejected.
+    skill_run_id = serializers.CharField(required=False, allow_null=True, allow_blank=True, max_length=64)
 
 
 class ShareSessionSerializer(serializers.Serializer):

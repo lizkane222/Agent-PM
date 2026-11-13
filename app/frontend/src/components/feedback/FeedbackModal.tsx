@@ -120,7 +120,7 @@ export default function FeedbackModal({ onClose }: Props) {
           <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="var(--twilio-red,#DB131A)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ margin: "0 auto 12px", display: "block" }}>
             <polyline points="20 6 9 17 4 12" />
           </svg>
-          <p style={{ fontSize: "1rem", fontWeight: 600, color: "var(--twilio-navy)", margin: 0 }}>Thanks for the feedback!</p>
+          <p style={{ fontSize: "1rem", fontWeight: 600, color: "var(--text-ink)", margin: 0 }}>Thanks for the feedback!</p>
           <p style={{ fontSize: "0.8125rem", color: "var(--twilio-gray-60)", marginTop: 4 }}>We'll look into it.</p>
         </div>
       </ModalShell>
@@ -132,7 +132,7 @@ export default function FeedbackModal({ onClose }: Props) {
       <div style={{ padding: "20px 20px 16px" }}>
         {/* Header */}
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
-          <p style={{ fontSize: "1rem", fontWeight: 700, color: "var(--twilio-navy)", margin: 0 }}>
+          <p style={{ fontSize: "1rem", fontWeight: 700, color: "var(--text-ink)", margin: 0 }}>
             Share Feedback
           </p>
           <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--twilio-gray-60)", padding: 2 }}>
@@ -153,7 +153,7 @@ export default function FeedbackModal({ onClose }: Props) {
           style={{
             width: "100%", boxSizing: "border-box", resize: "vertical",
             padding: "8px 10px", borderRadius: 6, border: "1px solid var(--border, rgba(0,0,0,0.12))",
-            fontSize: "0.875rem", fontFamily: "var(--font-base)", color: "var(--twilio-navy)",
+            fontSize: "0.875rem", fontFamily: "var(--font-base)", color: "var(--text-ink)",
             background: "var(--surface, #fff)", outline: "none",
           }}
         />
@@ -171,7 +171,7 @@ export default function FeedbackModal({ onClose }: Props) {
             }}>
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--twilio-red,#DB131A)" strokeWidth="2" strokeLinecap="round"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
               <div style={{ flex: 1, minWidth: 0 }}>
-                <p style={{ margin: 0, fontSize: "0.75rem", fontWeight: 600, color: "var(--twilio-navy)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{attachedElement.label}</p>
+                <p style={{ margin: 0, fontSize: "0.75rem", fontWeight: 600, color: "var(--text-ink)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{attachedElement.label}</p>
                 <p style={{ margin: 0, fontSize: "0.6875rem", color: "var(--twilio-gray-60)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{attachedElement.pageUrl}</p>
               </div>
               <button onClick={clearAttached} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--twilio-gray-60)", flexShrink: 0 }}>

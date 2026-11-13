@@ -1,6 +1,6 @@
 import React from "react";
 import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { http, HttpResponse } from "msw";
 import { server } from "../../test/msw-server";
@@ -23,8 +23,9 @@ vi.mock("../../lib/appLog", () => ({
   LOG_STORAGE_KEY: "app_log",
 }));
 
+const currentUserStub = vi.hoisted(() => ({ me: null as null | { id: number; access_level: string } }));
 vi.mock("../../context/CurrentUserContext", () => ({
-  useCurrentUser: () => null,
+  useCurrentUser: () => currentUserStub.me,
   CurrentUserProvider: ({ children }: { children: React.ReactNode }) => <>{children}</>,
 }));
 
@@ -70,7 +71,8 @@ vi.mock("../../components/shared/RichTextMentionEditor", () => ({
 function daysFromNow(days: number): string {
   const d = new Date();
   d.setDate(d.getDate() + days);
-  return d.toISOString().slice(0, 10);
+  // Local calendar day, like the app: toISOString() is the UTC day, a day ahead every evening west of UTC.
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
 const FUTURE_MEETING_DATE = daysFromNow(10);
@@ -292,6 +294,44 @@ describe("AccountDetailPage — Project Goals", () => {
     await renderPage();
     await screen.findByRole("button", { name: /Segment Data Deletion/i });
     expect(await screen.findByTitle("Ashley Shadday")).toBeInTheDocument();
+  });
+
+  it("clicking an action item under a project opens the action item modal, not the side panel", async () => {
+    server.use(
+      http.get("/api/v1/accounts/projects/", () => HttpResponse.json({
+        results: [{ ...mockProject, id: 7, name: "Segment Data Deletion", action_ids: [itemAlice.airtable_id] }],
+        count: 1,
+      })),
+    );
+    await renderPage();
+    const projectRow = await screen.findByTestId("project-row-7");
+    fireEvent.click(within(projectRow).getByText("Alice task"));
+
+    expect(await screen.findByTestId("action-item-modal-panel")).toBeInTheDocument();
+    // Not expanded inline either.
+    expect(within(projectRow).queryByText("Collapse")).not.toBeInTheDocument();
+  });
+
+  it("action item modal on the account page is the standard shared modal and Save PATCHes /fields/", async () => {
+    server.use(
+      http.get("/api/v1/accounts/projects/", () => HttpResponse.json({
+        results: [{ ...mockProject, id: 7, name: "Segment Data Deletion", action_ids: [itemAlice.airtable_id] }],
+        count: 1,
+      })),
+    );
+    await renderPage();
+    const projectRow = await screen.findByTestId("project-row-7");
+    fireEvent.click(within(projectRow).getByText("Alice task"));
+    const panel = await screen.findByTestId("action-item-modal-panel");
+    expect(within(panel).getByLabelText("Est. Time (min)")).toBeInTheDocument();
+    for (const name of [/Upload/, /Add Link/, /\+ Artifact/]) {
+      expect(within(panel).getByRole("button", { name })).toBeInTheDocument();
+    }
+    fireEvent.change(within(panel).getByLabelText("Task"), { target: { value: "Alice renamed" } });
+    fireEvent.click(within(panel).getByRole("button", { name: /^Save changes$/ }));
+    await waitFor(() => expect(fieldPatches.length).toBeGreaterThan(0));
+    expect(fieldPatches[0].id).toBe(itemAlice.airtable_id);
+    expect(fieldPatches[0].body).toMatchObject({ task: "Alice renamed" });
   });
 
   it("excludes an action item claimed by a project from the drag-source strip, and restores it when removed", async () => {
@@ -821,208 +861,8 @@ describe("AccountDetailPage — action item modal file drop", () => {
 });
 
 // ── GET Meeting Notes ─────────────────────────────────────────────────────────
-
-/**
- * The button scans the user's Gong/Zoom recap emails for meetings that have no AI
- * summary yet. It deliberately scans *every* meeting the user can see, not just this
- * account's, so the request must carry no account filter — and it re-reads this
- * account's meetings afterwards so an imported summary appears without a reload.
- */
-describe("AccountDetailPage — GET Meeting Notes", () => {
-  const SCAN_PATH = "/api/v1/integrations/gmail/meeting-notes/";
-
-  const emptyReport = {
-    days: 30,
-    account_name: "",
-    scanned_emails: 3,
-    scanned_meetings: 2,
-    updated: [],
-    skipped: [],
-    errors: [],
-    summaries_truncated: false,
-    max_summaries: 25,
-  };
-
-  beforeEach(() => {
-    // vi.resetModules() is not optional here. The kanban block above calls it, which
-    // detaches the module instance that test/setup.ts holds a reference to — so its
-    // resetRequestCache() then clears a stale copy and the page's live GET cache
-    // (lib/requestCache.ts, 10s TTL) survives into the next test. A fresh module graph
-    // per test gives each one an empty cache, so the meetings re-read below is really
-    // observed at the network layer.
-    vi.resetModules();
-    localStorage.clear();
-    registerHandlers();
-  });
-
-  async function clickButton() {
-    const button = await screen.findByRole("button", { name: /GET Meeting Notes/i });
-    fireEvent.click(button);
-    return button;
-  }
-
-  /** Find a result row by its combined text — the provider name is its own <span>. */
-  function rowMatching(pattern: RegExp): HTMLElement | undefined {
-    return within(screen.getByRole("status"))
-      .getAllByRole("listitem")
-      .find((li) => pattern.test(li.textContent ?? ""));
-  }
-
-  it("renders the button in the Timeline header", async () => {
-    await renderPage();
-    expect(await screen.findByRole("button", { name: /GET Meeting Notes/i })).toBeInTheDocument();
-  });
-
-  it("scopes the scan to this account", async () => {
-    let body: unknown = "not called";
-    server.use(
-      http.post(SCAN_PATH, async ({ request }) => {
-        body = await request.json();
-        return HttpResponse.json(emptyReport);
-      })
-    );
-
-    await renderPage();
-    await clickButton();
-
-    // Scoped by airtable_id, not just the display name: a Django company_name that has
-    // drifted from its AirtableAccount name would otherwise match nothing.
-    await waitFor(() => expect(body).not.toBe("not called"));
-    expect(body).toEqual({
-      account: mockAirtableAccount.airtable_id,
-      account_name: mockAccountWithMembers.company_name,
-    });
-  });
-
-  it("reports the scan counts when nothing was found", async () => {
-    server.use(http.post(SCAN_PATH, () => HttpResponse.json(emptyReport)));
-
-    await renderPage();
-    await clickButton();
-
-    expect(await screen.findByText(/No new meeting notes found for Acme Corp/i)).toBeInTheDocument();
-    expect(screen.getByText(/3 recap emails against 2 meetings/i)).toBeInTheDocument();
-  });
-
-  it("lists each updated meeting with its provider", async () => {
-    server.use(
-      http.post(SCAN_PATH, () => HttpResponse.json({
-        ...emptyReport,
-        updated: [{
-          meeting_id: 1, airtable_id: "recMTG001", meeting_name: "Q3 Review",
-          date: "2026-08-10T10:00:00Z", account_name: "Acme Corp", sources: ["gong"],
-        }],
-      }))
-    );
-
-    await renderPage();
-    await clickButton();
-
-    expect(await screen.findByText(/Added notes to 1 meeting/i)).toBeInTheDocument();
-    // The provider sits in its own <span> for capitalisation, so match on the row's
-    // full text rather than a single text node.
-    expect(rowMatching(/Q3 Review.*gong/i)).toBeTruthy();
-  });
-
-  it("does not name the account on rows, since every row is this account", async () => {
-    server.use(
-      http.post(SCAN_PATH, () => HttpResponse.json({
-        ...emptyReport,
-        updated: [{
-          meeting_id: 1, airtable_id: "recMTG001", meeting_name: "Q3 Review",
-          date: null, account_name: "Acme Corp", sources: ["zoom"],
-        }],
-      }))
-    );
-
-    await renderPage();
-    await clickButton();
-
-    await screen.findByText(/Added notes to 1 meeting/i);
-    const row = rowMatching(/Q3 Review/);
-    expect(row).toBeTruthy();
-    expect(row!.textContent).not.toMatch(/Acme Corp/);
-  });
-
-  it("says when the per-run summary limit was reached", async () => {
-    server.use(
-      http.post(SCAN_PATH, () => HttpResponse.json({
-        ...emptyReport, summaries_truncated: true, max_summaries: 25,
-      }))
-    );
-
-    await renderPage();
-    await clickButton();
-
-    expect(await screen.findByText(/Stopped at the per-run limit of 25/i)).toBeInTheDocument();
-  });
-
-  it("re-reads this account's meetings so an imported summary shows up", async () => {
-    let meetingFetches = 0;
-    server.use(
-      http.get("/api/v1/airtable/meetings/", () => {
-        meetingFetches += 1;
-        return HttpResponse.json({ results: [mockMeetingFuture] });
-      }),
-      http.post(SCAN_PATH, () => HttpResponse.json(emptyReport)),
-    );
-
-    await renderPage();
-    // Wait for the button (proves the account loaded) before counting: the initial
-    // meetings fetch is chained after it and can outlast waitFor's 1s default.
-    await screen.findByRole("button", { name: /GET Meeting Notes/i });
-    await waitFor(() => expect(meetingFetches).toBeGreaterThan(0), { timeout: 3000 });
-    const before = meetingFetches;
-
-    await clickButton();
-
-    // The scan is a POST, which clears the client's GET cache (lib/requestCache.ts),
-    // so this really does hit the network rather than replaying the pre-scan response.
-    await waitFor(() => expect(meetingFetches).toBeGreaterThan(before), { timeout: 3000 });
-  });
-
-  it("shows the backend's message when Gmail is not connected", async () => {
-    server.use(
-      http.post(SCAN_PATH, () =>
-        HttpResponse.json({ detail: "Gmail not connected. Connect Gmail from Settings." }, { status: 400 })
-      )
-    );
-
-    await renderPage();
-    await clickButton();
-
-    expect(await screen.findByRole("alert")).toHaveTextContent(/Gmail not connected/i);
-  });
-
-  it("falls back to a generic message when the error has no detail", async () => {
-    server.use(http.post(SCAN_PATH, () => new HttpResponse(null, { status: 500 })));
-
-    await renderPage();
-    await clickButton();
-
-    expect(await screen.findByRole("alert")).toHaveTextContent(/Could not read Gmail/i);
-  });
-
-  it("disables the button while the scan is in flight", async () => {
-    let release: (() => void) | undefined;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
-    server.use(
-      http.post(SCAN_PATH, async () => {
-        await gate;
-        return HttpResponse.json(emptyReport);
-      })
-    );
-
-    await renderPage();
-    const button = await clickButton();
-
-    await waitFor(() => expect(button).toBeDisabled());
-    expect(screen.getByText(/Checking email…/i)).toBeInTheDocument();
-
-    release?.();
-    await waitFor(() => expect(button).not.toBeDisabled());
-  });
-});
+// The "GET Meeting Notes" button left the Account Timeline header (notes sync automatically;
+// see AccountDetailTimelineScope.test.tsx). The button itself is still used on the profile page.
 
 // ── Enter-to-add on note composers ────────────────────────────────────────────
 
@@ -1130,7 +970,7 @@ describe("AccountDetailPage — meeting summary mention detection", () => {
     const d = new Date();
     d.setDate(d.getDate() + daysAhead);
     while (d.getDay() === 0 || d.getDay() === 6) d.setDate(d.getDate() + 1);
-    return d.toISOString().slice(0, 10);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
   }
   const weekdayMeeting = { ...mockMeetingFuture, date: nextWeekdayMeetingDate(5) };
 
@@ -1365,5 +1205,67 @@ describe("AccountDetailPage — drag a team member onto an action item", () => {
     await new Promise((r) => setTimeout(r, 50));
     expect(within(card).queryByText("✓ Assigned")).not.toBeInTheDocument();
     expect(within(card).getByText("Alice Smith")).toBeInTheDocument();
+  });
+});
+
+describe("AccountDetailPage — editing an artifact from the viewer", () => {
+  afterEach(() => { currentUserStub.me = null; });
+  beforeEach(() => {
+    vi.resetModules();
+    localStorage.clear();
+    registerHandlers();
+  });
+
+  const asUser = (id: number) => { currentUserStub.me = { id, access_level: "basic" }; server.use(
+    http.get("/api/v1/accounts/accounts/:id/artifacts/", () => HttpResponse.json([{ ...mockArtifact, uploaded_by: 1, uploaded_by_username: "alice" }])),
+  ); };
+
+  it("lets the uploader edit the name and updates the list", async () => {
+    asUser(1);
+    let body: Record<string, unknown> | null = null;
+    server.use(http.patch("/api/v1/accounts/artifacts/:id/", async ({ request }) => {
+      body = (await request.json()) as Record<string, unknown>;
+      return HttpResponse.json({ ...mockArtifact, ...body, uploaded_by: 1, updated_by: 1, updated_by_username: "alice" });
+    }));
+    await renderPage();
+    await waitFor(() => screen.getByText("Product Spec"));
+    fireEvent.click(screen.getByText("Product Spec"));
+    fireEvent.click(await screen.findByTestId("artifact-edit-btn"));
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Spec v2" } });
+    fireEvent.click(screen.getByTestId("artifact-save-btn"));
+    await waitFor(() => expect(body).not.toBeNull());
+    expect(body!.name).toBe("Spec v2");
+    expect(await screen.findByTestId("artifact-updated-by")).toHaveTextContent("alice");
+  });
+
+  it("shows no edit control to someone who did not add it", async () => {
+    asUser(2);
+    await renderPage();
+    await waitFor(() => screen.getByText("Product Spec"));
+    fireEvent.click(screen.getByText("Product Spec"));
+    await screen.findByTestId("artifact-details");
+    expect(screen.queryByTestId("artifact-edit-btn")).toBeNull();
+  });
+});
+
+describe("AccountDetailPage — Select for email prefers the twilio.com address", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    localStorage.clear();
+    registerHandlers();
+  });
+
+  it("uses the twilio address even when it is not the member's primary", async () => {
+    const alice = { ...mockTeamMembers[0], email: "alice@segment.com", additional_emails: ["alice@twilio.com"] };
+    server.use(
+      http.get("/api/v1/team/members/", () =>
+        HttpResponse.json({ results: [alice, ...mockTeamMembers.slice(1)], count: mockTeamMembers.length }),
+      ),
+    );
+    await renderPage();
+    fireEvent.click(await screen.findByText("Select for email"));
+    fireEvent.click(await screen.findByTitle("Alice Smith"));
+    expect(await screen.findByTestId("email-select-list")).toHaveTextContent("alice@twilio.com");
+    expect(screen.getByTestId("email-select-list")).not.toHaveTextContent("segment.com");
   });
 });

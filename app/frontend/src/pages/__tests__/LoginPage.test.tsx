@@ -17,9 +17,9 @@ import { login } from "../../lib/auth";
 const mockLogin = vi.mocked(login);
 
 // Default: Okta not enabled
-function mockOidcStatus(enabled: boolean) {
+function mockOidcStatus(enabled: boolean, google = false) {
   vi.spyOn(global, "fetch").mockResolvedValueOnce({
-    json: async () => ({ okta_enabled: enabled }),
+    json: async () => ({ okta_enabled: enabled, google_enabled: google }),
   } as Response);
 }
 
@@ -133,5 +133,66 @@ describe("LoginPage", () => {
     await waitFor(() => expect(global.fetch).toHaveBeenCalled());
     expect(await screen.findByLabelText(/^password$/i)).toBeInTheDocument();
     expect(screen.getByRole("link", { name: /sign in with okta sso/i })).toBeInTheDocument();
+  });
+
+  describe("Google sign-in", () => {
+    it("offers only Sign in with Google, pointing at the backend, with no password form", async () => {
+      mockOidcStatus(false, true);
+      renderPage();
+      const link = await screen.findByRole("link", { name: /^sign in with google$/i });
+      expect(link).toHaveAttribute("href", "/api/v1/auth/google/start/");
+      expect(screen.queryByLabelText(/^password$/i)).not.toBeInTheDocument();
+      expect(screen.queryByRole("link", { name: /okta/i })).not.toBeInTheDocument();
+    });
+
+    it("prefers Google when Okta is also configured", async () => {
+      mockOidcStatus(true, true);
+      renderPage();
+      expect(await screen.findByRole("link", { name: /^sign in with google$/i })).toBeInTheDocument();
+      expect(screen.queryByRole("link", { name: /okta/i })).not.toBeInTheDocument();
+    });
+
+    it.each([
+      ["wrong_domain", /company google account/i],
+      ["no_account", /ask an admin/i],
+      ["cancelled", /cancelled/i],
+      ["session_expired", /took too long/i],
+      ["verification_failed", /could not be verified/i],
+    ])("explains the %s outcome returned by the backend", async (code, message) => {
+      mockOidcStatus(false, true);
+      renderPage(`/login?error=${code}`);
+      expect(await screen.findByRole("alert")).toHaveTextContent(message);
+    });
+
+    it("ignores an unknown error code rather than echoing it", async () => {
+      mockOidcStatus(false, true);
+      renderPage("/login?error=<script>alert(1)</script>");
+      await screen.findByRole("link", { name: /^sign in with google$/i });
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    });
+
+    it("keeps ?local=1 as a break-glass password form", async () => {
+      mockOidcStatus(false, true);
+      renderPage("/login?local=1");
+      expect(await screen.findByLabelText(/^password$/i)).toBeInTheDocument();
+    });
+  });
+
+  describe("hero", () => {
+    it("shows the Agent PM logo over a background image", async () => {
+      mockOidcStatus(false, true);
+      renderPage();
+      await screen.findByRole("link", { name: /^sign in with google$/i });
+      const hero = screen.getByTestId("login-hero");
+      expect(hero.style.backgroundImage).toMatch(/url\(.+\)/);
+      expect(hero.querySelector('img[alt="Agent PM"]')).toHaveAttribute("src", "/logo.svg");
+    });
+
+    it("keeps the sign-in controls beside the hero", async () => {
+      mockOidcStatus(false, true);
+      renderPage();
+      expect(await screen.findByRole("link", { name: /^sign in with google$/i })).toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: /sign in to agent pm/i })).toBeInTheDocument();
+    });
   });
 });

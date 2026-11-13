@@ -31,6 +31,7 @@ import { EXPORT_ITEM_DRAG_KEY } from "../ExportBar";
 import type { CanvasNode } from "./types";
 import { COMPONENT_REGISTRY } from "./registry";
 import { layoutsApi } from "../../lib/api";
+import PinnedSkillsSection from "../skills/PinnedSkillsSection";
 
 const DEFAULT_SIZE: Record<string, { w: number; h: number }> = {
   Page:       { w: 816, h: 1056 }, // US Letter @96dpi; absent = silent 200×60 fallback
@@ -395,7 +396,7 @@ function CanvasArea({
         // The grid is painted on the viewport, offset by the pan and scaled by
         // the zoom, so it fills the visible area at every zoom and in every
         // direction — there is no canvas edge to reach.
-        backgroundImage: "radial-gradient(circle, #AEBBC1 1px, transparent 1px)",
+        backgroundImage: "radial-gradient(circle, var(--canvas-dot, #AEBBC1) 1px, transparent 1px)",
         backgroundSize: `${gridSpacing}px ${gridSpacing}px`,
         backgroundPosition: `${panX}px ${panY}px`,
         userSelect: marquee || isPanning ? "none" : undefined,
@@ -483,7 +484,7 @@ function CanvasArea({
 // (rendered by Layout.tsx above the page) is now the single export tray.
 // Its DraggablePill fires kind="export-item" which handleDragEnd handles below.
 
-export default function PageBuilder() {
+export default function PageBuilder({ fillParent = false }: { fillParent?: boolean } = {}) {
   const {
     nodes, commit,
     undo, redo, canUndo, canRedo,
@@ -1079,7 +1080,7 @@ export default function PageBuilder() {
     )}
     <DndContext sensors={sensors} collisionDetection={pointerWithin} onDragEnd={handleDragEnd}>
 
-      <div className="flex flex-col overflow-hidden" style={{ height: "calc(100vh - 56px)" }}>
+      <div className="flex flex-col overflow-hidden" style={{ height: fillParent ? "100%" : "calc(100vh - 56px)" }}>
 
         {/* ── Top toolbar ───────────────────────────────────────────────── */}
         <div className="h-10 shrink-0 border-b border-gray-200 bg-white flex items-center px-4 gap-2">
@@ -1217,7 +1218,8 @@ export default function PageBuilder() {
         </CanvasViewContext.Provider>
 
         {/* ── Right: Inspector panel ────────────────────────────────────── */}
-        <div className="w-64 shrink-0 border-l border-gray-200 bg-white overflow-y-auto flex flex-col">
+        <div className="w-64 shrink-0 border-l border-gray-200 bg-white overflow-hidden flex flex-col">
+<div className="flex-1 min-h-0 overflow-y-auto flex flex-col">
 
           {/* Header with undo/redo + copy/duplicate */}
           <div className="px-3 py-2 border-b border-gray-100 flex items-center justify-between shrink-0">
@@ -1317,6 +1319,11 @@ export default function PageBuilder() {
               <LayerTree nodes={nodes} selectedId={selectedId} onSelect={setSelectedId} onDelete={deleteNode} depth={0} />
             </div>
           )}
+          </div>
+          {/* Claude Skills: always present (even with an empty canvas), closed until opened */}
+          <div className="border-t border-gray-100 px-3 py-2 shrink-0 max-h-56 overflow-y-auto" data-testid="layouts-skills-section">
+            <PinnedSkillsSection page="layouts" variant="collapsible" />
+          </div>
         </div>
         </div>
       </div>

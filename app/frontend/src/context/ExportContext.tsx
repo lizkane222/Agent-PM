@@ -49,6 +49,22 @@ interface ExportContextValue {
 }
 
 const STORAGE_KEY = "agentpm_export_tray";
+/** Whether the tray is open. Separate from the items so closing never empties it. */
+export const TRAY_OPEN_KEY = "agentpm_export_tray_open";
+
+function loadPersistedOpen(): boolean {
+  try {
+    const raw = localStorage.getItem(TRAY_OPEN_KEY);
+    if (raw === "1") return true;
+    if (raw === "0") return false;
+  } catch { /* fall through */ }
+  // Never decided: open if there is something collected (the old behaviour).
+  return loadPersistedItems().length > 0;
+}
+
+function persistOpen(open: boolean) {
+  try { localStorage.setItem(TRAY_OPEN_KEY, open ? "1" : "0"); } catch { /* ignore */ }
+}
 
 function loadPersistedItems(): ExportItem[] {
   try {
@@ -60,7 +76,7 @@ function loadPersistedItems(): ExportItem[] {
 const ExportContext = createContext<ExportContextValue | null>(null);
 
 export function ExportProvider({ children }: { children: React.ReactNode }) {
-  const [exportMode, setExportMode] = useState(() => loadPersistedItems().length > 0);
+  const [exportMode, setExportMode] = useState(loadPersistedOpen);
   const [items, setItems] = useState<ExportItem[]>(loadPersistedItems);
 
   // Mirror of `items` so `toggleItem` can decide add-vs-remove without depending
@@ -86,7 +102,12 @@ export function ExportProvider({ children }: { children: React.ReactNode }) {
    * action, and the tray is the user's collected work. `clearItems` (the tray's
    * own "Clear" button) is the only thing that discards.
    */
-  const toggleMode = useCallback(() => setExportMode((v) => !v), []);
+  const toggleMode = useCallback(() => {
+    setExportMode((v) => {
+      persistOpen(!v);
+      return !v;
+    });
+  }, []);
 
   const toggleItem = useCallback((item: ExportItem) => {
     const exists = itemsRef.current.some((i) => i.id === item.id);
@@ -95,7 +116,7 @@ export function ExportProvider({ children }: { children: React.ReactNode }) {
     );
     // Picking something must reveal where it went — otherwise the item lands in
     // a tray the user can't see.
-    if (!exists) setExportMode(true);
+    if (!exists) { setExportMode(true); persistOpen(true); }
   }, []);
 
   const isSelected = useCallback(

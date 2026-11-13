@@ -12,10 +12,10 @@ export interface AuthUser {
 }
 
 // ── Agent (moved to types/agents.ts — re-exported here for backwards compat) ────
-export type { SessionParticipant, AgentSession, AgentMessage, ToolCall, AgentSkill, AgentSkillStatus, AgentSkillVisibility, AgentSkillScript, AgentTool, SkillContextRecord, SlackSource, SkillContextDefaults, SkillTemplate, AgentSkillAttachment, SkillRunInput, SkillRunResult, KeywordTemplate, KeywordExpansion, SlackConversations } from "./agents";
+export type { SessionParticipant, AgentSession, AgentMessage, ToolCall, AgentSkill, AgentSkillStatus, AgentSkillVisibility, AgentSkillScript, AgentTool, SkillContextRecord, SlackSource, SkillContextDefaults, SkillTemplate, AgentSkillAttachment, SkillRunInput, SkillRunResult, KeywordTemplate, KeywordExpansion, SlackConversations, SkillPageKey, PagePin, SkillRunStatus, SkillRunRow, SkillRunEventRow, SkillRunDetail } from "./agents";
 
 // ── Scheduler (moved to types/scheduler.ts — re-exported here for backwards compat) ────
-export type { Reminder, ReminderStatus, ReminderResourceType, CalendarEvent, MeetingNote, Attendee } from "./scheduler";
+export type { Reminder, ReminderLink, ReminderLinkOption, ReminderLinkType, ReminderOccurrence, ReminderRecipientChoices, ReminderRecipientOption, ReminderStatus, ReminderResourceType, CalendarEvent, MeetingNote, Attendee } from "./scheduler";
 
 export interface ActionItem {
   id: number;
@@ -106,9 +106,13 @@ export type {
   AccountArtifact,
   AccountProject,
   ProjectMember,
+  AccountTicket,
+  TicketKind,
+  TicketStatus,
   GoalResource,
   SalesforceProjectData,
   GoalSection,
+  NoteRef,
   AccountRoleType,
   AccountRole,
   PanelItem,
@@ -293,6 +297,7 @@ export interface AirtableActionItem {
   created_at: string;
   updated_at: string;
   marked_done_at: string | null;
+  status_changed_at?: string | null;
   last_synced: string;
   attachments?: ActionItemAttachment[];
   waiting_on?: ActionItemDependency[];
@@ -307,6 +312,8 @@ export interface EventMatchResult {
   meetings?: AirtableMeeting[];
   this_meeting?: AirtableMeeting | null; // the stub linked to THIS specific event
   accounts?: AirtableAccount[]; // only when needs_categorization=true
+  /** Present only when a recurring-series option was sent: how many other instances were linked. */
+  series_updated?: { subsequent: number; historical: number; uids: string[] };
 }
 
 // ── Integrations ──────────────────────────────────────────────────────────────
@@ -431,6 +438,9 @@ export interface UserPageNote {
   owner_username: string;
   content: string;
   account_ref_label: string;
+  /** Account this note is filed under (null = a general note). Only its owner can see the note. */
+  account: number | null;
+  account_name: string;
   created_at: string;
   updated_at: string;
 }

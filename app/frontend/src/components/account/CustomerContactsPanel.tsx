@@ -101,7 +101,7 @@ export function CustomerContactsPanel({ accountId, accountName }: { accountId: n
       </div>
 
       {showForm && (
-        <div className="px-4 py-3 border-b border-gray-100 space-y-2.5" style={{ background: "#f9fafb" }}>
+        <div className="px-4 py-3 border-b border-gray-100 space-y-2.5" style={{ background: "var(--surface-subtle)" }}>
           <p className="text-[11px] font-semibold text-[var(--twilio-navy)] uppercase tracking-wide">
             {editId ? "Edit contact" : "New contact"}
           </p>
@@ -203,7 +203,7 @@ export function CustomerContactsPanel({ accountId, accountName }: { accountId: n
             </div>
 
             {isOpen && (
-              <div className="px-4 pb-3 space-y-2" style={{ background: "#f9fafb" }}>
+              <div className="px-4 pb-3 space-y-2" style={{ background: "var(--surface-subtle)" }}>
                 {c.description && (
                   <p className="text-[11px] text-[var(--twilio-navy)] opacity-70 leading-relaxed">{c.description}</p>
                 )}

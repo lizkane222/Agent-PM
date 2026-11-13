@@ -40,6 +40,8 @@ export const mockUserPageNote = (overrides: Partial<UserPageNote> = {}): UserPag
   owner_username: "lizkane",
   content: "",
   account_ref_label: "",
+  account: null,
+  account_name: "",
   created_at: "2026-08-18T00:00:00Z",
   updated_at: "2026-08-18T00:00:00Z",
   ...overrides,

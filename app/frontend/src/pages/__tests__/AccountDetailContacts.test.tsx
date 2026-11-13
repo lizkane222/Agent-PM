@@ -98,7 +98,9 @@ describe("AccountDetailPage — customer contacts", () => {
     expect(groups.map((g) => g.querySelector("p")!.textContent)).toEqual(["Apps", "Platform", "No team"]);
     const platform = within(groups[1]).getAllByTitle(/·/).map((b) => b.getAttribute("title")!.split(" ·")[0]);
     expect(platform).toEqual(["Bo Chen", "Ann Lee"]);
-    expect(within(groups[1]).getByLabelText("Unstar Bo Chen")).toHaveTextContent("★");
+    expect(within(groups[1]).getByLabelText("Main point of contact: Bo Chen")).toHaveTextContent("★");
+    expect(screen.queryByLabelText("Main point of contact: Ann Lee")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/^(Star|Unstar) /)).not.toBeInTheDocument();
   });
 
   it("clicking another profile switches the panel directly and highlights it", async () => {
@@ -122,20 +124,13 @@ describe("AccountDetailPage — customer contacts", () => {
     await waitFor(() => expect(patches.find((p) => p.id === "1")?.body.team).toBe("Security"));
   });
 
-  it("stars from the list row", async () => {
-    await renderPage();
-    fireEvent.click(screen.getByLabelText("Star Ann Lee"));
-    await waitFor(() => expect(patches).toEqual([{ id: "1", body: { is_main_poc: true } }]));
-    await waitFor(() => expect(screen.getByLabelText("Unstar Ann Lee")).toBeInTheDocument());
-  });
-
   it("stars from the profile panel", async () => {
     await renderPage();
     fireEvent.click(screen.getByTitle("Di Ames · Engineer"));
     fireEvent.click(await screen.findByLabelText("Set as main point of contact"));
     await waitFor(() => expect(patches).toEqual([{ id: "4", body: { is_main_poc: true } }]));
     expect(await screen.findByLabelText("Unset main point of contact")).toBeInTheDocument();
-    await waitFor(() => expect(screen.getByLabelText("Unstar Di Ames")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByLabelText("Main point of contact: Di Ames")).toBeInTheDocument());
   });
 
   it("add form offers existing team names and sends the team", async () => {
@@ -155,5 +150,37 @@ describe("AccountDetailPage — customer contacts", () => {
     fireEvent.click(screen.getByRole("button", { name: "Add Contact" }));
     await waitFor(() => expect(body).not.toBeNull());
     expect(body!.team).toBe("Apps");
+  });
+});
+
+describe("AccountDetailPage — selected contact chip frame", () => {
+  beforeEach(() => { register(); });
+  it("keeps the star inside the selected chip's bordered element and shows the full name", async () => {
+    await renderPage();
+    fireEvent.click(screen.getByTitle("Ann Lee · Engineer"));
+    await screen.findByDisplayValue("Ann Lee");
+    const frame = screen.getByTitle("Ann Lee · Engineer").closest("[data-contact-chip-frame]") as HTMLElement;
+    expect(frame).toHaveAttribute("data-contact-chip-frame", "selected");
+    expect(frame.className).toContain("ring-2");
+        expect(frame.textContent).toContain("Ann");
+    expect(frame.textContent).toContain("Lee");
+    expect(frame.querySelectorAll(".truncate").length).toBe(0);
+  });
+});
+
+describe("AccountDetailPage — selected contact chip frame", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    localStorage.clear();
+    register();
+  });
+  it("keeps the star inside the selected chip's bordered element and shows the full name", async () => {
+    await renderPage();
+    fireEvent.click(screen.getByTitle("Ann Lee · Engineer"));
+    await screen.findByDisplayValue("Ann Lee");
+    const frame = screen.getByTitle("Ann Lee · Engineer").closest("[data-contact-chip-frame]") as HTMLElement;
+    expect(frame).toHaveAttribute("data-contact-chip-frame", "selected");
+    expect(frame.className).toContain("ring-2");
+        expect(frame.querySelectorAll(".truncate").length).toBe(0);
   });
 });

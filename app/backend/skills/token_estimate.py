@@ -98,7 +98,7 @@ def totals(rounds: int, base: int, prompt: int, tool_result: int, out_per_round:
     return {"rounds": rounds, "input": inp, "output": out, "total": inp + out}
 
 
-def estimate_skill(skill, *, client, model: str) -> dict:
+def estimate_skill(skill, *, client, model: str, user=None) -> dict:
     facts = skill_facts(skill)
     ask = (
         f"Skill name: {skill.name}\nDescription: {skill.description}\n"
@@ -109,6 +109,8 @@ def estimate_skill(skill, *, client, model: str) -> dict:
     resp = client.messages.create(
         model=model, max_tokens=500, system=_SYSTEM, messages=[{"role": "user", "content": ask}],
     )
+    from agents.usage import record_llm_usage
+    record_llm_usage(user, "Skill token estimate", resp)
     j = loads_object(resp.content[0].text)
 
     expected = _clamp(j.get("rounds_expected"), 1, MAX_ROUNDS, 3)

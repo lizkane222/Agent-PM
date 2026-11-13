@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import { useStatusLabels } from "../../hooks/useStatusLabels";
 import { useCurrentUser } from "../../context/CurrentUserContext";
 import { useActionItemFieldOptions } from "../../hooks/useActionItemFieldOptions";
 import { useScheduledOccurrences } from "../../hooks/useScheduledOccurrences";
@@ -11,7 +12,9 @@ import { ContextMenu, FocusPinBadge, focusPinMenuItem, type ContextMenuItem } fr
 import { ActionItemModal } from "../account/ActionItemModal";
 import { useFocusPins } from "../../hooks/useFocusPins";
 import { useActionItemZoneSets } from "../../hooks/useActionItemZoneSets";
-import { groupActionItems, DONE_WINDOW_DAYS, isRecentlyDone, type SidebarGroupKey } from "../../lib/actionItemSidebarOrder";
+import { SIDEBAR_SECTION_STATUS, groupActionItems, sidebarGroupLabel, DONE_WINDOW_DAYS, isRecentlyDone, type SidebarGroupKey } from "../../lib/actionItemSidebarOrder";
+import { useColumnSort } from "../../hooks/useStatusArrivalOrder";
+import ColumnSortButton from "../account/ColumnSortButton";
 import SidebarFilterFlags from "./SidebarFilterFlags";
 import CommentPreviewList from "../comments/CommentPreviewList";
 import { useCommentMenuItem } from "../comments/commentMenuItem";
@@ -30,6 +33,8 @@ import {
   CalPillDate,
   CalPillUrl,
 } from "./calendarHelpers";
+import { instantDayKey, localDateKey } from "../../lib/timelineDay";
+import { fromLocalDatetimeValue } from "../../lib/datetimeLocal";
 
 function OccurrencesList({ airtableId }: { airtableId: string }) {
   const occurrences = useScheduledOccurrences(airtableId);
@@ -68,6 +73,7 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
   onOpenModal: (item: AirtableActionItem) => void;
   onAccountDrop: (accountId: number, accountName: string) => void;
 }) {
+  const { label: statusLabel } = useStatusLabels();
   const [ctxPos, setCtxPos] = useState<{ x: number; y: number } | null>(null);
   const { addToTray } = useExportTray();
   const { isPinned, toggle: toggleFocusPin } = useFocusPins();
@@ -143,7 +149,7 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
       className="rounded-lg select-none cursor-pointer group"
       style={{
         position: "relative",
-        background: "#F5F3FF",
+        background: "var(--tint-violet-50)",
         borderLeft: "3px solid #a78bfa",
         padding: "8px 10px",
         display: "flex",
@@ -157,7 +163,7 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
       {/* Row 1: badges + actions */}
       <div className="flex items-center gap-1.5 flex-wrap">
         <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded whitespace-nowrap ${PRIORITY_COLORS_CAL[item.priority] ?? "bg-gray-100 text-gray-600"}`}>{item.priority}</span>
-        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded whitespace-nowrap ${STATUS_COLORS_CAL[item.status] ?? "bg-gray-100 text-gray-700"}`}>{item.status}</span>
+        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded whitespace-nowrap ${STATUS_COLORS_CAL[item.status] ?? "bg-gray-100 text-gray-700"}`}>{statusLabel(item.status)}</span>
         {item.due_date && (
           <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded whitespace-nowrap bg-amber-50 text-amber-700">
             {new Date(item.due_date).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
@@ -168,7 +174,7 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
             onClick={(e) => { e.stopPropagation(); onReminderToggle(); }}
             title={hasReminder ? `Reminder: ${new Date(item.reminder_due_at!).toLocaleString()}` : "Set reminder"}
             className="rounded p-0.5 hover:bg-gray-200 transition-colors"
-            style={{ color: hasReminder ? "#f59e0b" : "#9ca3af" }}
+            style={{ color: hasReminder ? "#f59e0b" : "var(--text-gray-400)" }}
           >
             <svg viewBox="0 0 16 16" width="12" height="12" fill={hasReminder ? "currentColor" : "none"} stroke="currentColor" strokeWidth="1.5">
               <path strokeLinecap="round" d="M8 1a5 5 0 00-5 5v2.5L1.5 10h13L13 8.5V6a5 5 0 00-5-5z"/>
@@ -231,6 +237,7 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
 export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (msg: string, type: "success" | "warn") => void; expandItemId?: string | null }) {
   const currentUser = useCurrentUser();
   const { status: statusOptions } = useActionItemFieldOptions();
+  const { label: statusLabel } = useStatusLabels();
   const [items, setItems] = useState<AirtableActionItem[]>([]);
   const [loading, setLoading] = useState(true);
   // `expandItemId` used to force a card into its inline expanded editor. Editing now happens
@@ -360,8 +367,8 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
     if (!reminderDate) return;
     setReminderSaving(true);
     try {
-      const due_at = `${reminderDate}T${reminderTime}:00`;
-      const { data } = await airtableApi.setActionItemReminder(item.id, { due_at, notify_in_app: true });
+      const due_at = fromLocalDatetimeValue(`${reminderDate}T${reminderTime}`);
+      const { data } = await airtableApi.setActionItemReminder(item.id, { due_at });
       setItems((prev) => prev.map((i) => i.airtable_id === item.airtable_id ? data : i));
       setReminderItemId(null);
       const reminderLabel = new Date(due_at).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
@@ -450,6 +457,8 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
     : items;
 
   // Text box and flag chips compose: a card must satisfy both.
+  const { prefs: statusPrefs } = useStatusLabels();
+  const { sortDirection: colSortDirection, toggleSort: toggleColSort, applySort: applyColSort } = useColumnSort();
   const groups = groupActionItems(textMatched, { trackingIds, stagedIds, pinnedIds, selectedFlags });
   const visibleCount = groups.reduce((n, g) => n + g.items.length, 0);
   const isNarrowed = !!filterTerm.trim() || selectedFlags.size > 0;
@@ -510,10 +519,13 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
             {/* Section header — the same micro-header vocabulary the card's "On calendar"
                 label uses, so it reads as part of the sidebar rather than a new surface. */}
             <p data-section={group.key} className="text-[9px] font-semibold uppercase tracking-wide text-[var(--twilio-gray-60)] flex items-center gap-1">
-              <span>{group.key === "done" ? `${group.label} · last ${DONE_WINDOW_DAYS} days` : group.label}</span>
+              <span>{group.key === "done" ? `${sidebarGroupLabel(group.key, group.label, statusPrefs)} · last ${DONE_WINDOW_DAYS} days` : sidebarGroupLabel(group.key, group.label, statusPrefs)}</span>
               <span className="opacity-60">{group.items.length}</span>
+              {SIDEBAR_SECTION_STATUS[group.key] && (
+                <ColumnSortButton status={SIDEBAR_SECTION_STATUS[group.key]!} direction={colSortDirection(SIDEBAR_SECTION_STATUS[group.key]!)} onToggle={toggleColSort} className="ml-auto" />
+              )}
             </p>
-            {group.items.map((item) => {
+            {(SIDEBAR_SECTION_STATUS[group.key] ? applyColSort(group.items, SIDEBAR_SECTION_STATUS[group.key]!) : group.items).map((item) => {
             const isStaged = stagedIds.has(item.airtable_id);
             return (
               <div key={item.airtable_id} className="relative">
@@ -538,7 +550,7 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
                       setReminderItemId(null);
                     } else {
                       setReminderItemId(item.airtable_id);
-                      setReminderDate(item.reminder_due_at ? item.reminder_due_at.slice(0, 10) : new Date().toISOString().slice(0, 10));
+                      setReminderDate(item.reminder_due_at ? instantDayKey(item.reminder_due_at) : localDateKey(new Date()));
                       setReminderTime(item.reminder_due_at ? item.reminder_due_at.slice(11, 16) : "09:00");
                     }
                   }}
@@ -550,11 +562,11 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
                     <div className="flex gap-1.5">
                       <input type="date" value={reminderDate} onChange={(e) => setReminderDate(e.target.value)}
                         className="flex-1 text-[11px] rounded border border-amber-200 px-1.5 py-1 focus:outline-none focus:border-amber-400"
-                        style={{ background: "#fff" }}
+                        style={{ background: "var(--surface-card)" }}
                       />
                       <input type="time" value={reminderTime} onChange={(e) => setReminderTime(e.target.value)}
                         className="w-20 text-[11px] rounded border border-amber-200 px-1.5 py-1 focus:outline-none focus:border-amber-400"
-                        style={{ background: "#fff" }}
+                        style={{ background: "var(--surface-card)" }}
                       />
                     </div>
                     <div className="flex gap-1.5">
@@ -584,7 +596,7 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
       {/* Create card — pinned at bottom */}
       {creating && (
         <div className="shrink-0 border-t border-gray-100">
-          <div className="rounded-xl flex flex-col overflow-hidden m-3" style={{ background: "#F5F3FF", border: "1px solid #ddd6fe" }}>
+          <div className="rounded-xl flex flex-col overflow-hidden m-3" style={{ background: "var(--tint-violet-50)", border: "1px solid #ddd6fe" }}>
             {/* Task title */}
             <div className="px-4 pt-3 pb-2">
               <input
@@ -608,6 +620,7 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
               <CalPillSelect
                 value={form.status}
                 options={statusOptions as AirtableActionItem["status"][]}
+                format={statusLabel}
                 colorMap={STATUS_COLORS_CAL}
                 placeholder="Status"
                 onChange={(v) => setForm((f) => ({ ...f, status: v }))}
@@ -632,6 +645,7 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
                 <CalPillSelect
                   value={form.status}
                   options={statusOptions as AirtableActionItem["status"][]}
+                  format={statusLabel}
                   colorMap={STATUS_COLORS_CAL}
                   placeholder="Status"
                   onChange={(v) => setForm((f) => ({ ...f, status: v }))}

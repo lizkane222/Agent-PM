@@ -1,11 +1,13 @@
 """Tests for scheduler.ReminderViewSet — permission scoping and CRUD."""
 
+from datetime import timedelta
 from unittest import mock
 
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from django.test import override_settings
 from django.urls import reverse
+from django.utils import timezone
 from rest_framework.test import APITestCase
 
 from scheduler.models import CalendarEvent, MeetingNote, Reminder
@@ -83,6 +85,38 @@ class ReminderViewSetTest(APITestCase):
         ids = [r["id"] for r in resp.data["results"]]
         self.assertNotIn(self.r1.id, ids)
         self.assertNotIn(self.r3.id, ids)
+
+    def test_due_window_filters_by_when_a_reminder_is_due(self):
+        # Reminders that already fired are "sent", so the profile page filters by date, not status.
+        now = timezone.now()
+        fired_today = Reminder.objects.create(created_by=self.user1, title="Fired today", resource_type="general",
+                                              due_at=now - timedelta(hours=1), status="sent")
+        tomorrow = Reminder.objects.create(created_by=self.user1, title="Tomorrow", resource_type="general",
+                                           due_at=now + timedelta(days=1), status="pending")
+        later = Reminder.objects.create(created_by=self.user1, title="Next month", resource_type="general",
+                                        due_at=now + timedelta(days=30), status="pending")
+        self.client.force_authenticate(user=self.user1)
+        resp = self.client.get(REMINDERS_LIST_URL, {
+            "due_after": (now - timedelta(hours=3)).isoformat(),
+            "due_before": (now + timedelta(days=2)).isoformat(),
+        })
+        ids = {r["id"] for r in resp.data["results"]}
+        self.assertEqual(ids, {fired_today.id, tomorrow.id})
+        self.assertNotIn(later.id, ids)
+
+    def test_due_window_never_reaches_another_users_reminders(self):
+        now = timezone.now()
+        Reminder.objects.create(created_by=self.user2, title="Theirs", resource_type="general",
+                                due_at=now, status="pending")
+        self.client.force_authenticate(user=self.user1)
+        resp = self.client.get(REMINDERS_LIST_URL, {"due_after": (now - timedelta(days=1)).isoformat()})
+        self.assertNotIn("Theirs", [r["title"] for r in resp.data["results"]])
+
+    def test_an_unparseable_due_window_returns_nothing_not_everything(self):
+        self.client.force_authenticate(user=self.user1)
+        for param in ("due_after", "due_before"):
+            resp = self.client.get(REMINDERS_LIST_URL, {param: "not-a-date"})
+            self.assertEqual(resp.data["results"], [], param)
 
     def test_status_filter_returns_matching_reminders(self):
         dismissed = _make_reminder(self.user1, "Dismissed", status="dismissed")
@@ -1359,6 +1393,35 @@ class AvailabilityTest(APITestCase):
     def test_viewer_is_skipped(self):
         self.assertEqual(self._get(emails=self.me.email).data["people"], [])
 
+    def test_include_self_returns_own_calendar_with_full_titles(self):
+        CalendarEvent.objects.create(
+            owner=self.me, title="My dentist", start_datetime="2026-10-21T15:00:00Z",
+            end_datetime="2026-10-21T16:00:00Z")
+        CalendarEvent.objects.create(
+            owner=self.me, title="Cancelled", status="cancelled", start_datetime="2026-10-21T17:00:00Z",
+            end_datetime="2026-10-21T18:00:00Z")
+        person = self._get(emails=self.me.email, include_self="1").data["people"][0]
+        self.assertEqual((person["source"], person["name"], person["error"]), ("app", "Viewer", None))
+        self.assertEqual([(b["title"], b["title_visible"]) for b in person["busy"]], [("My dentist", True)])
+
+    def test_include_self_matches_google_account_and_team_member_addresses(self):
+        from team.models import UserProfile
+        profile, _ = UserProfile.objects.get_or_create(user=self.me)
+        profile.google_account_email = "liz.alt@gmail.com"
+        profile.save()
+        self.me.team_member.email = "liz.tm@twilio.com"
+        self.me.team_member.save()
+        CalendarEvent.objects.create(
+            owner=self.me, title="Mine", start_datetime="2026-10-21T15:00:00Z", end_datetime="2026-10-21T16:00:00Z")
+        for addr in ("liz.alt@gmail.com", "liz.tm@twilio.com"):
+            person = self._get(emails=addr, include_self="1").data["people"][0]
+            self.assertEqual(person["busy"][0]["title"], addr and "Mine")
+
+    def test_include_self_does_not_unmask_other_users(self):
+        busy = self._get(emails=f"{self.me.email},{self.ana.email}", include_self="1").data["people"]
+        ana = next(p for p in busy if p["email"] == self.ana.email)
+        self.assertEqual([b["title"] for b in ana["busy"]], ["Shared QBR", "Busy", "Busy"])
+
     def test_non_app_users_go_through_google_freebusy(self):
         service = mock.MagicMock()
         service.freebusy.return_value.query.return_value.execute.return_value = {"calendars": {
@@ -1415,6 +1478,32 @@ class TestNotificationsEndpointTest(APITestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(self._by_channel(resp)["sms"]["status"], "sent")
         send_sms.assert_called_once()
+
+    @mock.patch("scheduler.sms_delivery.fetch_outcome", return_value=("undelivered", 30034))
+    @mock.patch("scheduler.tasks._send_sms", return_value="SMabc")
+    def test_sms_the_carrier_refuses_is_reported_failed_not_sent(self, send_sms, _fetch):
+        with self.settings(TWILIO_ACCOUNT_SID="AC1", TWILIO_AUTH_TOKEN="t", TWILIO_PHONE_NUMBER="+15550000000"):
+            result = self._by_channel(self._post(["sms"]))["sms"]
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("A2P 10DLC", result["detail"])
+        self.assertNotIn("AC1", result["detail"])
+
+    @mock.patch("scheduler.sms_delivery.fetch_outcome", return_value=("delivered", None))
+    @mock.patch("scheduler.tasks._send_sms", return_value="SMabc")
+    def test_sms_delivered_is_reported_sent(self, send_sms, _fetch):
+        with self.settings(TWILIO_ACCOUNT_SID="AC1", TWILIO_AUTH_TOKEN="t", TWILIO_PHONE_NUMBER="+15550000000"):
+            result = self._by_channel(self._post(["sms"]))["sms"]
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(result["detail"], "")
+
+    @mock.patch("scheduler.sms_delivery.time.sleep")
+    @mock.patch("scheduler.sms_delivery.fetch_outcome", return_value=("queued", None))
+    @mock.patch("scheduler.tasks._send_sms", return_value="SMabc")
+    def test_sms_without_a_verdict_yet_is_sent_with_a_pending_note(self, send_sms, _fetch, _sleep):
+        with self.settings(TWILIO_ACCOUNT_SID="AC1", TWILIO_AUTH_TOKEN="t", TWILIO_PHONE_NUMBER="+15550000000"):
+            result = self._by_channel(self._post(["sms"]))["sms"]
+        self.assertEqual(result["status"], "sent")
+        self.assertIn("hasn't confirmed", result["detail"])
 
     @mock.patch("scheduler.tasks._send_sms")
     def test_missing_phone_is_skipped_with_a_reason(self, send_sms):

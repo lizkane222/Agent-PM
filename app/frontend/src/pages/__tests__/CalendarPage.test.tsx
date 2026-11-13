@@ -1,12 +1,15 @@
 import { MemoryRouter } from "react-router-dom";
 import { render, screen, waitFor, fireEvent, within, cleanup } from "@testing-library/react";
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { http, HttpResponse } from "msw";
 import { server } from "../../test/msw-server";
 import { AppErrorProvider } from "../../context/AppErrorContext";
-import { mockCalendarEvents } from "../../test/handlers/scheduler";
+import { mockCalendarEvents, mockReminders } from "../../test/handlers/scheduler";
+import { toLocalDatetimeValue } from "../../lib/datetimeLocal";
 import { mockActionItem } from "../../test/handlers/action_items";
+import { mockGmailCredential } from "../../test/handlers/integrations";
 import { mockUserProfile } from "../../test/handlers/team";
+import { mockAgentSkill, mockPagePin, pagePinsFor } from "../../test/handlers/skills";
 import { mockArtifact, mockCodeArtifact } from "../../test/handlers/accounts";
 import {
   mockPlannedEntry,
@@ -25,6 +28,14 @@ import {
   withAlpha,
 } from "../../lib/eventColors";
 import CalendarPage from "../CalendarPage";
+import { OCCURRENCE_MS } from "../../lib/reminderSections";
+
+// A 30-second clock tick would make "moves to Historical by itself" a 30-second test.
+vi.mock("../../lib/reminderSections", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../lib/reminderSections")>()),
+  REMINDER_CLOCK_TICK_MS: 60,
+}));
+import { NotificationDefaultsProvider } from "../../context/NotificationDefaultsContext";
 
 // ── Mock FullCalendar ─────────────────────────────────────────────────────────
 // FullCalendar requires browser rendering APIs not available in jsdom. Swap it
@@ -38,17 +49,22 @@ vi.mock("@fullcalendar/react", async () => {
     props: Record<string, unknown>,
     _ref: unknown,
   ) {
-    const { datesSet, events, eventDidMount, select, eventClick, customButtons, headerToolbar, drop } = props as {
+    const { datesSet, events, eventDidMount, select, eventClick, customButtons, headerToolbar, drop, eventDrop } = props as {
       datesSet?: (info: {
         startStr: string;
         endStr: string;
         view: { type: string };
       }) => void;
+      eventDrop?: (info: unknown) => void;
       customButtons?: Record<string, { text: string; click: () => void }>;
       headerToolbar?: { left?: string; center?: string; right?: string };
       events?: Array<{
         id: string;
         title: string;
+        start?: string;
+        end?: string;
+        editable?: boolean;
+        durationEditable?: boolean;
         backgroundColor?: string;
         borderColor?: string;
         extendedProps?: unknown;
@@ -153,6 +169,21 @@ vi.mock("@fullcalendar/react", async () => {
           // Surfaced so tests can assert per-category event colors.
           "data-bg-color": ev.backgroundColor,
           "data-border-color": ev.borderColor,
+          "data-start": ev.start,
+          "data-end": ev.end,
+          "data-editable": String(ev.editable),
+          "data-duration-editable": String(ev.durationEditable),
+          // Test-only: drop this event on `__TEST_EVENT_DROP_TO__` the way FullCalendar's
+          // `eventDrop` reports it. `revert` is recorded so a test can see a failed move undone.
+          onDoubleClick: () => {
+            const g = globalThis as Record<string, unknown>;
+            const to = new Date(g.__TEST_EVENT_DROP_TO__ as string);
+            eventDrop?.({
+              event: { id: ev.id, extendedProps: ev.extendedProps, start: to, end: new Date(to.getTime() + 15 * 60_000),
+                       startStr: to.toISOString(), endStr: new Date(to.getTime() + 15 * 60_000).toISOString() },
+              revert: () => { g.__TEST_REVERTED__ = true; },
+            });
+          },
           // Clicking an event fires FullCalendar's eventClick, which is what opens
           // the meeting detail panel in the real app.
           onClick: () => eventClick?.({ event: ev }),
@@ -272,6 +303,11 @@ vi.mock("../../components/calendar/AccountsSidebar", async () => {
       open?: boolean;
       onToggle?: () => void;
       onSelectAccount?: (name: string | null) => void;
+      onLink?: (accountId: number, accountName: string, eventUid?: string) => void;
+      updateHistorical?: boolean;
+      onUpdateHistoricalChange?: (on: boolean) => void;
+      updateSubsequent?: boolean;
+      onUpdateSubsequentChange?: (on: boolean) => void;
     }) {
       if (!props.onShowUnlinkedView) return null;
       return React.createElement("div", null, [
@@ -294,6 +330,18 @@ vi.mock("../../components/calendar/AccountsSidebar", async () => {
           },
           `Unlinked (${props.unlinkedCount ?? 0})`,
         ),
+        React.createElement("button", {
+          key: "hist", "data-testid": "opt-historical", "aria-pressed": !!props.updateHistorical,
+          onClick: () => props.onUpdateHistoricalChange?.(!props.updateHistorical),
+        }, "historical"),
+        React.createElement("button", {
+          key: "subseq", "data-testid": "opt-subsequent", "aria-pressed": !!props.updateSubsequent,
+          onClick: () => props.onUpdateSubsequentChange?.(!props.updateSubsequent),
+        }, "subsequent"),
+        React.createElement("button", {
+          key: "link", "data-testid": "link-first-event",
+          onClick: () => props.onLink?.(7, "Acme Corp", "series1_20260728"),
+        }, "Link event"),
         // The real footer button that enters Log Time mode. Stubbed with a fixed
         // account so a test can reach the panel without driving account selection.
         React.createElement(
@@ -339,11 +387,29 @@ global.ResizeObserver = class ResizeObserver {
 
 // ── Helper ────────────────────────────────────────────────────────────────────
 
+/** One calendar block of a reminder as the server returns it: 15 minutes from its start. */
+function reminderRow(overrides: Partial<(typeof mockCalendarEvents)[number]> = {}) {
+  return {
+    ...mockCalendarEvents[0],
+    id: 601,
+    title: "Follow up with client",
+    start_datetime: "2026-07-30T09:00:00Z",
+    end_datetime: "2026-07-30T09:15:00Z",
+    calendar_id: "reminders",
+    reminder: 1,
+    google_event_id: "",
+    is_synced: false,
+    ...overrides,
+  };
+}
+
 function renderPage() {
   render(
     <MemoryRouter>
       <AppErrorProvider>
-        <CalendarPage />
+        <NotificationDefaultsProvider>
+          <CalendarPage />
+        </NotificationDefaultsProvider>
       </AppErrorProvider>
     </MemoryRouter>,
   );
@@ -368,6 +434,46 @@ describe("CalendarPage", () => {
         HttpResponse.json({ id: 1, company_name: "Admin" }),
       ),
     );
+  });
+
+  describe("recurring-meeting options on account assignment", () => {
+    async function linkAndCaptureBody() {
+      let body: Record<string, unknown> | null = null;
+      server.use(
+        http.post("/api/v1/airtable/categorize/", async ({ request }) => {
+          body = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ needs_categorization: false });
+        }),
+      );
+      return { fire: async () => { fireEvent.click(screen.getByTestId("link-first-event")); await waitFor(() => expect(body).not.toBeNull()); return body!; } };
+    }
+
+    it("sends both options as false by default", async () => {
+      renderPage();
+      const { fire } = await linkAndCaptureBody();
+      const body = await fire();
+      expect(body).toMatchObject({ event_uid: "series1_20260728", update_subsequent: false, update_historical: false });
+    });
+
+    it("sends the options the user switched on, and marks the other instances as linked", async () => {
+      renderPage();
+      let body: Record<string, unknown> | null = null;
+      server.use(
+        http.post("/api/v1/airtable/categorize/", async ({ request }) => {
+          body = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({
+            needs_categorization: false,
+            series_updated: { subsequent: 1, historical: 1, uids: ["series1_20260804", "series1_20260721"] },
+          });
+        }),
+      );
+      fireEvent.click(await screen.findByTestId("opt-subsequent"));
+      fireEvent.click(screen.getByTestId("opt-historical"));
+      expect(screen.getByTestId("opt-subsequent")).toHaveAttribute("aria-pressed", "true");
+      fireEvent.click(screen.getByTestId("link-first-event"));
+      await waitFor(() => expect(body).toMatchObject({ update_subsequent: true, update_historical: true }));
+      await waitFor(() => expect(screen.getByText(/\+2 recurring/)).toBeInTheDocument());
+    });
   });
 
   it("renders FullCalendar stub without a manual sync button", async () => {
@@ -1288,18 +1394,9 @@ describe("CalendarPage", () => {
     });
 
     it("paints a scheduled reminder on the grid from the same reminder color", async () => {
-      // A scheduled reminder is a synthetic 15-minute marker carrying
-      // calendar_id "work_tracking" — it must still resolve as a reminder, not as an
-      // action item, and it keeps its washed fill with the accent as the edge.
-      localStorage.setItem(
-        "scheduledReminders",
-        JSON.stringify([{
-          reminderId: 1,
-          title: "Follow up with client",
-          start: "2026-07-30T09:00:00",
-          end: "2026-07-30T09:15:00",
-        }]),
-      );
+      // A reminder is a server-side row on the "reminders" calendar. It resolves as a reminder
+      // (not an action item) and keeps its washed fill with the accent as the edge.
+      server.use(http.get("/api/v1/scheduler/events/", () => HttpResponse.json([reminderRow()])));
       withColors({ reminder: REMINDER_COLOR });
       renderPage();
 
@@ -1311,6 +1408,696 @@ describe("CalendarPage", () => {
         expect(marker).toHaveAttribute("data-bg-color", tint(REMINDER_COLOR, 0.9));
       });
     });
+  });
+});
+
+// ── Reminders on the calendar ─────────────────────────────────────────────────
+
+describe("CalendarPage — reminders on the calendar", () => {
+  const DUE_LOCAL = "2026-12-01T15:00";
+  const view = (name: string) => fireEvent.click(document.querySelector(`[data-fc-button='${name}']`)!);
+  const markers = () => Array.from(document.querySelectorAll<HTMLElement>("[data-testid='calendar-event']"));
+
+  beforeEach(() => {
+    sessionStorage.clear();
+    localStorage.clear();
+  });
+
+  function serveMarker() {
+    server.use(http.get("/api/v1/scheduler/events/", () => HttpResponse.json([reminderRow()])));
+  }
+
+  async function openForm() {
+    renderPage();
+    view("viewReminders"); // forces the Reminders tab
+    fireEvent.click(await screen.findByRole("button", { name: "+ New Reminder" }));
+    return screen.findByPlaceholderText("Reminder title");
+  }
+
+  function captureReminderPosts() {
+    const posts: Array<Record<string, unknown>> = [];
+    let eventPosts = 0;
+    server.use(
+      http.post("/api/v1/scheduler/reminders/", async ({ request }) => {
+        const body = (await request.json()) as Record<string, unknown>;
+        posts.push(body);
+        return HttpResponse.json({ id: 99, recipients: [], recipient_details: [], occurrences: [], status: "pending", ...body }, { status: 201 });
+      }),
+      http.post("/api/v1/scheduler/events/", () => { eventPosts++; return HttpResponse.json({}, { status: 201 }); }),
+    );
+    return { posts, eventPosts: () => eventPosts };
+  }
+
+  it("shows a reminder on the grid for 15 minutes from its start time", async () => {
+    serveMarker();
+    renderPage();
+    await waitFor(() => expect(markers()).toHaveLength(1));
+    const [marker] = markers();
+    expect(marker).toHaveTextContent("Follow up with client");
+    expect(marker.dataset.start).toBe("2026-07-30T09:00:00Z");
+    expect(new Date(marker.dataset.end!).getTime() - new Date(marker.dataset.start!).getTime()).toBe(15 * 60_000);
+  });
+
+  it("lists the reminder in the Reminders view", async () => {
+    serveMarker();
+    renderPage();
+    await waitFor(() => expect(markers()).toHaveLength(1));
+    view("viewReminders");
+    await waitFor(() => expect(markers()).toHaveLength(1));
+  });
+
+  it("keeps the reminder out of the Meetings and Action items views", async () => {
+    serveMarker();
+    renderPage();
+    await waitFor(() => expect(markers()).toHaveLength(1));
+    view("viewMeetings");
+    await waitFor(() => expect(markers()).toHaveLength(0));
+    view("viewActionItems");
+    await waitFor(() => expect(markers()).toHaveLength(0));
+  });
+
+  it("shows the same reminder at every time it has been added to the calendar", async () => {
+    server.use(http.get("/api/v1/scheduler/events/", () => HttpResponse.json([
+      reminderRow(),
+      reminderRow({ id: 602, start_datetime: "2026-07-31T14:00:00Z", end_datetime: "2026-07-31T14:15:00Z" }),
+    ])));
+    renderPage();
+    await waitFor(() => expect(markers()).toHaveLength(2));
+    expect(markers().map((m) => m.dataset.start)).toEqual(["2026-07-30T09:00:00Z", "2026-07-31T14:00:00Z"]);
+  });
+
+  it("creating a reminder saves the due time the user picked (their local time) and adds no calendar row itself", async () => {
+    const { posts, eventPosts } = captureReminderPosts();
+    const title = await openForm();
+    fireEvent.change(title, { target: { value: "Call Acme" } });
+    fireEvent.change(document.querySelector('input[type="datetime-local"]')!, { target: { value: DUE_LOCAL } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(posts).toHaveLength(1));
+    // The wall clock the user typed, as the real instant — not read as UTC by the server.
+    expect(posts[0].due_at).toBe(new Date(DUE_LOCAL).toISOString());
+    expect(posts[0]).toMatchObject({ title: "Call Acme", links: [], notify_in_app: true, recipients: [] });
+    expect(posts[0]).not.toHaveProperty("confirm_notify_others");
+    // The server owns the marker; the client no longer creates a block with its own times.
+    expect(eventPosts()).toBe(0);
+  });
+
+  it("uses the notification channels from Settings, not just in-app", async () => {
+    server.use(http.get("/api/v1/team/profiles/me/", () => HttpResponse.json({
+      ...mockUserProfile, notify_default_in_app: true, notify_default_push: true, notify_default_sms: true,
+    })));
+    const { posts } = captureReminderPosts();
+    const title = await openForm();
+    // Settings load asynchronously; the form must use them once they have.
+    await waitFor(async () => {
+      fireEvent.change(title, { target: { value: "Call Acme" } });
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await waitFor(() => expect(posts.length).toBeGreaterThan(0));
+    });
+    expect(posts[0]).toMatchObject({ notify_in_app: true, notify_push: true, notify_sms: true, notify_slack: false });
+  });
+
+  it("lists every time the reminder is on the calendar and can take one off", async () => {
+    const removed: string[] = [];
+    server.use(
+      http.get("/api/v1/scheduler/reminders/", () => HttpResponse.json({ results: [{
+        ...mockReminders[0],
+        occurrences: [
+          { id: 11, start: "2026-07-30T09:00:00Z", end: "2026-07-30T09:15:00Z" },
+          { id: 12, start: "2026-07-31T14:00:00Z", end: "2026-07-31T14:15:00Z" },
+        ],
+      }], count: 1 })),
+      http.delete("/api/v1/scheduler/reminders/:id/occurrences/:eventId/", ({ params }) => {
+        removed.push(String(params.eventId));
+        return HttpResponse.json({ ...mockReminders[0], occurrences: [] });
+      }),
+    );
+    renderPage();
+    view("viewReminders");
+    const list = await screen.findByTestId("reminder-occurrences");
+    expect(list).toHaveTextContent("On the calendar");
+    expect(within(list).getAllByRole("button")).toHaveLength(2);
+    expect(list).toHaveTextContent(new Date("2026-07-31T14:00:00Z").toLocaleString(undefined, { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }));
+
+    fireEvent.click(within(list).getAllByRole("button")[1]);
+    await waitFor(() => expect(removed).toEqual(["12"]));
+  });
+
+  it("says so when the reminder is not on the calendar yet", async () => {
+    renderPage();
+    view("viewReminders");
+    const [first] = await screen.findAllByTestId("reminder-occurrences");
+    expect(first).toHaveTextContent("Not on the calendar");
+  });
+
+  describe("clicking a reminder on the calendar", () => {
+    const START = "2026-07-30T09:00:00Z";
+
+    it("shows its time in the user's time zone, matching the grid — not UTC", async () => {
+      serveMarker();
+      renderPage();
+      fireEvent.click((await screen.findAllByTestId("calendar-event"))[0]);
+      const input = await waitFor(() => {
+        const el = document.querySelector<HTMLInputElement>('input[type="datetime-local"]');
+        expect(el).not.toBeNull();
+        return el!;
+      });
+      expect(input.value).toBe(toLocalDatetimeValue(START));
+      expect(screen.getByText("Reminds at (15 min)")).toBeInTheDocument();
+    });
+
+    it("moves just that block when the time is changed, and renames the reminder", async () => {
+      serveMarker();
+      const moves: Array<{ url: string; body: Record<string, unknown> }> = [];
+      const renames: Array<Record<string, unknown>> = [];
+      server.use(
+        http.patch("/api/v1/scheduler/reminders/:id/occurrences/:eventId/", async ({ request }) => {
+          moves.push({ url: new URL(request.url).pathname, body: (await request.json()) as Record<string, unknown> });
+          return HttpResponse.json(mockReminders[0]);
+        }),
+        http.patch("/api/v1/scheduler/reminders/:id/", async ({ request }) => {
+          renames.push((await request.json()) as Record<string, unknown>);
+          return HttpResponse.json(mockReminders[0]);
+        }),
+      );
+      renderPage();
+      fireEvent.click((await screen.findAllByTestId("calendar-event"))[0]);
+      const input = await waitFor(() => {
+        const el = document.querySelector<HTMLInputElement>('input[type="datetime-local"]');
+        expect(el).not.toBeNull();
+        return el!;
+      });
+      fireEvent.change(input, { target: { value: DUE_LOCAL } });
+      fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+      await waitFor(() => expect(moves).toHaveLength(1));
+      // This block's own id (601), and the real instant for the local time typed.
+      expect(moves[0].url).toBe("/api/v1/scheduler/reminders/1/occurrences/601/");
+      expect(moves[0].body.start).toBe(new Date(DUE_LOCAL).toISOString());
+      // The reminder's due time is not patched from here: only title/notes go to the reminder.
+      expect(renames.every((r) => !("due_at" in r))).toBe(true);
+    });
+
+    it("does not move the block when only the title changes", async () => {
+      serveMarker();
+      let moves = 0;
+      server.use(http.patch("/api/v1/scheduler/reminders/:id/occurrences/:eventId/", () => { moves++; return HttpResponse.json(mockReminders[0]); }));
+      renderPage();
+      fireEvent.click((await screen.findAllByTestId("calendar-event"))[0]);
+      const title = await screen.findByDisplayValue("Follow up with client");
+      fireEvent.change(title, { target: { value: "Renamed" } });
+      fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+      await waitFor(() => expect(screen.getByRole("button", { name: "Save changes" })).toBeEnabled());
+      expect(moves).toBe(0);
+    });
+  });
+
+  describe("the reminders sidebar sections", () => {
+    // Local noon on the day the fixtures use, with only Date faked: the page's own interval, MSW
+    // and testing-library's polling all keep working on real timers.
+    const NOW = new Date(2026, 6, 30, 12, 0, 0);
+    const iso = (day: number, h: number, m = 0) => new Date(2026, 6, day, h, m).toISOString();
+    const rem = (id: number, title: string, due_at: string, over: Record<string, unknown> = {}) => ({
+      ...mockReminders[0], id, title, due_at, status: "pending", occurrences: [], ...over,
+    });
+    const serve = (reminders: unknown[]) =>
+      server.use(http.get("/api/v1/scheduler/reminders/", () => HttpResponse.json({ results: reminders, count: reminders.length })));
+    const section = (key: string) => {
+      const header = document.querySelector<HTMLElement>(`[data-section='${key}']`)!;
+      const cards: string[] = [];
+      for (let el = header.nextElementSibling; el && !el.matches("[data-section]"); el = el.nextElementSibling) {
+        const t = el.querySelector("p.text-\\[13px\\]")?.textContent;
+        if (t) cards.push(t);
+      }
+      return { header: header.textContent ?? "", cards };
+    };
+
+    beforeEach(() => { vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(NOW); });
+    afterEach(() => vi.useRealTimers());
+
+    async function open() {
+      renderPage();
+      view("viewReminders");
+      await screen.findByText("Today", { selector: "h3" }, { timeout: 4000 });
+    }
+
+    it("sorts every reminder into Today, Upcoming or Historical", async () => {
+      serve([
+        rem(1, "Later today", iso(30, 15)),
+        rem(2, "Tomorrow", iso(31, 9)),
+        rem(3, "Yesterday", iso(29, 9)),
+        rem(4, "Done and dismissed", iso(20, 9), { status: "dismissed" }),
+        rem(5, "Earlier today", iso(30, 8), { status: "sent" }),
+      ]);
+      await open();
+      await waitFor(() => expect(section("today").cards).toEqual(["Later today"]));
+      expect(section("upcoming").cards).toEqual(["Tomorrow"]);
+      expect(section("historical").cards).toEqual(["Earlier today", "Yesterday", "Done and dismissed"]);
+      expect(section("today").header).toContain("(1)");
+    });
+
+    it("asks for every reminder, not just pending ones", async () => {
+      let status: string | null = "unset";
+      server.use(http.get("/api/v1/scheduler/reminders/", ({ request }) => {
+        status = new URL(request.url).searchParams.get("status");
+        return HttpResponse.json({ results: [], count: 0 });
+      }));
+      await open().catch(() => {});
+      await waitFor(() => expect(status).toBeNull());
+    });
+
+    it("moves a reminder from Today to Historical once its time has finished, without a reload", async () => {
+      serve([rem(1, "Soon", iso(30, 12, 10))]);
+      await open();
+      await waitFor(() => expect(section("today").cards).toEqual(["Soon"]));
+      // Still inside its 15 minutes at 12:20.
+      vi.setSystemTime(new Date(2026, 6, 30, 12, 20));
+      await new Promise((r) => setTimeout(r, 200));
+      expect(section("today").cards).toEqual(["Soon"]);
+      // Over at 12:25.
+      vi.setSystemTime(new Date(2026, 6, 30, 12, 10).getTime() + OCCURRENCE_MS + 1000);
+      await waitFor(() => expect(section("historical").cards).toEqual(["Soon"]));
+      expect(section("today").cards).toEqual([]);
+    });
+
+    it("files a reminder by the next unfinished time it is on the calendar", async () => {
+      serve([rem(1, "Twice", iso(29, 9), {
+        occurrences: [
+          { id: 1, start: iso(29, 9), end: iso(29, 9, 15) },
+          { id: 2, start: iso(31, 14), end: iso(31, 14, 15) },
+        ],
+      })]);
+      await open();
+      await waitFor(() => expect(section("upcoming").cards).toEqual(["Twice"]));
+    });
+
+    it("shows ten past reminders and offers the rest", async () => {
+      serve(Array.from({ length: 12 }, (_, i) => rem(i + 1, `Old ${i + 1}`, iso(1 + i, 9), { status: "sent" })));
+      await open();
+      await waitFor(() => expect(section("historical").cards).toHaveLength(10));
+      fireEvent.click(screen.getByRole("button", { name: "Show all 12" }));
+      await waitFor(() => expect(section("historical").cards).toHaveLength(12));
+      expect(screen.getByRole("button", { name: "Show fewer" })).toBeInTheDocument();
+    });
+
+    it("says what is empty in each section", async () => {
+      serve([rem(1, "Tomorrow", iso(31, 9))]);
+      await open();
+      expect(await screen.findByText("Nothing else today.")).toBeInTheDocument();
+      expect(screen.getByText("No past reminders.")).toBeInTheDocument();
+    });
+
+    describe("snoozing", () => {
+      const snoozeBody = () => {
+        const bodies: Array<Record<string, unknown>> = [];
+        server.use(http.post("/api/v1/scheduler/reminders/:id/snooze/", async ({ request }) => {
+          const body = (await request.json()) as Record<string, unknown>;
+          bodies.push(body);
+          return HttpResponse.json({ ...mockReminders[0], id: 1, title: "Prep QBR", status: "pending",
+            due_at: (body.until as string) ?? iso(30, 14), occurrences: [] });
+        }));
+        return bodies;
+      };
+      const openMenu = async () => {
+        await open();
+        fireEvent.click(await screen.findByRole("button", { name: /Snooze Prep QBR/ }));
+        return screen.findByRole("menu", { name: "Snooze until" });
+      };
+
+      it("lists Custom first, then the ready-made options", async () => {
+        serve([rem(1, "Prep QBR", iso(30, 15), { resource_type: "account", resource_id: 1 })]);
+        const menu = await openMenu();
+        expect(within(menu).getAllByRole("menuitem").map((b) => b.querySelector("span")?.textContent ?? b.textContent)).toEqual([
+          "Custom…", "15 minutes later", "Before end of day", "Tomorrow morning", "Before next account meeting",
+        ]);
+      });
+
+      it("15 minutes later sends a time 15 minutes from now and updates the card", async () => {
+        serve([rem(1, "Prep QBR", iso(30, 12, 5))]);
+        const bodies = snoozeBody();
+        const menu = await openMenu();
+        fireEvent.click(within(menu).getByRole("menuitem", { name: /15 minutes later/ }));
+        await waitFor(() => expect(bodies).toHaveLength(1));
+        // `from` is the time the card sits under, so that calendar block is the one that moves.
+        expect(bodies[0]).toEqual({ until: new Date(2026, 6, 30, 12, 15).toISOString(), from: iso(30, 12, 5) });
+        await waitFor(() => expect(screen.queryByRole("menu", { name: "Snooze until" })).toBeNull());
+      });
+
+      it("before end of day is 5 PM today and tomorrow morning is 9 AM tomorrow", async () => {
+        serve([rem(1, "Prep QBR", iso(30, 12, 5))]);
+        const bodies = snoozeBody();
+        let menu = await openMenu();
+        fireEvent.click(within(menu).getByRole("menuitem", { name: /Before end of day/ }));
+        await waitFor(() => expect(bodies).toHaveLength(1));
+        expect(bodies[0]).toEqual({ until: new Date(2026, 6, 30, 17, 0).toISOString(), from: iso(30, 12, 5) });
+
+        fireEvent.click(await screen.findByRole("button", { name: /Snooze Prep QBR/ }));
+        menu = await screen.findByRole("menu", { name: "Snooze until" });
+        fireEvent.click(within(menu).getByRole("menuitem", { name: /Tomorrow morning/ }));
+        await waitFor(() => expect(bodies).toHaveLength(2));
+        // (This fake server re-serves the original reminder, so the card is back under 12:05.)
+        expect(bodies[1]).toEqual({ until: new Date(2026, 6, 31, 9, 0).toISOString(), from: iso(30, 12, 5) });
+      });
+
+      it("Custom lets the user pick any future time", async () => {
+        serve([rem(1, "Prep QBR", iso(30, 12, 5))]);
+        const bodies = snoozeBody();
+        const menu = await openMenu();
+        fireEvent.click(within(menu).getByRole("menuitem", { name: "Custom…" }));
+        const input = within(menu).getByLabelText("Snooze until");
+        fireEvent.change(input, { target: { value: "2026-08-03T10:30" } });
+        fireEvent.click(within(menu).getByRole("button", { name: "Snooze" }));
+        await waitFor(() => expect(bodies).toHaveLength(1));
+        expect(bodies[0]).toEqual({ until: new Date("2026-08-03T10:30").toISOString(), from: iso(30, 12, 5) });
+      });
+
+      it("Custom refuses a time that has already passed", async () => {
+        serve([rem(1, "Prep QBR", iso(30, 12, 5))]);
+        const bodies = snoozeBody();
+        const menu = await openMenu();
+        fireEvent.click(within(menu).getByRole("menuitem", { name: "Custom…" }));
+        fireEvent.change(within(menu).getByLabelText("Snooze until"), { target: { value: "2026-07-29T10:30" } });
+        const go = within(menu).getByRole("button", { name: "Snooze" });
+        expect(go).toBeDisabled();
+        fireEvent.click(go);
+        expect(bodies).toHaveLength(0);
+      });
+
+      it("before the next account meeting asks the server, and is unavailable without an account", async () => {
+        serve([
+          rem(1, "Prep QBR", iso(30, 15), { resource_type: "account", resource_id: 1 }),
+          rem(2, "Loose end", iso(30, 16)),
+        ]);
+        const bodies = snoozeBody();
+        await open();
+        fireEvent.click(await screen.findByRole("button", { name: /Snooze Loose end/ }));
+        const noAccount = within(await screen.findByRole("menu")).getByRole("menuitem", { name: /Before next account meeting/ });
+        expect(noAccount).toBeDisabled();
+        expect(noAccount).toHaveAttribute("title", expect.stringContaining("Link this reminder to an account"));
+
+        fireEvent.click(screen.getByRole("button", { name: "Cancel" })); // close the first menu
+        fireEvent.click(screen.getByRole("button", { name: /Snooze Prep QBR/ }));
+        const menu = await screen.findByRole("menu", { name: "Snooze until" });
+        fireEvent.click(within(menu).getByRole("menuitem", { name: /Before next account meeting/ }));
+        await waitFor(() => expect(bodies).toEqual([{ preset: "next_account_meeting", from: iso(30, 15) }]));
+      });
+
+      it("shows the server's reason and keeps the menu open when it refuses", async () => {
+        serve([rem(1, "Prep QBR", iso(30, 15), { resource_type: "account", resource_id: 1 })]);
+        server.use(http.post("/api/v1/scheduler/reminders/:id/snooze/", () =>
+          HttpResponse.json({ until: "There is no upcoming meeting on this account to snooze it before." }, { status: 400 })));
+        const menu = await openMenu();
+        fireEvent.click(within(menu).getByRole("menuitem", { name: /Before next account meeting/ }));
+        expect(await within(menu).findByRole("alert")).toHaveTextContent("no upcoming meeting");
+        expect(screen.getByRole("menu", { name: "Snooze until" })).toBeInTheDocument();
+      });
+
+      it("a historical reminder can be snoozed back to life", async () => {
+        serve([rem(1, "Prep QBR", iso(28, 9), { status: "sent" })]);
+        const bodies = snoozeBody();
+        const menu = await openMenu();
+        fireEvent.click(within(menu).getByRole("menuitem", { name: /15 minutes later/ }));
+        await waitFor(() => expect(bodies).toHaveLength(1));
+      });
+    });
+  });
+
+  describe("dragging a reminder on the calendar", () => {
+    const TO = "2026-07-31T15:30:00.000Z";
+    const g = globalThis as Record<string, unknown>;
+    beforeEach(() => { g.__TEST_EVENT_DROP_TO__ = TO; g.__TEST_REVERTED__ = false; });
+
+    it("lets a reminder block be dragged to another time, but not stretched", async () => {
+      serveMarker();
+      renderPage();
+      const [block] = await screen.findAllByTestId("calendar-event");
+      expect(block.dataset.editable).toBe("true");
+      expect(block.dataset.durationEditable).toBe("false");
+    });
+
+    it("moves just that block: one request with the new time, the block keeps its 15 minutes", async () => {
+      // A server that remembers the move, as the real one does: the page re-reads the calendar
+      // afterwards and must get the block back at the new time.
+      let row = reminderRow();
+      const moves: Array<{ url: string; body: Record<string, unknown> }> = [];
+      let eventPatches = 0;
+      server.use(
+        http.get("/api/v1/scheduler/events/", () => HttpResponse.json([row])),
+        http.patch("/api/v1/scheduler/reminders/:id/occurrences/:eventId/", async ({ request }) => {
+          const body = (await request.json()) as { start: string };
+          moves.push({ url: new URL(request.url).pathname, body });
+          row = { ...row, start_datetime: body.start, end_datetime: new Date(new Date(body.start).getTime() + 15 * 60_000).toISOString() };
+          return HttpResponse.json(mockReminders[0]);
+        }),
+        // A reminder must never go through the meeting path (which would push it to Google).
+        http.patch("/api/v1/scheduler/events/:id/", () => { eventPatches++; return HttpResponse.json({}); }),
+      );
+      renderPage();
+      fireEvent.doubleClick((await screen.findAllByTestId("calendar-event"))[0]);
+
+      await waitFor(() => expect(moves).toHaveLength(1));
+      expect(moves[0].url).toBe("/api/v1/scheduler/reminders/1/occurrences/601/");
+      expect(moves[0].body).toEqual({ start: TO });
+      // The block is redrawn at the new time straight away.
+      await waitFor(() => expect(markers()[0].dataset.start).toBe(TO));
+      expect(new Date(markers()[0].dataset.end!).getTime() - new Date(TO).getTime()).toBe(15 * 60_000);
+      expect(eventPatches).toBe(0);
+    });
+
+    it("puts the block back and says why when the move is refused", async () => {
+      serveMarker();
+      server.use(http.patch("/api/v1/scheduler/reminders/:id/occurrences/:eventId/", () =>
+        HttpResponse.json({ start: "The reminder is already on the calendar at that time." }, { status: 400 })));
+      renderPage();
+      fireEvent.doubleClick((await screen.findAllByTestId("calendar-event"))[0]);
+
+      await waitFor(() => expect(g.__TEST_REVERTED__).toBe(true));
+      await waitFor(() => expect(markers()[0].dataset.start).toBe("2026-07-30T09:00:00Z"));
+      expect(await screen.findByText(/already on the calendar at that time/)).toBeInTheDocument();
+    });
+
+    it("announces the change so the sidebar's list of times updates", async () => {
+      serveMarker();
+      server.use(http.patch("/api/v1/scheduler/reminders/:id/occurrences/:eventId/", () => HttpResponse.json(mockReminders[0])));
+      let reminderGets = 0;
+      server.use(http.get("/api/v1/scheduler/reminders/", () => { reminderGets++; return HttpResponse.json({ results: mockReminders, count: 1 }); }));
+      renderPage();
+      view("viewReminders");
+      await waitFor(() => expect(reminderGets).toBeGreaterThan(0));
+      const before = reminderGets;
+      fireEvent.doubleClick((await screen.findAllByTestId("calendar-event"))[0]);
+      await waitFor(() => expect(reminderGets).toBeGreaterThan(before));
+    });
+  });
+
+  describe("the sidebar's form matches the Reminders page", () => {
+    it("offers the same fields", async () => {
+      await openForm();
+      expect(screen.getByPlaceholderText("Reminder title")).toBeInTheDocument();
+      expect(screen.getByPlaceholderText("Notes (optional)")).toBeInTheDocument();
+      expect(document.querySelector('input[type="datetime-local"]')).not.toBeNull();
+      expect(screen.getByTestId("reminder-links-field")).toBeInTheDocument();
+      expect(screen.getByTestId("recipients-hint")).toBeInTheDocument(); // the "also notify" picker, nothing linked yet
+      const channels = screen.getByRole("group", { name: "Notify me via" });
+      expect(within(channels).getAllByRole("checkbox").map((c) => c.parentElement?.textContent)).toEqual(["In-app", "Laptop", "Phone", "Slack"]);
+    });
+
+    it("can link to any of the record types, not only an account", async () => {
+      await openForm();
+      const field = screen.getByTestId("reminder-links-field");
+      fireEvent.click(within(field).getByRole("button", { name: /\+ Link/ }));
+      expect(within(field).getAllByRole("option").length).toBeGreaterThan(0); // accounts, by default
+      fireEvent.change(within(field).getByLabelText("Record type"), { target: { value: "action_item" } });
+      expect(await within(field).findByRole("option", { name: /Draft QBR deck/ })).toBeInTheDocument();
+    });
+
+    it("pre-ticks the user's Settings channels and says teammates are reached their own way", async () => {
+      server.use(http.get("/api/v1/team/profiles/me/", () => HttpResponse.json({
+        ...mockUserProfile, notify_default_in_app: true, notify_default_push: true, notify_default_sms: false,
+      })));
+      await openForm();
+      const channels = screen.getByRole("group", { name: "Notify me via" });
+      await waitFor(() => expect(within(channels).getByRole("checkbox", { name: "Laptop" })).toBeChecked());
+      expect(within(channels).getByRole("checkbox", { name: "Phone" })).not.toBeChecked();
+      expect(screen.getByText(/Anyone you add under .Also notify. is reached the way they chose in their own Settings/)).toBeInTheDocument();
+    });
+
+    it("sends the creator's channel choices, and the same fields the Reminders page sends", async () => {
+      const { posts } = captureReminderPosts();
+      const title = await openForm();
+      fireEvent.change(title, { target: { value: "Ping" } });
+      fireEvent.click(within(screen.getByRole("group", { name: "Notify me via" })).getByRole("checkbox", { name: "Phone" }));
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await waitFor(() => expect(posts).toHaveLength(1));
+      expect(posts[0]).toMatchObject({ notify_sms: true, recipients: [] });
+      const { buildReminderPayload } = await import("../../lib/reminderDraft");
+      const expected = buildReminderPayload({
+        title: "x", body: "", dueLocal: "2026-12-01T10:00", links: [], recipients: [],
+        channels: { notify_in_app: true, notify_push: false, notify_sms: false, notify_slack: false },
+      });
+      expect(Object.keys(posts[0]).sort()).toEqual(Object.keys(expected).sort());
+    });
+
+    it("lists a teammate who has never signed in, but will not let you pick them", async () => {
+      server.use(http.get("/api/v1/scheduler/reminders/recipients/", () => HttpResponse.json({
+        results: [{ user_id: null, member_id: 61, name: "Pat Nologin", available: false,
+          reason: "Pat Nologin hasn't signed in to AgentPM yet, so there is no way to notify them in the app.", accounts: ["Acme Corp"] }],
+        sources: ["Acme Corp"], accounts: ["Acme Corp"],
+      })));
+      await openForm();
+      await linkAcme();
+      fireEvent.click(await screen.findByRole("button", { name: "Notify teammates" }));
+      const pat = await screen.findByRole("checkbox", { name: /Pat Nologin/ });
+      expect(pat).toBeDisabled();
+      expect(screen.getByTestId("recipient-m61")).toHaveAttribute("title", expect.stringContaining("hasn't signed in"));
+    });
+  });
+
+  it("re-reads the calendar after a reminder is created so the marker appears", async () => {
+    let eventGets = 0;
+    server.use(http.get("/api/v1/scheduler/events/", () => { eventGets++; return HttpResponse.json([]); }));
+    captureReminderPosts();
+    const title = await openForm();
+    await waitFor(() => expect(eventGets).toBeGreaterThan(0));
+    const before = eventGets;
+    fireEvent.change(title, { target: { value: "Call Acme" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(eventGets).toBeGreaterThan(before));
+  });
+
+  it("links the reminder to the chosen account", async () => {
+    const { posts } = captureReminderPosts();
+    const title = await openForm();
+    fireEvent.change(title, { target: { value: "Prep QBR" } });
+    await linkAcme();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(posts).toHaveLength(1));
+    expect(posts[0].links).toEqual([{ resource_type: "account", resource_id: 1, resource_label: "Acme Corp" }]);
+    expect(posts[0].recipients).toEqual([]); // default: only me
+    expect(posts[0]).not.toHaveProperty("confirm_notify_others");
+  });
+
+  it("offers teammates only once an account is chosen", async () => {
+    await openForm();
+    expect(screen.getByTestId("recipients-hint")).toHaveTextContent("Notifies only you");
+    expect(screen.queryByRole("button", { name: "Notify teammates" })).toBeNull();
+  });
+
+  /** Link Acme Corp the way the Reminders page does: the shared "link to records" field. */
+  async function linkAcme() {
+    const field = screen.getByTestId("reminder-links-field");
+    fireEvent.click(within(field).getByRole("button", { name: /\+ Link/ }));
+    fireEvent.mouseDown(await within(field).findByRole("option", { name: /Acme Corp/ }));
+  }
+  async function chooseAccountAndOpenTeammates() {
+    await linkAcme();
+    fireEvent.click(await screen.findByRole("button", { name: "Notify teammates" }));
+    await screen.findByTestId("recipient-2");
+  }
+
+  it("lists everyone on the account but will not let you pick someone who opted out, and says why", async () => {
+    await openForm();
+    await chooseAccountAndOpenTeammates();
+
+    const ana = screen.getByRole("checkbox", { name: "Ana Reyes" });
+    const ben = screen.getByRole("checkbox", { name: /Ben Ortiz/ });
+    expect(ana).toBeEnabled();
+    expect(ben).toBeDisabled();
+    expect(screen.getByTestId("recipient-3")).toHaveAttribute(
+      "title", expect.stringContaining("has turned off being notified by other users"),
+    );
+    fireEvent.click(ben);
+    expect(ben).not.toBeChecked();
+  });
+
+  it("asks 'are you sure?' before notifying anyone else, and sends nothing until they say yes", async () => {
+    const { posts } = captureReminderPosts();
+    const title = await openForm();
+    fireEvent.change(title, { target: { value: "Prep QBR" } });
+    await chooseAccountAndOpenTeammates();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Ana Reyes" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    const dialog = await screen.findByRole("alertdialog");
+    expect(dialog).toHaveTextContent("Are you sure you want to notify these users?");
+    expect(dialog).toHaveTextContent("Ana Reyes");
+    expect(posts).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole("button", { name: "Go back" }));
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(posts).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Yes, notify them" }));
+    await waitFor(() => expect(posts).toHaveLength(1));
+    expect(posts[0]).toMatchObject({ recipients: [2], confirm_notify_others: true });
+    expect(posts[0].links).toEqual([{ resource_type: "account", resource_id: 1, resource_label: "Acme Corp" }]);
+  });
+
+  it("shows the server's reason when it refuses a recipient and keeps the form open", async () => {
+    server.use(http.post("/api/v1/scheduler/reminders/", () =>
+      HttpResponse.json({ recipients: ["Ana Reyes has turned off being notified by other users in their Settings."] }, { status: 400 })));
+    const title = await openForm();
+    fireEvent.change(title, { target: { value: "Prep QBR" } });
+    await chooseAccountAndOpenTeammates();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Ana Reyes" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Yes, notify them" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("turned off being notified");
+    expect(screen.getByPlaceholderText("Reminder title")).toHaveValue("Prep QBR");
+  });
+
+  it("unlinking the record that reached them clears teammates picked through it", async () => {
+    await openForm();
+    await chooseAccountAndOpenTeammates();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Ana Reyes" }));
+    expect(screen.getByRole("button", { name: "Notify teammates" })).toHaveTextContent("Me + Ana Reyes");
+    fireEvent.click(within(screen.getByTestId("reminder-links-field")).getByRole("button", { name: "Remove link to Acme Corp" }));
+    expect(await screen.findByTestId("recipients-hint")).toBeInTheDocument();
+  });
+
+  it("lets an existing reminder be switched to Laptop and Phone notifications", async () => {
+    const patches: Array<Record<string, unknown>> = [];
+    server.use(http.patch("/api/v1/scheduler/reminders/:id/", async ({ request }) => {
+      const body = (await request.json()) as Record<string, unknown>;
+      patches.push(body);
+      return HttpResponse.json({ ...mockReminders[0], ...body });
+    }));
+    renderPage();
+    view("viewReminders");
+    fireEvent.click(await screen.findByText("Follow up with client"));
+    const channels = await screen.findByRole("group", { name: "Notify me via" });
+    expect(within(channels).getByRole("checkbox", { name: "In-app" })).toBeChecked();
+    expect(within(channels).getByRole("checkbox", { name: "Laptop" })).not.toBeChecked();
+    fireEvent.click(within(channels).getByRole("checkbox", { name: "Laptop" }));
+    fireEvent.click(within(channels).getByRole("checkbox", { name: "Phone" }));
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+
+    await waitFor(() => expect(patches).toHaveLength(1));
+    // Only what changed is sent.
+    expect(patches[0]).toEqual({ notify_push: true, notify_sms: true });
+  });
+
+  it("editing a reminder's due time sends the real instant for the local time shown", async () => {
+    const patches: Array<Record<string, unknown>> = [];
+    server.use(http.patch("/api/v1/scheduler/reminders/:id/", async ({ request }) => {
+      const body = (await request.json()) as Record<string, unknown>;
+      patches.push(body);
+      return HttpResponse.json({ ...mockReminders[0], ...body });
+    }));
+    renderPage();
+    view("viewReminders");
+    fireEvent.click(await screen.findByText("Follow up with client"));
+    const due = document.querySelector<HTMLInputElement>('input[type="datetime-local"]')!;
+    // The field shows the stored instant as the user's local wall clock, not as UTC.
+    expect(due.value).toBe(toLocalDatetimeValue(mockReminders[0].due_at));
+    fireEvent.change(due, { target: { value: DUE_LOCAL } });
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+
+    await waitFor(() => expect(patches).toHaveLength(1));
+    expect(patches[0].due_at).toBe(new Date(DUE_LOCAL).toISOString());
   });
 });
 
@@ -1520,6 +2307,43 @@ describe("CalendarPage — editing an event", () => {
     await openEditViaMenu();
     expect(within(form()).queryByText(/and notify them/i)).not.toBeInTheDocument();
     expect(within(form()).queryByText(/will notify/i)).not.toBeInTheDocument();
+  });
+
+  // The panel listed bare dots: Google stores displayName "" for most guests and `??` does not
+  // fall through on an empty string, so the name span rendered nothing.
+  it("lists each guest's email, and their name when there is one", async () => {
+    serveEvent({
+      attendees: [
+        { email: "plain@example.com", displayName: "", responseStatus: "accepted" },
+        { email: "named@example.com", displayName: "Nina Named", responseStatus: "declined" },
+      ],
+    });
+    renderPage();
+    fireEvent.click(await eventEl());
+    expect(await screen.findByText("plain@example.com")).toBeInTheDocument();
+    expect(screen.getByText("Nina Named")).toBeInTheDocument();
+    expect(screen.getByText("named@example.com")).toBeInTheDocument();
+  });
+
+  it("offers the account page's guest actions once the meeting has an account", async () => {
+    server.use(
+      http.get("/api/v1/accounts/contacts/", () =>
+        HttpResponse.json({ count: 1, next: null, previous: null, results: [
+          { id: 1, account: 5, name: "Known Kim", email: "kim@example.com", role: "", description: "" },
+        ] }),
+      ),
+    );
+    serveEvent({
+      account: 5,
+      attendees: [
+        { email: "kim@example.com", displayName: "", responseStatus: "accepted" },
+        { email: "new@example.com", displayName: "", responseStatus: "accepted" },
+      ],
+    });
+    renderPage();
+    fireEvent.click(await eventEl());
+    expect(await screen.findByTitle("Already a contact")).toBeInTheDocument();
+    expect(screen.getAllByTitle("Add to team or contacts")).toHaveLength(1);
   });
 
   it("does not show the guest notice on a solo event", async () => {
@@ -2391,24 +3215,20 @@ describe("scheduled action items are database rows and survive a sync", () => {
       expect(localStorage.getItem(LEGACY_ITEMS_KEY)).not.toBeNull();
     });
 
-    it("migrates a legacy reminder to a reminders-calendar row", async () => {
-      const posted: Array<Record<string, unknown>> = [];
+    it("clears a legacy reminder entry without creating a calendar row for it", async () => {
+      // A reminder is drawn from its due time now; a browser-stored block at another time is
+      // the artefact being retired, so it is not recreated.
+      let posts = 0;
       localStorage.setItem(LEGACY_REMINDERS_KEY, JSON.stringify([
         { reminderId: 1, title: "Follow up with client", start: "2026-07-30T09:00:00Z", end: "" },
       ]));
-      server.use(
-        http.post("/api/v1/scheduler/events/", async ({ request }) => {
-          const body = await request.json() as Record<string, unknown>;
-          posted.push(body);
-          return HttpResponse.json({ ...scheduledRow(), ...body }, { status: 201 });
-        }),
-      );
+      server.use(http.post("/api/v1/scheduler/events/", () => { posts++; return HttpResponse.json({}, { status: 201 }); }));
 
       renderPage();
       await screen.findByTestId("fullcalendar");
 
-      await waitFor(() => expect(posted).toHaveLength(1));
-      expect(posted[0]).toMatchObject({ calendar_id: "reminders", reminder: 1 });
+      await waitFor(() => expect(localStorage.getItem(LEGACY_REMINDERS_KEY)).toBeNull());
+      expect(posts).toBe(0);
     });
 
     it("does not re-create a row when the legacy entry already has one", async () => {
@@ -2930,6 +3750,132 @@ describe("CalendarPage — Log Time rows and project auto-import", () => {
     expect(JSON.parse(localStorage.getItem("logtime::Acme Corp::suppressedAutoProjects") ?? "[]")).toHaveLength(1);
   });
 
+  describe("Log button (Mark and Log are one)", () => {
+    // Two projects on the same day, each with its own action item.
+    function serveTwoProjects(posts: Array<Record<string, unknown>>, salesforce = true) {
+      serveWeek();
+      server.use(
+        http.get("/api/v1/integrations/status/", () =>
+          HttpResponse.json({ connected: salesforce ? [{ ...mockGmailCredential, provider: "salesforce", is_active: true }] : [mockGmailCredential], sync_states: [] }),
+        ),
+        http.get("/api/v1/scheduler/events/", () =>
+          HttpResponse.json([
+            { ...mockCalendarEvents[0], id: 76, google_event_id: "", title: "Build widget", calendar_id: "work_tracking", agentpm_airtable_id: "recWIDGET", account_name: "Acme Corp", start_datetime: at(15), end_datetime: at(15, 30) },
+            { ...mockCalendarEvents[0], id: 79, google_event_id: "", title: "Ship gadget", calendar_id: "work_tracking", agentpm_airtable_id: "recGADGET", account_name: "Acme Corp", start_datetime: at(16), end_datetime: at(16, 30) },
+          ]),
+        ),
+        http.get("/api/v1/airtable/action-items/", () =>
+          HttpResponse.json([
+            { ...mockActionItem, id: 1, airtable_id: "recWIDGET", task: "Build widget", account_name: "Acme Corp" },
+            { ...mockActionItem, id: 3, airtable_id: "recGADGET", task: "Ship gadget", account_name: "Acme Corp" },
+          ]),
+        ),
+        http.get("/api/v1/accounts/projects/", () =>
+          HttpResponse.json({
+            count: 2, next: null, previous: null,
+            results: [
+              { id: 5, account: 1, name: "Widget Rollout", description: "", url: "", position: 0, action_ids: ["recWIDGET"], meeting_ids: [], goal_ids: [], resources: [], sf_data: {}, sf_project_id: "a0W000000000001AAA", kind: "project", created_at: "" },
+              { id: 7, account: 1, name: "Gadget Launch", description: "", url: "", position: 1, action_ids: ["recGADGET"], meeting_ids: [], goal_ids: [], resources: [], sf_data: {}, sf_project_id: "a0W000000000002AAA", kind: "project", created_at: "" },
+            ],
+          }),
+        ),
+        http.post("/api/v1/salesforce/log-time/", async ({ request }) => {
+          posts.push((await request.json()) as Record<string, unknown>);
+          return HttpResponse.json({}, { status: 201 });
+        }),
+      );
+    }
+
+    const block = (name: string) => screen.getAllByText(name).map((el) => el.closest(".rounded-lg.border") as HTMLElement).find((b) => b && within(b).queryAllByRole("button", { name: /^(Log|Logged)$/ }).length > 0)!;
+
+    it("has no separate Mark button", async () => {
+      serveTwoProjects([]);
+      render(<MemoryRouter><AppErrorProvider><CalendarPage /></AppErrorProvider></MemoryRouter>);
+      fireEvent.click(await screen.findByTestId("enter-log-time"));
+      await screen.findByText("Log Week");
+      await waitFor(() => expect(screen.getAllByRole("button", { name: "Log" }).length).toBeGreaterThanOrEqual(2));
+      expect(screen.queryByRole("button", { name: "Mark" })).not.toBeInTheDocument();
+    });
+
+    it("logging one project marks only that project, and the other stays loggable", async () => {
+      const posts: Array<Record<string, unknown>> = [];
+      serveTwoProjects(posts);
+      render(<MemoryRouter><AppErrorProvider><CalendarPage /></AppErrorProvider></MemoryRouter>);
+      fireEvent.click(await screen.findByTestId("enter-log-time"));
+      await screen.findByText("Log Week");
+      await waitFor(() => expect(screen.getAllByRole("button", { name: "Log" }).length).toBeGreaterThanOrEqual(2));
+
+      const widget = block("Widget Rollout");
+      fireEvent.click(within(widget).getByRole("button", { name: "Log" }));
+
+      await waitFor(() => expect(within(block("Widget Rollout")).getByRole("button", { name: "Logged" })).toBeDisabled());
+      expect(posts).toHaveLength(1);
+      expect(posts[0].project_sf_id).toBe("a0W000000000001AAA");
+      // Greyed, not green.
+      expect(within(block("Widget Rollout")).getByRole("button", { name: "Logged" }).className).toContain("bg-gray-200");
+
+      // The other project is untouched: still "Log", enabled, and its rows are not struck through.
+      const gadget = block("Gadget Launch");
+      expect(within(gadget).getByRole("button", { name: "Log" })).toBeEnabled();
+      expect(within(gadget).getByText("Ship gadget").className).not.toContain("line-through");
+      expect(within(block("Widget Rollout")).getByText("Build widget").className).toContain("line-through");
+    });
+
+    describe("before Salesforce is connected", () => {
+      async function open() {
+        const posts: Array<Record<string, unknown>> = [];
+        serveTwoProjects(posts, false);
+        render(<MemoryRouter><AppErrorProvider><CalendarPage /></AppErrorProvider></MemoryRouter>);
+        fireEvent.click(await screen.findByTestId("enter-log-time"));
+        await screen.findByText("Log Week");
+        await waitFor(() => expect(screen.getAllByRole("button", { name: "Log" }).length).toBeGreaterThanOrEqual(2));
+        return posts;
+      }
+
+      it("Log toggles that project on and off, and writes nothing to Salesforce", async () => {
+        const posts = await open();
+        fireEvent.click(within(block("Widget Rollout")).getByRole("button", { name: "Log" }));
+        const logged = await within(block("Widget Rollout")).findByRole("button", { name: "Logged" });
+        expect(logged).toBeEnabled(); // clickable: it is a toggle
+        expect(within(block("Gadget Launch")).getByRole("button", { name: "Log" })).toBeEnabled();
+
+        fireEvent.click(logged);
+        await within(block("Widget Rollout")).findByRole("button", { name: "Log" });
+        expect(within(block("Widget Rollout")).getByText("Build widget").className).not.toContain("line-through");
+        expect(posts).toHaveLength(0);
+      });
+    });
+
+    it("once connected, a logged project cannot be logged again", async () => {
+      const posts: Array<Record<string, unknown>> = [];
+      serveTwoProjects(posts);
+      render(<MemoryRouter><AppErrorProvider><CalendarPage /></AppErrorProvider></MemoryRouter>);
+      fireEvent.click(await screen.findByTestId("enter-log-time"));
+      await screen.findByText("Log Week");
+      await waitFor(() => expect(screen.getAllByRole("button", { name: "Log" }).length).toBeGreaterThanOrEqual(2));
+      // Wait for the connection to be known: before then the button is the toggle.
+      await new Promise((r) => setTimeout(r, 50));
+      fireEvent.click(within(block("Widget Rollout")).getByRole("button", { name: "Log" }));
+      await waitFor(() => expect(within(block("Widget Rollout")).getByRole("button", { name: "Logged" })).toBeDisabled());
+      fireEvent.click(within(block("Widget Rollout")).getByRole("button", { name: "Logged" }));
+      expect(posts).toHaveLength(1);
+    });
+
+    it("a failed log stays 'Log' so it can be retried", async () => {
+      const posts: Array<Record<string, unknown>> = [];
+      serveTwoProjects(posts);
+      server.use(http.post("/api/v1/salesforce/log-time/", () => HttpResponse.json({ detail: "no" }, { status: 502 })));
+      render(<MemoryRouter><AppErrorProvider><CalendarPage /></AppErrorProvider></MemoryRouter>);
+      fireEvent.click(await screen.findByTestId("enter-log-time"));
+      await screen.findByText("Log Week");
+      await waitFor(() => expect(screen.getAllByRole("button", { name: "Log" }).length).toBeGreaterThanOrEqual(2));
+      fireEvent.click(within(block("Widget Rollout")).getByRole("button", { name: "Log" }));
+      await waitFor(() => expect(within(block("Widget Rollout")).getByRole("button", { name: "Log" })).toBeEnabled());
+      expect(within(block("Widget Rollout")).queryByRole("button", { name: "Logged" })).not.toBeInTheDocument();
+      expect(await screen.findByText(/Could not log this time to Salesforce/)).toBeInTheDocument();
+    });
+  });
+
   it("a removed row stays removed across a remount", async () => {
     serveWeek();
     const row = await openPanel();
@@ -3135,5 +4081,41 @@ describe("CalendarPage — record links in the event panel", () => {
     await openBlock();
     const link = await screen.findByTestId("panel-account-link");
     expect(link).toHaveAttribute("href", "/accounts/42");
+  });
+});
+
+// ── Pinned Claude skills row ─────────────────────────────────────────────────────────
+
+describe("CalendarPage — pinned Claude skills", () => {
+  const pinned = () => server.use(pagePinsFor("calendar", [
+    mockPagePin({ id: 1, page: "calendar", skill: mockAgentSkill({ id: 1, name: "weekly-update" }) }),
+    mockPagePin({ id: 2, page: "calendar", skill: mockAgentSkill({ id: 2, name: "renewal-check" }) }),
+  ]));
+
+  it("shows them in a row below the calendar with white buttons", async () => {
+    pinned();
+    renderPage();
+    const row = await screen.findByTestId("calendar-skills-row");
+    await within(row).findByRole("button", { name: /^Weekly Update/ });
+    expect(within(row).getAllByTestId("pinned-chip")[0]).toHaveStyle({ background: "#fff" });
+    expect(within(row).getByRole("button", { name: /^Renewal Check/ })).toBeInTheDocument();
+    // Below the calendar: after the expand/collapse tab that closes the calendar card.
+    const tab = screen.getByTitle(/Collapse calendar|Expand calendar/);
+    expect(tab.compareDocumentPosition(row) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("scrolls sideways rather than wrapping when there are many", async () => {
+    pinned();
+    renderPage();
+    const row = await screen.findByTestId("calendar-skills-row");
+    await within(row).findByRole("button", { name: /^Weekly Update/ });
+    expect(within(row).getByTestId("pinned-skills-calendar")).toHaveStyle({ overflowX: "auto", whiteSpace: "nowrap" });
+  });
+
+  it("is in the same box as the calendar, so it is exactly as wide", async () => {
+    renderPage();
+    const row = await screen.findByTestId("calendar-skills-row");
+    const card = document.querySelector("[data-content-view]") as HTMLElement;
+    expect(row.parentElement).toBe(card.parentElement);
   });
 });

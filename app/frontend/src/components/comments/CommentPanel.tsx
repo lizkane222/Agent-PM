@@ -5,6 +5,7 @@
  * Top-level comments scroll; replies are indented below each parent.
  * "Reply" button opens an inline reply composer.
  */
+import { Z } from "../../lib/zLayers";
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import type { Comment, CommentResourceType } from "../../types";
@@ -60,7 +61,7 @@ function CommentRow({
   return (
     <div
       className="group"
-      style={{ marginLeft: depth > 0 ? "1.5rem" : 0, borderLeft: depth > 0 ? "2px solid #e5e7eb" : undefined, paddingLeft: depth > 0 ? "0.75rem" : 0 }}
+      style={{ marginLeft: depth > 0 ? "1.5rem" : 0, borderLeft: depth > 0 ? "2px solid var(--border-subtle)" : undefined, paddingLeft: depth > 0 ? "0.75rem" : 0 }}
     >
       <div className="py-2">
         {/* Header */}
@@ -232,7 +233,7 @@ export default function CommentPanel({ resourceType, resourceId, resourceLabel, 
     <div
       ref={panelRef}
       className="flex flex-col rounded-2xl shadow-2xl border border-gray-200 bg-white overflow-hidden"
-      style={{ width: COMMENT_PANEL_WIDTH, maxHeight: COMMENT_PANEL_HEIGHT, zIndex: 9999 }}
+      style={{ width: COMMENT_PANEL_WIDTH, maxHeight: COMMENT_PANEL_HEIGHT, zIndex: Z.popover }}
     >
       {/*
         Header. The record label goes on its own line, clamped to two lines.

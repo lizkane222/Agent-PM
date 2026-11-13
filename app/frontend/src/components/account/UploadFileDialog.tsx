@@ -33,7 +33,7 @@ export function UploadFileDialog({
     setRows((prev) => prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onCancel}>
+    <div className="fixed inset-0 z-[9000] flex items-center justify-center bg-black/40" onClick={onCancel}>
       <div
         role="dialog"
         aria-label="Upload files"

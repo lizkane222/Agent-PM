@@ -91,7 +91,13 @@ class UserPageNote(models.Model):
         related_name="page_notes",
     )
     content = models.TextField(blank=True)
+    # Display name of the linked account. Kept for the notepad's tab label; `account` is the real link.
     account_ref_label = models.CharField(max_length=255, blank=True)
+    # Optional link to an account. The note stays private to its owner; the owner sees it under
+    # that account's "Account Notes". SET_NULL: deleting an account must not delete a person's notes.
+    account = models.ForeignKey(
+        "accounts.Account", null=True, blank=True, on_delete=models.SET_NULL, related_name="notepad_notes",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

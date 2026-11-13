@@ -197,6 +197,38 @@ class AccountAttributionTests(_Base):
         self.assertEqual(self.rows(), {("2026-10-14", "Acme", "calendar"): 60})
 
 
+class AdminTimeTests(_Base):
+    """Time on the user's own Admin workspace is reported under one label, whichever table it came from."""
+
+    def test_an_event_linked_to_the_admin_account_shows_as_admin(self):
+        admin = Account.objects.create(company_name="Admin", is_admin_account=True, admin_owner=self.user)
+        admin.team_members.add(self.member)
+        self.event("Expenses", account=admin, minutes=40)
+        self.assertEqual(self.rows(), {("2026-10-14", "Admin", "calendar"): 40})
+
+    def test_the_airtable_spelling_is_folded_into_the_same_label(self):
+        at_admin = AirtableAccount.objects.create(airtable_id="recADMIN", name="ADMIN")
+        AirtableActionItem.objects.create(airtable_id="recITEM", task="Timesheet", account=at_admin)
+        self.event("Timesheet", agentpm_airtable_id="recITEM", minutes=25)
+        self.assertEqual(self.rows(), {("2026-10-14", "Admin", "calendar"): 25})
+
+    def test_logged_admin_time_and_calendar_admin_time_do_not_split_into_two_rows(self):
+        admin = Account.objects.create(company_name="Admin", is_admin_account=True, admin_owner=self.user)
+        self.logged(30, account=admin)
+        self.event("Admin catch-up", account=admin, minutes=60, day=D + timedelta(days=1))
+        accounts = {r["account"] for r in self.run_alloc(end=D + timedelta(days=1))["rows"]}
+        self.assertEqual(accounts, {"Admin"})
+
+    def test_the_response_names_the_admin_label_for_the_panel(self):
+        self.assertEqual(self.run_alloc()["admin_account"], "Admin")
+
+    def test_another_users_admin_time_is_never_included(self):
+        other = User.objects.create_user("bob", email="bob@example.com", password="x")
+        other_admin = Account.objects.create(company_name="Admin", is_admin_account=True, admin_owner=other)
+        self.event("Bob's admin", account=other_admin, owner=other)
+        self.assertEqual(self.rows(), {})
+
+
 class LoggedBeatsCalendarTests(_Base):
     def test_logged_time_is_used_instead_of_the_calendar_for_that_day_and_account(self):
         self.logged(45, self.acme)

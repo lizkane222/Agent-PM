@@ -38,6 +38,12 @@ def _llm_client():
     return build_sync_client()
 
 
+def _record_usage(user, feature, response) -> None:
+    """Attribute this call's tokens to the signed-in caller; never raises."""
+    from agents.usage import record_llm_usage
+    record_llm_usage(user, feature, response)
+
+
 def _review_model() -> str:
     """Resolved per call, not cached at import, so override_settings works in tests."""
     return model_for_tier(TIER_DEFAULT)
@@ -65,7 +71,7 @@ _REVIEW_SYSTEM = textwrap.dedent("""\
     }
 """)
 
-def _claude_review_skill(skill: ClaudeSkill) -> dict:
+def _claude_review_skill(skill: ClaudeSkill, user=None) -> dict:
     # truststore.inject_into_ssl() (called at module load) injects the system
     # CA bundle (including corporate Zscaler CA) so TLS verification is intact.
     client = _llm_client()
@@ -80,6 +86,7 @@ def _claude_review_skill(skill: ClaudeSkill) -> dict:
         system=_REVIEW_SYSTEM,
         messages=[{"role": "user", "content": prompt}],
     )
+    _record_usage(user, "Skill review", response)
     raw = response.content[0].text.strip()
     if raw.startswith("```"):
         raw = raw.split("```")[1]
@@ -174,7 +181,7 @@ _FIX_SYSTEM = textwrap.dedent("""\
 """) + _SANDBOX_RULES
 
 
-def _claude_generate_code(name: str, description: str) -> str:
+def _claude_generate_code(name: str, description: str, user=None) -> str:
     """Ask Claude to generate Python skill code from a name and description."""
     client = _llm_client()
     prompt = (
@@ -188,6 +195,7 @@ def _claude_generate_code(name: str, description: str) -> str:
         system=_GENERATE_SYSTEM,
         messages=[{"role": "user", "content": prompt}],
     )
+    _record_usage(user, "Skill generation", response)
     code = response.content[0].text.strip()
     # Strip accidental markdown fences if the model adds them
     if code.startswith("```"):
@@ -196,7 +204,7 @@ def _claude_generate_code(name: str, description: str) -> str:
     return code
 
 
-def _claude_fix_code(skill: ClaudeSkill) -> str:
+def _claude_fix_code(skill: ClaudeSkill, user=None) -> str:
     """Ask Claude to rewrite skill code to address prior review feedback."""
     client = _llm_client()
     feedback_block = skill.review_feedback or ""
@@ -215,6 +223,7 @@ def _claude_fix_code(skill: ClaudeSkill) -> str:
         system=_FIX_SYSTEM,
         messages=[{"role": "user", "content": prompt}],
     )
+    _record_usage(user, "Skill generation", response)
     code = response.content[0].text.strip()
     if code.startswith("```"):
         lines = code.split("\n")
@@ -264,7 +273,7 @@ class ClaudeSkillViewSet(viewsets.ModelViewSet):
         skill.status = "reviewing"
         skill.save(update_fields=["status"])
         try:
-            result  = _claude_review_skill(skill)
+            result  = _claude_review_skill(skill, user=request.user)
             verdict = result.get("verdict", "rejected")
             skill.review_feedback    = result.get("feedback", "")
             skill.review_suggestions = result.get("suggestions", "")
@@ -470,7 +479,7 @@ class ClaudeSkillViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         try:
-            code = _claude_generate_code(name, description)
+            code = _claude_generate_code(name, description, user=request.user)
             return Response({"code": code})
         except Exception as exc:
             logger.exception("Code generation failed: %s", exc)
@@ -496,7 +505,7 @@ class ClaudeSkillViewSet(viewsets.ModelViewSet):
             )
         # Generate fixed code
         try:
-            new_code = _claude_fix_code(skill)
+            new_code = _claude_fix_code(skill, user=request.user)
         except Exception as exc:
             logger.exception("Code fix generation failed for skill '%s': %s", skill.name, exc)
             return Response({"detail": "Code fix failed. Check server logs."}, status=status.HTTP_502_BAD_GATEWAY)
@@ -506,7 +515,7 @@ class ClaudeSkillViewSet(viewsets.ModelViewSet):
         skill.status = "reviewing"
         skill.save(update_fields=["code", "status"])
         try:
-            result  = _claude_review_skill(skill)
+            result  = _claude_review_skill(skill, user=request.user)
             verdict = result.get("verdict", "rejected")
             skill.review_feedback    = result.get("feedback", "")
             skill.review_suggestions = result.get("suggestions", "")
@@ -622,7 +631,7 @@ _AGENT_SKILL_GENERATE_SYSTEM = textwrap.dedent("""\
 _PLATFORM_TOOL_CATALOG = mcp_server.skill_safe_tools()
 
 
-def _claude_review_agent_skill(skill: AgentSkill) -> dict:
+def _claude_review_agent_skill(skill: AgentSkill, user=None) -> dict:
     client = _llm_client()
     scripts_text = ""
     for s in (skill.scripts or []):
@@ -640,6 +649,7 @@ def _claude_review_agent_skill(skill: AgentSkill) -> dict:
         system=_AGENT_SKILL_REVIEW_SYSTEM,
         messages=[{"role": "user", "content": prompt}],
     )
+    _record_usage(user, "Skill review", response)
     raw = response.content[0].text.strip()
     if raw.startswith("```"):
         raw = raw.split("```")[1]
@@ -672,7 +682,26 @@ def _generation_context_text(ctx: dict) -> str:
     return "\n\nAuthor selections:\n" + "\n".join(f"- {l}" for l in lines) if lines else ""
 
 
-def _claude_generate_agent_skill(description: str, context: dict | None = None) -> dict:
+_GENERATE_TOOL = {
+    "name": "define_skill",
+    "description": "Return the finished skill definition.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "description": {"type": "string"},
+            "instructions": {"type": "string", "description": "Markdown steps; code blocks and quotes are fine."},
+            "allowed_tools": {"type": "array", "items": {"type": "string"}},
+            "needs_script": {"type": "boolean"},
+            "script": {"type": "string"},
+        },
+        "required": ["name", "description", "instructions", "allowed_tools", "needs_script"],
+    },
+}
+_GENERATE_TOOL_NOTE = "\n\nReturn the skill by calling the define_skill tool; do not reply with prose or JSON text."
+
+
+def _claude_generate_agent_skill(description: str, context: dict | None = None, user=None) -> dict:
     client = _llm_client()
     system = _AGENT_SKILL_GENERATE_SYSTEM.replace(
         "{allowed_tools_catalog}", ", ".join(_PLATFORM_TOOL_CATALOG)
@@ -680,52 +709,52 @@ def _claude_generate_agent_skill(description: str, context: dict | None = None) 
     response = client.messages.create(
         model=_review_model(),
         max_tokens=4096,
-        system=system,
+        system=system + _GENERATE_TOOL_NOTE,
+        # A forced tool call returns the skill as already-valid structured data. Asking the
+        # model to hand-write one big JSON string full of markdown (code blocks, quotes) was
+        # intermittently invalid, and the old repair then silently dropped `instructions`.
+        tools=[_GENERATE_TOOL],
+        tool_choice={"type": "tool", "name": _GENERATE_TOOL["name"]},
         messages=[{"role": "user", "content": description + _generation_context_text(context or {})}],
     )
-    raw = response.content[0].text.strip()
-    # Strip markdown code fence if present
-    if raw.startswith("```"):
-        parts = raw.split("```")
-        raw = parts[1] if len(parts) > 1 else parts[0]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    raw = raw.strip()
-    # If still truncated, attempt to close open JSON objects/arrays
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        # Count unclosed braces/brackets and close them
-        opens = raw.count("{") - raw.count("}")
-        opens_arr = raw.count("[") - raw.count("]")
-        # Truncate to last complete key-value pair before the broken string
-        # by finding the last comma at the top level
-        depth = 0
-        last_safe = 0
-        in_str = False
-        escape = False
-        for i, ch in enumerate(raw):
-            if escape:
-                escape = False
-                continue
-            if ch == "\\" and in_str:
-                escape = True
-                continue
-            if ch == '"' and not escape:
-                in_str = not in_str
-                continue
-            if in_str:
-                continue
-            if ch in "{[":
-                depth += 1
-            elif ch in "}]":
-                depth -= 1
-            elif ch == "," and depth == 1:
-                last_safe = i
-        if last_safe:
-            raw = raw[:last_safe]
-            raw += "}" * opens + "]" * opens_arr
-        return json.loads(raw)
+    _record_usage(user, "Skill generation", response)
+    return _skill_from_response(response)
+
+
+class GenerationIncomplete(Exception):
+    """Claude replied, but not with a usable skill. The message is safe to show the author."""
+
+
+def _skill_from_response(response) -> dict:
+    """The generated skill as a plain dict, or GenerationIncomplete — never a partial success."""
+    if getattr(response, "stop_reason", None) == "max_tokens":
+        raise GenerationIncomplete("Claude ran out of room before finishing the instructions. Try a shorter description.")
+
+    data = None
+    for block in response.content:
+        if getattr(block, "type", None) == "tool_use" and getattr(block, "name", "") == _GENERATE_TOOL["name"]:
+            data = dict(block.input)
+            break
+    if data is None:
+        # Fallback for a reply that arrived as text. loads_object takes the first "{" to the
+        # last "}", so a code block *inside* the instructions can't truncate it the way
+        # splitting on triple-backticks did.
+        from .claude_json import loads_object
+
+        text = next((b.text for b in response.content if hasattr(b, "text")), "")
+        try:
+            data = loads_object(text)
+        except ValueError:
+            raise GenerationIncomplete("Claude's reply couldn't be read. Please try again.")
+
+    for key in ("name", "description", "instructions"):
+        if not isinstance(data.get(key), str) or not data[key].strip():
+            raise GenerationIncomplete("Claude's reply was missing the skill's " + key + ". Please try again.")
+    tools = data.get("allowed_tools")
+    data["allowed_tools"] = [t for t in tools if isinstance(t, str)] if isinstance(tools, list) else []
+    data["needs_script"] = bool(data.get("needs_script"))
+    data["script"] = data["script"] if isinstance(data.get("script"), str) else ""
+    return data
 
 
 import re as _re
@@ -750,6 +779,34 @@ def _validate_no_angle_brackets(text: str, field: str) -> str | None:
 
 
 ESTIMATE_BATCH = 10   # skills estimated per request; each is one Claude call
+
+
+def _start_console_run(request, skill, surface: str) -> str | None:
+    """Open this launch's Console run. Never fails the launch: a missing Console line is not worth a 500."""
+    from .skill_console import create_run
+
+    try:
+        data = request.data
+        params = {
+            "free_text": data.get("free_text") or "",
+            "accounts": len(data.get("account_ids") or []),
+            "template": data.get("template_key") or "",
+        }
+        return str(create_run(request.user, skill, surface=surface, page=str(data.get("page") or ""), params=params).pk)
+    except Exception:
+        logger.exception("Could not open a Console run for skill %s", getattr(skill, "pk", "?"))
+        return None
+
+
+def _stage_run_data(run_id: str, parts: list[dict]) -> bool:
+    """Store a run's oversized data for `get_skill_run_data`. False when it could not be saved."""
+    from .models import SkillRun
+
+    try:
+        return SkillRun.objects.filter(pk=run_id).update(data_parts=parts) == 1
+    except Exception:
+        logger.exception("Could not stage data for skill run %s", run_id)
+        return False
 
 
 def _budget_block_response(user):
@@ -882,8 +939,11 @@ class AgentSkillViewSet(viewsets.ModelViewSet):
         if not description:
             return Response({"detail": "description is required."}, status=status.HTTP_400_BAD_REQUEST)
         try:
-            result = _claude_generate_agent_skill(description, request.data.get("context"))
+            result = _claude_generate_agent_skill(description, request.data.get("context"), user=request.user)
             return Response(result)
+        except GenerationIncomplete as exc:
+            logger.warning("Agent skill generation was incomplete: %s", exc)
+            return Response({"detail": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
         except Exception as exc:
             logger.exception("Agent skill generation failed: %s", exc)
             return Response({"detail": "Generation failed. Check server logs."}, status=status.HTTP_502_BAD_GATEWAY)
@@ -907,7 +967,7 @@ class AgentSkillViewSet(viewsets.ModelViewSet):
         skill.status = "pending_review"
         skill.save(update_fields=["status"])
         try:
-            result  = _claude_review_agent_skill(skill)
+            result  = _claude_review_agent_skill(skill, user=request.user)
             verdict = result.get("verdict", "FAIL")
             skill.review_verdict  = verdict
             skill.review_findings = result.get("findings", {})
@@ -941,7 +1001,7 @@ class AgentSkillViewSet(viewsets.ModelViewSet):
                             status=status.HTTP_400_BAD_REQUEST)
         try:
             result = recommend(description, instructions if isinstance(instructions, str) else "",
-                               client=_llm_client(), model=_review_model())
+                               client=_llm_client(), model=_review_model(), user=request.user)
         except Exception as exc:
             logger.exception("Tool recommendation failed: %s", exc)
             return Response({"detail": "Couldn't get recommendations right now. Pick tools manually or try again."},
@@ -996,7 +1056,7 @@ class AgentSkillViewSet(viewsets.ModelViewSet):
         failed = []
         for sk in targets:
             try:
-                te.estimate_skill(sk, client=client, model=model)
+                te.estimate_skill(sk, client=client, model=model, user=request.user)
             except Exception as exc:
                 logger.exception("Token estimate failed for skill %s: %s", sk.pk, exc)
                 failed.append(sk.name)
@@ -1035,16 +1095,27 @@ class AgentSkillViewSet(viewsets.ModelViewSet):
                 {"detail": f"Skill is not approved (status: {skill.status})."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        from .run_assembly import assemble_run
+        from .run_assembly import RUN_ID_TOKEN, assemble_run
 
         blocked = _budget_block_response(request.user)
         if blocked is not None:
             return blocked
         try:
-            result = assemble_run(skill, request.user, request.data)
+            result = assemble_run(skill, request.user, request.data, stage_data=True)
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
-        return Response(result)
+        run_id = _start_console_run(request, skill, "chat")
+        parts = result.pop("data_parts", [])
+        staged = None
+        if parts:
+            if run_id and _stage_run_data(run_id, parts):
+                result["prompt"] = result["prompt"].replace(RUN_ID_TOKEN, run_id)
+                staged = {"parts": len(parts), "characters": sum(len(p["text"]) for p in parts)}
+            else:
+                # Nowhere to keep it: paste it all, as before. The chat will say if it is too long.
+                result = assemble_run(skill, request.user, request.data)
+                result.pop("data_parts", None)
+        return Response({**result, "run_id": run_id, **({"data_staged": staged} if staged else {})})
 
     @action(detail=False, methods=["get", "post"], url_path="resolve-keywords")
     def resolve_keywords(self, request):
@@ -1142,8 +1213,9 @@ class AgentSkillViewSet(viewsets.ModelViewSet):
             result = assemble_run(skill, request.user, request.data)
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
-        key = create_launch_context(request.user, skill, result)
-        return Response({"key": key, "script": result["script"], "warnings": result["warnings"]})
+        run_id = _start_console_run(request, skill, "voice")
+        key = create_launch_context(request.user, skill, result, run_id=run_id)
+        return Response({"key": key, "script": result["script"], "warnings": result["warnings"], "run_id": run_id})
 
 
 class VoiceLaunchView(APIView):

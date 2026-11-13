@@ -188,3 +188,103 @@ class ReminderClaimTests(TestCase):
         self.assertTrue(any("channel failures" in line for line in logs.output))
         deliver_due_reminders()  # a second run must not retry it
         self.assertEqual(MockClient.return_value.messages.create.call_count, 1)
+
+
+# ── Carrier verdict after Twilio accepts a text ───────────────────────────────
+
+class SmsDeliveryFollowUpTests(TestCase):
+    """Twilio queues the text; the carrier can refuse it afterwards (e.g. 30034)."""
+
+    def setUp(self):
+        from team.models import Notification
+
+        self.Notification = Notification
+        self.user = _make_user()
+
+    def _deliver(self, MockClient, sid="SMabc"):
+        MockClient.return_value.messages.create.return_value.sid = sid
+        _make_reminder(self.user)
+        with patch("scheduler.tasks.check_sms_delivery.apply_async") as sched:
+            deliver_due_reminders()
+        return sched
+
+    @override_settings(**TWILIO_SETTINGS)
+    @patch("twilio.rest.Client")
+    def test_send_sms_returns_the_message_sid(self, MockClient):
+        MockClient.return_value.messages.create.return_value.sid = "SMabc"
+        reminder = _make_reminder(self.user)
+        self.assertEqual(_send_sms(self.user.profile, reminder), "SMabc")
+
+    @override_settings(**TWILIO_SETTINGS)
+    @patch("twilio.rest.Client")
+    def test_a_delivery_check_is_scheduled_for_the_recorded_row(self, MockClient):
+        sched = self._deliver(MockClient)
+        row = self.Notification.objects.get(channel="sms")
+        self.assertEqual(row.status, "sent")
+        sched.assert_called_once()
+        self.assertEqual(sched.call_args.kwargs["args"], [row.pk, "SMabc", 0])
+
+    @override_settings(**TWILIO_SETTINGS)
+    @patch("twilio.rest.Client")
+    def test_a_broker_outage_does_not_break_delivery(self, MockClient):
+        MockClient.return_value.messages.create.return_value.sid = "SMabc"
+        reminder = _make_reminder(self.user)
+        with patch("scheduler.tasks.check_sms_delivery.apply_async", side_effect=OSError("redis down")):
+            deliver_due_reminders()
+        reminder.refresh_from_db()
+        self.assertEqual(reminder.status, "sent")
+        self.assertEqual(self.Notification.objects.get(channel="sms").status, "sent")
+
+    @override_settings(**TWILIO_SETTINGS)
+    @patch("scheduler.sms_delivery.fetch_outcome", return_value=("undelivered", 30034))
+    @patch("twilio.rest.Client")
+    def test_a_carrier_refusal_marks_the_notification_failed_with_a_reason(self, MockClient, _fetch):
+        from ..tasks import check_sms_delivery
+
+        self._deliver(MockClient)
+        row = self.Notification.objects.get(channel="sms")
+        check_sms_delivery(row.pk, "SMabc")
+        row.refresh_from_db()
+        self.assertEqual(row.status, "failed")
+        self.assertIn("A2P 10DLC", row.body)
+        self.assertIn("30034", row.body)
+        self.assertNotIn("ACtest", row.body)
+
+    @override_settings(**TWILIO_SETTINGS)
+    @patch("scheduler.sms_delivery.fetch_outcome", return_value=("delivered", None))
+    @patch("twilio.rest.Client")
+    def test_a_delivered_text_stays_sent_and_is_not_rechecked(self, MockClient, _fetch):
+        from ..tasks import check_sms_delivery
+
+        self._deliver(MockClient)
+        row = self.Notification.objects.get(channel="sms")
+        with patch("scheduler.tasks.check_sms_delivery.apply_async") as sched:
+            check_sms_delivery(row.pk, "SMabc")
+        row.refresh_from_db()
+        self.assertEqual(row.status, "sent")
+        sched.assert_not_called()
+
+    @override_settings(**TWILIO_SETTINGS)
+    @patch("scheduler.sms_delivery.fetch_outcome", return_value=("sent", None))
+    @patch("twilio.rest.Client")
+    def test_a_text_still_in_flight_is_rechecked_later_then_given_up_on(self, MockClient, _fetch):
+        from ..tasks import check_sms_delivery
+        from .. import sms_delivery
+
+        self._deliver(MockClient)
+        row = self.Notification.objects.get(channel="sms")
+        with patch("scheduler.tasks.check_sms_delivery.apply_async") as sched:
+            check_sms_delivery(row.pk, "SMabc", 0)
+            self.assertEqual(sched.call_args.kwargs["args"], [row.pk, "SMabc", 1])
+            sched.reset_mock()
+            check_sms_delivery(row.pk, "SMabc", len(sms_delivery.RECHECK_DELAYS) - 1)
+            sched.assert_not_called()
+        row.refresh_from_db()
+        self.assertEqual(row.status, "sent")
+
+    def test_error_codes_map_to_fixed_text_only(self):
+        from .. import sms_delivery
+
+        self.assertIn("A2P", sms_delivery.describe_error(30034))
+        self.assertEqual(sms_delivery.describe_error("nope"), sms_delivery.GENERIC_HELP)
+        self.assertEqual(sms_delivery.describe_error(99999), sms_delivery.GENERIC_HELP)

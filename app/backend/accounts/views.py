@@ -21,8 +21,8 @@ from scheduler.serializers import ActionItemSerializer, CalendarEventSerializer,
 
 from .artifact_images import image_upload_error
 from .artifact_links import used_in_map
-from .models import Account, AccountArtifact, AccountNote, AccountProject, AccountQuickLink, AccountRole, CustomerContact, CustomerContactNote, ProjectMember
-from .serializers import AccountArtifactSerializer, AccountNoteSerializer, AccountProjectSerializer, AccountQuickLinkSerializer, AccountRoleSerializer, AccountSerializer, CustomerContactNoteSerializer, CustomerContactSerializer, ProjectMemberSerializer
+from .models import Account, AccountArtifact, AccountNote, AccountProject, AccountQuickLink, AccountRole, AccountTicket, CustomerContact, CustomerContactNote, ProjectMember
+from .serializers import AccountArtifactSerializer, AccountNoteSerializer, AccountProjectSerializer, AccountTicketSerializer, AccountQuickLinkSerializer, AccountRoleSerializer, AccountSerializer, CustomerContactNoteSerializer, CustomerContactSerializer, ProjectMemberSerializer
 
 logger = logging.getLogger(__name__)
 
@@ -334,6 +334,21 @@ class AccountViewSet(viewsets.ModelViewSet):
             logger.exception("Failed to fetch calendar events for account %s", pk)
             return Response([])
 
+    @action(detail=True, methods=["get"], url_path="timeline")
+    def timeline(self, request, pk=None):
+        """Events + meetings for the Account Detail Timeline. ``?scope=mine|team``.
+
+        Visibility is the account's own (``get_object`` -> this viewset's queryset), so a
+        non-member gets 404. See ``accounts/timeline.py`` for what teammates' events reveal.
+        """
+        from .timeline import build_timeline
+
+        scope = request.query_params.get("scope", "mine")
+        if scope not in ("mine", "team"):
+            return Response({"detail": "scope must be 'mine' or 'team'."}, status=status.HTTP_400_BAD_REQUEST)
+        account = self.get_object()
+        return Response(build_timeline(account, request.user, scope))
+
     @action(detail=True, methods=["get", "post"], url_path="notes")
     def notes(self, request, pk=None):
         account = self.get_object()
@@ -520,9 +535,14 @@ class AccountViewSet(viewsets.ModelViewSet):
             data["resource_type"] = "account"
             data["resource_id"] = account.id
             data.setdefault("resource_label", account.company_name)
-            serializer = ReminderSerializer(data=data)
+            # With the request, so the user's own notification defaults apply to channels the
+            # caller did not name, exactly as when a reminder is made anywhere else.
+            serializer = ReminderSerializer(data=data, context={"request": request})
             serializer.is_valid(raise_exception=True)
             reminder = serializer.save(created_by=request.user)
+            from scheduler import reminder_calendar
+
+            reminder_calendar.sync_reminder_block(reminder, created=True)
             publish_activity_event(
                 request.user, "reminder.created",
                 "**Created** Reminder",
@@ -698,7 +718,7 @@ class AccountArtifactViewSet(
             if not allowed:
                 from rest_framework.exceptions import PermissionDenied
                 raise PermissionDenied("You cannot attach artifacts to this account.")
-        instance = serializer.save()
+        instance = serializer.save(updated_by=user)
         try:
             from airtable_sync.write_back import push_artifact_upsert
             push_artifact_upsert(instance)
@@ -860,6 +880,9 @@ class AdminAccountView(APIView):
 class AccountProjectViewSet(viewsets.ModelViewSet):
     serializer_class = AccountProjectSerializer
     permission_classes = [IsAuthenticated]
+    # The Action Items page reads every visible project in one request (the alternative is
+    # one request per account); the default paginator ignores ?page_size=.
+    pagination_class = ClientPageSizePagination
 
     def get_queryset(self):
         from django.db.models import Q
@@ -1114,3 +1137,115 @@ class ProjectMemberViewSet(
         from .access import assert_can_change_members
         assert_can_change_members(self.request.user, set(), {instance.team_member_id})
         instance.delete()
+
+
+class AccountTicketViewSet(viewsets.ModelViewSet):
+    """JIRA / Zendesk tickets and product gaps on an account.
+
+    A ``needs_review`` row (filed by the Gmail scanner with no matching account) has no
+    account and is visible and editable only by ``found_by`` - staff get no bypass.
+    """
+
+    serializer_class = AccountTicketSerializer
+    permission_classes = [IsAuthenticated]
+    pagination_class = ClientPageSizePagination
+
+    def get_queryset(self):
+        from django.db.models import Q
+        user = self.request.user
+        mine_to_review = Q(review_state="needs_review", found_by=user)
+        confirmed = Q(review_state="confirmed")
+        if not _staff_sees_all(user):
+            confirmed &= Q(account__team_members__user=user) | Q(account__admin_owner=user)
+        qs = AccountTicket.objects.select_related("account", "created_by", "found_by").filter(
+            confirmed | mine_to_review
+        ).distinct()
+        params = self.request.query_params
+        if params.get("review") == "needs_review":
+            qs = qs.filter(review_state="needs_review")
+        elif self.action == "list":
+            qs = qs.filter(review_state="confirmed")
+        if params.get("account"):
+            qs = qs.filter(account__id=params["account"])
+        if params.get("kind"):
+            qs = qs.filter(kind=params["kind"])
+        return qs
+
+    @staticmethod
+    def _apply_resolution(serializer_data, instance=None):
+        """resolved_at follows status unless the caller supplied it."""
+        from django.utils import timezone
+
+        new_status = serializer_data.get("status")
+        if new_status is None or "resolved_at" in serializer_data:
+            return
+        done = ("resolved", "closed")
+        was_done = instance is not None and instance.status in done
+        if new_status in done:
+            if not was_done or instance.resolved_at is None:
+                serializer_data["resolved_at"] = timezone.now()
+        elif was_done:
+            serializer_data["resolved_at"] = None
+
+    def _log(self, ticket, what):
+        try:
+            from realtime.sync import publish_activity_event
+
+            if ticket.account_id:
+                publish_activity_event(
+                    self.request.user,
+                    "account.field_changed",
+                    f"**{ticket.get_kind_display()}** {what}: {ticket.external_key or ticket.title}",
+                    detail=ticket.account.company_name,
+                    metadata={
+                        "field": f"ticket:{ticket.kind}", "account_id": ticket.account_id,
+                        "resource": {"type": "account_ticket", "id": str(ticket.pk)},
+                    },
+                )
+        except Exception:
+            logger.exception("ticket activity log failed")
+
+    def perform_create(self, serializer):
+        account = serializer.validated_data.get("account")
+        if account is None:
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError({"account": "An account is required."})
+        _assert_account_membership(self.request.user, account)
+        self._apply_resolution(serializer.validated_data)
+        ticket = serializer.save(created_by=self.request.user, review_state="confirmed")
+        self._log(ticket, "added")
+
+    def perform_update(self, serializer):
+        inst = serializer.instance
+        target = serializer.validated_data.get("account") or inst.account
+        _assert_account_membership(self.request.user, target)
+        self._apply_resolution(serializer.validated_data, inst)
+        extra = {}
+        if inst.review_state == "needs_review" and target is not None:
+            extra["review_state"] = "confirmed"
+        before_status = inst.status
+        ticket = serializer.save(**extra)
+        self._log(ticket, "updated" if ticket.status == before_status else f"moved to {ticket.status}")
+
+    @action(detail=True, methods=["post"], url_path="assign")
+    def assign(self, request, pk=None):
+        """POST {account, kind?, title?} - file a needs_review ticket on an account and confirm it."""
+        ticket = self.get_object()
+        if ticket.review_state != "needs_review" or ticket.found_by_id != request.user.pk:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        account = Account.objects.filter(pk=request.data.get("account")).first() if request.data.get("account") else None
+        if account is None:
+            return Response({"account": ["A valid account is required."]}, status=status.HTTP_400_BAD_REQUEST)
+        _assert_account_membership(request.user, account)
+        kind = request.data.get("kind")
+        if kind:
+            if kind not in dict(AccountTicket.KIND_CHOICES):
+                return Response({"kind": ["Unknown kind."]}, status=status.HTTP_400_BAD_REQUEST)
+            ticket.kind = kind
+        if "title" in request.data:
+            ticket.title = str(request.data.get("title") or "")[:500]
+        ticket.account = account
+        ticket.review_state = "confirmed"
+        ticket.save()
+        self._log(ticket, "added")
+        return Response(self.get_serializer(ticket).data)

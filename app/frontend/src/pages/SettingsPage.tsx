@@ -11,7 +11,9 @@ import { useNotificationDefaults } from "../context/NotificationDefaultsContext"
 import type { OAuthCredential, UserProfile } from "../types";
 import TagInput from "../components/shared/TagInput";
 import IntegrationVoteModal, { type IntegrationVote } from "../components/settings/IntegrationVoteModal";
+import TimezoneField from "../components/account/TimezoneField";
 import PhoneNumberInput from "../components/settings/PhoneNumberInput";
+import StatusNamesSection from "../components/settings/StatusNamesSection";
 import UserAccessPanel from "../components/settings/UserAccessPanel";
 import { CHANNEL_LABEL, channelsToTest, type NotificationSnapshot, type TestChannel } from "../lib/notificationTests";
 import { isValidE164 } from "../lib/phone";
@@ -306,7 +308,6 @@ export default function SettingsPage() {
           notify_default_slack: profileRes.data.notify_default_slack,
           notify_default_push: profileRes.data.notify_default_push,
           notify_default_sms: profileRes.data.notify_default_sms,
-          notification_email: profileRes.data.notification_email,
           notification_slack: profileRes.data.notification_slack,
         };
         // Load Gmail config from profile
@@ -417,7 +418,6 @@ export default function SettingsPage() {
       notify_default_slack: notifDefaults.notify_default_slack,
       notify_default_push: notifDefaults.notify_default_push,
       notify_default_sms: notifDefaults.notify_default_sms,
-      notification_email: !!profile.notification_email,
       notification_slack: !!profile.notification_slack,
     };
     try {
@@ -428,8 +428,8 @@ export default function SettingsPage() {
         phone_number: profile.phone_number,
         google_account_email: profile.google_account_email,
         slack_user_id: profile.slack_user_id,
-        notification_email: profile.notification_email,
         notification_slack: profile.notification_slack,
+        allow_reminders_from_others: profile.allow_reminders_from_others ?? true,
       });
       setProfile(data);
       setSaveSuccess(true);
@@ -487,7 +487,9 @@ export default function SettingsPage() {
 
   const handleSignOut = useCallback(async () => {
     await logout();
-    window.location.href = "/oidc/logout/";
+    // The login page, not /oidc/logout/: the dev server does not proxy /oidc, so that path landed on a
+    // React route that does not exist. A full load also drops every in-memory store and cache.
+    window.location.href = "/login";
   }, []);
 
   const handlePushRegister = useCallback(async () => {
@@ -955,13 +957,15 @@ export default function SettingsPage() {
                 <label className="block text-sm font-medium text-[var(--twilio-navy)] mb-1">
                   Timezone
                 </label>
-                <input
-                  type="text"
-                  value={profile.timezone ?? ""}
-                  onChange={(e) => setProfile({ ...profile, timezone: e.target.value })}
-                  placeholder="America/New_York"
-                  className="w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                {/* "UTC" is the stored default, i.e. "never chose one": show it as empty. */}
+                <TimezoneField
+                  inputId="settings-timezone"
+                  value={profile.timezone && profile.timezone !== "UTC" ? profile.timezone : ""}
+                  onChange={(z) => setProfile({ ...profile, timezone: z || "UTC" })}
                 />
+                <p className="mt-1 text-xs text-[var(--twilio-gray-60)]">
+                  Your own setting always overrides a time zone a colleague set for you.
+                </p>
               </div>
             </div>
 
@@ -1057,18 +1061,26 @@ export default function SettingsPage() {
                 </div>
               </label>
 
-              {/* Legacy email/slack general toggles */}
+              {/* Whether teammates may notify me through their reminders */}
+              <label className="flex items-start gap-3 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={profile.allow_reminders_from_others ?? true}
+                  onChange={(e) => setProfile({ ...profile, allow_reminders_from_others: e.target.checked })}
+                  className="mt-0.5 h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
+                />
+                <div>
+                  <p className="text-sm font-medium text-[var(--twilio-navy)]">Allow other users to notify me</p>
+                  <p className="text-xs text-[var(--twilio-gray-60)]">
+                    Teammates on your accounts can add you to a reminder they create, and you will be notified when it is due.
+                    Turn this off and they will see you listed as unavailable.
+                  </p>
+                </div>
+              </label>
+
+              {/* Legacy Slack general toggle (email notifications are not offered) */}
               <div className="pt-3 border-t border-gray-100 space-y-2">
                 <p className="text-xs font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide">General notifications</p>
-                <label className="flex items-center gap-2 text-sm text-[var(--twilio-navy)] cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={profile.notification_email ?? false}
-                    onChange={(e) => setProfile({ ...profile, notification_email: e.target.checked })}
-                    className="h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
-                  />
-                  Email notifications
-                </label>
                 <label className="flex items-center gap-2 text-sm text-[var(--twilio-navy)] cursor-pointer">
                   <input
                     type="checkbox"
@@ -1108,7 +1120,7 @@ export default function SettingsPage() {
                   {testResults.map((r) => (
                     <li key={r.channel} className={r.status === "sent" ? "text-green-700" : r.status === "failed" ? "text-red-600" : "text-amber-700"}>
                       {r.status === "sent" ? "✓" : r.status === "failed" ? "✕" : "–"}{" "}
-                      Test {CHANNEL_LABEL[r.channel]}: {r.status === "sent" ? "sent" : r.detail}
+                      Test {CHANNEL_LABEL[r.channel]}: {r.status === "sent" ? (r.detail ? `sent — ${r.detail}` : "sent") : r.detail}
                     </li>
                   ))}
                 </ul>
@@ -1181,6 +1193,8 @@ export default function SettingsPage() {
       {profile?.is_staff && (
         <StaffGmailKeywordsSection />
       )}
+
+      <StatusNamesSection />
 
       {/* Edit App */}
       <section className="bg-white rounded-lg border border-gray-200 shadow-sm">

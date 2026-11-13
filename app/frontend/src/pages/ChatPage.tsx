@@ -8,13 +8,19 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useLocation } from "react-router-dom";
-import { agentApi, skillsApi } from "../lib/api";
-import { consumeExportToChat } from "../components/ExportBar";
+import { agentApi } from "../lib/api";
+import { consumeExportToChat, EXPORT_ITEM_DRAG_KEY } from "../components/ExportBar";
+import { AttachmentList } from "../components/chat/AttachmentChip";
+import { formatMessageWithAttachments, parseMessageAttachments, type ChatAttachment } from "../lib/chatAttachments";
+import { fmtUsd } from "../lib/tokenBudget";
+import type { ExportItem } from "../context/ExportContext";
 import ConversationIcon from "../assets/icons/Conversation.svg?react";
 import PageBuilder from "../components/pagebuilder/PageBuilder";
 import { getAccessToken, isTokenExpired, refreshAccessToken } from "../lib/auth";
 import { budgetBlockedMessage } from "../lib/tokenBudget";
-import type { AgentSession, ClaudeSkill, SessionParticipant } from "../types";
+import type { AgentSession, SessionParticipant } from "../types";
+import SlashSkillMenu from "../components/chat/SlashSkillMenu";
+import { useSlashSkills } from "../hooks/useSlashSkills";
 
 const LAST_SESSION_KEY = "agentpm_last_session_id";
 
@@ -23,6 +29,17 @@ interface DisplayMessage {
   content: string;
   isStreaming?: boolean;
   timestamp: Date;
+  /** Real usage for an assistant message (from the stream's usage frame or the stored row). */
+  usage?: { input: number; output: number; costUsd?: string | undefined };
+}
+
+/** Maps a stored API message onto what the page displays. */
+function toDisplayMessage(m: { role: string; content: string; created_at?: string; input_tokens?: number; output_tokens?: number; cost_usd?: string }): DisplayMessage {
+  const role = m.role === "tool_result" ? "assistant" : (m.role as "user" | "assistant");
+  const usage = role === "assistant" && ((m.input_tokens ?? 0) > 0 || (m.output_tokens ?? 0) > 0)
+    ? { input: m.input_tokens ?? 0, output: m.output_tokens ?? 0, costUsd: m.cost_usd }
+    : undefined;
+  return { role, content: m.content, timestamp: new Date(m.created_at ?? Date.now()), ...(usage ? { usage } : {}) };
 }
 
 const CONVERSATION_STARTERS = [
@@ -53,62 +70,10 @@ const CONVERSATION_STARTERS = [
   },
 ];
 
-// Six distinct jitter animations — assigned to starters by index
-const JITTER_STYLES = [
-  { animationName: "jitter-a" },
-  { animationName: "jitter-b" },
-  { animationName: "jitter-c" },
-  { animationName: "jitter-d" },
-  { animationName: "jitter-e" },
-  { animationName: "jitter-f" },
-];
-
-const jitterCSS = `
-@keyframes jitter-a {
-  0%,100% { transform: translate(0px, 0px) rotate(0deg); }
-  20%      { transform: translate(1.5px, -1px) rotate(0.4deg); }
-  40%      { transform: translate(-1px, 1.5px) rotate(-0.3deg); }
-  60%      { transform: translate(1px, 1px) rotate(0.2deg); }
-  80%      { transform: translate(-1.5px, -0.5px) rotate(-0.4deg); }
-}
-@keyframes jitter-b {
-  0%,100% { transform: translate(0px, 0px) rotate(0deg); }
-  25%      { transform: translate(-2px, 1px) rotate(-0.5deg); }
-  50%      { transform: translate(1.5px, -1.5px) rotate(0.3deg); }
-  75%      { transform: translate(0.5px, 2px) rotate(-0.2deg); }
-}
-@keyframes jitter-c {
-  0%,100% { transform: translate(0px, 0px) rotate(0deg); }
-  15%      { transform: translate(2px, 0.5px) rotate(0.3deg); }
-  45%      { transform: translate(-1px, -2px) rotate(-0.4deg); }
-  70%      { transform: translate(1px, 1.5px) rotate(0.5deg); }
-  85%      { transform: translate(-2px, -1px) rotate(-0.2deg); }
-}
-@keyframes jitter-d {
-  0%,100% { transform: translate(0px, 0px) rotate(0deg); }
-  30%      { transform: translate(-1.5px, 2px) rotate(0.4deg); }
-  60%      { transform: translate(2px, -1px) rotate(-0.5deg); }
-  90%      { transform: translate(-0.5px, -1.5px) rotate(0.2deg); }
-}
-@keyframes jitter-e {
-  0%,100% { transform: translate(0px, 0px) rotate(0deg); }
-  20%      { transform: translate(1px, 2px) rotate(-0.3deg); }
-  55%      { transform: translate(-2px, -0.5px) rotate(0.5deg); }
-  80%      { transform: translate(1.5px, -2px) rotate(-0.4deg); }
-}
-@keyframes jitter-f {
-  0%,100% { transform: translate(0px, 0px) rotate(0deg); }
-  35%      { transform: translate(-1px, -2px) rotate(0.3deg); }
-  65%      { transform: translate(2px, 1.5px) rotate(-0.5deg); }
-  85%      { transform: translate(-1.5px, 1px) rotate(0.4deg); }
-}
+const chatCSS = `
 @keyframes slideDown {
   from { opacity: 0; transform: translateY(-8px); }
   to   { opacity: 1; transform: translateY(0); }
-}
-@keyframes chatExpand {
-  from { opacity: 0; transform: scaleY(0.18) translateY(40%); transform-origin: bottom center; }
-  to   { opacity: 1; transform: scaleY(1)   translateY(0);    transform-origin: bottom center; }
 }
 `;
 
@@ -121,17 +86,17 @@ function CopyButton({ text }: { text: string }) {
         setCopied(true);
         setTimeout(() => setCopied(false), 1500);
       }}
-      style={{ flexShrink: 0, alignSelf: "center", padding: "6px", borderRadius: "6px", color: "var(--text-secondary, #aaa)", background: "transparent", border: "none", cursor: "pointer", opacity: 0.5 }}
+      style={{ flexShrink: 0, alignSelf: "center", padding: "2px 4px", borderRadius: "6px", color: "var(--text-secondary, #aaa)", background: "transparent", border: "none", cursor: "pointer", opacity: 0.6 }}
       onMouseEnter={e => { e.currentTarget.style.opacity = "1"; e.currentTarget.style.background = "rgba(0,0,0,0.05)"; }}
-      onMouseLeave={e => { e.currentTarget.style.opacity = "0.5"; e.currentTarget.style.background = "transparent"; }}
+      onMouseLeave={e => { e.currentTarget.style.opacity = "0.6"; e.currentTarget.style.background = "transparent"; }}
       title="Copy message"
     >
       {copied ? (
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
           <polyline points="20 6 9 17 4 12"/>
         </svg>
       ) : (
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
           <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
         </svg>
@@ -142,13 +107,13 @@ function CopyButton({ text }: { text: string }) {
 
 function ThinkingBubble() {
   return (
-    <div style={{ display: "flex", alignItems: "flex-end", gap: "10px" }}>
-      <div style={{ width: "32px", height: "32px", borderRadius: "10px", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(226,35,26,0.08)", color: "var(--twilio-red, #e22)" }}>
+    <div style={{ display: "flex", alignItems: "flex-end", gap: "8px" }}>
+      <div style={{ width: "28px", height: "28px", borderRadius: "50%", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(226,35,26,0.08)", color: "var(--twilio-red, #e22)" }}>
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
         </svg>
       </div>
-      <div style={{ padding: "12px 16px", borderRadius: "12px 12px 12px 2px", background: "var(--surface, #fff)", border: "1px solid var(--border, rgba(0,0,0,0.08))", display: "flex", alignItems: "center", gap: "5px" }}>
+      <div style={{ padding: "12px 16px", borderRadius: "12px", background: "var(--chat-agent-bubble, #fff)", border: "1px solid var(--border, rgba(0,0,0,0.08))", display: "flex", alignItems: "center", gap: "5px" }} role="status" aria-label="Agent is thinking">
         <style>{`
           @keyframes thinkingDot {
             0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
@@ -169,54 +134,62 @@ function ThinkingBubble() {
 
 function MessageBubble({ message }: { message: DisplayMessage }) {
   const isUser = message.role === "user";
-  const [hovered, setHovered] = useState(false);
+  const [showUsage, setShowUsage] = useState(false);
   const time = message.timestamp.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  // Attached records render as chips; the full text is still what was sent to the model.
+  const { text, attachments } = parseMessageAttachments(message.content);
+  const usage = message.usage;
+  const metaStyle = { fontSize: "0.6875rem", color: "var(--text-secondary, #888)" } as const;
   return (
     <div
-      style={{ display: "flex", gap: "10px", alignItems: "flex-start", justifyContent: isUser ? "flex-end" : "flex-start" }}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
+      data-testid="chat-message"
+      data-role={message.role}
+      style={{ display: "flex", gap: "8px", alignItems: "flex-start", justifyContent: isUser ? "flex-end" : "flex-start" }}
     >
       {!isUser && (
-        <div style={{ flexShrink: 0, height: "32px", width: "32px", borderRadius: "50%", background: "var(--twilio-red, #e22)", display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontSize: "0.75rem", fontWeight: 700 }}>
+        <div style={{ flexShrink: 0, height: "28px", width: "28px", borderRadius: "50%", background: "var(--twilio-red, #e22)", display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontSize: "0.6875rem", fontWeight: 700 }}>
           AI
         </div>
       )}
-      {isUser && (
-        <div style={{ visibility: hovered ? "visible" : "hidden" }}>
-          <CopyButton text={message.content} />
-        </div>
-      )}
-      <div style={{ display: "flex", flexDirection: "column", gap: "4px", maxWidth: "560px" }}>
+      <div style={{ display: "flex", flexDirection: "column", gap: "4px", maxWidth: "min(85%, 560px)", minWidth: 0, alignItems: isUser ? "flex-end" : "flex-start" }}>
         <div
           style={{
-            padding: "12px 16px", borderRadius: isUser ? "18px 18px 4px 18px" : "18px 18px 18px 4px",
-            fontSize: "0.875rem", lineHeight: 1.6,
-            background: isUser ? "var(--twilio-red, #e22)" : "var(--surface, #fff)",
-            color: isUser ? "#fff" : "var(--text-primary, #111)",
-            border: isUser ? "none" : "1px solid var(--border, rgba(0,0,0,0.08))",
-            boxShadow: isUser ? "none" : "0 1px 3px rgba(0,0,0,0.06)",
+            padding: "10px 14px", borderRadius: "12px", maxWidth: "100%",
+            fontSize: "0.875rem", lineHeight: 1.55,
+            background: isUser ? "var(--twilio-gray-10, #f4f4f6)" : "var(--chat-agent-bubble, #fff)",
+            color: "var(--text-primary, #111)",
+            border: "1px solid var(--border, rgba(0,0,0,0.08))",
+            display: "flex", flexDirection: "column", gap: attachments.length ? 8 : 0,
           }}
         >
-          <p style={{ margin: 0, whiteSpace: "pre-wrap" }}>{message.content}</p>
-          {message.isStreaming && (
-            <span style={{ display: "inline-block", marginLeft: "4px", height: "14px", width: "2px", background: "currentColor", verticalAlign: "middle", animation: "pulse 1s infinite" }} />
+          {attachments.length > 0 && <AttachmentList attachments={attachments} />}
+          {(text || message.isStreaming || attachments.length === 0) && (
+            <p style={{ margin: 0, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+              {text}
+              {message.isStreaming && (
+                <span style={{ display: "inline-block", marginLeft: "4px", height: "14px", width: "2px", background: "currentColor", verticalAlign: "middle", animation: "pulse 1s infinite" }} />
+              )}
+            </p>
           )}
         </div>
-        <span style={{ fontSize: "0.6875rem", color: "var(--text-secondary, #aaa)", textAlign: isUser ? "right" : "left" }}>
-          {time}
-        </span>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexDirection: isUser ? "row-reverse" : "row" }}>
+          <span style={metaStyle}>{time}</span>
+          {!message.isStreaming && <CopyButton text={text || message.content} />}
+          {!isUser && usage && !message.isStreaming && (
+            <button
+              type="button"
+              onClick={() => setShowUsage((v) => !v)}
+              aria-expanded={showUsage}
+              title="Show token usage and cost for this reply"
+              style={{ ...metaStyle, background: "transparent", border: "none", cursor: "pointer", padding: 0, fontVariantNumeric: "tabular-nums" }}
+            >
+              {showUsage
+                ? `${(usage.input + usage.output).toLocaleString()} tokens (${usage.input.toLocaleString()} in · ${usage.output.toLocaleString()} out)${usage.costUsd !== undefined ? ` · ${fmtUsd(usage.costUsd)}` : ""}`
+                : "tokens · cost"}
+            </button>
+          )}
+        </div>
       </div>
-      {!isUser && (
-        <div style={{ visibility: hovered ? "visible" : "hidden" }}>
-          <CopyButton text={message.content} />
-        </div>
-      )}
-      {isUser && (
-        <div style={{ flexShrink: 0, height: "32px", width: "32px", borderRadius: "50%", background: "var(--surface-alt, rgba(0,0,0,0.08))", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "0.75rem", fontWeight: 700, color: "var(--text-primary, #111)" }}>
-          You
-        </div>
-      )}
     </div>
   );
 }
@@ -535,7 +508,6 @@ function StarterCards({
   onSend: () => void;
   messagesEndRef: React.RefObject<HTMLDivElement>;
 }) {
-  const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
 
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
@@ -552,15 +524,11 @@ function StarterCards({
             ✕ close
           </button>
         </div>
-        {/* Grid with large gap so jitter movement never overlaps neighbors */}
         <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "20px" }}>
           {CONVERSATION_STARTERS.map((s, i) => {
-            const anim = JITTER_STYLES[i % JITTER_STYLES.length]!;
             return (
               <button
                 key={i}
-                onMouseEnter={() => setHoveredIdx(i)}
-                onMouseLeave={() => setHoveredIdx(null)}
                 onClick={() => onSelect(s.question)}
                 style={{
                   padding: "10px 14px",
@@ -573,15 +541,10 @@ function StarterCards({
                   display: "flex",
                   alignItems: "center",
                   gap: "8px",
-                  animationName: hoveredIdx === i ? "none" : anim.animationName,
-                  animationDuration: `${2.2 + i * 0.37}s`,
-                  animationTimingFunction: "ease-in-out",
-                  animationIterationCount: "infinite",
-                  animationDirection: "alternate",
                 }}
                 onMouseOver={(e) => {
                   (e.currentTarget as HTMLButtonElement).style.borderColor = "#818cf8";
-                  (e.currentTarget as HTMLButtonElement).style.background = "#eef2ff";
+                  (e.currentTarget as HTMLButtonElement).style.background = "var(--tint-indigo-50, #eef2ff)";
                 }}
                 onMouseOut={(e) => {
                   (e.currentTarget as HTMLButtonElement).style.borderColor = "var(--border, rgba(0,0,0,0.08))";
@@ -638,16 +601,12 @@ function StarterCards({
 }
 
 function MainStarterGrid({ onSelect }: { onSelect: (q: string) => void }) {
-  const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
   return (
     <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "16px", width: "100%", maxWidth: "680px" }}>
       {CONVERSATION_STARTERS.map((s, i) => {
-        const anim = JITTER_STYLES[i % JITTER_STYLES.length]!;
         return (
           <button
             key={i}
-            onMouseEnter={() => setHoveredIdx(i)}
-            onMouseLeave={() => setHoveredIdx(null)}
             onClick={() => onSelect(s.question)}
             style={{
               padding: "12px 14px",
@@ -660,11 +619,6 @@ function MainStarterGrid({ onSelect }: { onSelect: (q: string) => void }) {
               alignItems: "center",
               gap: "8px",
               fontFamily: "var(--font-base)",
-              animationName: hoveredIdx === i ? "none" : anim.animationName,
-              animationDuration: `${2.2 + i * 0.37}s`,
-              animationTimingFunction: "ease-in-out",
-              animationIterationCount: "infinite",
-              animationDirection: "alternate",
             }}
             onMouseOver={e => { (e.currentTarget).style.borderColor = "var(--twilio-red, #e22)"; (e.currentTarget).style.background = "rgba(226,35,26,0.04)"; }}
             onMouseOut={e => { (e.currentTarget).style.borderColor = "var(--border, rgba(0,0,0,0.08))"; (e.currentTarget).style.background = "var(--surface, #fff)"; }}
@@ -926,10 +880,9 @@ export default function ChatPage() {
   const [activeSessionId, setActiveSessionId] = useState<number | null>(null);
   const [messages, setMessages] = useState<DisplayMessage[]>([]);
   const [input, setInput] = useState("");
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+  const slash = useSlashSkills({ value: input, onChange: setInput, inputRef: composerRef });
   const [isSending, setIsSending] = useState(false);
-  const [allSkills, setAllSkills] = useState<ClaudeSkill[]>([]);
-  const [cmdSuggestions, setCmdSuggestions] = useState<ClaudeSkill[]>([]);
-  const [cmdHighlight, setCmdHighlight] = useState(0);
   const [showWhereToStart, setShowWhereToStart] = useState(
     !!(location.state as { openWhereToStart?: boolean } | null)?.openWhereToStart
   );
@@ -942,6 +895,8 @@ export default function ChatPage() {
   const [wtsInput, setWtsInput] = useState("");
   const [wtsIsSending, setWtsIsSending] = useState(false);
   const [sessionTokens, setSessionTokens] = useState<{ input: number; output: number }>({ input: 0, output: 0 });
+  const [pendingAttachments, setPendingAttachments] = useState<ChatAttachment[]>([]);
+  const [dropActive, setDropActive] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const wtsEndRef = useRef<HTMLDivElement>(null);
 
@@ -957,13 +912,7 @@ export default function ChatPage() {
             ? (data.results.find((s) => s.id === parseInt(savedId, 10)) ?? data.results[0]!)
             : data.results[0]!;
           setActiveSessionId(target.id);
-          setMessages(
-            target.messages.map((m) => ({
-              role: m.role === "tool_result" ? "assistant" : m.role,
-              content: m.content,
-              timestamp: new Date(m.created_at ?? Date.now()),
-            }))
-          );
+          setMessages(target.messages.map(toDisplayMessage));
         }
       } catch {
         // First time — no sessions yet.
@@ -1024,27 +973,16 @@ export default function ChatPage() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // Load skills for slash-command autocomplete
-  useEffect(() => {
-    skillsApi.list().then(({ data }) => setAllSkills(data.results)).catch(() => {});
-  }, []);
-
-  // Recompute command suggestions whenever input changes
-  useEffect(() => {
-    if (input.startsWith("/")) {
-      const query = input.toLowerCase();
-      setCmdSuggestions(allSkills.filter(s => s.command && s.command.toLowerCase().startsWith(query)));
-      setCmdHighlight(0);
-    } else {
-      setCmdSuggestions([]);
-    }
-  }, [input, allSkills]);
-
   const sendMessage = useCallback(async (overrideMessage?: string) => {
-    const message = (overrideMessage ?? input).trim();
-    if (!message || isSending) return;
+    const typed = (overrideMessage ?? input).trim();
+    // Attachments ride in the same string the model receives; the UI renders them back as chips.
+    const attached = overrideMessage === undefined ? pendingAttachments : [];
+    if ((!typed && attached.length === 0) || isSending) return;
+    const message = formatMessageWithAttachments(
+      typed || (attached.length ? "Please review the attached records." : ""), attached);
 
     setInput("");
+    setPendingAttachments([]);
     setIsSending(true);
     setShowMainStarters(true); // reveal sticky starters bar on first send
     const now = new Date();
@@ -1113,11 +1051,18 @@ export default function ChatPage() {
             const jsonStart = sentinelIdx + TOKEN_SENTINEL.length;
             const jsonEnd = chunk.indexOf("\x00", jsonStart);
             const raw = chunk.slice(jsonStart, jsonEnd >= 0 ? jsonEnd : undefined);
-            const usage = JSON.parse(raw) as { input_tokens: number; output_tokens: number };
+            const usage = JSON.parse(raw) as { input_tokens: number; output_tokens: number; cost_usd?: string };
             setSessionTokens(prev => ({
               input: prev.input + (usage.input_tokens ?? 0),
               output: prev.output + (usage.output_tokens ?? 0),
             }));
+            const turnUsage = { input: usage.input_tokens ?? 0, output: usage.output_tokens ?? 0, costUsd: usage.cost_usd };
+            setMessages((prev) => {
+              const updated = [...prev];
+              const last = updated[updated.length - 1];
+              if (last && last.role === "assistant") updated[updated.length - 1] = { ...last, usage: turnUsage };
+              return updated;
+            });
           } catch { /* ignore parse errors */ }
         }
 
@@ -1159,7 +1104,7 @@ export default function ChatPage() {
     } finally {
       setIsSending(false);
     }
-  }, [input, isSending, activeSessionId]);
+  }, [input, isSending, activeSessionId, pendingAttachments]);
 
   // Auto-scroll WTS messages
   useEffect(() => {
@@ -1261,48 +1206,22 @@ export default function ChatPage() {
     [sendWtsMessage]
   );
 
-  const selectChatSkill = useCallback((skill: ClaudeSkill) => {
-    setCmdSuggestions([]);
-    setInput("");
-    void sendMessage(`Run the skill "${skill.name}": ${skill.description}`);
-  }, [sendMessage]);
-
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-      if (cmdSuggestions.length > 0) {
-        if (e.key === "ArrowDown") {
-          e.preventDefault();
-          setCmdHighlight(h => Math.min(h + 1, cmdSuggestions.length - 1));
-          return;
-        }
-        if (e.key === "ArrowUp") {
-          e.preventDefault();
-          setCmdHighlight(h => Math.max(h - 1, 0));
-          return;
-        }
-        if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
-          e.preventDefault();
-          const s = cmdSuggestions[cmdHighlight];
-          if (s) selectChatSkill(s);
-          return;
-        }
-        if (e.key === "Escape") {
-          setCmdSuggestions([]);
-          return;
-        }
-      }
+      if (slash.handleKeyDown(e)) return;
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
         void sendMessage();
       }
     },
-    [sendMessage, cmdSuggestions, cmdHighlight, selectChatSkill]
+    [sendMessage, slash]
   );
 
   const startNewSession = useCallback(() => {
     setActiveSessionId(null);
     setMessages([]);
     setSessionTokens({ input: 0, output: 0 });
+    setPendingAttachments([]);
     setShowWhereToStart(false);
     setShowMainStarters(false);
     localStorage.removeItem(LAST_SESSION_KEY);
@@ -1397,22 +1316,50 @@ export default function ChatPage() {
     setActiveSessionId(s.id);
     setShowWhereToStart(false);
     setShowMainStarters(false);
-    setMessages(
-      s.messages.map((m) => ({
-        role: m.role === "tool_result" ? "assistant" as const : m.role,
-        content: m.content,
-        timestamp: new Date(m.created_at ?? Date.now()),
-      }))
-    );
+    setMessages(s.messages.map(toDisplayMessage));
     // Restore persisted token counts for this session.
     const input = s.messages.reduce((sum, m) => sum + (m.input_tokens ?? 0), 0);
     const output = s.messages.reduce((sum, m) => sum + (m.output_tokens ?? 0), 0);
     setSessionTokens({ input, output });
   }, []);
 
+  // Export-tray pills dragged onto the chat become pending attachments. dragover can only read
+  // the payload's *types*, never its data, so the drop target is chosen by type alone.
+  const isExportDrag = (e: React.DragEvent) => Array.from(e.dataTransfer?.types ?? []).includes(EXPORT_ITEM_DRAG_KEY);
+  const dropHandlers = showWhereToStart ? {} : {
+    onDragOver: (e: React.DragEvent) => {
+      if (!isExportDrag(e)) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "copy";
+      if (!dropActive) setDropActive(true);
+    },
+    onDragLeave: (e: React.DragEvent) => {
+      if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDropActive(false);
+    },
+    onDrop: (e: React.DragEvent) => {
+      if (!isExportDrag(e)) return;
+      e.preventDefault();
+      setDropActive(false);
+      try {
+        const item = JSON.parse(e.dataTransfer.getData(EXPORT_ITEM_DRAG_KEY)) as ExportItem;
+        setPendingAttachments((prev) => prev.some((a) => a.id === item.id) ? prev : [...prev, {
+          id: item.id, type: item.type, label: item.label, summary: item.summary, content: item.content,
+        }]);
+      } catch { /* not one of ours */ }
+    },
+  };
+  const removeAttachment = (a: ChatAttachment) => setPendingAttachments((prev) => prev.filter((x) => x.id !== a.id));
+  const canSend = !isSending && (input.trim().length > 0 || pendingAttachments.length > 0);
+
+  const composerAttachments = pendingAttachments.length > 0 && (
+    <div data-testid="pending-attachments" style={{ marginBottom: 8 }}>
+      <AttachmentList attachments={pendingAttachments} onRemove={removeAttachment} />
+    </div>
+  );
+
   return (
     <>
-      <style>{jitterCSS}</style>
+      <style>{chatCSS}</style>
 
       <div style={{ display: "flex", height: "100%", fontFamily: "var(--font-base)", overflow: "hidden" }}>
 
@@ -1426,7 +1373,14 @@ export default function ChatPage() {
           {/* Header */}
           <div style={{ padding: "20px 16px 12px", borderBottom: "1px solid var(--border, rgba(0,0,0,0.08))" }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-              <h1 style={{ margin: 0, fontSize: "1.125rem", fontWeight: 700, display: "flex", alignItems: "center", gap: 6 }}><ConversationIcon width={18} height={18} style={{ flexShrink: 0 }} />Agent</h1>
+              <h1 style={{ margin: 0, fontSize: "1.125rem", fontWeight: 700 }}>
+                <button
+                  type="button"
+                  onClick={startNewSession}
+                  title="Start a new conversation"
+                  style={{ all: "unset", cursor: "pointer", display: "flex", alignItems: "center", gap: 6, fontWeight: 700 }}
+                ><ConversationIcon width={18} height={18} style={{ flexShrink: 0 }} />Agent</button>
+              </h1>
               <button
                 onClick={startNewSession}
                 style={{
@@ -1488,8 +1442,16 @@ export default function ChatPage() {
         </div>
 
         {/* ── Right panel ── */}
-        <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", background: "var(--bg, var(--twilio-gray-10, #f5f5f5))" }}
+        <div
+          data-testid="chat-drop-zone"
+          {...dropHandlers}
+          style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", background: "var(--bg, var(--twilio-gray-10, #f5f5f5))", position: "relative", outline: dropActive ? "2px dashed var(--twilio-red, #e22)" : "none", outlineOffset: -4 }}
         >
+          {dropActive && (
+            <div style={{ position: "absolute", top: 12, left: "50%", transform: "translateX(-50%)", zIndex: 20, padding: "6px 14px", borderRadius: 99, background: "var(--twilio-red, #e22)", color: "#fff", fontSize: "0.75rem", fontWeight: 600, pointerEvents: "none" }}>
+              Drop to attach to your message
+            </div>
+          )}
 
           {showWhereToStart ? (
             <StarterCards
@@ -1524,37 +1486,13 @@ export default function ChatPage() {
               {/* Input */}
               <div style={{ width: "100%", maxWidth: "680px", borderTop: "1px solid var(--border, rgba(0,0,0,0.08))", paddingTop: "24px", display: "flex", gap: "12px", alignItems: "flex-end" }}>
                 <div style={{ flex: 1, position: "relative" }}>
-                  {cmdSuggestions.length > 0 && (
-                    <div style={{
-                      position: "absolute", bottom: "calc(100% + 6px)", left: 0, right: 0,
-                      background: "var(--surface, #fff)", border: "1px solid rgba(0,0,0,0.12)",
-                      borderRadius: "10px", boxShadow: "0 4px 16px rgba(0,0,0,0.12)", zIndex: 50, overflow: "hidden",
-                    }}>
-                      {cmdSuggestions.map((s, i) => (
-                        <button
-                          key={s.id}
-                          onMouseDown={(e) => { e.preventDefault(); selectChatSkill(s); }}
-                          onMouseEnter={() => setCmdHighlight(i)}
-                          style={{
-                            display: "flex", flexDirection: "column", width: "100%", textAlign: "left",
-                            padding: "8px 14px", border: "none", cursor: "pointer",
-                            background: i === cmdHighlight ? "rgba(226,35,26,0.06)" : "transparent",
-                            borderLeft: i === cmdHighlight ? "3px solid var(--twilio-red, #e22)" : "3px solid transparent",
-                          }}
-                        >
-                          <span style={{ fontSize: "0.8125rem", fontWeight: 700, fontFamily: "var(--font-mono, monospace)", color: "var(--twilio-red, #e22)" }}>
-                            {s.command}
-                          </span>
-                          <span style={{ fontSize: "0.75rem", color: "var(--text-secondary, #888)", marginTop: "1px", lineHeight: 1.4 }}>
-                            {s.name} — {s.description}
-                          </span>
-                        </button>
-                      ))}
-                    </div>
-                  )}
+                  <SlashSkillMenu menu={slash} />
+                  {composerAttachments}
                   <textarea
                     value={input}
-                    onChange={(e) => setInput(e.target.value)}
+                    ref={composerRef}
+                    onChange={slash.handleChange}
+                    onSelect={slash.handleSelect}
                     onKeyDown={handleKeyDown}
                     rows={3}
                     placeholder="Or just start typing… (/ for skills)"
@@ -1564,8 +1502,8 @@ export default function ChatPage() {
                 </div>
                 <button
                   onClick={() => void sendMessage()}
-                  disabled={isSending || !input.trim()}
-                  style={{ padding: "14px 24px", borderRadius: "12px", fontSize: "0.9375rem", fontWeight: 600, background: "var(--twilio-red, #e22)", color: "#fff", border: "none", cursor: "pointer", opacity: (isSending || !input.trim()) ? 0.4 : 1, fontFamily: "var(--font-base)", whiteSpace: "nowrap" }}
+                  disabled={!canSend}
+                  style={{ padding: "14px 24px", borderRadius: "12px", fontSize: "0.9375rem", fontWeight: 600, background: "var(--twilio-red, #e22)", color: "#fff", border: "none", cursor: "pointer", opacity: !canSend ? 0.4 : 1, fontFamily: "var(--font-base)", whiteSpace: "nowrap" }}
                 >
                   {isSending ? "Sending…" : "Send"}
                 </button>
@@ -1573,7 +1511,7 @@ export default function ChatPage() {
             </div>
           ) : (
             /* ── Active chat ── */
-            <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", background: "var(--surface, #fff)", animation: "chatExpand 4s cubic-bezier(0.22, 1, 0.36, 1) both" }}>
+            <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", background: "var(--surface, #fff)" }}>
 
               {/* Sticky chat name header */}
               <ChatNameHeader
@@ -1625,7 +1563,8 @@ export default function ChatPage() {
                 </div>
               )}
 
-              <div style={{ flex: 1, overflowY: "auto", padding: "28px 32px", display: "flex", flexDirection: "column", gap: "16px" }}>
+              <div style={{ flex: 1, overflowY: "auto", padding: "24px 16px" }}>
+              <div style={{ width: "100%", maxWidth: "720px", margin: "0 auto", display: "flex", flexDirection: "column", gap: "14px" }}>
                 {messages.map((msg, i) => {
                   const msgDay = msg.timestamp.toDateString();
                   const prevDay = i > 0 ? messages[i - 1]!.timestamp.toDateString() : null;
@@ -1646,7 +1585,9 @@ export default function ChatPage() {
                 {isSending && <ThinkingBubble />}
                 <div ref={messagesEndRef} />
               </div>
-              <div style={{ borderTop: "1px solid var(--border, rgba(0,0,0,0.08))", padding: "16px 24px 12px", display: "flex", flexDirection: "column", gap: "10px" }}>
+              </div>
+              <div style={{ borderTop: "1px solid var(--border, rgba(0,0,0,0.08))", padding: "12px 16px", display: "flex", flexDirection: "column", gap: "8px", alignItems: "center" }}>
+               <div style={{ width: "100%", maxWidth: "720px", display: "flex", flexDirection: "column", gap: "8px" }}>
                 {/* Token counter chip */}
                 {(sessionTokens.input > 0 || sessionTokens.output > 0) && (
                   <div style={{ display: "flex", justifyContent: "flex-end" }}>
@@ -1661,37 +1602,13 @@ export default function ChatPage() {
                 )}
                 <div style={{ display: "flex", gap: "12px", alignItems: "flex-end" }}>
                 <div style={{ flex: 1, position: "relative" }}>
-                  {cmdSuggestions.length > 0 && (
-                    <div style={{
-                      position: "absolute", bottom: "calc(100% + 6px)", left: 0, right: 0,
-                      background: "var(--surface, #fff)", border: "1px solid rgba(0,0,0,0.12)",
-                      borderRadius: "10px", boxShadow: "0 4px 16px rgba(0,0,0,0.12)", zIndex: 50, overflow: "hidden",
-                    }}>
-                      {cmdSuggestions.map((s, i) => (
-                        <button
-                          key={s.id}
-                          onMouseDown={(e) => { e.preventDefault(); selectChatSkill(s); }}
-                          onMouseEnter={() => setCmdHighlight(i)}
-                          style={{
-                            display: "flex", flexDirection: "column", width: "100%", textAlign: "left",
-                            padding: "8px 14px", border: "none", cursor: "pointer",
-                            background: i === cmdHighlight ? "rgba(226,35,26,0.06)" : "transparent",
-                            borderLeft: i === cmdHighlight ? "3px solid var(--twilio-red, #e22)" : "3px solid transparent",
-                          }}
-                        >
-                          <span style={{ fontSize: "0.8125rem", fontWeight: 700, fontFamily: "var(--font-mono, monospace)", color: "var(--twilio-red, #e22)" }}>
-                            {s.command}
-                          </span>
-                          <span style={{ fontSize: "0.75rem", color: "var(--text-secondary, #888)", marginTop: "1px", lineHeight: 1.4 }}>
-                            {s.name} — {s.description}
-                          </span>
-                        </button>
-                      ))}
-                    </div>
-                  )}
+                  <SlashSkillMenu menu={slash} />
+                  {composerAttachments}
                   <textarea
                     value={input}
-                    onChange={(e) => setInput(e.target.value)}
+                    ref={composerRef}
+                    onChange={slash.handleChange}
+                    onSelect={slash.handleSelect}
                     onKeyDown={handleKeyDown}
                     rows={3}
                     placeholder="Type a message… (Enter to send, / for skills)"
@@ -1701,12 +1618,13 @@ export default function ChatPage() {
                 </div>
                 <button
                   onClick={() => void sendMessage()}
-                  disabled={isSending || !input.trim()}
-                  style={{ padding: "14px 24px", borderRadius: "12px", fontSize: "0.9375rem", fontWeight: 600, background: "var(--twilio-red, #e22)", color: "#fff", border: "none", cursor: "pointer", opacity: (isSending || !input.trim()) ? 0.4 : 1, fontFamily: "var(--font-base)", whiteSpace: "nowrap" }}
+                  disabled={!canSend}
+                  style={{ padding: "14px 24px", borderRadius: "12px", fontSize: "0.9375rem", fontWeight: 600, background: "var(--twilio-red, #e22)", color: "#fff", border: "none", cursor: "pointer", opacity: !canSend ? 0.4 : 1, fontFamily: "var(--font-base)", whiteSpace: "nowrap" }}
                 >
                   {isSending ? "Sending…" : "Send"}
                 </button>
                 </div>
+               </div>
               </div>
             </div>
           )}

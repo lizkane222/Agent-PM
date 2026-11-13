@@ -62,13 +62,6 @@ export interface ScheduleActionItemInput {
   accountName?: string | null;
 }
 
-export interface ScheduleReminderInput {
-  reminderId: number;
-  title: string;
-  start: string;
-  end?: string;
-}
-
 /** "YYYY-MM-DDTHH:MM" — the granularity a duplicate is judged at. */
 export function startMinute(iso: string): string {
   return (iso ?? "").slice(0, 16);
@@ -103,20 +96,6 @@ export function hasActionItemAt(
   );
 }
 
-export function hasReminderAt(
-  events: readonly CalendarEvent[],
-  reminderId: number,
-  start: string,
-): boolean {
-  const minute = startMinute(start);
-  return events.some(
-    (e) =>
-      e.calendar_id === REMINDERS_CALENDAR_ID &&
-      e.reminder === reminderId &&
-      startMinute(e.start_datetime) === minute,
-  );
-}
-
 /**
  * Create the calendar row for a dropped action item.
  *
@@ -138,20 +117,6 @@ export async function scheduleActionItem(
     end_datetime: endFor(input.start, input.end),
     calendar_id: WORK_TRACKING_CALENDAR_ID,
     agentpm_airtable_id: input.airtableId,
-  });
-  return data;
-}
-
-/** Create the calendar row for a dropped reminder. */
-export async function scheduleReminder(
-  input: ScheduleReminderInput,
-): Promise<CalendarEvent> {
-  const { data } = await schedulerApi.createEvent({
-    title: input.title,
-    start_datetime: input.start,
-    end_datetime: endFor(input.start, input.end),
-    calendar_id: REMINDERS_CALENDAR_ID,
-    reminder: input.reminderId,
   });
   return data;
 }
@@ -228,24 +193,11 @@ export async function migrateLegacyScheduledItems(
     }
   }
 
-  for (const reminder of reminders) {
-    if (!reminder?.reminderId || !reminder?.start) { result.alreadyPresent += 1; continue; }
-    if (hasReminderAt(known, reminder.reminderId, reminder.start)) {
-      result.alreadyPresent += 1;
-      continue;
-    }
-    try {
-      known.push(await scheduleReminder({
-        reminderId: reminder.reminderId,
-        title: reminder.title || "Reminder",
-        start: reminder.start,
-        end: reminder.end,
-      }));
-      result.created += 1;
-    } catch {
-      result.failed += 1;
-    }
-  }
+  // Legacy reminder schedulings are not recreated. A reminder is now drawn from its due time
+  // (one server-side marker with start == end, see scheduler/reminder_calendar.py), so a
+  // browser-stored 15-minute block at some other time is exactly the artefact being removed.
+  // They count as handled so the key is cleared.
+  result.alreadyPresent += reminders.length;
 
   if (result.failed === 0) {
     try {

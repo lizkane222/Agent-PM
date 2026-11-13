@@ -228,7 +228,6 @@ export function AccountNoteRow({
       resource_id: accountId,
       resource_label: accountName,
       due_at: due.toISOString(),
-      notify_in_app: true,
     } as Parameters<typeof schedulerApi.createReminder>[0])
       .then(() => { setRemSaved(true); markDone("reminder"); setTimeout(() => { setRemSaved(false); setOpenTooltip(null); }, 1400); })
       .catch(() => {});

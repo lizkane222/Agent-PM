@@ -26,7 +26,7 @@ export function ArtifactViewer({
   const hasDetails = Boolean(artifact.description?.trim()) || references.length > 0 || usedIn.length > 0 || Boolean(artifact.uploaded_by_username);
 
   return (
-    <div className="fixed inset-0 z-50 flex flex-col bg-black/70 backdrop-blur-sm" onClick={onClose}>
+    <div className="fixed inset-0 z-[9000] flex flex-col bg-black/70 backdrop-blur-sm" onClick={onClose}>
       <div
         style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 20px", background: "rgba(0,0,0,0.6)", flexShrink: 0 }}
         onClick={(e) => e.stopPropagation()}
@@ -64,7 +64,7 @@ export function ArtifactViewer({
         {canPreview && artifact.mime_type.startsWith("image/") ? (
           <img src={href} alt={artifact.name} style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }} />
         ) : canPreview ? (
-          <iframe src={href} title={artifact.name} style={{ width: "100%", height: "100%", border: "none", background: "#fff" }} />
+          <iframe src={href} title={artifact.name} style={{ width: "100%", height: "100%", border: "none", background: "var(--surface-card)" }} />
         ) : (
           <div style={{ textAlign: "center", color: "#fff" }}>
             <div style={{ fontSize: "3rem", marginBottom: "12px", display: "flex", justifyContent: "center" }}>
@@ -82,7 +82,7 @@ export function ArtifactViewer({
         {hasDetails && (
           <aside
             data-testid="artifact-details"
-            style={{ width: "300px", flexShrink: 0, background: "#fff", overflowY: "auto", padding: "16px", borderLeft: "1px solid rgba(0,0,0,0.08)" }}
+            style={{ width: "300px", flexShrink: 0, background: "var(--surface-card)", overflowY: "auto", padding: "16px", borderLeft: "1px solid rgba(0,0,0,0.08)" }}
           >
             {artifact.uploaded_by_username && (
               <div className="flex items-center gap-2 mb-3">
@@ -98,7 +98,7 @@ export function ArtifactViewer({
               <div className="mb-3">
                 <p className="text-[9px] font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide">Description</p>
                 <div
-                  className="mt-1 text-xs text-[var(--twilio-navy)] prose-sm"
+                  className="mt-1 text-xs text-[var(--twilio-navy)] prose-sm rich-text"
                   dangerouslySetInnerHTML={{ __html: sanitizeHtml(plainToHtml(artifact.description)) }}
                 />
               </div>

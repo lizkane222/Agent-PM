@@ -18,6 +18,7 @@ RESOURCE_TYPE_CHOICES = [
     ("artifact", "Account Artifact"),
     ("meeting_note", "Meeting Note"),
     ("claude_skill", "Claude Skill"),
+    ("account_ticket", "Account Ticket"),
 ]
 
 

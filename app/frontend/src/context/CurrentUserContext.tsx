@@ -2,6 +2,7 @@ import { createContext, useContext, useEffect, useState } from "react";
 import { teamApi } from "../lib/api";
 import { identify, track } from "../lib/analytics";
 import type { UserProfile } from "../types";
+import { localDateKey } from "../lib/timelineDay";
 
 const DAILY_OPEN_KEY = "agentpm_last_opened_date";
 
@@ -28,7 +29,7 @@ export function CurrentUserProvider({ children }: { children: React.ReactNode })
           timezone: data.timezone,
         });
         // Fire "App Opened" once per calendar day
-        const today = new Date().toISOString().slice(0, 10);
+        const today = localDateKey(new Date());
         const lastOpened = localStorage.getItem(DAILY_OPEN_KEY);
         if (lastOpened !== today) {
           track("App Opened", { date: today });

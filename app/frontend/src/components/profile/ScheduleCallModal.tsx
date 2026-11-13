@@ -84,7 +84,7 @@ export default function ScheduleCallModal({ personName, personEmail, onClose, on
 
   return (
     <div role="dialog" aria-label={`Schedule call with ${personName}`} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center" }} onClick={onClose}>
-      <div style={{ background: "#fff", borderRadius: 12, padding: 20, width: 420, maxWidth: "92vw" }} onClick={(e) => e.stopPropagation()}>
+      <div style={{ background: "var(--surface-card)", borderRadius: 12, padding: 20, width: 420, maxWidth: "92vw" }} onClick={(e) => e.stopPropagation()}>
         <h2 style={{ margin: 0, fontSize: "1.0625rem" }}>Schedule call with {first}</h2>
         {result ? (
           <>
@@ -101,14 +101,14 @@ export default function ScheduleCallModal({ personName, personEmail, onClose, on
             <input id="sc-min" type="number" min={5} step={5} style={field} value={minutes} onChange={(e) => setMinutes(Number(e.target.value))} />
             <label style={label} htmlFor="sc-extra">Other invitees (emails)</label>
             <input id="sc-extra" style={field} placeholder="a@x.com, b@y.com" value={extra} onChange={(e) => setExtra(e.target.value)} />
-            {badEmail && <p style={{ color: "#b91c1c", fontSize: "0.75rem", margin: "4px 0 0" }}>"{badEmail}" is not a valid email.</p>}
+            {badEmail && <p style={{ color: "var(--ink-red)", fontSize: "0.75rem", margin: "4px 0 0" }}>"{badEmail}" is not a valid email.</p>}
             <p style={{ fontSize: "0.75rem", color: "var(--text-secondary, #666)" }}>{personName} ({personEmail}) is added to the meeting automatically.</p>
             <label style={{ display: "flex", gap: 8, alignItems: "flex-start", fontSize: "0.8125rem", margin: "6px 0" }}>
               <input type="checkbox" checked={emailInvites} onChange={(e) => setEmailInvites(e.target.checked)} style={{ marginTop: 3 }} />
               <span>Email the invitation to everyone on this meeting. It is sent once, now, and not re-sent if you edit the meeting later.</span>
             </label>
             <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 8 }}>
-              <button onClick={onClose} style={{ padding: "8px 14px", borderRadius: 8, border: "1px solid var(--border, rgba(0,0,0,0.15))", background: "#fff", cursor: "pointer" }}>Cancel</button>
+              <button onClick={onClose} style={{ padding: "8px 14px", borderRadius: 8, border: "1px solid var(--border, rgba(0,0,0,0.15))", background: "var(--surface-card)", cursor: "pointer" }}>Cancel</button>
               <button onClick={() => void save()} disabled={!canSave} style={{ padding: "8px 14px", borderRadius: 8, border: "none", background: "var(--twilio-navy, #0d1b2e)", color: "#fff", fontWeight: 600, cursor: canSave ? "pointer" : "not-allowed", opacity: canSave ? 1 : 0.5 }}>
                 {saving ? "Scheduling…" : "Schedule"}
               </button>

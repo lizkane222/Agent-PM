@@ -1802,22 +1802,90 @@ class GoogleCalendarPushNewAgentpmEventsTest(APITestCase):
         self.assertEqual(private["agentpm_source"], "action_item")
         self.assertEqual(private["agentpm_airtable_id"], "rec-Create Diagram")
 
-    def test_a_reminder_row_is_pushed_with_the_reminder_source(self):
+    def test_a_reminder_marker_is_never_mirrored_to_google(self):
+        """A reminder is a point in time drawn from its due time. Google would give it a
+        duration and the next pull would write that back, turning it into a block again."""
         from django.utils import timezone
         from scheduler.models import Reminder
 
         reminder = Reminder.objects.create(
             created_by=self.user, title="Call back", due_at=timezone.now()
         )
-        self._pending(
+        marker = self._pending(
             "Call back", calendar_id="reminders", agentpm_airtable_id="", reminder=reminder
         )
         service = self._service([{"id": "g-rem-1"}])
         self._run(service)
 
-        private = service.events.return_value.insert.call_args.kwargs["body"]["extendedProperties"]["private"]
-        self.assertEqual(private["agentpm_source"], "reminder")
-        self.assertEqual(private["agentpm_reminder_id"], str(reminder.pk))
+        service.events.return_value.insert.assert_not_called()
+        marker.refresh_from_db()
+        self.assertEqual(marker.google_event_id, "")
+
+    def test_a_google_copy_of_a_reminder_never_rewrites_the_marker(self):
+        """Reminders made before they stopped being mirrored have a Google copy with a duration.
+        Importing it would turn the point-in-time marker back into a block."""
+        from django.utils import timezone
+        from scheduler.models import CalendarEvent, Reminder
+
+        due = timezone.now() + _td(days=1)
+        reminder = Reminder.objects.create(created_by=self.user, title="Call back", due_at=due)
+        marker = self._pending(
+            "Call back", calendar_id="reminders", agentpm_airtable_id="", reminder=reminder,
+            start=due, end_datetime=due, google_event_id="g-old", is_synced=True,
+        )
+        google_copy = {
+            "id": "g-old", "summary": "Call back", "status": "confirmed",
+            "start": {"dateTime": due.isoformat()},
+            "end": {"dateTime": (due + _td(minutes=15)).isoformat()},
+            "extendedProperties": {"private": {"agentpm_source": "reminder", "agentpm_reminder_id": str(reminder.pk)}},
+        }
+        service = self._service([])
+        service.events.return_value.list.return_value.execute.return_value = {"items": [google_copy], "nextPageToken": None}
+        self._run(service)
+
+        marker.refresh_from_db()
+        self.assertEqual(marker.start_datetime, marker.end_datetime)
+        self.assertEqual(CalendarEvent.objects.filter(calendar_id="reminders").count(), 1)
+
+    def test_two_overlapping_syncs_insert_a_row_only_once(self):
+        """Regression: a dropped action item showed as two blocks (2026-11-12). The per-user
+        sync lock lives in the process-local cache, so Daphne's poll and the Celery worker
+        could both select the same unpushed row and each insert it, creating two Google events
+        (and, after the pull, two CalendarEvents). A second run that starts while the first is
+        still talking to Google must skip the row."""
+        from integrations import views as integrations_views
+        from scheduler.models import CalendarEvent
+
+        event = self._pending("Overlap")
+        window = (event.start_datetime - _td(days=1), event.start_datetime + _td(days=1))
+        inserts = []
+
+        outer_service = MagicMock()
+        inner_service = MagicMock()
+        for svc in (outer_service, inner_service):
+            svc.events.return_value.insert.return_value.execute.side_effect = (
+                lambda *a, **k: (inserts.append(1), {"id": f"g-{len(inserts)}"})[1]
+            )
+        outer_service.events.return_value.insert.return_value.execute.side_effect = (
+            lambda *a, **k: (
+                inserts.append(1),
+                integrations_views._push_new_agentpm_events(self.user, inner_service, *window),
+                {"id": "g-outer"},
+            )[2]
+        )
+
+        integrations_views._push_new_agentpm_events(self.user, outer_service, *window)
+
+        self.assertEqual(len(inserts), 1, "the row was inserted into Google more than once")
+        event.refresh_from_db()
+        self.assertEqual(event.google_event_id, "g-outer")
+        self.assertEqual(CalendarEvent.objects.filter(agentpm_airtable_id=event.agentpm_airtable_id).count(), 1)
+
+    def test_a_failed_insert_releases_its_claim(self):
+        event = self._pending("Releases")
+        self._run(self._service([RuntimeError("google down")]))
+        event.refresh_from_db()
+        self.assertEqual(event.google_event_id, "")
 
     def test_one_failing_insert_does_not_abort_the_rest(self):
         """A batch of schedulings must not be lost to a single flaky call."""

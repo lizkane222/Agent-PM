@@ -7,7 +7,7 @@ export function EventDescription({ text, className = "", style }: { text: string
   return (
     <div
       data-testid="event-description"
-      className={`leading-relaxed break-words ${className}`}
+      className={`leading-relaxed break-words rich-text ${className}`}
       style={style}
       dangerouslySetInnerHTML={{ __html: html }}
     />

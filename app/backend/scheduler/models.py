@@ -76,6 +76,12 @@ class CalendarEvent(models.Model):
         blank=True,
         related_name="calendar_events",
     )
+    # For a reminder occurrence (`calendar_id == "reminders"`): when its start-time
+    # notification was claimed. Each occurrence notifies once, at its own start, so a reminder
+    # added to the calendar three times notifies three times. Null = not yet. The occurrence
+    # that sits at the reminder's `due_at` is notified by the reminder itself (its `status`),
+    # not by this field. See `scheduler/tasks.py::deliver_due_occurrences`.
+    reminder_notified_at = models.DateTimeField(null=True, blank=True)
     # The account-page project this block belongs to. Set when an action item (or meeting)
     # that is filed under a project -- directly, or under a goal whose parent is a project --
     # is dropped onto the calendar, so the project carries over from the item to its time.
@@ -276,6 +282,9 @@ class Reminder(models.Model):
     )
     resource_id = models.PositiveIntegerField(null=True, blank=True)
     resource_label = models.CharField(max_length=300, blank=True)  # display name of linked resource
+    # Everything the reminder is linked to: [{resource_type, resource_id, resource_label}, ...].
+    # The three fields above mirror the primary one (see scheduler/reminder_links.py).
+    links = models.JSONField(default=list, blank=True)
 
     # Scheduling
     due_at = models.DateTimeField()
@@ -285,6 +294,16 @@ class Reminder(models.Model):
     notify_slack = models.BooleanField(default=False)
     notify_push = models.BooleanField(default=False)
     notify_sms = models.BooleanField(default=False)
+
+    # Other people to notify as well as the creator. Empty (the default) means only the
+    # creator is notified. The reminder itself always stays the creator's: recipients get a
+    # notification and nothing else (they cannot see, edit or dismiss it). Who may be added
+    # is enforced in `scheduler/reminder_recipients.py`, not here.
+    recipients = models.ManyToManyField(
+        User,
+        blank=True,
+        related_name="reminders_received",
+    )
 
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="pending")
 

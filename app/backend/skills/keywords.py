@@ -9,12 +9,15 @@ the UI. Unresolvable pieces are reported, never guessed.
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import date, datetime, timedelta
 
 from agents import rest_bridge
 from agents.fuzzy import resolve_name
 from agents.tool_policy import ToolPolicyError
+
+logger = logging.getLogger(__name__)
 
 # kind -> (label, takes a date range)
 KINDS = {
@@ -50,7 +53,8 @@ _MONTHS = ["january", "february", "march", "april", "may", "june", "july", "augu
 
 def parse_date_range(text: str | None, today: date | None = None) -> tuple[date, date] | None:
     """
-    "last-30-days", "this-week", "last-week", "this-month", "last-month", "october",
+    "last-30-days", "this-week", "last-week", "this-month", "last-month", "this-quarter", "last-quarter",
+    "this-year", "last-year", "october",
     "october-2025", "2026-10-01..2026-10-31", "2026-10". None when absent/unparseable.
     """
     if not text:
@@ -73,6 +77,18 @@ def parse_date_range(text: str | None, today: date | None = None) -> tuple[date,
             first = (first - timedelta(days=1)).replace(day=1)
         nxt = (first + timedelta(days=32)).replace(day=1)
         return first, nxt - timedelta(days=1)
+    if t in ("this-quarter", "last-quarter"):
+        q_first_month = 3 * ((today.month - 1) // 3) + 1
+        year, month = today.year, q_first_month
+        if t == "last-quarter":
+            month -= 3
+            if month < 1:
+                month, year = month + 12, year - 1
+        first = date(year, month, 1)
+        return first, _month_span(year, month + 2)[1]  # a quarter starts in month 1/4/7/10, so never crosses a year
+    if t in ("this-year", "last-year"):
+        year = today.year - (t == "last-year")
+        return date(year, 1, 1), date(year, 12, 31)
     m = re.fullmatch(r"(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})", t)
     if m:
         a, b = date.fromisoformat(m.group(1)), date.fromisoformat(m.group(2))
@@ -95,14 +111,31 @@ def _month_span(year: int, month: int) -> tuple[date, date] | None:
     return first, (first + timedelta(days=32)).replace(day=1) - timedelta(days=1)
 
 
+# A `${…}` argument naming one of these is a placeholder to fill in at run time, not a literal value
+# (the editor's `@#--` picker inserts `${account_name}` / `${date-range}` as markers to be replaced).
+ACCOUNT_PLACEHOLDERS = {"account", "account_name", "accountname", "company", "company_name", "customer", "customer_name"}
+RANGE_PLACEHOLDERS = {"date_range", "daterange", "range", "dates", "date", "period", "time_range"}
+DEFAULT_RANGE = "last-30-days"
+
+
+def _is_placeholder(braced: str | None, allowed: set[str]) -> bool:
+    return braced is not None and braced.strip().lower().replace("-", "_").replace(" ", "_") in allowed
+
+
 def find_keywords(text: str) -> list[dict]:
-    """Every keyword in `text`: {raw, kind, account, range}. Account/range may be ""."""
+    """
+    Every keyword in `text`: {raw, kind, account, range, account_placeholder, range_placeholder}.
+    Account/range may be "". A placeholder (``${account_name}``, ``${date_range}``) is flagged so the
+    caller can fill it in from the run's input instead of treating the marker as a real name.
+    """
     found = []
     for m in KEYWORD_RE.finditer(text or ""):
         found.append({
             "raw": m.group(0), "kind": m.group(1),
             "account": (m.group(2) or m.group(3) or "").replace("-", " ").strip(),
             "range": (m.group(4) or m.group(5) or ""),
+            "account_placeholder": _is_placeholder(m.group(2), ACCOUNT_PLACEHOLDERS),
+            "range_placeholder": _is_placeholder(m.group(4), RANGE_PLACEHOLDERS),
         })
     return found
 
@@ -183,6 +216,9 @@ def expand_keyword(user, kw: dict, today: date | None = None) -> dict:
             ]
     except ToolPolicyError as exc:
         return {**base, "ok": False, "error": str(exc)}
+    except Exception:  # noqa: BLE001 - one lookup must never sink the whole run
+        logger.exception("keyword lookup failed: %s", kw.get("kind"))
+        return {**base, "ok": False, "error": f"Couldn't look up {label.lower()} just now."}
     return {
         **base, "ok": True, "label": label, "account": name,
         "range": [span[0].isoformat(), span[1].isoformat()] if span else None,

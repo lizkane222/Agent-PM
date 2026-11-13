@@ -29,6 +29,8 @@ export interface CustomerContact {
   team: string;
   /** Main point of contact (star). Several per account are allowed. */
   is_main_poc: boolean;
+  /** IANA zone name (e.g. "America/Chicago"); "" when not set. */
+  timezone?: string;
   airtable_id: string;
   notes_count: number;
   notes: CustomerContactNote[];
@@ -41,6 +43,7 @@ export interface AccountTeamMember {
   full_name: string;
   title: string;
   email: string;
+  additional_emails?: string[];
   avatar_url: string;
   slack_handle: string;
 }
@@ -53,6 +56,8 @@ export interface SlackChannel {
   channel: string;
   url: string;
   type: SlackChannelType;
+  /** Optional http(s) icon for a custom (non-preset) workspace. */
+  workspace_icon?: string;
 }
 
 export interface Account {
@@ -68,6 +73,7 @@ export interface Account {
   owner_username: string | null;
   primary_contact: number | null;
   primary_contact_name: string | null;
+  primary_contact_text?: string;
   team_members: AccountTeamMember[];
   notes_count: number;
   created_by: number | null;
@@ -83,6 +89,7 @@ export interface AccountNote {
   author_username: string | null;
   author_display: string;
   content: string;
+  references?: { resource_type: string; resource_id: number; label: string; url: string }[];
   created_at: string;
   updated_at: string;
 }
@@ -116,8 +123,22 @@ export interface AccountArtifact {
   used_in: CommentReference[];
   uploaded_by: number | null;
   uploaded_by_username: string | null;
+  /** Who last edited the artifact; null/absent until it has been edited. */
+  updated_by?: number | null;
+  updated_by_username?: string | null;
   created_at: string;
   updated_at: string;
+}
+
+/** A note LINKED to a project/goal (never a copy). `id` is always a string. */
+export interface NoteRef {
+  kind: "account_note" | "meeting_note" | "summary";
+  /** account_note: AccountNote pk. meeting_note: MeetingNote pk. summary: `<meeting airtable_id>::<bullet text>`. */
+  id: string;
+  /** meeting_note: CalendarEvent pk; summary: AirtableMeeting airtable_id. */
+  meetingId?: string;
+  /** Snapshot shown in the project card (plain text, truncated). */
+  label: string;
 }
 
 export interface AccountProject {
@@ -131,10 +152,38 @@ export interface AccountProject {
   meeting_ids: string[];
   goal_ids: string[];
   resources: GoalResource[];
+  note_refs?: NoteRef[];
   sf_data: SalesforceProjectData;
   sf_project_id: string;
   kind: "project" | "goal";
   created_at: string;
+}
+
+export type TicketKind = "jira" | "zendesk" | "product_gap";
+export type TicketStatus = "open" | "in_progress" | "waiting" | "resolved" | "closed";
+
+/** A JIRA / Zendesk ticket or product gap tied to an account (or awaiting review, account=null). */
+export interface AccountTicket {
+  id: number;
+  account: number | null;
+  account_name: string;
+  kind: TicketKind;
+  url: string;
+  external_key: string;
+  title: string;
+  status: TicketStatus;
+  notes: string;
+  source_created_at: string | null;
+  source_updated_at: string | null;
+  resolved_at: string | null;
+  created_at: string;
+  updated_at: string;
+  created_by_username: string;
+  found_by_username: string;
+  review_state: "confirmed" | "needs_review";
+  source_subject: string;
+  source_sender: string;
+  source_snippet: string;
 }
 
 // A team.TeamMember linked to a specific AccountProject — a member can be on
@@ -258,6 +307,7 @@ export interface GoalSection {
   meetingIds: string[];
   goalIds: string[]; // for projects: IDs of nested goals
   resources: GoalResource[];
+  noteRefs?: NoteRef[];
   sfData?: SalesforceProjectData;
   sfProjectId?: string;
 }

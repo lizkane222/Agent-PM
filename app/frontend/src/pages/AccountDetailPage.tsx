@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useStatusLabels } from "../hooks/useStatusLabels";
 import { createPortal } from "react-dom";
 import { useParams, useNavigate } from "react-router-dom";
 import CorporateIcon from "../assets/icons/Corporate.svg?react";
@@ -8,27 +9,36 @@ import statisticsIconUrl from "../assets/icons/Statistics.svg";
 import cloudUploadIconUrl from "../assets/icons/Cloud Upload.svg";
 import { accountsApi, airtableApi, teamApi, skillsApi, schedulerApi, integrationsApi, searchApi } from "../lib/api";
 import type { GmailThread, MeetingNotesSource, SearchResult } from "../lib/api";
+import TimezoneField, { ContactLocalTime } from "../components/account/TimezoneField";
+import TeamMemberTimezone from "../components/account/TeamMemberTimezone";
+import OverlapPlanner, { type PlannerPerson } from "../components/account/OverlapPlanner";
+import { browserZone } from "../lib/timezones";
 import { MeetingSummarySourceToggle, preferredMeetingSource } from "../components/account/MeetingSummarySourceToggle";
-import { GetMeetingNotesButton } from "../components/shared/GetMeetingNotesButton";
+import { useTimelineScope, type TimelineScope } from "../hooks/useTimelineScope";
 import { meetingHasNotes, MEETING_NOTES_UPDATED_EVENT } from "../lib/meetingNotes";
 import type { Account, AccountArtifact, AccountNote, AccountQuickLink, AccountTeamMember, ActionItemAttachment, AirtableAccount, AirtableActionItem, AirtableMeeting, Attendee, CalendarEvent, CommentReference, CustomerContact, CustomerContactNote, GoalSection, MeetingNote, ProjectMember, Reminder, TeamMember } from "../types";
 import { ProjectGoals } from "../components/account/ProjectGoals";
+import { ActionItemModal } from "../components/account/ActionItemModal";
 import { EventDescription } from "../components/shared/EventDescription";
 import { truncateWords } from "../lib/truncateWords";
 import { ArtifactIcon as SharedArtifactIcon } from "../components/account/ArtifactIcon";
 import { ArtifactImageField } from "../components/account/ArtifactImageField";
 import { groupContactsByTeam, teamSuggestions } from "../lib/contactGroups";
+import { useTeamLayout } from "../hooks/useFitsOneRow";
 import { UploadFileDialog, type PendingUpload } from "../components/account/UploadFileDialog";
 import { ROLE_META, getTitleRole } from "../lib/titleRoles";
 import { useLogGlow } from "../hooks/useLogGlow";
 import { addLog } from "../lib/appLog";
+import { AttendeeActionButton } from "../components/account/AttendeeActionButton";
+import { guestName, knownFullName, matchAttendee } from "../lib/attendeeMatch";
+import { allEmails, preferredEmail } from "../lib/teamEmails";
+import { fullNameFromEmail } from "../lib/nameFromEmail";
 import { logActionItemUpdate, changedActionItemFields } from "../lib/actionItemLog";
 import { assignActionItemToMember, isMemberDrag, readMemberDragData, setMemberDragData } from "../lib/actionItemAssign";
 import { useScheduledOccurrences } from "../hooks/useScheduledOccurrences";
 import { useActionItemFieldOptions } from "../hooks/useActionItemFieldOptions";
 import { useCurrentUser } from "../context/CurrentUserContext";
 import { useRightClickComment } from "../components/comments/CommentContext";
-import CommentTrigger from "../components/comments/CommentTrigger";
 import CommentPreviewList from "../components/comments/CommentPreviewList";
 import CommentCountBadge from "../components/comments/CommentCountBadge";
 import { useCommentMenuItem } from "../components/comments/commentMenuItem";
@@ -38,29 +48,37 @@ import { ACTION_ITEMS_UPDATED_KEY } from "../lib/actionItemEvents";
 import ArtifactPicker from "../components/action-items/ArtifactPicker";
 import { useFocusPins } from "../hooks/useFocusPins";
 import { useStatusArrivalOrder } from "../hooks/useStatusArrivalOrder";
+import ColumnSortButton from "../components/account/ColumnSortButton";
 import { ArtifactBrowseBar } from "../components/account/ArtifactBrowseBar";
+import { LinkedNotepadNotes } from "../components/account/LinkedNotepadNotes";
+import { ArtifactDetailsRail } from "../components/account/ArtifactDetailsRail";
 import { DEFAULT_ARTIFACT_BROWSE, browseArtifacts, type ArtifactBrowseState } from "../lib/artifactBrowse";
 import UrlPillInput from "../components/shared/UrlPillInput";
-import LinkedRecordsList from "../components/shared/LinkedRecordsList";
 import { useSlackLinkAutosave } from "../hooks/useSlackLinkAutosave";
 import InlineCommentThread from "../components/comments/InlineCommentThread";
-import ActivityLogSection from "../components/ActivityLogSection";
 import AccountActivityLog from "../components/account/AccountActivityLog";
 import { EmailMessageBody } from "../components/account/EmailMessageBody";
 import { useEmailThreads } from "../hooks/useEmailThreads";
 import { saveLoadedThreads } from "../lib/emailThreadStore";
-import { convertActionItemToEvent, restoreConversion } from "../hooks/useConvert";
 import RichTextMentionEditor, { type RichTextMentionEditorHandle } from "../components/shared/RichTextMentionEditor";
 import { htmlToPreviewText, sanitizeHtml, plainToHtml, renderMeetingNoteText } from "../lib/noteHelpers";
 import { useAppError } from "../context/AppErrorContext";
+import { PinNoteProvider, PinNoteButton } from "../components/account/PinNoteButton";
+import { localDateKey, instantDayKey, dateFieldDayKey } from "../lib/timelineDay";
 import { permissionMessage } from "../lib/permissions";
 import CloudCoachPushToast from "../components/shared/CloudCoachPushToast";
+import { setNoteDragData, noteLabel, noteRefKey, buildNoteLinkIndex, type NoteLinkIndex } from "../lib/noteLinks";
+import type { NoteRef } from "../types/accounts";
+import AccountMeetingNotesTimeline from "../components/account/AccountMeetingNotesTimeline";
 import CollapsibleAccountSection from "../components/account/CollapsibleAccountSection";
+import AccountTicketsSection from "../components/account/AccountTicketsSection";
 import SlackChannelsField from "../components/account/SlackChannelsField";
 import MaskedArrValue from "../components/account/MaskedArrValue";
 import { useAccountSectionCollapse, ACCOUNT_SECTION_IDS as SECTION_IDS } from "../hooks/useAccountSectionCollapse";
 import { timelineMeetingCount } from "../lib/accountMeetings";
 import { isPushOk, summarizePush, type CloudCoachPushResult } from "../lib/cloudCoachPush";
+import PinnedSkillsSection from "../components/skills/PinnedSkillsSection";
+import { toLocalDatetimeValue } from "../lib/datetimeLocal";
 
 // ── Edit Modal ────────────────────────────────────────────────────────────────
 
@@ -101,7 +119,7 @@ function EditAccountModal({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onClose}>
+    <div className="fixed inset-0 z-[9000] flex items-center justify-center bg-black/40" onClick={onClose}>
       <div
         className="rounded-xl shadow-xl w-full max-w-lg mx-4 p-6"
         style={{ background: "var(--surface, #fff)", fontFamily: "var(--font-base)" }}
@@ -258,12 +276,14 @@ const NEW_AI_PRIORITY_COLORS: Record<string, string> = {
   Low: "bg-gray-100 text-[var(--twilio-navy)] ring-1 ring-gray-200",
 };
 
-function AccPillSelect<T extends string>({ value, options, colorMap, placeholder, onChange }: {
+function AccPillSelect<T extends string>({ value, options, colorMap, placeholder, onChange, format }: {
   value: T | undefined;
   options: readonly T[];
   colorMap: Record<string, string>;
   placeholder: string;
   onChange: (v: T) => void;
+  /** Display-only text for a value (e.g. status names); the option VALUE stays canonical. */
+  format?: (v: string) => string;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLSelectElement>(null);
@@ -273,13 +293,13 @@ function AccPillSelect<T extends string>({ value, options, colorMap, placeholder
     return (
       <select ref={ref} value={value ?? ""} onChange={(e) => { onChange(e.target.value as T); setOpen(false); }} onBlur={() => setOpen(false)}
         className="rounded-full border border-indigo-400 bg-white px-2.5 py-0.5 text-[12px] font-semibold focus:outline-none cursor-pointer">
-        {options.map((o) => <option key={o} value={o}>{o}</option>)}
+        {options.map((o) => <option key={o} value={o}>{format ? format(o) : o}</option>)}
       </select>
     );
   }
   return (
     <button type="button" onClick={() => setOpen(true)} className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[12px] font-semibold cursor-pointer hover:opacity-75 transition-opacity ${cls}`}>
-      {value ?? placeholder}
+      {value != null ? (format ? format(value) : value) : placeholder}
       <svg viewBox="0 0 8 5" fill="currentColor" className="w-1.5 h-1.5 opacity-50"><path d="M0 0l4 5 4-5z"/></svg>
     </button>
   );
@@ -379,6 +399,7 @@ function NewActionItemCard({
 }) {
   const currentUser = useCurrentUser();
   const { status: statusOptions } = useActionItemFieldOptions();
+  const { label: statusLabel } = useStatusLabels();
   const [form, setForm] = useState<Partial<AirtableActionItem>>(BLANK_NEW_FORM());
   const [saving, setSaving] = useState(false);
   const { reportError } = useAppError();
@@ -411,7 +432,7 @@ function NewActionItemCard({
   return (
     <div
       className="rounded-xl flex flex-col overflow-hidden select-none"
-      style={{ background: "#F4F4F6", width: "240px", flexShrink: 0, boxShadow: "0 1px 3px rgba(0,0,0,0.08)" }}
+      style={{ background: "var(--surface-subtle-4)", width: "240px", flexShrink: 0, boxShadow: "0 1px 3px rgba(0,0,0,0.08)" }}
     >
       {/* Task title */}
       <div className="px-4 pt-3 pb-2">
@@ -435,6 +456,7 @@ function NewActionItemCard({
         <AccPillSelect
           value={form.status}
           options={statusOptions as AirtableActionItem["status"][]}
+          format={statusLabel}
           colorMap={NEW_AI_STATUS_COLORS}
           placeholder="Status"
           onChange={(v) => set({ status: v })}
@@ -511,431 +533,6 @@ function ActionItemCardOccurrences({ airtableId }: { airtableId: string }) {
   );
 }
 
-function ActionItemModal({
-  item,
-  teamMembers = [],
-  meetings = [],
-  onClose,
-  onUpdated,
-  onAutosaved,
-  onConverted,
-  onDeleted,
-}: {
-  item: AirtableActionItem;
-  teamMembers?: TeamMember[];
-  meetings?: AirtableMeeting[];
-  onClose: () => void;
-  onUpdated?: (updated: AirtableActionItem) => void;
-  /** Fires for a pasted Slack link, which saves itself without waiting for Save — see
-   *  hooks/useSlackLinkAutosave.ts. Distinct from `onUpdated`: the caller closes the modal in
-   *  response to `onUpdated` (the explicit Save button), and a paste must not trigger that. */
-  onAutosaved?: (updated: AirtableActionItem) => void;
-  onConverted?: () => void;
-  onDeleted?: (id: number) => void;
-}) {
-  const { status: statusOptions } = useActionItemFieldOptions();
-  const [form, setForm] = useState<Partial<AirtableActionItem>>({ ...item });
-  const [saving, setSaving] = useState(false);
-  const [converting, setConverting] = useState(false);
-  const [deleting, setDeleting] = useState(false);
-  const [saveError, setSaveError] = useState<string | null>(null);
-  const [attachments, setAttachments] = useState<ActionItemAttachment[]>(item.attachments ?? []);
-  const [uploadingAttachment, setUploadingAttachment] = useState(false);
-  const [attachError, setAttachError] = useState<string | null>(null);
-  const attachFileRef = useRef<HTMLInputElement>(null);
-  const memberNames = ["Unassigned", ...teamMembers.map((m) => m.full_name)] as string[];
-
-  // Dragging OS files anywhere onto the modal attaches them, same as the + File button.
-  // A local-* draft has no PK for an attachment to hang off, same guard the Attachments
-  // section itself uses.
-  const [fileDragOver, setFileDragOver] = useState(false);
-  const fileDragCounterRef = useRef(0);
-  const canAttachFiles = !item.airtable_id.startsWith("local-");
-
-  useEffect(() => {
-    if (item.airtable_id.startsWith("local-")) return;
-    airtableApi.listAttachments(item.id).then(({ data }) => setAttachments(data)).catch(() => {});
-  }, [item.id, item.airtable_id]);
-
-  const accent = PRIORITY_ACCENT[form.priority ?? item.priority] ?? "#9ca3af";
-  const set = (patch: Partial<AirtableActionItem>) => setForm((f) => ({ ...f, ...patch }));
-  // A pasted Slack link saves on its own — see hooks/useSlackLinkAutosave.ts.
-  const autosaveSlackLink = useSlackLinkAutosave();
-
-  async function handleDelete() {
-    if (!window.confirm("Delete this action item? This cannot be undone.")) return;
-    setDeleting(true);
-    try {
-      await airtableApi.deleteActionItem(item.id);
-      onDeleted?.(item.id);
-      onClose();
-    } catch { /* silent */ } finally {
-      setDeleting(false);
-    }
-  }
-
-  async function handleSave() {
-    if (saving) return;
-    setSaving(true);
-    setSaveError(null);
-    try {
-      const changes = changedActionItemFields(item, form);
-      const { data } = await airtableApi.updateActionItemFields(item.airtable_id, changes);
-      logActionItemUpdate(item, changes);
-      onUpdated?.(data);
-      onClose();
-    } catch (err: unknown) {
-      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error ?? "Save failed";
-      setSaveError(msg);
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function handleConvertToEvent() {
-    if (converting) return;
-    setConverting(true);
-    try {
-      await convertActionItemToEvent(item);
-      onConverted?.();
-      onClose();
-    } catch { /* best effort */ } finally {
-      setConverting(false);
-    }
-  }
-
-  async function handleAttachFiles(files: FileList | File[]) {
-    setUploadingAttachment(true);
-    setAttachError(null);
-    const failed: string[] = [];
-    let lastError: unknown = null;
-    for (const f of Array.from(files)) {
-      try {
-        const { data } = await airtableApi.uploadAttachmentFile(item.id, f);
-        setAttachments((prev) => [data, ...prev]);
-      } catch (err: unknown) {
-        // Never swallow this: silence here reads as "I picked a file and nothing happened".
-        failed.push(f.name);
-        lastError = err;
-      }
-    }
-    if (failed.length) {
-      const data = (lastError as { response?: { data?: { detail?: string; error?: string } } })?.response?.data;
-      setAttachError(`${data?.detail ?? data?.error ?? "Upload failed."} (${failed.join(", ")})`);
-    }
-    setUploadingAttachment(false);
-  }
-
-  async function handleDeleteAttachment(attachId: number) {
-    await airtableApi.deleteAttachment(item.id, attachId);
-    setAttachments((prev) => prev.filter((a) => a.id !== attachId));
-  }
-
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
-      onClick={onClose}
-    >
-      <div
-        data-testid="action-item-modal-panel"
-        className="relative rounded-2xl shadow-2xl flex flex-col overflow-hidden"
-        style={{ background: "#fff", width: "480px", maxWidth: "calc(100vw - 32px)", maxHeight: "calc(100vh - 48px)", borderLeft: `4px solid ${accent}` }}
-        onClick={(e) => e.stopPropagation()}
-        // The modal isn't a portal, so a drag/drop over it would otherwise bubble to the
-        // kanban board's own drop zones underneath (handleKanbanDrop, handleNoteDropOnActions
-        // etc.), which assume a real DataTransfer carrying their own custom keys.
-        onDragEnter={(e) => {
-          e.stopPropagation();
-          if (!canAttachFiles || !e.dataTransfer.types.includes("Files")) return;
-          e.preventDefault();
-          fileDragCounterRef.current += 1;
-          if (fileDragCounterRef.current === 1) setFileDragOver(true);
-        }}
-        onDragOver={(e) => {
-          e.stopPropagation();
-          if (!canAttachFiles || !e.dataTransfer.types.includes("Files")) return;
-          e.preventDefault();
-        }}
-        onDragLeave={(e) => {
-          e.stopPropagation();
-          if (fileDragCounterRef.current === 0) return;
-          fileDragCounterRef.current -= 1;
-          if (fileDragCounterRef.current <= 0) { fileDragCounterRef.current = 0; setFileDragOver(false); }
-        }}
-        onDrop={(e) => {
-          e.stopPropagation();
-          if (!canAttachFiles) return;
-          e.preventDefault();
-          fileDragCounterRef.current = 0;
-          setFileDragOver(false);
-          if (e.dataTransfer.files.length) void handleAttachFiles(e.dataTransfer.files);
-        }}
-      >
-        {fileDragOver && (
-          <div className="absolute inset-0 z-20 flex items-center justify-center rounded-2xl border-2 border-dashed border-indigo-400 bg-indigo-50/70 pointer-events-none">
-            <p className="text-sm font-bold text-indigo-600">Drop files to attach</p>
-          </div>
-        )}
-
-        {/* Header */}
-        <div className="flex items-center justify-between px-5 py-4" style={{ borderBottom: "1px solid rgba(0,0,0,0.07)" }}>
-          <textarea
-            autoFocus
-            value={form.task ?? ""}
-            onChange={(e) => set({ task: e.target.value })}
-            placeholder="Task name…"
-            rows={2}
-            className="flex-1 text-sm font-semibold text-[var(--twilio-navy)] bg-transparent border-b border-transparent focus:border-indigo-400 focus:outline-none pb-0.5 mr-3 resize-none leading-snug"
-            style={{ overflow: "hidden", fieldSizing: "content" } as React.CSSProperties}
-          />
-          <div className="flex items-center gap-1.5 shrink-0">
-            <CommentTrigger
-              resourceType="action_item"
-              resourceId={item.id}
-              resourceLabel={item.task ?? ""}
-              disabled={item.airtable_id.startsWith("local-")}
-            />
-            <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-xl leading-none transition-colors">×</button>
-          </div>
-        </div>
-
-        {/* Scrollable body */}
-        <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
-          {/* Existing comments, in place — the header icon opens the full thread. */}
-          {!item.airtable_id.startsWith("local-") && (
-            <CommentPreviewList
-              resourceType="action_item"
-              resourceId={item.id}
-              resourceLabel={item.task ?? ""}
-              variant="panel"
-            />
-          )}
-
-          {/* Priority + Status pills */}
-          <div className="flex items-center gap-2 flex-wrap">
-            <AccPillSelect
-              value={form.priority}
-              options={["Critical", "High", "Medium", "Low"] as const}
-              colorMap={NEW_AI_PRIORITY_COLORS}
-              placeholder="Priority"
-              onChange={(v) => set({ priority: v })}
-            />
-            <AccPillSelect
-              value={form.status}
-              options={statusOptions as AirtableActionItem["status"][]}
-              colorMap={NEW_AI_STATUS_COLORS}
-              placeholder="Status"
-              onChange={(v) => set({ status: v })}
-            />
-            <AccPillDate value={form.due_date} onChange={(v) => set({ due_date: v })} />
-          </div>
-
-          {/* Description. Steps live in the Checklist section below. */}
-          <div>
-            <p className="text-xs font-semibold uppercase tracking-wide text-[var(--twilio-gray-60)] mb-1.5">
-              Description
-            </p>
-            <RichTextMentionEditor
-              value={form.task_details ?? ""}
-              onChange={(html) => set({ task_details: html })}
-              placeholder="Additional context or notes…"
-              minHeightClassName="min-h-[64px]"
-            />
-          </div>
-
-          {/* Checklist — its own field, directly below the description. Real Airtable items
-              only: steps key off the numeric PK, which a local-* draft lacks until promoted. */}
-          {!item.airtable_id.startsWith("local-") && (
-            <div className="pt-3 border-t border-gray-100">
-              <StepsPanel actionItemId={item.id} />
-            </div>
-          )}
-
-          {/* Time + Slack */}
-          <div className="flex flex-wrap gap-2 items-center">
-            <AccPillNumber value={form.estimated_time} label="Est." onChange={(v) => set({ estimated_time: v ?? 0 })} />
-            <AccPillNumber value={form.time_spent} label="Spent" onChange={(v) => set({ time_spent: v ?? 0 })} />
-            <AccPillNumber value={form.prep_time} label="Prep" onChange={(v) => set({ prep_time: v ?? 0 })} />
-            <AccPillUrl
-              value={form.slack_thread_url}
-              onChange={(v) => { set({ slack_thread_url: v }); autosaveSlackLink(item, v, onAutosaved); }}
-            />
-          </div>
-
-          {/* Assignee */}
-          {teamMembers.length > 0 && (
-            <div className="flex items-center gap-2">
-              <span className="text-xs text-[var(--twilio-gray-60)]">Assignee</span>
-              <AccPillSelect
-                value={(form.assignee_name || "Unassigned") as string}
-                options={memberNames as string[]}
-                colorMap={{}}
-                placeholder="Unassigned"
-                onChange={(v) => {
-                  const member = teamMembers.find((m) => m.full_name === v);
-                  set({ assignee_airtable_id: member ? String(member.id) : "", assignee_name: member?.full_name ?? "" });
-                }}
-              />
-            </div>
-          )}
-
-          {/* Account */}
-          {item.account_name && (
-            <div className="flex items-center gap-2">
-              <span className="text-xs text-[var(--twilio-gray-60)]">Account</span>
-              <span className="inline-flex items-center gap-1 text-xs font-medium text-[var(--twilio-navy)] bg-gray-100 px-2 py-0.5 rounded-full">
-                <CorporateIcon width={10} height={10} className="shrink-0 opacity-60" />
-                {item.account_name}
-              </span>
-            </div>
-          )}
-
-          {/* Link to meeting — only shown for Done items */}
-          {(form.status === "Done" || item.status === "Done") && meetings.length > 0 && (
-            <div className="flex items-center gap-2">
-              <span className="text-xs text-[var(--twilio-gray-60)] shrink-0">Pin to meeting</span>
-              <select
-                value={form.linked_meeting ?? ""}
-                onChange={(e) => set({ linked_meeting: e.target.value ? Number(e.target.value) : null })}
-                className="flex-1 rounded-lg border border-gray-200 bg-gray-50 px-2.5 py-1 text-xs text-[var(--twilio-navy)] focus:bg-white focus:border-indigo-400 focus:outline-none"
-              >
-                <option value="">— No meeting —</option>
-                {meetings.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.name}{m.date ? ` (${new Date(m.date).toLocaleDateString(undefined, { month: "short", day: "numeric" })})` : ""}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
-
-          {/* Attachments */}
-          {!item.airtable_id.startsWith("local-") && (
-            <div>
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-xs font-semibold uppercase tracking-wide text-[var(--twilio-gray-60)]">
-                  Attachments{attachments.length > 0 && ` (${attachments.length})`}
-                </span>
-                <div className="flex items-center gap-1">
-                  {uploadingAttachment && <span className="text-[11px] text-gray-400 animate-pulse">Uploading…</span>}
-                  <button
-                    onClick={() => attachFileRef.current?.click()}
-                    title="Click to pick a file, or drag a file from your computer anywhere onto this window"
-                    className="text-[11px] px-2 py-0.5 rounded border border-gray-200 text-[var(--twilio-navy)] hover:bg-gray-50 transition-colors"
-                  >+ File</button>
-                  <ArtifactPicker
-                    actionItemId={item.id}
-                    accountName={item.account_name}
-                    onAttached={(a) => setAttachments((prev) => [a, ...prev])}
-                    onError={setAttachError}
-                  />
-                  <input ref={attachFileRef} type="file" multiple className="hidden" onChange={(e) => e.target.files && void handleAttachFiles(e.target.files)} />
-                </div>
-              </div>
-              {attachError && (
-                <p role="alert" className="text-xs text-red-600 mb-2 bg-red-50 border border-red-200 rounded px-2 py-1">
-                  {attachError}
-                </p>
-              )}
-              {attachments.length === 0 ? (
-                <p className="text-xs text-gray-400 italic">No attachments yet.</p>
-              ) : (
-                <div className="flex flex-col gap-1.5">
-                  {attachments.map((a) => {
-                    const href = a.file_url ?? a.url ?? "";
-                    return (
-                      <div key={a.id} className="flex items-center gap-2 text-xs bg-gray-50 rounded-lg px-3 py-1.5">
-                        <span className="shrink-0">📎</span>
-                        {href ? (
-                          <a href={href} target="_blank" rel="noreferrer" className="flex-1 truncate text-indigo-600 hover:underline">{a.name || href}</a>
-                        ) : (
-                          <span className="flex-1 truncate text-[var(--twilio-navy)]">{a.name}</span>
-                        )}
-                        <button onClick={() => void handleDeleteAttachment(a.id)} className="shrink-0 text-gray-300 hover:text-red-400 transition-colors">×</button>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          )}
-
-          <ActionItemCardOccurrences airtableId={item.airtable_id} />
-
-          {/* Activity log */}
-          <div>
-            <span className="text-xs font-semibold uppercase tracking-wide text-[var(--twilio-gray-60)] mb-2 block">Activity</span>
-            <ActivityLogSection
-              resourceType="action_item"
-              resourceId={item.airtable_id}
-              variant="inline"
-              onRestore={async (rd) => { await restoreConversion(rd); onConverted?.(); onClose(); }}
-            />
-          </div>
-
-          {/* Timestamps */}
-          {!item.airtable_id.startsWith("local-") && (
-            <div className="pt-3 border-t border-gray-100 flex flex-wrap gap-x-5 gap-y-1">
-              <span className="text-[11px] text-[var(--twilio-gray-60)]">
-                <span className="font-semibold uppercase tracking-wide">Created</span>{" "}
-                {item.created_at ? new Date(item.created_at).toLocaleString(undefined, { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" }) : "—"}
-              </span>
-              {item.marked_done_at && (
-                <span className="text-[11px] text-emerald-600">
-                  <span className="font-semibold uppercase tracking-wide">Completed</span>{" "}
-                  {new Date(item.marked_done_at).toLocaleString(undefined, { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" })}
-                </span>
-              )}
-            </div>
-          )}
-        </div>
-
-        {/* Footer */}
-        <div className="px-5 py-3 space-y-2" style={{ borderTop: "1px solid rgba(0,0,0,0.07)" }}>
-          <button
-            type="button"
-            disabled={converting}
-            onClick={() => void handleConvertToEvent()}
-            className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border border-amber-300 bg-amber-50 text-amber-800 hover:bg-amber-100 disabled:opacity-50 transition-colors"
-          >
-            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-3.5 h-3.5 shrink-0">
-              <rect x="2" y="3" width="12" height="11" rx="1.5"/>
-              <path d="M5 2v2M11 2v2M2 7h12" strokeLinecap="round"/>
-            </svg>
-            {converting ? "Converting…" : "Convert to Event"}
-          </button>
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <button
-                onClick={() => void handleDelete()}
-                disabled={deleting}
-                title="Delete action item"
-                className="p-1.5 rounded-lg text-gray-400 hover:text-red-500 hover:bg-red-50 disabled:opacity-40 transition-colors"
-              >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/></svg>
-              </button>
-              <button
-                onClick={onClose}
-                className="text-sm font-medium text-[var(--twilio-gray-60)] hover:text-[var(--twilio-navy)] transition-colors"
-              >
-                Cancel
-              </button>
-              {saveError && <span className="text-xs text-red-600">{saveError}</span>}
-            </div>
-            <button
-              disabled={saving}
-              onClick={() => void handleSave()}
-              className="px-4 py-1.5 text-sm font-semibold rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-40 transition-colors"
-            >
-              {saving ? "Saving…" : "Save changes"}
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 function ActionItemCard({
   item,
   onDragStart,
@@ -951,6 +548,7 @@ function ActionItemCard({
   onUpdated?: (updated: AirtableActionItem) => void;
   onDeleted?: (id: number) => void;
 }) {
+  const { label: statusLabel } = useStatusLabels();
   const [modalOpen, setModalOpen] = useState(false);
   const [ctxPos, setCtxPos] = useState<{ x: number; y: number } | null>(null);
   const { isPinned, toggle: toggleFocusPin } = useFocusPins();
@@ -1014,7 +612,7 @@ function ActionItemCard({
         className="rounded-lg select-none flex flex-col gap-1.5 cursor-pointer hover:shadow-md transition-shadow shrink-0"
         style={{
           position: "relative",
-          background: assignFlash ? "#f0fdf4" : memberDragOver ? "#eef2ff" : "#F4F4F6",
+          background: assignFlash ? "var(--tint-green-50)" : memberDragOver ? "var(--tint-indigo-50)" : "var(--surface-subtle-4)",
           borderLeft: `3px solid ${accent}`,
           outline: memberDragOver ? "2px solid #6366f1" : "none",
           outlineOffset: "-1px",
@@ -1035,7 +633,7 @@ function ActionItemCard({
           </p>
         )}
         <div className="flex flex-wrap gap-1">
-          <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${STATUS_PILLS[item.status] ?? "bg-gray-100 text-gray-700"}`}>{item.status}</span>
+          <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${STATUS_PILLS[item.status] ?? "bg-gray-100 text-gray-700"}`}>{statusLabel(item.status)}</span>
           <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${PRIORITY_COLORS[item.priority] ?? ""}`}>{item.priority}</span>
           {item.due_date && (
             <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-amber-50 text-amber-700">
@@ -1088,10 +686,10 @@ function ActionItemCard({
 }
 
 const ACCOUNT_STATUS_STYLES: Record<string, React.CSSProperties> = {
-  prospect: { background: "#fef9c3", color: "#a16207" },
-  active: { background: "#dcfce7", color: "#15803d" },
+  prospect: { background: "var(--tint-yellow-100)", color: "var(--ink-amber)" },
+  active: { background: "#dcfce7", color: "var(--ink-green)" },
   inactive: { background: "var(--bg, #f5f5f5)", color: "var(--text-secondary, #888)" },
-  churned: { background: "#fee2e2", color: "#dc2626" },
+  churned: { background: "var(--tint-red-100)", color: "#dc2626" },
 };
 
 function fmtDuration(secs: number): string {
@@ -1285,7 +883,7 @@ function MeetingNotesPanel({ eventId, accountName, airtableAccountId, onCreatedA
   return (
     <div style={{ marginTop: "12px" }}>
       <p style={{ fontSize: "0.6875rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em", color: "var(--twilio-gray-60)", marginBottom: "6px" }}>Meeting Notes</p>
-      <div style={{ border: "1px solid rgba(0,0,0,0.08)", borderRadius: "8px", background: "#fff", overflow: "hidden" }}>
+      <div style={{ border: "1px solid rgba(0,0,0,0.08)", borderRadius: "8px", background: "var(--surface-card)", overflow: "hidden" }}>
         <div style={{ display: "flex", alignItems: "flex-start", gap: "6px", padding: "6px 10px", borderBottom: notes.length > 0 ? "1px solid rgba(0,0,0,0.06)" : undefined }}>
           <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: "#d1d5db", flexShrink: 0, marginTop: "7px" }} />
           <div style={{ flex: 1 }}>
@@ -1381,8 +979,8 @@ function AccountNoteRowSimple({
         ) : (
           <div
             onClick={() => { setEditing(true); setText(note.html); }}
-            style={{ fontSize: "0.8125rem", color: "var(--twilio-navy)", lineHeight: 1.5, cursor: "text" }}
-            className="prose prose-sm max-w-none"
+            style={{ fontSize: "0.8125rem", color: "var(--text-ink)", lineHeight: 1.5, cursor: "text" }}
+            className="prose prose-sm max-w-none rich-text"
             dangerouslySetInnerHTML={{ __html: sanitizeHtml(plainToHtml(note.html)) }}
           />
         )}
@@ -1393,7 +991,7 @@ function AccountNoteRowSimple({
           <button
             title="Create action item"
             onClick={(e) => { setTooltipAnchorY(e.currentTarget.getBoundingClientRect().bottom); setOpenAction(openAction === "action" ? null : "action"); }}
-            style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("action") ? "#2563eb" : "#9ca3af" }}
+            style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("action") ? "#2563eb" : "var(--text-gray-400)" }}
             className={doneActions.has("action") ? "transition-opacity" : "opacity-0 group-hover:opacity-100 transition-opacity"}
           >
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" style={{ width: "12px", height: "12px" }}><path d="M8 5h9M8 10h9M8 15h9" strokeLinecap="round"/><path d="M3 5l1.5 1.5L7 3M3 10l1.5 1.5L7 8M3 15l1.5 1.5L7 13" strokeLinecap="round" strokeLinejoin="round"/></svg>
@@ -1401,7 +999,7 @@ function AccountNoteRowSimple({
           <button
             title="Set reminder"
             onClick={(e) => { setTooltipAnchorY(e.currentTarget.getBoundingClientRect().bottom); setOpenAction(openAction === "reminder" ? null : "reminder"); }}
-            style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("reminder") ? "#2563eb" : "#9ca3af" }}
+            style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("reminder") ? "#2563eb" : "var(--text-gray-400)" }}
             className={doneActions.has("reminder") ? "transition-opacity" : "opacity-0 group-hover:opacity-100 transition-opacity"}
           >
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" style={{ width: "12px", height: "12px" }}><circle cx="10" cy="10" r="7"/><path d="M10 6v4l3 2" strokeLinecap="round" strokeLinejoin="round"/></svg>
@@ -1409,7 +1007,7 @@ function AccountNoteRowSimple({
           <button
             title="Create meeting"
             onClick={(e) => { setTooltipAnchorY(e.currentTarget.getBoundingClientRect().bottom); setOpenAction(openAction === "calendar" ? null : "calendar"); }}
-            style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("calendar") ? "#2563eb" : "#9ca3af" }}
+            style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("calendar") ? "#2563eb" : "var(--text-gray-400)" }}
             className={doneActions.has("calendar") ? "transition-opacity" : "opacity-0 group-hover:opacity-100 transition-opacity"}
           >
             <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" style={{ width: "12px", height: "12px" }}><rect x="2" y="4" width="16" height="14" rx="2"/><path d="M2 8h16M6 2v4M14 2v4" strokeLinecap="round"/></svg>
@@ -1418,6 +1016,7 @@ function AccountNoteRowSimple({
           <NoteActionButton title="Delete" onClick={() => onDelete(note.id)} danger>
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" style={{ width: "12px", height: "12px" }}><path d="M2 4h12M5 4V2h6v2M6 7v5M10 7v5M3 4l1 9h8l1-9" strokeLinecap="round" strokeLinejoin="round"/></svg>
           </NoteActionButton>
+          <PinNoteButton text={note.html} isHtml />
           {openAction && (
             <NoteActionTooltip
               kind={openAction}
@@ -1439,7 +1038,7 @@ function AccountNoteRowSimple({
 
 function NoteActionButton({ title, onClick, danger, children }: { title: string; onClick: () => void; danger?: boolean; children: React.ReactNode }) {
   return (
-    <button title={title} onClick={onClick} style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", color: danger ? "#9ca3af" : "#9ca3af", display: "flex", alignItems: "center" }}
+    <button title={title} onClick={onClick} style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", color: danger ? "var(--text-gray-400)" : "var(--text-gray-400)", display: "flex", alignItems: "center" }}
       onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = danger ? "#ef4444" : "var(--twilio-navy)"; (e.currentTarget as HTMLButtonElement).style.background = danger ? "#fef2f2" : "#f3f4f6"; }}
       onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = "#9ca3af"; (e.currentTarget as HTMLButtonElement).style.background = "none"; }}>
       {children}
@@ -1462,13 +1061,13 @@ function NoteActionTooltip({ kind, noteText, eventId, accountName, airtableAccou
   const currentUser = useCurrentUser();
   const [priority, setPriority] = useState<"Low"|"Medium"|"High"|"Critical">("Medium");
   const [due, setDue] = useState("");
-  const [remDate, setRemDate] = useState(() => { const d = new Date(); d.setDate(d.getDate() + 1); return d.toISOString().slice(0,10); });
+  const [remDate, setRemDate] = useState(() => { const d = new Date(); d.setDate(d.getDate() + 1); return localDateKey(d); });
   const [remTime, setRemTime] = useState("09:00");
   const tooltipElRef = useRef<HTMLDivElement>(null);
   const [openUpward] = useState(() => anchorY != null ? anchorY > window.innerHeight - 300 : false);
   const [calTitle, setCalTitle] = useState(htmlToPreviewText(noteText).slice(0, 80));
-  const [calStart, setCalStart] = useState(() => { const d = new Date(); d.setDate(d.getDate() + 1); d.setHours(10,0,0,0); return d.toISOString().slice(0,16); });
-  const [calEnd, setCalEnd] = useState(() => { const d = new Date(); d.setDate(d.getDate() + 1); d.setHours(11,0,0,0); return d.toISOString().slice(0,16); });
+  const [calStart, setCalStart] = useState(() => { const d = new Date(); d.setDate(d.getDate() + 1); d.setHours(10,0,0,0); return toLocalDatetimeValue(d.toISOString()); });
+  const [calEnd, setCalEnd] = useState(() => { const d = new Date(); d.setDate(d.getDate() + 1); d.setHours(11,0,0,0); return toLocalDatetimeValue(d.toISOString()); });
   const [done, setDone] = useState(false);
 
   const stripped = htmlToPreviewText(noteText).replace(/@\S+/g, "").trim();
@@ -1489,7 +1088,7 @@ function NoteActionTooltip({ kind, noteText, eventId, accountName, airtableAccou
       localStorage.setItem("actionItemsUpdated", String(Date.now()));
       window.dispatchEvent(new StorageEvent("storage", { key: "actionItemsUpdated", newValue: String(Date.now()) }));
     } else if (kind === "reminder") {
-      await schedulerApi.createReminder({ title: stripped.slice(0, 200) || "Note reminder", body: htmlToPreviewText(noteText), resource_type: "calendar_event", resource_id: eventId, due_at: new Date(`${remDate}T${remTime}:00`).toISOString(), notify_in_app: true } as Parameters<typeof schedulerApi.createReminder>[0]);
+      await schedulerApi.createReminder({ title: stripped.slice(0, 200) || "Note reminder", body: htmlToPreviewText(noteText), resource_type: "calendar_event", resource_id: eventId, due_at: new Date(`${remDate}T${remTime}:00`).toISOString() } as Parameters<typeof schedulerApi.createReminder>[0]);
     } else {
       await schedulerApi.createEvent({ title: calTitle, description: `From meeting note: ${noteText}`, start_datetime: new Date(calStart).toISOString(), end_datetime: new Date(calEnd).toISOString() } as Parameters<typeof schedulerApi.createEvent>[0]);
     }
@@ -1501,35 +1100,35 @@ function NoteActionTooltip({ kind, noteText, eventId, accountName, airtableAccou
   const label = kind === "action" ? "Create Action Item" : kind === "reminder" ? "Set Reminder" : "Create Meeting";
 
   return (
-    <div ref={tooltipElRef} style={{ position: "absolute", right: 0, ...(openUpward ? { bottom: "100%", marginBottom: "4px" } : { top: "100%", marginTop: "4px" }), zIndex: 9999, background: "#fff", border: "1px solid #e5e7eb", borderRadius: "10px", padding: "10px 12px", width: "240px", boxShadow: "0 4px 16px rgba(0,0,0,0.12)", display: "flex", flexDirection: "column", gap: "8px" }}>
-      <p style={{ fontSize: "0.6875rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", color: "#6b7280", margin: 0 }}>{label}</p>
-      <div style={{ fontSize: "0.75rem", background: "#f9fafb", borderRadius: "5px", padding: "4px 7px", color: "#374151", lineHeight: 1.4, maxHeight: "40px", overflow: "hidden" }}>{stripped}</div>
+    <div ref={tooltipElRef} style={{ position: "absolute", right: 0, ...(openUpward ? { bottom: "100%", marginBottom: "4px" } : { top: "100%", marginTop: "4px" }), zIndex: 9999, background: "var(--surface-card)", border: "1px solid var(--border-subtle)", borderRadius: "10px", padding: "10px 12px", width: "240px", boxShadow: "0 4px 16px rgba(0,0,0,0.12)", display: "flex", flexDirection: "column", gap: "8px" }}>
+      <p style={{ fontSize: "0.6875rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", color: "var(--text-gray-500)", margin: 0 }}>{label}</p>
+      <div style={{ fontSize: "0.75rem", background: "var(--surface-subtle)", borderRadius: "5px", padding: "4px 7px", color: "var(--text-gray-700)", lineHeight: 1.4, maxHeight: "40px", overflow: "hidden" }}>{stripped}</div>
       {kind === "action" && (
         <div style={{ display: "flex", gap: "6px" }}>
           <div style={{ flex: 1 }}>
-            <p style={{ fontSize: "0.6875rem", color: "#9ca3af", marginBottom: "3px" }}>Priority</p>
-            <select value={priority} onChange={(e) => setPriority(e.target.value as typeof priority)} style={{ width: "100%", fontSize: "0.75rem", border: "1px solid #e5e7eb", borderRadius: "5px", padding: "3px 6px", outline: "none" }}>
+            <p style={{ fontSize: "0.6875rem", color: "var(--text-gray-400)", marginBottom: "3px" }}>Priority</p>
+            <select value={priority} onChange={(e) => setPriority(e.target.value as typeof priority)} style={{ width: "100%", fontSize: "0.75rem", border: "1px solid var(--border-subtle)", borderRadius: "5px", padding: "3px 6px", outline: "none" }}>
               {(["Low","Medium","High","Critical"] as const).map((p) => <option key={p}>{p}</option>)}
             </select>
           </div>
           <div style={{ flex: 1 }}>
-            <p style={{ fontSize: "0.6875rem", color: "#9ca3af", marginBottom: "3px" }}>Due date</p>
-            <input type="date" value={due} onChange={(e) => setDue(e.target.value)} style={{ width: "100%", fontSize: "0.75rem", border: "1px solid #e5e7eb", borderRadius: "5px", padding: "3px 6px", outline: "none" }} />
+            <p style={{ fontSize: "0.6875rem", color: "var(--text-gray-400)", marginBottom: "3px" }}>Due date</p>
+            <input type="date" value={due} onChange={(e) => setDue(e.target.value)} style={{ width: "100%", fontSize: "0.75rem", border: "1px solid var(--border-subtle)", borderRadius: "5px", padding: "3px 6px", outline: "none" }} />
           </div>
         </div>
       )}
       {kind === "reminder" && (
         <div style={{ display: "flex", gap: "6px" }}>
-          <div style={{ flex: 1 }}><p style={{ fontSize: "0.6875rem", color: "#9ca3af", marginBottom: "3px" }}>Date</p><input type="date" value={remDate} onChange={(e) => setRemDate(e.target.value)} style={{ width: "100%", fontSize: "0.75rem", border: "1px solid #e5e7eb", borderRadius: "5px", padding: "3px 6px", outline: "none" }} /></div>
-          <div style={{ flex: 1 }}><p style={{ fontSize: "0.6875rem", color: "#9ca3af", marginBottom: "3px" }}>Time</p><input type="time" value={remTime} onChange={(e) => setRemTime(e.target.value)} style={{ width: "100%", fontSize: "0.75rem", border: "1px solid #e5e7eb", borderRadius: "5px", padding: "3px 6px", outline: "none" }} /></div>
+          <div style={{ flex: 1 }}><p style={{ fontSize: "0.6875rem", color: "var(--text-gray-400)", marginBottom: "3px" }}>Date</p><input type="date" value={remDate} onChange={(e) => setRemDate(e.target.value)} style={{ width: "100%", fontSize: "0.75rem", border: "1px solid var(--border-subtle)", borderRadius: "5px", padding: "3px 6px", outline: "none" }} /></div>
+          <div style={{ flex: 1 }}><p style={{ fontSize: "0.6875rem", color: "var(--text-gray-400)", marginBottom: "3px" }}>Time</p><input type="time" value={remTime} onChange={(e) => setRemTime(e.target.value)} style={{ width: "100%", fontSize: "0.75rem", border: "1px solid var(--border-subtle)", borderRadius: "5px", padding: "3px 6px", outline: "none" }} /></div>
         </div>
       )}
       {kind === "calendar" && (
         <>
-          <div><p style={{ fontSize: "0.6875rem", color: "#9ca3af", marginBottom: "3px" }}>Title</p><input value={calTitle} onChange={(e) => setCalTitle(e.target.value)} style={{ width: "100%", fontSize: "0.75rem", border: "1px solid #e5e7eb", borderRadius: "5px", padding: "3px 6px", outline: "none", boxSizing: "border-box" }} /></div>
+          <div><p style={{ fontSize: "0.6875rem", color: "var(--text-gray-400)", marginBottom: "3px" }}>Title</p><input value={calTitle} onChange={(e) => setCalTitle(e.target.value)} style={{ width: "100%", fontSize: "0.75rem", border: "1px solid var(--border-subtle)", borderRadius: "5px", padding: "3px 6px", outline: "none", boxSizing: "border-box" }} /></div>
           <div style={{ display: "flex", gap: "6px" }}>
-            <div style={{ flex: 1 }}><p style={{ fontSize: "0.6875rem", color: "#9ca3af", marginBottom: "3px" }}>Start</p><input type="datetime-local" value={calStart} onChange={(e) => setCalStart(e.target.value)} style={{ width: "100%", fontSize: "0.6875rem", border: "1px solid #e5e7eb", borderRadius: "5px", padding: "3px 6px", outline: "none" }} /></div>
-            <div style={{ flex: 1 }}><p style={{ fontSize: "0.6875rem", color: "#9ca3af", marginBottom: "3px" }}>End</p><input type="datetime-local" value={calEnd} onChange={(e) => setCalEnd(e.target.value)} style={{ width: "100%", fontSize: "0.6875rem", border: "1px solid #e5e7eb", borderRadius: "5px", padding: "3px 6px", outline: "none" }} /></div>
+            <div style={{ flex: 1 }}><p style={{ fontSize: "0.6875rem", color: "var(--text-gray-400)", marginBottom: "3px" }}>Start</p><input type="datetime-local" value={calStart} onChange={(e) => setCalStart(e.target.value)} style={{ width: "100%", fontSize: "0.6875rem", border: "1px solid var(--border-subtle)", borderRadius: "5px", padding: "3px 6px", outline: "none" }} /></div>
+            <div style={{ flex: 1 }}><p style={{ fontSize: "0.6875rem", color: "var(--text-gray-400)", marginBottom: "3px" }}>End</p><input type="datetime-local" value={calEnd} onChange={(e) => setCalEnd(e.target.value)} style={{ width: "100%", fontSize: "0.6875rem", border: "1px solid var(--border-subtle)", borderRadius: "5px", padding: "3px 6px", outline: "none" }} /></div>
           </div>
         </>
       )}
@@ -1756,7 +1355,7 @@ function GongSummaryPanel({ eventId, meetingId: meetingIdProp, existingNotes, ex
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "6px" }}>
         <p style={{ fontSize: "0.6875rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em", color: "var(--twilio-gray-60)", margin: 0 }}>Meeting Summary</p>
         <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-          {saveState === "saving" && <span style={{ fontSize: "0.6875rem", color: "#9ca3af" }}>Saving…</span>}
+          {saveState === "saving" && <span style={{ fontSize: "0.6875rem", color: "var(--text-gray-400)" }}>Saving…</span>}
           {saveState === "saved" && <span style={{ fontSize: "0.6875rem", color: "#16a34a" }}>✓ Saved</span>}
           {saveState === "error" && <span style={{ fontSize: "0.6875rem", color: "#dc2626" }}>Save failed</span>}
           <MeetingSummarySourceToggle
@@ -1781,7 +1380,7 @@ function GongSummaryPanel({ eventId, meetingId: meetingIdProp, existingNotes, ex
             placeholder={source === "zoom"
               ? "Paste your Zoom AI Companion summary or any bulleted text here…"
               : "Paste your Gong notes, meeting summary, or any bulleted text here…"}
-            style={{ width: "100%", fontSize: "0.8125rem", border: "1px solid #e5e7eb", borderRadius: "7px", padding: "8px 10px", outline: "none", resize: "vertical", lineHeight: 1.5, boxSizing: "border-box", color: "var(--twilio-navy)" }}
+            style={{ width: "100%", fontSize: "0.8125rem", border: "1px solid var(--border-subtle)", borderRadius: "7px", padding: "8px 10px", outline: "none", resize: "vertical", lineHeight: 1.5, boxSizing: "border-box", color: "var(--text-ink)" }}
           />
           <button onClick={() => void handleParse()} disabled={!raw.trim()} style={{ marginTop: "5px", width: "100%", padding: "5px 0", fontSize: "0.75rem", fontWeight: 700, background: "#6366f1", color: "#fff", border: "none", borderRadius: "6px", cursor: raw.trim() ? "pointer" : "not-allowed", opacity: raw.trim() ? 1 : 0.4 }}>
             Parse & Save
@@ -1790,12 +1389,12 @@ function GongSummaryPanel({ eventId, meetingId: meetingIdProp, existingNotes, ex
       )}
 
       {items.length > 0 && (
-        <div style={{ border: "1px solid rgba(0,0,0,0.08)", borderRadius: "8px", background: "#fff", overflow: "hidden" }}>
+        <div style={{ border: "1px solid rgba(0,0,0,0.08)", borderRadius: "8px", background: "var(--surface-card)", overflow: "hidden" }}>
           {items.map((item, i) => {
             if (item.kind === "heading") {
               return (
                 <div key={i} style={{ padding: "6px 10px 3px", borderBottom: "1px solid rgba(0,0,0,0.05)" }}>
-                  <p style={{ fontSize: "0.6875rem", fontWeight: 700, textTransform: "capitalize", color: "var(--twilio-navy)", margin: 0, letterSpacing: "0.01em" }}>{item.text}</p>
+                  <p style={{ fontSize: "0.6875rem", fontWeight: 700, textTransform: "capitalize", color: "var(--text-ink)", margin: 0, letterSpacing: "0.01em" }}>{item.text}</p>
                 </div>
               );
             }
@@ -1841,12 +1440,12 @@ function GongBulletRow({ text, eventId, accountName, airtableAccountId, isLast, 
   return (
     <div className="group" style={{ display: "flex", alignItems: "flex-start", gap: "6px", padding: "6px 10px", borderBottom: isLast ? undefined : "1px solid rgba(0,0,0,0.05)", position: "relative" }}>
       <span style={{ width: "5px", height: "5px", borderRadius: "50%", background: "#9ca3af", flexShrink: 0, marginTop: "7px" }} />
-      <p style={{ flex: 1, fontSize: "0.8125rem", color: "var(--twilio-navy)", lineHeight: 1.5, margin: 0 }}>{renderWithMentions(text)}</p>
+      <p style={{ flex: 1, fontSize: "0.8125rem", color: "var(--text-ink)", lineHeight: 1.5, margin: 0 }}>{renderWithMentions(text)}</p>
       <div ref={tooltipRef} style={{ display: "flex", alignItems: "center", gap: "2px", flexShrink: 0, position: "relative" }}>
         <button
           title="Create action item"
           onClick={(e) => { setTooltipAnchorY(e.currentTarget.getBoundingClientRect().bottom); setOpenAction(openAction === "action" ? null : "action"); }}
-          style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("action") ? "#2563eb" : "#9ca3af" }}
+          style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("action") ? "#2563eb" : "var(--text-gray-400)" }}
           className={doneActions.has("action") ? "transition-opacity" : "opacity-0 group-hover:opacity-100 transition-opacity"}
         >
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" style={{ width: "12px", height: "12px" }}><path d="M8 5h9M8 10h9M8 15h9" strokeLinecap="round"/><path d="M3 5l1.5 1.5L7 3M3 10l1.5 1.5L7 8M3 15l1.5 1.5L7 13" strokeLinecap="round" strokeLinejoin="round"/></svg>
@@ -1854,7 +1453,7 @@ function GongBulletRow({ text, eventId, accountName, airtableAccountId, isLast, 
         <button
           title="Set reminder"
           onClick={(e) => { setTooltipAnchorY(e.currentTarget.getBoundingClientRect().bottom); setOpenAction(openAction === "reminder" ? null : "reminder"); }}
-          style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("reminder") ? "#2563eb" : "#9ca3af" }}
+          style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("reminder") ? "#2563eb" : "var(--text-gray-400)" }}
           className={doneActions.has("reminder") ? "transition-opacity" : "opacity-0 group-hover:opacity-100 transition-opacity"}
         >
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" style={{ width: "12px", height: "12px" }}><circle cx="10" cy="10" r="7"/><path d="M10 6v4l3 2" strokeLinecap="round" strokeLinejoin="round"/></svg>
@@ -1862,11 +1461,12 @@ function GongBulletRow({ text, eventId, accountName, airtableAccountId, isLast, 
         <button
           title="Create meeting"
           onClick={(e) => { setTooltipAnchorY(e.currentTarget.getBoundingClientRect().bottom); setOpenAction(openAction === "calendar" ? null : "calendar"); }}
-          style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("calendar") ? "#2563eb" : "#9ca3af" }}
+          style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("calendar") ? "#2563eb" : "var(--text-gray-400)" }}
           className={doneActions.has("calendar") ? "transition-opacity" : "opacity-0 group-hover:opacity-100 transition-opacity"}
         >
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" style={{ width: "12px", height: "12px" }}><rect x="2" y="4" width="16" height="14" rx="2"/><path d="M2 8h16M6 2v4M14 2v4" strokeLinecap="round"/></svg>
         </button>
+        <PinNoteButton text={text} />
         {openAction && (
           <NoteActionTooltip
             kind={openAction}
@@ -1918,7 +1518,7 @@ function ContactNoteRow({
 
   if (editing) {
     return (
-      <li className={`flex items-start gap-${isXs ? "1.5" : "2"} ${isXs ? "text-[11px]" : "text-xs"}`} style={{ color: "var(--twilio-navy)" }}>
+      <li className={`flex items-start gap-${isXs ? "1.5" : "2"} ${isXs ? "text-[11px]" : "text-xs"}`} style={{ color: "var(--text-ink)" }}>
         <span className={`${isXs ? "w-1.5 h-1.5" : "w-1.5 h-1.5"} rounded-full bg-gray-300 shrink-0 mt-1.5`} />
         <div className="flex-1 flex flex-col gap-1">
           <RichTextMentionEditor
@@ -1948,10 +1548,10 @@ function ContactNoteRow({
   }
 
   return (
-    <li className={`group/note flex items-start gap-${isXs ? "1.5" : "2"} ${isXs ? "text-[11px]" : "text-xs"}`} style={{ color: "var(--twilio-navy)" }}>
+    <li className={`group/note flex items-start gap-${isXs ? "1.5" : "2"} ${isXs ? "text-[11px]" : "text-xs"}`} style={{ color: "var(--text-ink)" }}>
       <span className="w-1.5 h-1.5 rounded-full bg-gray-300 shrink-0 mt-1.5" />
       <span
-        className="flex-1 leading-relaxed prose prose-sm max-w-none"
+        className="flex-1 leading-relaxed prose prose-sm max-w-none rich-text"
         dangerouslySetInnerHTML={{ __html: sanitizeHtml(plainToHtml(note.content)) }}
       />
       <button
@@ -2030,10 +1630,10 @@ function CustomerContactModal({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onClose}>
+    <div className="fixed inset-0 z-[9000] flex items-center justify-center bg-black/40" onClick={onClose}>
       <div
         className="rounded-2xl shadow-2xl flex flex-col overflow-hidden"
-        style={{ background: "#fff", width: "440px", maxWidth: "calc(100vw - 32px)", maxHeight: "calc(100vh - 48px)" }}
+        style={{ background: "var(--surface-card)", width: "440px", maxWidth: "calc(100vw - 32px)", maxHeight: "calc(100vh - 48px)" }}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -2172,12 +1772,17 @@ type PanelItem =
   | { kind: "contact"; item: CustomerContact }
   | { kind: "calendar"; item: CalendarEvent; linkedMeeting?: AirtableMeeting; reminders?: Reminder[]; onAddReminder?: (due_at: string, title: string) => Promise<void>; onDismissReminder?: (id: number) => Promise<void> };
 
+function inferredFull(email: string): string {
+  return fullNameFromEmail(email).name;
+}
+
 function AttendeeList({
   attendees,
   responseColor,
   account,
   teamMembers,
   contacts,
+  onAccountUpdated,
   onContactsChange,
 }: {
   attendees: Attendee[];
@@ -2207,13 +1812,33 @@ function AttendeeList({
   }, [popover]);
 
   const currentAttendee = popover != null ? attendees[popover.index] : null;
+  // The account's team as last returned by the server, so a guest turns into a check mark at once
+  // (the parent's copy of the account is not refreshed from here).
+  const [teamOverride, setTeamOverride] = useState<AccountTeamMember[] | null>(null);
+  useEffect(() => { setTeamOverride(null); }, [account]);
+  const accountTeam = teamOverride ?? account?.team_members ?? [];
 
   async function handleAddToTwilio(memberId: number) {
     if (!account || addingMember) return;
     setAddingMember(true);
     try {
-      await accountsApi.addTeamMember(account.id, memberId);
+      // Record the address this guest was invited under on the team member (once), then make
+      // sure they are on the account's team. Both are idempotent.
+      const member = teamMembers.find((m) => m.id === memberId);
+      const guestEmail = (currentAttendee?.email ?? "").trim();
+      if (member && guestEmail && !allEmails(member).some((e) => e.toLowerCase() === guestEmail.toLowerCase())) {
+        await teamApi.addMemberEmail(memberId, guestEmail);
+      }
+      const { data } = await accountsApi.addTeamMember(account.id, memberId);
+      setTeamOverride(data.team_members ?? []);
+      onAccountUpdated?.(data);
+      addLog({
+        category: "account",
+        message: `Linked ${guestEmail || "a guest"} to Twilio team member "${member?.full_name ?? memberId}"`,
+        resource: { type: "account", id: account.id },
+      });
     } catch (err) {
+      // Adding someone else to an account, or an address to someone else, is PM/Admin only.
       reportError(permissionMessage(err, "Could not add them to the account."), "AttendeeList");
     } finally {
       setAddingMember(false);
@@ -2248,18 +1873,28 @@ function AttendeeList({
         {attendees.map((a, i) => (
           <div key={i} className="group relative" style={{ display: "flex", alignItems: "center", gap: "8px" }}>
             <span style={{ width: "7px", height: "7px", borderRadius: "50%", flexShrink: 0, background: responseColor[a.responseStatus] ?? "#888", display: "inline-block" }} title={a.responseStatus} />
-            <span style={{ fontSize: "0.75rem", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              {a.displayName
-                ? <><span style={{ fontWeight: 500 }}>{a.displayName}</span> <span className="opacity-50">{a.email}</span></>
-                : a.email}
-            </span>
+            {(() => {
+              // A guest with a check mark and a full name shows the name alone; the address is the tooltip.
+              const known = account ? knownFullName(a, matchAttendee(a, contacts ?? [], accountTeam)) : "";
+              return (
+                <span title={known ? a.email : undefined} style={{ fontSize: "0.75rem", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {known
+                    ? <span style={{ fontWeight: 500 }}>{known}</span>
+                    : a.displayName
+                      ? <><span style={{ fontWeight: 500 }}>{a.displayName}</span> <span className="opacity-50">{a.email}</span></>
+                      : a.email}
+                </span>
+              );
+            })()}
             {account && (
-              <button
-                onClick={() => { setPopover({ index: i, mode: "pick" }); setSearch(""); }}
-                className="opacity-0 group-hover:opacity-100 transition-opacity shrink-0 w-5 h-5 rounded-full flex items-center justify-center text-indigo-600 hover:bg-indigo-50"
-                style={{ fontSize: "14px", lineHeight: 1 }}
-                title="Add to team or contacts"
-              >+</button>
+              <AttendeeActionButton
+                attendee={a}
+                account={account}
+                contacts={contacts ?? []}
+                accountTeamMembers={accountTeam}
+                onContactsChange={onContactsChange}
+                onAdd={() => { setPopover({ index: i, mode: "pick" }); setSearch(""); }}
+              />
             )}
 
             {/* Popover */}
@@ -2317,7 +1952,8 @@ function AttendeeList({
 
                 {popover.mode === "customer-form" && currentAttendee && (
                   <CustomerContactQuickForm
-                    defaultName={currentAttendee.displayName ?? ""}
+                    defaultName={guestName(currentAttendee) || inferredFull(currentAttendee.email)}
+                    nameGuessed={!guestName(currentAttendee) && !!inferredFull(currentAttendee.email)}
                     defaultEmail={currentAttendee.email}
                     saving={addingContact}
                     onSave={(name, email, role) => void handleAddAsContact(name, email, role)}
@@ -2334,9 +1970,9 @@ function AttendeeList({
 }
 
 function CustomerContactQuickForm({
-  defaultName, defaultEmail, saving, onSave, onBack,
+  defaultName, defaultEmail, saving, onSave, onBack, nameGuessed = false,
 }: {
-  defaultName: string; defaultEmail: string; saving: boolean;
+  defaultName: string; defaultEmail: string; saving: boolean; nameGuessed?: boolean;
   onSave: (name: string, email: string, role: string) => void;
   onBack: () => void;
 }) {
@@ -2348,6 +1984,7 @@ function CustomerContactQuickForm({
       <p className="text-[11px] font-semibold text-[var(--twilio-navy)]">Add as customer contact</p>
       <input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="Full name *"
         className="w-full rounded-lg border border-gray-200 px-2.5 py-1.5 text-xs text-[var(--twilio-navy)] focus:border-indigo-400 focus:outline-none" />
+      {nameGuessed && name === defaultName && <p className="text-[10px] text-amber-600 -mt-1">Name guessed from the email address. Please check it.</p>}
       <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Email"
         className="w-full rounded-lg border border-gray-200 px-2.5 py-1.5 text-xs text-[var(--twilio-navy)] focus:border-indigo-400 focus:outline-none" />
       <input value={role} onChange={(e) => setRole(e.target.value)} placeholder="Role / title"
@@ -2376,6 +2013,7 @@ function ActionItemSidePanelContent({
   onUpdated?: (updated: AirtableActionItem) => void;
 }) {
   const { status: statusOptions } = useActionItemFieldOptions();
+  const { label: statusLabel } = useStatusLabels();
   const [form, setForm] = useState<Partial<AirtableActionItem>>({ ...item });
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -2507,6 +2145,7 @@ function ActionItemSidePanelContent({
         <AccPillSelect
           value={form.status}
           options={statusOptions as AirtableActionItem["status"][]}
+          format={statusLabel}
           colorMap={NEW_AI_STATUS_COLORS}
           placeholder="Status"
           onChange={(v) => set({ status: v })}
@@ -2678,6 +2317,32 @@ function ActionItemSidePanelContent({
   );
 }
 
+/** Copy text for the user to paste elsewhere; nothing is sent by the app. */
+async function copyTextToClipboard(text: string): Promise<void> {
+  try {
+    if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(text); return; }
+  } catch { /* fall through to the legacy path */ }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand("copy"); } finally { document.body.removeChild(ta); }
+}
+
+/** The starred customer contact shown as the sidebar's Primary Contact: the most recently starred
+ *  (latest updated_at among is_main_poc contacts). Null when none is starred, so the account's own
+ *  primary_contact (an internal TeamMember) shows instead. */
+export function mainContactName(contacts: CustomerContact[]): string | null {
+  let best: CustomerContact | null = null;
+  for (const c of contacts) {
+    if (!c.is_main_poc) continue;
+    if (!best || (c.updated_at ?? "") >= (best.updated_at ?? "")) best = c;
+  }
+  return best ? best.name : null;
+}
+
 function ContactSidePanelContent({
   contact,
   onUpdated,
@@ -2690,7 +2355,7 @@ function ContactSidePanelContent({
   teamOptions?: string[];
 }) {
   const { reportError } = useAppError();
-  const [form, setForm] = useState({ name: contact.name, role: contact.role, description: contact.description, email: contact.email, team: contact.team ?? "" });
+  const [form, setForm] = useState({ name: contact.name, role: contact.role, description: contact.description, email: contact.email, team: contact.team ?? "", timezone: contact.timezone ?? "" });
   const [starred, setStarred] = useState(!!contact.is_main_poc);
   useEffect(() => { setStarred(!!contact.is_main_poc); }, [contact.is_main_poc]);
   // Switching to another profile unmounts this panel (keyed by contact id). Flush unsaved edits so
@@ -2786,7 +2451,7 @@ function ContactSidePanelContent({
             value={form.name}
             onChange={(e) => setField("name", e.target.value)}
             className="w-full text-sm font-semibold border-b border-transparent hover:border-gray-200 focus:border-indigo-300 focus:outline-none bg-transparent"
-            style={{ color: "var(--twilio-navy)" }}
+            style={{ color: "var(--text-ink)" }}
           />
           <input
             value={form.role}
@@ -2795,6 +2460,7 @@ function ContactSidePanelContent({
             className="w-full text-xs border-b border-transparent hover:border-gray-200 focus:border-indigo-300 focus:outline-none bg-transparent mt-0.5"
             style={{ color: "var(--twilio-gray-60)" }}
           />
+          <ContactLocalTime zone={form.timezone} className="block mt-0.5" />
         </div>
         <button
           type="button"
@@ -2818,11 +2484,17 @@ function ContactSidePanelContent({
           onChange={(e) => setField("team", e.target.value)}
           placeholder="Their internal team"
           className="flex-1 text-xs border-b border-transparent hover:border-gray-200 focus:border-indigo-300 focus:outline-none bg-transparent"
-          style={{ color: "var(--twilio-navy)" }}
+          style={{ color: "var(--text-ink)" }}
         />
         <datalist id="contact-team-suggestions-panel">
           {teamOptions.map((t) => <option key={t} value={t} />)}
         </datalist>
+      </div>
+
+      {/* Time zone */}
+      <div>
+        <p className="text-[11px] text-[var(--twilio-gray-60)] mb-1">Time zone</p>
+        <TimezoneField value={form.timezone} onChange={(z) => setField("timezone", z)} />
       </div>
 
       {/* Email */}
@@ -2834,7 +2506,7 @@ function ContactSidePanelContent({
           onChange={(e) => setField("email", e.target.value)}
           placeholder="email@company.com"
           className="flex-1 text-xs border-b border-transparent hover:border-gray-200 focus:border-indigo-300 focus:outline-none bg-transparent"
-          style={{ color: "var(--twilio-navy)" }}
+          style={{ color: "var(--text-ink)" }}
         />
       </div>
 
@@ -2847,7 +2519,7 @@ function ContactSidePanelContent({
           rows={3}
           placeholder="Context, background…"
           className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-xs placeholder:text-gray-400 focus:bg-white focus:border-indigo-400 focus:outline-none resize-none"
-          style={{ color: "var(--twilio-navy)" }}
+          style={{ color: "var(--text-ink)" }}
         />
       </div>
 
@@ -2855,7 +2527,7 @@ function ContactSidePanelContent({
       {dirty && (
         <div className="flex justify-end gap-2">
           <button
-            onClick={() => { const reset = { name: contact.name, role: contact.role, description: contact.description, email: contact.email, team: contact.team ?? "" }; setForm(reset); flushRef.current = { ...flushRef.current, form: reset, dirty: false }; setDirty(false); }}
+            onClick={() => { const reset = { name: contact.name, role: contact.role, description: contact.description, email: contact.email, team: contact.team ?? "", timezone: contact.timezone ?? "" }; setForm(reset); flushRef.current = { ...flushRef.current, form: reset, dirty: false }; setDirty(false); }}
             className="text-xs text-[var(--twilio-gray-60)] hover:text-[var(--twilio-navy)] transition-colors"
           >Discard</button>
           <button
@@ -2994,7 +2666,7 @@ function SidePanel({ panel, onClose, onCreatedActionItem, onMeetingUpdated, onUp
             <>
               {/* Status badge */}
               {ev.status !== "confirmed" && (
-                <span style={{ display: "inline-block", fontSize: "0.6875rem", fontWeight: 600, padding: "2px 8px", borderRadius: "6px", background: ev.status === "cancelled" ? "#fee2e2" : "#fef9c3", color: ev.status === "cancelled" ? "#dc2626" : "#a16207", marginBottom: "2px" }}>
+                <span style={{ display: "inline-block", fontSize: "0.6875rem", fontWeight: 600, padding: "2px 8px", borderRadius: "6px", background: ev.status === "cancelled" ? "var(--tint-red-100)" : "var(--tint-yellow-100)", color: ev.status === "cancelled" ? "#dc2626" : "var(--ink-amber)", marginBottom: "2px" }}>
                   {ev.status}
                 </span>
               )}
@@ -3089,7 +2761,7 @@ function SidePanel({ panel, onClose, onCreatedActionItem, onMeetingUpdated, onUp
 const DAY_ABBR = ["Su", "M", "T", "W", "Th", "F", "Sa"];
 
 function isoDate(d: Date): string {
-  return d.toISOString().slice(0, 10);
+  return localDateKey(d);
 }
 
 /** Returns an array of Date objects for each weekday (Mon–Fri) over the window. */
@@ -3108,6 +2780,9 @@ function buildDayWindow(centerDate: Date, halfWeeks = 3): Date[] {
   }
   return days;
 }
+
+const TIMELINE_VISIBLE_DAYS = 5;
+const TIMELINE_DAY_GAP = 6;
 
 function AccountTimeline({
   meetings,
@@ -3132,6 +2807,20 @@ function AccountTimeline({
   const scrollRef = useRef<HTMLDivElement>(null);
   const [dragOverDay, setDragOverDay] = useState<string | null>(null);
 
+  // Exactly TIMELINE_VISIBLE_DAYS columns fill the visible width; the rest scroll.
+  const [viewportW, setViewportW] = useState(0);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const measure = () => setViewportW(el.clientWidth);
+    measure();
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  });
+  const dayWidth = viewportW > 0
+    ? Math.max(96, Math.floor((viewportW - TIMELINE_DAY_GAP * (TIMELINE_VISIBLE_DAYS - 1)) / TIMELINE_VISIBLE_DAYS))
+    : 120;
+
   const days = buildDayWindow(today, 3);
 
   // Build lookup maps by date string
@@ -3149,7 +2838,7 @@ function AccountTimeline({
   for (const m of meetings) {
     if (!m.date) continue;
     if (mergedMeetingIds.has(m.airtable_id)) continue;
-    const d = isoDate(new Date(m.date));
+    const d = dateFieldDayKey(m.date);
     (meetingsByDate[d] ??= []).push(m);
   }
 
@@ -3164,13 +2853,13 @@ function AccountTimeline({
   const actionsByDate: Record<string, AirtableActionItem[]> = {};
   for (const item of actionItems) {
     if (!item.due_date) continue;
-    const d = isoDate(new Date(item.due_date));
+    const d = dateFieldDayKey(item.due_date);
     (actionsByDate[d] ??= []).push(item);
   }
 
   const calByDate: Record<string, CalendarEvent[]> = {};
   for (const ev of calendarEvents) {
-    const d = isoDate(new Date(ev.start_datetime));
+    const d = instantDayKey(ev.start_datetime);
     (calByDate[d] ??= []).push(ev);
   }
 
@@ -3187,7 +2876,8 @@ function AccountTimeline({
       const elW = todayEl.offsetWidth;
       container.scrollLeft = elLeft - containerW / 2 + elW / 2;
     }
-  }, []);
+    // Re-centre when the column width is (re)measured, not on every render.
+  }, [dayWidth]);
 
   if (!hasAny) {
     return <p className="text-xs text-[var(--twilio-gray-60)] italic py-1">No meetings, action items, or calendar events yet.</p>;
@@ -3199,7 +2889,7 @@ function AccountTimeline({
       className="overflow-x-auto pb-2"
       style={{ scrollbarWidth: "thin" }}
     >
-      <div style={{ display: "flex", gap: "6px", minWidth: "max-content" }}>
+      <div style={{ display: "flex", gap: `${TIMELINE_DAY_GAP}px`, minWidth: "max-content" }}>
         {days.map((day) => {
           const ds = isoDate(day);
           const isToday = ds === todayStr;
@@ -3222,7 +2912,7 @@ function AccountTimeline({
                 if (aid && onDropActionOnDay) onDropActionOnDay(aid, ds);
               }}
               style={{
-                width: "120px",
+                width: `${dayWidth}px`,
                 flexShrink: 0,
                 display: "flex",
                 flexDirection: "column",
@@ -3304,12 +2994,12 @@ function AccountTimeline({
                             cursor: "pointer",
                           }}
                         >
-                          <span style={{ flexShrink: 0, fontSize: "0.6rem", color: "#15803d", marginTop: "2px" }}>✓</span>
+                          <span style={{ flexShrink: 0, fontSize: "0.6rem", color: "var(--ink-green)", marginTop: "2px" }}>✓</span>
                           <span style={{
                             fontSize: "0.6rem",
                             fontWeight: 500,
                             lineHeight: 1.3,
-                            color: "#15803d",
+                            color: "var(--ink-green)",
                             textDecoration: "line-through",
                             overflow: "hidden",
                             display: "-webkit-box",
@@ -3340,8 +3030,8 @@ function AccountTimeline({
                             title={pinned.task}
                             style={{ display: "flex", alignItems: "flex-start", gap: "4px", width: "100%", textAlign: "left", background: "rgba(21,128,61,0.08)", border: "1px solid rgba(21,128,61,0.22)", borderRadius: "3px", padding: "2px 5px", marginLeft: "6px", cursor: "pointer" }}
                           >
-                            <span style={{ flexShrink: 0, fontSize: "0.6rem", color: "#15803d", marginTop: "2px" }}>✓</span>
-                            <span style={{ fontSize: "0.6rem", fontWeight: 500, lineHeight: 1.3, color: "#15803d", textDecoration: "line-through", wordBreak: "break-word" }}>{pinned.task}</span>
+                            <span style={{ flexShrink: 0, fontSize: "0.6rem", color: "var(--ink-green)", marginTop: "2px" }}>✓</span>
+                            <span style={{ fontSize: "0.6rem", fontWeight: 500, lineHeight: 1.3, color: "var(--ink-green)", textDecoration: "line-through", wordBreak: "break-word" }}>{pinned.task}</span>
                           </button>
                         ))}
                       </div>
@@ -3389,7 +3079,7 @@ function AccountTimeline({
                           fontSize: "0.625rem",
                           fontWeight: 500,
                           lineHeight: 1.35,
-                          color: isDone ? "#15803d" : isOverdue ? "#dc2626" : "#6d28d9",
+                          color: isDone ? "var(--ink-green)" : isOverdue ? "#dc2626" : "#6d28d9",
                           textDecoration: isDone ? "line-through" : "none",
                           overflow: "hidden",
                           display: "-webkit-box",
@@ -3808,6 +3498,9 @@ function ArtifactsPanel({ accountId, airtableAccountId }: { accountId: number; a
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragCounterRef = useRef(0);
   const { reportError } = useAppError();
+  const me = useCurrentUser();
+  // Mirrors the server: only the uploader (or an Admin) can update an artifact.
+  const canEditArtifact = (a: AccountArtifact) => !!me && (me.id === a.uploaded_by || me.access_level === "admin");
 
   const load = useCallback(() => {
     accountsApi.listArtifacts(accountId)
@@ -4063,9 +3756,12 @@ function ArtifactsPanel({ accountId, airtableAccountId }: { accountId: number; a
 
       {viewer && (
         <ArtifactViewer
+          key={`${viewer.id}-${viewer.updated_at}`}
           artifact={viewer}
           onClose={() => setViewer(null)}
           canPreview={isPreviewable(viewer)}
+          canEdit={canEditArtifact(viewer)}
+          onUpdated={(u) => { setViewer(u); setArtifacts((prev) => prev.map((x) => (x.id === u.id ? u : x))); }}
         />
       )}
 
@@ -4177,7 +3873,7 @@ function AddArtifactModal({
   const linkIcons = ARTIFACT_ICON_CATALOG.filter((e) => !e.key.startsWith("file_"));
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onClose}>
+    <div className="fixed inset-0 z-[9000] flex items-center justify-center bg-black/40" onClick={onClose}>
       <div
         style={{ background: "var(--surface, #fff)", borderRadius: "12px", padding: "24px", width: "100%", maxWidth: "440px", boxShadow: "0 8px 32px rgba(0,0,0,0.15)", fontFamily: "var(--font-base)" }}
         onClick={(e) => e.stopPropagation()}
@@ -4354,10 +4050,14 @@ function ArtifactViewer({
   artifact,
   onClose,
   canPreview,
+  canEdit = false,
+  onUpdated = () => {},
 }: {
   artifact: AccountArtifact;
   onClose: () => void;
   canPreview: boolean;
+  canEdit?: boolean;
+  onUpdated?: (a: AccountArtifact) => void;
 }) {
   const href = artifact.file_url ?? artifact.url ?? "";
   const references = artifact.references ?? [];
@@ -4365,7 +4065,7 @@ function ArtifactViewer({
   const hasDetails = Boolean(artifact.description?.trim()) || references.length > 0 || usedIn.length > 0 || Boolean(artifact.uploaded_by_username);
 
   return (
-    <div className="fixed inset-0 z-50 flex flex-col bg-black/70 backdrop-blur-sm" onClick={onClose}>
+    <div className="fixed inset-0 z-[9000] flex flex-col bg-black/70 backdrop-blur-sm" onClick={onClose}>
       <div
         style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 20px", background: "rgba(0,0,0,0.6)", flexShrink: 0 }}
         onClick={(e) => e.stopPropagation()}
@@ -4403,7 +4103,7 @@ function ArtifactViewer({
         {canPreview && artifact.mime_type.startsWith("image/") ? (
           <img src={href} alt={artifact.name} style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }} />
         ) : canPreview ? (
-          <iframe src={href} title={artifact.name} style={{ width: "100%", height: "100%", border: "none", background: "#fff" }} />
+          <iframe src={href} title={artifact.name} style={{ width: "100%", height: "100%", border: "none", background: "var(--surface-card)" }} />
         ) : (
           <div style={{ textAlign: "center", color: "#fff" }}>
             <div style={{ fontSize: "3rem", marginBottom: "12px", display: "flex", justifyContent: "center" }}>
@@ -4418,33 +4118,8 @@ function ArtifactViewer({
         )}
         </div>
 
-        {hasDetails && (
-          <aside
-            data-testid="artifact-details"
-            style={{ width: "300px", flexShrink: 0, background: "#fff", overflowY: "auto", padding: "16px", borderLeft: "1px solid rgba(0,0,0,0.08)" }}
-          >
-            {artifact.uploaded_by_username && (
-              <div className="flex items-center gap-2 mb-3">
-                <span className="w-6 h-6 rounded-full bg-indigo-600 text-white text-[10px] font-bold flex items-center justify-center shrink-0">
-                  {artifact.uploaded_by_username[0].toUpperCase()}
-                </span>
-                <span className="text-xs text-gray-600">
-                  Added by <span className="font-semibold text-gray-800">{artifact.uploaded_by_username}</span>
-                </span>
-              </div>
-            )}
-            {artifact.description?.trim() && (
-              <div className="mb-3">
-                <p className="text-[9px] font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide">Description</p>
-                <div
-                  className="mt-1 text-xs text-[var(--twilio-navy)]"
-                  dangerouslySetInnerHTML={{ __html: sanitizeHtml(plainToHtml(artifact.description)) }}
-                />
-              </div>
-            )}
-            <LinkedRecordsList title="Mentions in description" references={references} className="mb-3" />
-            <LinkedRecordsList title="Used in" references={usedIn} />
-          </aside>
+        {(hasDetails || canEdit) && (
+          <ArtifactDetailsRail artifact={artifact} canEdit={canEdit} onUpdated={onUpdated} />
         )}
       </div>
     </div>
@@ -4510,6 +4185,7 @@ function AccountNoteRow({
   onSave,
   onDelete,
   onCreatedActionItem,
+  linkedIn,
 }: {
   note: AccountNote;
   accountId: number;
@@ -4519,6 +4195,8 @@ function AccountNoteRow({
   onSave: (n: AccountNote) => void;
   onDelete: (id: number) => void;
   onCreatedActionItem?: (item: AirtableActionItem) => void;
+  /** Names of the projects/goals this note is linked under (badge). */
+  linkedIn?: string[];
 }) {
   const currentUser = useCurrentUser();
   const [editing, setEditing] = useState(false);
@@ -4632,7 +4310,6 @@ function AccountNoteRow({
       resource_id: accountId,
       resource_label: accountName,
       due_at: due.toISOString(),
-      notify_in_app: true,
     } as Parameters<typeof schedulerApi.createReminder>[0])
       .then(() => { setRemSaved(true); markDone("reminder"); setTimeout(() => { setRemSaved(false); setOpenTooltip(null); }, 1400); })
       .catch(() => {});
@@ -4640,12 +4317,14 @@ function AccountNoteRow({
 
   return (
     <li
+      data-note-id={note.id}
       className="group relative flex items-start gap-2 px-3 py-2 hover:bg-gray-50 transition-colors"
-      draggable
+      draggable={!editing}
       onDragStart={(e) => {
         e.dataTransfer.setData("noteText", note.content);
         e.dataTransfer.setData("noteId", String(note.id));
-        e.dataTransfer.effectAllowed = "copy";
+        setNoteDragData(e, { kind: "account_note", id: String(note.id), label: noteLabel(note.content) });
+        e.dataTransfer.effectAllowed = "copyMove";
       }}
     >
       <span className="mt-[6px] h-1.5 w-1.5 rounded-full bg-[var(--twilio-navy)] shrink-0 opacity-50 cursor-grab active:cursor-grabbing" />
@@ -4668,10 +4347,15 @@ function AccountNoteRow({
           </div>
         ) : (
           <div
-            className="text-sm text-[var(--twilio-navy)] leading-relaxed cursor-text prose prose-sm max-w-none"
+            className="text-sm text-[var(--twilio-navy)] leading-relaxed cursor-text prose prose-sm max-w-none rich-text"
             onClick={() => { setEditing(true); setEditText(note.content); }}
             dangerouslySetInnerHTML={{ __html: sanitizeHtml(plainToHtml(note.content)) }}
           />
+        )}
+        {linkedIn && linkedIn.length > 0 && (
+          <span data-testid="note-linked-badge" className="inline-block mt-1 text-[10px] px-1.5 py-0.5 rounded-full bg-indigo-50 text-indigo-500" title={`Linked to ${linkedIn.join(", ")}`}>
+            In: {linkedIn.join(", ")}
+          </span>
         )}
       </div>
 
@@ -4841,6 +4525,7 @@ function AccountMeetingNotes({
   onUpdate,
   onDelete,
   onCreatedActionItem,
+  noteLinks,
 }: {
   accountId: number;
   accountName: string;
@@ -4851,6 +4536,7 @@ function AccountMeetingNotes({
   onUpdate: (id: number, content: string) => void;
   onDelete: (id: number) => void;
   onCreatedActionItem?: (item: AirtableActionItem) => void;
+  noteLinks?: NoteLinkIndex;
 }) {
   const [draft, setDraft] = useState("");
   const [saving, setSaving] = useState(false);
@@ -4911,6 +4597,7 @@ function AccountMeetingNotes({
               onSave={handleSaveEdit}
               onDelete={onDelete}
               onCreatedActionItem={onCreatedActionItem}
+              linkedIn={noteLinks?.[noteRefKey({ kind: "account_note", id: String(note.id) })]}
             />
           ))}
         </ul>
@@ -5117,7 +4804,7 @@ function SidebarField({
         >
           <span className="flex-1 min-w-0">{display}</span>
           {!readOnly && (
-            <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" className="w-2.5 h-2.5 shrink-0 opacity-0 group-hover/field:opacity-30 transition-opacity" style={{ color: "var(--twilio-navy)" }}>
+            <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" className="w-2.5 h-2.5 shrink-0 opacity-0 group-hover/field:opacity-30 transition-opacity" style={{ color: "var(--text-ink)" }}>
               <path d="M8 1.5l2.5 2.5-6 6L2 10.5l.5-2.5 6-6z" strokeLinejoin="round"/>
             </svg>
           )}
@@ -5140,22 +4827,32 @@ export default function AccountDetailPage() {
   // order items were moved into it. Also the observer that records those moves, so it has to
   // see every actionItems change — hence a hook at the top level rather than inside the
   // kanban's render closure.
-  const { orderForStatus } = useStatusArrivalOrder(actionItems);
+  const { orderForStatus, sortDirection, toggleSort } = useStatusArrivalOrder(actionItems);
+  const { label: statusLabel } = useStatusLabels();
   const [meetings, setMeetings] = useState<AirtableMeeting[]>([]);
   const [calendarEvents, setCalendarEvents] = useState<CalendarEvent[]>([]);
   const [notes, setNotes] = useState<AccountNote[]>([]);
   const [allMembers, setAllMembers] = useState<TeamMember[]>([]);
+  const plannerMe = useCurrentUser();
   const [accountReminders, setAccountReminders] = useState<Reminder[]>([]);
   const [meetingReminders, setMeetingReminders] = useState<Record<number, Reminder[]>>({});
   const [contacts, setContacts] = useState<CustomerContact[]>([]);
   const [quickLinks, setQuickLinks] = useState<AccountQuickLink[]>([]);
   const [selectedContact, setSelectedContact] = useState<CustomerContact | null>(null);
   const [addingContact, setAddingContact] = useState(false);
-  const [addContactForm, setAddContactForm] = useState({ name: "", role: "", email: "", description: "", team: "" });
+  const [emailSelectMode, setEmailSelectMode] = useState(false);
+  const contactGroups = useMemo(() => groupContactsByTeam(contacts), [contacts]);
+  const { ref: teamLayoutRef, layout: teamLayout } = useTeamLayout(contactGroups.length, 8, [contacts]);
+  const [emailPicks, setEmailPicks] = useState<Set<string>>(new Set());
+  const [emailCopied, setEmailCopied] = useState(false);
+  const toggleEmailPick = (key: string) => setEmailPicks((prev) => { const n = new Set(prev); if (n.has(key)) n.delete(key); else n.add(key); return n; });
+  const [addContactForm, setAddContactForm] = useState({ name: "", role: "", email: "", description: "", team: "", timezone: "" });
   const [addContactSaving, setAddContactSaving] = useState(false);
   const [loading, setLoading] = useState(true);
   const [editOpen, setEditOpen] = useState(false);
   const [panel, setPanel] = useState<PanelItem | null>(null);
+  // Action item opened as a modal from the projects/goals list (the timeline still uses the side panel).
+  const [goalModalItem, setGoalModalItem] = useState<AirtableActionItem | null>(null);
   // Section folding is a global preference (hooks/useAccountSectionCollapse). Selecting
   // something that opens the right-hand detail panel re-opens it if it was folded away,
   // otherwise the click would appear to do nothing.
@@ -5182,6 +4879,40 @@ export default function AccountDetailPage() {
   // Outcome of the Cloud Coach membership push that assigning a member can trigger.
   const [cloudCoachPushes, setCloudCoachPushes] = useState<CloudCoachPushResult[] | null>(null);
   const { reportError } = useAppError();
+  // Keep the account's saved free-text primary contact in step with the starred customer contact.
+  // Observes `contacts` (every star toggle lands there), so each path that stars a contact is covered.
+  const accountRef = useRef(account);
+  accountRef.current = account;
+  const prevStarsRef = useRef<Map<number, { starred: boolean; name: string }> | null>(null);
+  useEffect(() => {
+    const prev = prevStarsRef.current;
+    prevStarsRef.current = new Map(contacts.map((c) => [c.id, { starred: !!c.is_main_poc, name: c.name }]));
+    const acct = accountRef.current;
+    if (!prev || !acct) return;
+    const saved = (acct.primary_contact_text ?? "").trim();
+    let target: string | null = null;
+    for (const c of contacts) {
+      const before = prev.get(c.id);
+      if (!before) continue;
+      if (!before.starred && c.is_main_poc) target = c.name.trim();
+    }
+    if (target === null) {
+      for (const [id, before] of prev) {
+        const now = contacts.find((c) => c.id === id);
+        if (!now || !before.starred || now.is_main_poc) continue;
+        if (saved && saved === before.name.trim()) target = (mainContactName(contacts) ?? "").trim();
+      }
+    }
+    if (target === null || target === saved) return;
+    const text = target;
+    setAccount((a) => (a ? { ...a, primary_contact_text: text } : a));
+    accountsApi.updateAccount(acct.id, { primary_contact_text: text } as Partial<Account>)
+      .then(({ data }) => setAccount(data))
+      .catch((err) => {
+        setAccount((a) => (a ? { ...a, primary_contact_text: saved } : a));
+        reportError(permissionMessage(err, "Could not save the primary contact."), "AccountDetailPage");
+      });
+  }, [contacts, reportError]);
   const prevGoalsRef = useRef<GoalSection[]>([]);
   const pendingGoalSaves = useRef(new Set<string>());
   // Ids whose create POST failed. Without this a failed goal is unrecoverable: it is in
@@ -5244,6 +4975,7 @@ export default function AccountDetailPage() {
               meetingIds: p.meeting_ids ?? [],
               goalIds: p.goal_ids ?? [],
               resources: p.resources ?? [],
+              noteRefs: p.note_refs ?? [],
               sfData: p.sf_data ?? {},
               sfProjectId: p.sf_project_id ?? "",
               kind: p.kind ?? "project",
@@ -5392,7 +5124,6 @@ export default function AccountDetailPage() {
     const { data } = await accountsApi.createAccountReminder(account.id, {
       title,
       due_at,
-      notify_in_app: true,
     });
     setAccountReminders((prev) => [...prev, data]);
   }
@@ -5410,7 +5141,6 @@ export default function AccountDetailPage() {
         resource_type: "calendar_event",
         resource_id: calendarEventId,
         resource_label: calTitle,
-        notify_in_app: true,
       });
       setMeetingReminders((prev) => ({ ...prev, [calendarEventId]: [...(prev[calendarEventId] ?? []), data] }));
     };
@@ -5469,6 +5199,7 @@ export default function AccountDetailPage() {
       meeting_ids: g.meetingIds,
       goal_ids: g.goalIds ?? [],
       resources: g.resources,
+      note_refs: g.noteRefs ?? [],
       sf_data: g.sfData ?? {},
       sf_project_id: g.sfProjectId ?? "",
       kind: g.kind ?? "project",
@@ -5598,10 +5329,31 @@ export default function AccountDetailPage() {
     const { data } = await accountsApi.createAccountReminder(account.id, {
       title: _stripMentions(text).slice(0, 200) || "Note reminder",
       due_at: tomorrow.toISOString(),
-      notify_in_app: true,
     });
     setAccountReminders((prev) => [...prev, data]);
   }
+
+  // Timeline data held on the server (Mine = my events, Team = every teammate's, de-duplicated).
+  // Until it arrives, or if it fails, the page falls back to the per-account fetches above.
+  const [timelineScope, setTimelineScope] = useTimelineScope();
+  const [timelineData, setTimelineData] = useState<{ scope: TimelineScope; events: CalendarEvent[]; meetings: AirtableMeeting[] } | null>(null);
+  const loadTimeline = useCallback(async () => {
+    if (!id) return;
+    try {
+      const { data } = await accountsApi.getTimeline(Number(id), timelineScope);
+      setTimelineData(data);
+    } catch {
+      setTimelineData(null);
+    }
+  }, [id, timelineScope]);
+  useEffect(() => {
+    setTimelineData(null);
+    void loadTimeline();
+  }, [loadTimeline]);
+  useEffect(() => {
+    window.addEventListener(MEETING_NOTES_UPDATED_EVENT, loadTimeline);
+    return () => window.removeEventListener(MEETING_NOTES_UPDATED_EVENT, loadTimeline);
+  }, [loadTimeline]);
 
   /** Re-read this account's meetings so a just-imported summary shows up. */
   // A background check added notes somewhere — re-read so the timeline icon flips.
@@ -5626,18 +5378,47 @@ export default function AccountDetailPage() {
   if (loading) return <div className="flex items-center justify-center h-full text-sm text-[var(--twilio-navy)]">Loading…</div>;
   if (!account) return <div className="flex items-center justify-center h-full text-sm text-[var(--twilio-navy)]">Account not found.</div>;
 
+  // What the Timeline draws: the server's answer for the chosen scope, else the page's own fetches.
+  // Meetings are the union, so a meeting reached only through an event (filed under no account,
+  // or a different one, by the notes importer) still supplies its notes check.
+  const timelineEvents = timelineData ? timelineData.events : calendarEvents;
+  const timelineMeetings = (() => {
+    if (!timelineData) return meetings;
+    const byId = new Map<string, AirtableMeeting>();
+    for (const m of meetings) byId.set(m.airtable_id, m);
+    for (const m of timelineData.meetings) byId.set(m.airtable_id, m);
+    return [...byId.values()];
+  })();
+
   // Opens the right-hand Event Details panel for a calendar event. Shared by the Timeline and
   // by the calendar-event chips in Project Goals so both open exactly the same panel.
   const openCalEventPanel = (ev: CalendarEvent) => setPanel({
     kind: "calendar",
     item: ev,
-    linkedMeeting: ev.agentpm_airtable_id ? meetings.find((m) => m.airtable_id === ev.agentpm_airtable_id) : undefined,
+    linkedMeeting: ev.agentpm_airtable_id ? timelineMeetings.find((m) => m.airtable_id === ev.agentpm_airtable_id) : undefined,
     reminders: meetingReminders[ev.id] ?? [],
     onAddReminder: async (due_at, title) => { await (await handleAddMeetingReminder(ev.id, account.id, ev.title))(due_at, title); },
     onDismissReminder: (id) => handleDismissMeetingReminder(ev.id, id),
   });
   // A Project Goals chip is the meeting record; open its calendar event when it has one
   // (same panel as the Timeline), else the meeting's own panel.
+  const noteLinkIndex = buildNoteLinkIndex(goals);
+  // Open the thing a linked note lives in: an Account Note scrolls to its row (unfolding the
+  // section first); a calendar note / summary bullet opens its meeting in the side panel.
+  const openNoteRef = (ref: NoteRef) => {
+    if (ref.kind === "account_note") {
+      if (sectionCollapse.isCollapsed(SECTION_IDS.accountNotes)) sectionCollapse.toggle(SECTION_IDS.accountNotes);
+      setTimeout(() => pageRef.current?.querySelector(`[data-note-id="${ref.id}"]`)?.scrollIntoView?.({ block: "center", behavior: "smooth" }), 0);
+      return;
+    }
+    if (ref.kind === "meeting_note") {
+      const ev = timelineEvents.find((e) => String(e.id) === ref.meetingId);
+      if (ev) openCalEventPanel(ev);
+      return;
+    }
+    const m = timelineMeetings.find((x) => x.airtable_id === ref.meetingId);
+    if (m) openMeetingChip(m);
+  };
   const openMeetingChip = (m: AirtableMeeting) => {
     const ev = calendarEvents.find((e) => e.agentpm_airtable_id === m.airtable_id);
     if (ev) openCalEventPanel(ev); else setPanel({ kind: "meeting", item: m });
@@ -5759,7 +5540,7 @@ export default function AccountDetailPage() {
           />
           <SidebarField
             label="Primary Contact"
-            value={account.primary_contact_name ?? ""}
+            value={account.primary_contact_text?.trim() || mainContactName(contacts) || account.primary_contact_name || ""}
             readOnly
             renderValue={(v) => v ? <span className="text-xs">{v}</span> : <span style={{ color: "var(--twilio-gray-60)", fontStyle: "italic", fontSize: "0.75rem" }}>—</span>}
           />
@@ -5778,6 +5559,7 @@ export default function AccountDetailPage() {
                       {m.full_name.split(" ")[0]}
                       <button
                         onClick={async () => {
+                          if (!window.confirm(`Remove ${m.full_name} from ${account.company_name}? They will be unlinked from this account.`)) return;
                           try {
                             const { data } = await accountsApi.removeTeamMember(account.id, m.id);
                             setAccount(data);
@@ -5840,6 +5622,12 @@ export default function AccountDetailPage() {
           onLinksChange={setQuickLinks}
         />
         </CollapsibleAccountSection>
+        {/* Pinned Claude skills — the same list on every account page; they run for this account */}
+        <CollapsibleAccountSection id="sidebar-claude-skills" title="Claude Skills" bare>
+          <div style={{ padding: "0.75rem 1rem" }}>
+            <PinnedSkillsSection page="account-detail" variant="column" context={{ accountIds: [account.id] }} />
+          </div>
+        </CollapsibleAccountSection>
         </div>
       </div>
 
@@ -5862,11 +5650,16 @@ export default function AccountDetailPage() {
                   const firstName = nameParts[0] ?? "";
                   const lastName = nameParts.slice(1).join(" ");
                   return (
+                    <div key={m.id} className="flex flex-col items-center">
+                    <div
+                      data-team-chip-frame={emailSelectMode && emailPicks.has(`m:${m.id}`) ? "selected" : "idle"}
+                      className={`relative rounded-lg transition-colors ${emailSelectMode && emailPicks.has(`m:${m.id}`) ? "bg-indigo-50 ring-2 ring-indigo-400 p-1 -m-1" : ""}`}
+                    >
                     <button
-                      key={m.id}
                       title={m.full_name}
-                      onClick={() => full && setPanel({ kind: "member", item: full })}
-                      className="group relative flex flex-col items-center gap-0.5 hover:opacity-80 transition-opacity"
+                      aria-pressed={emailSelectMode ? emailPicks.has(`m:${m.id}`) : undefined}
+                      onClick={() => emailSelectMode ? toggleEmailPick(`m:${m.id}`) : (full && setPanel({ kind: "member", item: full }))}
+                      className="group relative flex flex-col items-center gap-0.5 rounded-lg hover:opacity-80 transition-opacity"
                     >
                       {m.avatar_url
                         ? <img src={m.avatar_url} alt={m.full_name} className="h-9 w-9 rounded-full object-cover ring-2 ring-white" />
@@ -5875,6 +5668,9 @@ export default function AccountDetailPage() {
                       <span className="text-[10px] font-medium text-[var(--twilio-navy)] max-w-[56px] truncate leading-tight">{firstName}</span>
                       {lastName && <span className="text-[10px] text-[var(--twilio-navy)] opacity-60 max-w-[56px] truncate leading-tight">{lastName}</span>}
                     </button>
+                    </div>
+                    {full && <TeamMemberTimezone member={full} onUpdated={(u) => setAllMembers((prev) => prev.map((tm) => (tm.id === u.id ? { ...tm, ...u } : tm)))} />}
+                    </div>
                   );
                 })}
                 {internalMembers.length === 0 && <p className="text-xs text-[var(--twilio-gray-60)] italic">No team members assigned</p>}
@@ -5888,53 +5684,56 @@ export default function AccountDetailPage() {
                   {account.company_name} Team
                 </p>
                 <button
-                  onClick={() => { setAddContactForm({ name: "", role: "", email: "", description: "", team: "" }); setAddingContact(true); }}
+                  onClick={() => { setAddContactForm({ name: "", role: "", email: "", description: "", team: "", timezone: "" }); setAddingContact(true); }}
                   className="text-[11px] font-semibold text-indigo-600 hover:text-indigo-800 transition-colors"
                 >+ Add</button>
               </div>
-              <div className="flex flex-col gap-3">
-                {groupContactsByTeam(contacts).map((group) => (
+              <div
+                ref={teamLayoutRef}
+                data-testid="contact-team-groups"
+                data-team-layout={teamLayout}
+                className={teamLayout === "row" && contactGroups.length > 1 ? "flex flex-row flex-wrap items-start gap-x-4 gap-y-3" : "flex flex-col gap-3"}
+              >
+                {contactGroups.map((group) => (
                   <div key={group.team || "__no_team__"} data-testid="contact-team-group">
                     <p className="text-[10px] font-semibold uppercase tracking-wide text-[var(--twilio-gray-60)] mb-1">{group.label}</p>
-                    <div className="flex flex-wrap gap-2">
+                    <div data-team-chips className="flex flex-wrap gap-2">
                       {group.contacts.map((c) => {
                         const initials = c.name.split(" ").map((p) => p[0]).join("").toUpperCase().slice(0, 2);
                         const nameParts = c.name.trim().split(" ");
                         const firstName = nameParts[0] ?? "";
                         const lastName = nameParts.slice(1).join(" ");
-                        const isSelected = panel?.kind === "contact" && panel.item.id === c.id;
+                        const isSelected = emailSelectMode ? emailPicks.has(`c:${c.id}`) : (panel?.kind === "contact" && panel.item.id === c.id);
                         return (
-                          <div key={c.id} className="relative">
+                          <div
+                            key={c.id}
+                            data-contact-chip-frame={isSelected ? "selected" : "idle"}
+                            className={`relative rounded-lg transition-colors ${isSelected ? "bg-indigo-50 ring-2 ring-indigo-400 p-1 -m-1" : ""}`}
+                          >
                             <button
                               title={`${c.name}${c.role ? ` · ${c.role}` : ""}`}
                               aria-pressed={isSelected}
                               data-selected={isSelected ? "true" : undefined}
-                              onClick={() => setPanel({ kind: "contact", item: c })}
-                              className={`flex flex-col items-center gap-0.5 rounded-lg px-1 py-0.5 transition-colors ${isSelected ? "bg-indigo-50 ring-2 ring-indigo-400" : "hover:opacity-80"}`}
+                              onClick={() => emailSelectMode ? toggleEmailPick(`c:${c.id}`) : setPanel({ kind: "contact", item: c })}
+                              className={`flex flex-col items-center gap-0.5 rounded-lg transition-colors ${isSelected ? "" : "hover:opacity-80"}`}
                             >
                               <div className="h-9 w-9 rounded-full flex items-center justify-center text-[11px] font-semibold ring-2 ring-white"
                                 style={{ background: "rgba(99,102,241,0.13)", color: "#4f46e5" }}>
-                                {initials}
+                                {emailSelectMode ? (isSelected ? "✓" : "") : initials}
                               </div>
-                              <span className="text-[10px] font-medium text-[var(--twilio-navy)] max-w-[56px] truncate leading-tight">{firstName}</span>
-                              {lastName && <span className="text-[10px] text-[var(--twilio-navy)] opacity-60 max-w-[56px] truncate leading-tight">{lastName}</span>}
+                              <span className="text-[10px] font-medium text-[var(--twilio-navy)] max-w-[72px] break-words text-center leading-tight">{firstName}</span>
+                              {lastName && <span className="text-[10px] text-[var(--twilio-navy)] opacity-60 max-w-[72px] break-words text-center leading-tight">{lastName}</span>}
+                              <ContactLocalTime zone={c.timezone} className="max-w-[72px] text-center" />
                             </button>
-                            <button
-                              type="button"
-                              title={c.is_main_poc ? "Main point of contact (click to unset)" : "Mark as main point of contact"}
-                              aria-label={`${c.is_main_poc ? "Unstar" : "Star"} ${c.name}`}
-                              aria-pressed={!!c.is_main_poc}
-                              onClick={() => {
-                                accountsApi.updateContact(c.id, { is_main_poc: !c.is_main_poc })
-                                  .then(({ data }) => {
-                                    setContacts((prev) => prev.map((x) => x.id === data.id ? { ...x, is_main_poc: data.is_main_poc } : x));
-                                    setPanel((p) => p?.kind === "contact" && p.item.id === data.id ? { kind: "contact", item: { ...p.item, is_main_poc: data.is_main_poc } } : p);
-                                  })
-                                  .catch(() => reportError("Could not update the main point of contact.", "AccountDetailPage"));
-                              }}
-                              className="absolute -top-1 -right-1 text-[13px] leading-none"
-                              style={{ color: c.is_main_poc ? "#f59e0b" : "#cbd5e1" }}
-                            >{c.is_main_poc ? "★" : "☆"}</button>
+                            {c.is_main_poc && (
+                              <span
+                                role="img"
+                                aria-label={`Main point of contact: ${c.name}`}
+                                title="Main point of contact"
+                                className="absolute top-0.5 right-0.5 text-[13px] leading-none pointer-events-none"
+                                style={{ color: "#f59e0b" }}
+                              >★</span>
+                            )}
                           </div>
                         );
                       })}
@@ -5944,6 +5743,57 @@ export default function AccountDetailPage() {
                 {contacts.length === 0 && <p className="text-xs text-[var(--twilio-gray-60)] italic">No contacts yet.</p>}
               </div>
             </div>
+          </div>
+          <div className="mt-3 pt-2" style={{ borderTop: "1px solid var(--border, rgba(0,0,0,0.08))" }}>
+            <button
+              type="button"
+              onClick={() => { setEmailSelectMode((v) => !v); setEmailPicks(new Set()); setEmailCopied(false); }}
+              aria-pressed={emailSelectMode}
+              className="text-[11px] font-semibold text-indigo-600 hover:text-indigo-800 transition-colors"
+            >Select for email</button>
+            {emailSelectMode && (() => {
+              const picked: { name: string; email: string }[] = [];
+              for (const m of internalMembers) {
+                if (emailPicks.has(`m:${m.id}`)) picked.push({ name: m.full_name, email: preferredEmail(allMembers.find((tm) => tm.id === m.id) ?? m) });
+              }
+              for (const c of contacts) if (emailPicks.has(`c:${c.id}`)) picked.push({ name: c.name, email: c.email ?? "" });
+              const seen = new Set<string>();
+              const addrs: string[] = [];
+              for (const p of picked) {
+                const e = (p.email ?? "").trim();
+                if (e && !seen.has(e.toLowerCase())) { seen.add(e.toLowerCase()); addrs.push(e); }
+              }
+              const noEmail = picked.filter((p) => !(p.email ?? "").trim()).map((p) => p.name);
+              const list = addrs.join(", ");
+              // A team member's zone is their own setting, else one a colleague assigned; none -> null
+              // (the planner lists them under "No timezone set"). The viewer's zone is only the display zone.
+              const viewerTz = browserZone();
+              const plannerPeople: PlannerPerson[] = [];
+              for (const m of internalMembers) if (emailPicks.has(`m:${m.id}`)) {
+                const tm = allMembers.find((x) => x.id === m.id);
+                const isSelf = !!plannerMe && ((tm?.user != null && tm.user === plannerMe.id) || (!!plannerMe.email && (tm?.email ?? m.email ?? "").trim().toLowerCase() === plannerMe.email.trim().toLowerCase()));
+                plannerPeople.push({ id: `m:${m.id}`, name: m.full_name, zone: tm?.timezone || (isSelf ? viewerTz : null), email: preferredEmail(tm ?? m), kind: "team", ...(isSelf ? { isSelf: true } : {}) });
+              }
+              for (const c of contacts) if (emailPicks.has(`c:${c.id}`)) plannerPeople.push({ id: `c:${c.id}`, name: c.name, zone: c.timezone || null });
+              return (
+                <div data-testid="email-select-panel" className="mt-2 rounded-md border border-gray-200 bg-gray-50 p-2 text-xs">
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className="font-semibold text-[var(--twilio-navy)]">{addrs.length} email{addrs.length === 1 ? "" : "s"} selected</span>
+                    <button
+                      type="button"
+                      disabled={addrs.length === 0}
+                      onClick={() => {
+                        void copyTextToClipboard(list).then(() => { setEmailCopied(true); window.setTimeout(() => setEmailCopied(false), 1500); });
+                      }}
+                      className="text-[11px] font-semibold text-indigo-600 hover:text-indigo-800 disabled:opacity-40"
+                    >{emailCopied ? "Copied" : "Copy Emails"}</button>
+                  </div>
+                  <p data-testid="email-select-list" className="break-all text-[var(--twilio-navy)]">{list || <span className="italic text-[var(--twilio-gray-60)]">Select people above.</span>}</p>
+                  {noEmail.length > 0 && <p className="mt-1 text-[var(--twilio-gray-60)]">No email: {noEmail.join(", ")}</p>}
+                  {plannerPeople.length > 0 && <OverlapPlanner people={plannerPeople} viewerZone={viewerTz} />}
+                </div>
+              );
+            })()}
           </div>
         </div>
 
@@ -5955,9 +5805,9 @@ export default function AccountDetailPage() {
             style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.35)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center" }}
             onClick={(e) => { if (e.target === e.currentTarget) setAddingContact(false); }}
           >
-            <div style={{ background: "#fff", borderRadius: "12px", padding: "24px", width: "100%", maxWidth: "420px", boxShadow: "0 8px 32px rgba(0,0,0,0.18)", display: "flex", flexDirection: "column", gap: "16px" }}>
+            <div style={{ background: "var(--surface-card)", borderRadius: "12px", padding: "24px", width: "100%", maxWidth: "420px", boxShadow: "0 8px 32px rgba(0,0,0,0.18)", display: "flex", flexDirection: "column", gap: "16px" }}>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                <p style={{ fontSize: "0.9375rem", fontWeight: 700, color: "var(--twilio-navy)", margin: 0 }}>Add Customer Contact</p>
+                <p style={{ fontSize: "0.9375rem", fontWeight: 700, color: "var(--text-ink)", margin: 0 }}>Add Customer Contact</p>
                 <button onClick={() => setAddingContact(false)} style={{ background: "none", border: "none", fontSize: "1.2rem", cursor: "pointer", color: "var(--twilio-gray-60)", lineHeight: 1 }}>×</button>
               </div>
               {(["name", "role", "email", "description"] as const).map((field) => (
@@ -5970,7 +5820,7 @@ export default function AccountDetailPage() {
                       rows={3}
                       value={addContactForm[field]}
                       onChange={(e) => setAddContactForm((f) => ({ ...f, [field]: e.target.value }))}
-                      style={{ fontSize: "0.8125rem", border: "1px solid #e5e7eb", borderRadius: "7px", padding: "7px 10px", outline: "none", resize: "vertical", lineHeight: 1.5, color: "var(--twilio-navy)" }}
+                      style={{ fontSize: "0.8125rem", border: "1px solid var(--border-subtle)", borderRadius: "7px", padding: "7px 10px", outline: "none", resize: "vertical", lineHeight: 1.5, color: "var(--text-ink)" }}
                     />
                   ) : (
                     <input
@@ -5978,7 +5828,13 @@ export default function AccountDetailPage() {
                       value={addContactForm[field]}
                       onChange={(e) => setAddContactForm((f) => ({ ...f, [field]: e.target.value }))}
                       onKeyDown={(e) => { if (e.key === "Enter" && field === "name") e.preventDefault(); }}
-                      style={{ fontSize: "0.8125rem", border: "1px solid #e5e7eb", borderRadius: "7px", padding: "7px 10px", outline: "none", color: "var(--twilio-navy)" }}
+                      onBlur={field === "email" ? () => setAddContactForm((f) => {
+                        // Pre-fill (editable) a name guessed from the email, only when the name is still blank.
+                        if (f.name.trim()) return f;
+                        const guess = inferredFull(f.email);
+                        return guess ? { ...f, name: guess } : f;
+                      }) : undefined}
+                      style={{ fontSize: "0.8125rem", border: "1px solid var(--border-subtle)", borderRadius: "7px", padding: "7px 10px", outline: "none", color: "var(--text-ink)" }}
                     />
                   )}
                 </div>
@@ -5992,14 +5848,18 @@ export default function AccountDetailPage() {
                   maxLength={200}
                   placeholder="Their internal team, e.g. Platform"
                   onChange={(e) => setAddContactForm((f) => ({ ...f, team: e.target.value }))}
-                  style={{ fontSize: "0.8125rem", border: "1px solid #e5e7eb", borderRadius: "7px", padding: "7px 10px", outline: "none", color: "var(--twilio-navy)" }}
+                  style={{ fontSize: "0.8125rem", border: "1px solid var(--border-subtle)", borderRadius: "7px", padding: "7px 10px", outline: "none", color: "var(--text-ink)" }}
                 />
                 <datalist id="contact-team-suggestions">
                   {teamSuggestions(contacts).map((t) => <option key={t} value={t} />)}
                 </datalist>
               </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                <label style={{ fontSize: "0.75rem", fontWeight: 600, color: "var(--twilio-gray-60)" }}>Time zone</label>
+                <TimezoneField value={addContactForm.timezone} onChange={(z) => setAddContactForm((f) => ({ ...f, timezone: z }))} />
+              </div>
               <div style={{ display: "flex", gap: "8px", justifyContent: "flex-end", marginTop: "4px" }}>
-                <button onClick={() => setAddingContact(false)} style={{ padding: "7px 16px", fontSize: "0.8125rem", borderRadius: "7px", border: "1px solid #e5e7eb", background: "#fff", cursor: "pointer", color: "var(--twilio-gray-60)" }}>
+                <button onClick={() => setAddingContact(false)} style={{ padding: "7px 16px", fontSize: "0.8125rem", borderRadius: "7px", border: "1px solid var(--border-subtle)", background: "var(--surface-card)", cursor: "pointer", color: "var(--twilio-gray-60)" }}>
                   Cancel
                 </button>
                 <button
@@ -6014,6 +5874,7 @@ export default function AccountDetailPage() {
                         email: addContactForm.email.trim(),
                         description: addContactForm.description.trim(),
                         team: addContactForm.team.trim(),
+                        timezone: addContactForm.timezone,
                       });
                       setContacts((prev) => [...prev, data]);
                       setAddingContact(false);
@@ -6052,21 +5913,35 @@ export default function AccountDetailPage() {
         <div className="rounded-lg px-5 py-4" style={{ background: "var(--surface, #fff)", border: "1px solid var(--border, rgba(0,0,0,0.08))", boxShadow: "0 1px 4px rgba(0,0,0,0.04)" }}>
           <div className="flex items-center justify-between gap-2 mb-3 flex-wrap">
             <p className="text-xs font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide">Timeline</p>
-            {/* Scoped to this account: an import onto some other account's meeting
-                wouldn't be visible here, so reporting it would just confuse. The
-                profile and role pages run the unscoped version. */}
-            <GetMeetingNotesButton
-              scope={{ account: account.airtable_id || undefined, accountName: account.company_name }}
-              onImported={refreshMeetings}
-            />
+            <div role="group" aria-label="Timeline scope" className="inline-flex rounded-md overflow-hidden" style={{ border: "1px solid var(--border, rgba(0,0,0,0.12))" }}>
+              {(["mine", "team"] as const).map((sc) => (
+                <button
+                  key={sc}
+                  type="button"
+                  aria-pressed={timelineScope === sc}
+                  onClick={() => setTimelineScope(sc)}
+                  title={sc === "mine" ? "Only your own calendar events for this account" : "Every account team member's meetings, de-duplicated"}
+                  className="px-3 py-1 text-xs font-medium"
+                  style={{
+                    background: timelineScope === sc ? "var(--twilio-navy, #121c2d)" : "transparent",
+                    color: timelineScope === sc ? "#fff" : "var(--twilio-gray-60, #606b85)",
+                  }}
+                >
+                  {sc === "mine" ? "Mine" : "Team"}
+                </button>
+              ))}
+            </div>
           </div>
+          <p data-testid="timeline-notes-sync-note" className="text-xs text-[var(--twilio-gray-60)] mb-3">
+            Meeting notes sync automatically every 10 minutes from your connected Gmail.
+          </p>
 
           <AccountTimeline
-            meetings={meetings}
+            meetings={timelineMeetings}
             actionItems={actionItems}
-            calendarEvents={calendarEvents}
+            calendarEvents={timelineEvents}
             onSelectMeeting={(m) => setPanel({ kind: "meeting", item: m })}
-            onSelectAction={(i) => setPanel({ kind: "action", item: i })}
+            onSelectAction={(i) => setGoalModalItem(i)}
             onSelectCalEvent={openCalEventPanel}
             onDropActionOnDay={handleDropActionOnDay}
           />
@@ -6102,7 +5977,7 @@ export default function AccountDetailPage() {
           </p>
           {/* Kanban view selector bar */}
           {(() => {
-            const today = new Date().toISOString().slice(0, 10);
+            const today = localDateKey(new Date());
             const nextFutureMeeting = meetings
               .filter((m): m is typeof m & { date: string } => m.date !== null && m.date >= today)
               .sort((a, b) => a.date.localeCompare(b.date))[0];
@@ -6152,15 +6027,15 @@ export default function AccountDetailPage() {
                   className="ml-auto text-xs rounded px-2 py-0.5 focus:outline-none"
                   data-filtered={kanbanSearch.trim() ? "true" : "false"}
                   style={kanbanSearch.trim()
-                    ? { border: "1px solid #f59e0b", boxShadow: "0 0 0 2px rgba(245,158,11,0.45)", background: "#fffbeb", minWidth: 160 }
-                    : { border: "1px solid rgba(0,0,0,0.12)", background: "#fff", minWidth: 160 }}
+                    ? { border: "1px solid #f59e0b", boxShadow: "0 0 0 2px rgba(245,158,11,0.45)", background: "var(--tint-amber-50)", minWidth: 160 }
+                    : { border: "1px solid rgba(0,0,0,0.12)", background: "var(--surface-card)", minWidth: 160 }}
                 />
               </div>
             );
           })()}
           {/* Status columns — responsive grid */}
           {((): React.ReactNode => {
-            const today = new Date().toISOString().slice(0, 10);
+            const today = localDateKey(new Date());
             const nextFutureMeeting = meetings
               .filter((m): m is typeof m & { date: string } => m.date !== null && m.date >= today)
               .sort((a, b) => a.date.localeCompare(b.date))[0];
@@ -6245,7 +6120,7 @@ export default function AccountDetailPage() {
               <>
               {kanbanModalTab !== null && createPortal(
                 <div
-                  className="fixed inset-0 z-40 flex items-center justify-center bg-black/40"
+                  className="fixed inset-0 z-[9000] flex items-center justify-center bg-black/40"
                   onClick={() => setKanbanModalTab(null)}
                   onKeyDown={(e) => { if (e.key === "Escape") setKanbanModalTab(null); }}
                 >
@@ -6254,7 +6129,7 @@ export default function AccountDetailPage() {
                     role="dialog"
                     aria-label="Action items"
                     className="rounded-2xl shadow-2xl flex flex-col overflow-hidden"
-                    style={{ background: "#fff", width: "calc(100vw - 48px)", height: "calc(100vh - 48px)" }}
+                    style={{ background: "var(--surface-card)", width: "calc(100vw - 48px)", height: "calc(100vh - 48px)" }}
                     onClick={(e) => e.stopPropagation()}
                   >
                     <div className="flex items-center gap-3 px-5 py-3 shrink-0" style={{ borderBottom: "1px solid rgba(0,0,0,0.08)" }}>
@@ -6283,7 +6158,7 @@ export default function AccountDetailPage() {
                         className="ml-auto text-xs rounded px-2 py-1 focus:outline-none"
                         data-filtered={kanbanSearch.trim() ? "true" : "false"}
                         style={kanbanSearch.trim()
-                          ? { border: "1px solid #f59e0b", boxShadow: "0 0 0 2px rgba(245,158,11,0.45)", background: "#fffbeb", minWidth: 220 }
+                          ? { border: "1px solid #f59e0b", boxShadow: "0 0 0 2px rgba(245,158,11,0.45)", background: "var(--tint-amber-50)", minWidth: 220 }
                           : { border: "1px solid rgba(0,0,0,0.12)", minWidth: 220 }}
                       />
                       <button onClick={() => setKanbanModalTab(null)} aria-label="Close" className="text-gray-400 hover:text-gray-700 text-lg leading-none">✕</button>
@@ -6322,9 +6197,10 @@ export default function AccountDetailPage() {
                     >
                       <div className={`flex items-center gap-1.5 text-xs font-semibold ${header}`}>
                         <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dot}`} />
-                        {status}
+                        {statusLabel(status)}
+                        <ColumnSortButton status={status} direction={sortDirection(status)} onToggle={toggleSort} className="ml-auto" />
                         {colItems.length > 0 && (
-                          <span className="ml-auto text-[10px] font-normal opacity-60">{colItems.length}</span>
+                          <span className="text-[10px] font-normal opacity-60">{colItems.length}</span>
                         )}
                       </div>
                       {colItems.length > 0 && (
@@ -6376,9 +6252,10 @@ export default function AccountDetailPage() {
                       >
                         <div className={`flex items-center gap-1.5 text-xs font-semibold ${header}`}>
                           <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dot}`} />
-                          {status}
+                          {statusLabel(status)}
+                          <ColumnSortButton status={status} direction={sortDirection(status)} onToggle={toggleSort} className="ml-auto" />
                           {colItems.length > 0 && (
-                            <span className="ml-auto text-[10px] font-normal opacity-60">{colItems.length}</span>
+                            <span className="text-[10px] font-normal opacity-60">{colItems.length}</span>
                           )}
                         </div>
                         {colItems.length > 0 && (
@@ -6430,7 +6307,7 @@ export default function AccountDetailPage() {
                   resources: g.resources.map((r) => ({ label: r.label, url: r.url })),
                 }));
 
-                const today = new Date().toISOString().slice(0, 10);
+                const today = localDateKey(new Date());
 
                 try {
                   // Find the skill by name
@@ -6519,7 +6396,7 @@ export default function AccountDetailPage() {
               <p className="text-[10px] text-[var(--twilio-gray-60)] uppercase tracking-wide mb-1.5">Drag to a goal section below · drag to calendar to set due date</p>
               {meetings.length > 0 && (
                 <div className="flex flex-wrap gap-1.5 mb-1.5">
-                  {meetings.map((m) => (
+                  {meetings.filter((m, i, all) => all.findIndex((x) => x.name === m.name) === i).map((m) => (
                     <div
                       key={m.airtable_id}
                       draggable
@@ -6553,14 +6430,28 @@ export default function AccountDetailPage() {
             </div>
           )}
 
+          {goalModalItem && (
+            <ActionItemModal
+              item={goalModalItem}
+              teamMembers={allMembers}
+              meetings={meetings}
+              onClose={() => setGoalModalItem(null)}
+              onUpdated={(updated) => { setActionItems((prev) => prev.map((a) => a.id === updated.id ? updated : a)); setGoalModalItem(null); }}
+              onAutosaved={(updated) => setActionItems((prev) => prev.map((a) => a.id === updated.id ? updated : a))}
+              onConverted={() => { setActionItems((prev) => prev.map((a) => a.id === goalModalItem.id ? { ...a, status: "Done" } as AirtableActionItem : a)); setGoalModalItem(null); }}
+              onDeleted={(id) => { setActionItems((prev) => prev.filter((a) => a.id !== id)); setGoalModalItem(null); }}
+            />
+          )}
+
           <ProjectGoals
             goals={goals}
             actionItems={actionItems}
             meetings={meetings}
             onChange={handleGoalsChange}
-            onSelectAction={(i) => setPanel({ kind: "action", item: i })}
+            onSelectAction={(i) => setGoalModalItem(i)}
             onSelectMeeting={openMeetingChip}
             onNoteDropped={handleNoteDropOnGoal}
+            onSelectNote={openNoteRef}
             accountTeamMembers={account?.team_members ?? []}
             projectMembers={projectMembers}
             onAddProjectMember={handleAddProjectMember}
@@ -6576,8 +6467,8 @@ export default function AccountDetailPage() {
 
         </CollapsibleAccountSection>
 
-        <CollapsibleAccountSection id={SECTION_IDS.meetingNotes} title="Meeting Notes">
-        {/* Meeting Notes */}
+        <CollapsibleAccountSection id={SECTION_IDS.accountNotes} title="Account Notes">
+        {/* Account Notes */}
         <AccountMeetingNotes
           accountId={account.id}
           accountName={account.company_name}
@@ -6588,6 +6479,19 @@ export default function AccountDetailPage() {
           onUpdate={handleUpdateNote}
           onDelete={handleDeleteNote}
           onCreatedActionItem={(item) => setActionItems((prev) => [item, ...prev])}
+          noteLinks={noteLinkIndex}
+        />
+        <LinkedNotepadNotes accountId={account.id} />
+
+        </CollapsibleAccountSection>
+
+        <CollapsibleAccountSection id={SECTION_IDS.meetingNotes} title="Meeting Notes Timeline">
+        <AccountMeetingNotesTimeline
+          events={timelineEvents}
+          meetings={timelineMeetings}
+          onOpenEvent={openCalEventPanel}
+          onOpenMeeting={(m) => setPanel({ kind: "meeting", item: m })}
+          noteLinks={noteLinkIndex}
         />
 
         </CollapsibleAccountSection>
@@ -6659,6 +6563,18 @@ export default function AccountDetailPage() {
 
         </CollapsibleAccountSection>
 
+        <CollapsibleAccountSection id={SECTION_IDS.jiraTickets} title="JIRAs / Engineering Tickets">
+        <AccountTicketsSection account={account} kind="jira" />
+        </CollapsibleAccountSection>
+
+        <CollapsibleAccountSection id={SECTION_IDS.zendeskTickets} title="Zendesk / Support Tickets">
+        <AccountTicketsSection account={account} kind="zendesk" />
+        </CollapsibleAccountSection>
+
+        <CollapsibleAccountSection id={SECTION_IDS.productGaps} title="Product Gaps">
+        <AccountTicketsSection account={account} kind="product_gap" />
+        </CollapsibleAccountSection>
+
         <CollapsibleAccountSection id={SECTION_IDS.email} title="Email Chain Summary">
         {/* Email Chain Summary & Status */}
         <EmailChainSection account={account} />
@@ -6680,7 +6596,14 @@ export default function AccountDetailPage() {
           <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ transform: rightCollapsed ? "none" : "rotate(180deg)" }}><path d="M10 3L5 8l5 5" /></svg>
         </button>
         <div hidden={rightCollapsed} className="h-full">
-        {panel && <SidePanel panel={panel} onClose={() => setPanel(null)} onCreatedActionItem={(item) => setActionItems((prev) => [item, ...prev])} onMeetingUpdated={(updated) => { setMeetings((prev) => prev.map((m) => m.id === updated.id ? updated : m)); setPanel((p) => { if (!p) return p; if (p.kind === "meeting" && p.item.id === updated.id) return { kind: "meeting", item: updated }; if (p.kind === "calendar" && p.linkedMeeting?.id === updated.id) return { ...p, linkedMeeting: updated }; return p; }); }} onUpdatedActionItem={(updated) => { setActionItems((prev) => prev.map((a) => a.id === updated.id ? updated : a)); setPanel((p) => p?.kind === "action" && p.item.id === updated.id ? { kind: "action", item: updated } : p); }} teamMembers={allMembers} airtableAccountId={airtableAccount?.id} account={account} contacts={contacts} onContactsChange={setContacts} />}
+        {panel && <PinNoteProvider value={account && (panel.kind === "meeting" || panel.kind === "calendar") ? {
+          accountId: account.id, accountName: account.company_name,
+          label: panel.kind === "meeting" ? panel.item.name : panel.item.title,
+          date: panel.kind === "meeting" ? panel.item.date : panel.item.start_datetime,
+          resourceId: panel.item.id,
+          url: `/accounts/${account.id}` + (panel.kind === "meeting" ? `?meeting=${panel.item.id}` : panel.linkedMeeting ? `?meeting=${panel.linkedMeeting.id}` : ""),
+          onPinned: (n) => setNotes((prev) => [n, ...prev]),
+        } : null}><SidePanel panel={panel} onClose={() => setPanel(null)} onCreatedActionItem={(item) => setActionItems((prev) => [item, ...prev])} onMeetingUpdated={(updated) => { setMeetings((prev) => prev.map((m) => m.id === updated.id ? updated : m)); setPanel((p) => { if (!p) return p; if (p.kind === "meeting" && p.item.id === updated.id) return { kind: "meeting", item: updated }; if (p.kind === "calendar" && p.linkedMeeting?.id === updated.id) return { ...p, linkedMeeting: updated }; return p; }); }} onUpdatedActionItem={(updated) => { setActionItems((prev) => prev.map((a) => a.id === updated.id ? updated : a)); setPanel((p) => p?.kind === "action" && p.item.id === updated.id ? { kind: "action", item: updated } : p); }} teamMembers={allMembers} airtableAccountId={airtableAccount?.id} account={account} contacts={contacts} onContactsChange={setContacts} /></PinNoteProvider>}
         </div>
       </div>
 
@@ -6696,7 +6619,7 @@ export default function AccountDetailPage() {
 
       {/* ── Status Report modal ──────────────────────────────────────────────── */}
       {reportState.stage !== "idle" && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm px-4">
+        <div className="fixed inset-0 z-[9000] flex items-center justify-center bg-black/50 backdrop-blur-sm px-4">
           <div className="rounded-xl shadow-2xl w-full max-w-3xl max-h-[90vh] flex flex-col" style={{ background: "var(--surface, #fff)", fontFamily: "var(--font-base)" }}>
             {/* Header */}
             <div className="flex items-center justify-between px-6 py-4" style={{ borderBottom: "1px solid var(--border, rgba(0,0,0,0.08))" }}>
@@ -6787,7 +6710,7 @@ export default function AccountDetailPage() {
                     const url = URL.createObjectURL(blob);
                     const a = document.createElement("a");
                     a.href = url;
-                    a.download = `status-report-${(account?.company_name ?? "account").toLowerCase().replace(/\s+/g, "-")}-${new Date().toISOString().slice(0, 10)}.md`;
+                    a.download = `status-report-${(account?.company_name ?? "account").toLowerCase().replace(/\s+/g, "-")}-${localDateKey(new Date())}.md`;
                     a.click();
                     URL.revokeObjectURL(url);
                   }}
@@ -7111,7 +7034,7 @@ function EmailChainSection({ account }: { account: Account }) {
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `${account.company_name.toLowerCase().replace(/\s+/g, "-")}-email-status-${new Date().toISOString().slice(0,10)}.md`;
+      a.download = `${account.company_name.toLowerCase().replace(/\s+/g, "-")}-email-status-${localDateKey(new Date())}.md`;
       a.click();
       URL.revokeObjectURL(url);
     } finally {
@@ -7120,13 +7043,16 @@ function EmailChainSection({ account }: { account: Account }) {
   }
 
   return (
-    <div style={{ padding: "20px 24px", borderTop: "1px solid var(--border, rgba(0,0,0,0.08))" }}>
+    <div
+      className="rounded-lg px-5 py-4"
+      style={{ background: "var(--surface, #fff)", border: "1px solid var(--border, rgba(0,0,0,0.08))", boxShadow: "0 1px 4px rgba(0,0,0,0.04)" }}
+    >
       {/* Section header */}
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14, flexWrap: "wrap", gap: 10 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, flexWrap: "wrap", gap: 10 }}>
         <div>
-          <h3 style={{ margin: 0, fontSize: "0.9375rem", fontWeight: 700, color: "var(--text-primary, #111)" }}>
+          <p className="text-xs font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide">
             Email Chain Summary &amp; Status
-          </h3>
+          </p>
           <p style={{ margin: "2px 0 0", fontSize: "0.75rem", color: "var(--text-secondary, #888)" }}>
             Gmail threads related to {account.company_name}
           </p>
@@ -7304,7 +7230,7 @@ function MeetingTimelineBtn({
         data-has-notes={meetingHasNotes(m) ? "true" : "false"}
         title={meetingHasNotes(m) ? "Meeting notes added" : "No meeting notes yet"}
         aria-hidden="true"
-        style={{ marginRight: 3, fontWeight: 700, color: meetingHasNotes(m) ? "#16a34a" : "#9ca3af" }}
+        style={{ marginRight: 3, fontWeight: 700, color: meetingHasNotes(m) ? "#16a34a" : "var(--text-gray-400)" }}
       >
         {meetingHasNotes(m) ? "✓" : "◷"}
       </span>
@@ -7358,7 +7284,7 @@ function CalEventTimelineBtn({
           data-has-notes={meetingHasNotes(linkedMeeting) ? "true" : "false"}
           title={meetingHasNotes(linkedMeeting) ? "Meeting notes added" : "No meeting notes yet"}
           aria-hidden="true"
-          style={{ marginRight: 3, fontWeight: 700, color: meetingHasNotes(linkedMeeting) ? "#16a34a" : "#9ca3af" }}
+          style={{ marginRight: 3, fontWeight: 700, color: meetingHasNotes(linkedMeeting) ? "#16a34a" : "var(--text-gray-400)" }}
         >
           {meetingHasNotes(linkedMeeting) ? "✓" : "◷"}
         </span>

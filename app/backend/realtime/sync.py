@@ -69,19 +69,35 @@ def publish_activity_event(
         return
 
     sync_list_name = f"agent-feed-{user.pk}"
-    try:
-        item = client.sync.v1 \
+    payload = {
+        "id": event.pk,
+        "event_type": event_type,
+        "title": title,
+        "detail": detail,
+        "metadata": metadata,
+        "created_at": event.created_at.isoformat(),
+    }
+
+    def _create_item():
+        return client.sync.v1 \
             .services(settings.TWILIO_SYNC_SERVICE_SID) \
             .sync_lists(sync_list_name) \
             .sync_list_items \
-            .create(data={
-                "id": event.pk,
-                "event_type": event_type,
-                "title": title,
-                "detail": detail,
-                "metadata": metadata,
-                "created_at": event.created_at.isoformat(),
-            })
+            .create(data=payload)
+
+    try:
+        try:
+            item = _create_item()
+        except Exception as exc:
+            # The list is normally created by the browser's Sync client the first time the feed
+            # opens. Until then (or if that connection is blocked) every publish 404s and the
+            # event never reaches the live feed. Create the list and try once more.
+            if getattr(exc, "status", None) != 404:
+                raise
+            client.sync.v1.services(settings.TWILIO_SYNC_SERVICE_SID).sync_lists.create(
+                unique_name=sync_list_name
+            )
+            item = _create_item()
         AgentActivityEvent.objects.filter(pk=event.pk).update(sync_document_id=item.sid)
         logger.debug("Published activity event %s to Sync list item %s", event.pk, item.sid)
     except Exception as exc:

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useStatusLabels } from "../../hooks/useStatusLabels";
 import { airtableApi } from "../../lib/api";
 import type { AirtableActionItem, TeamMember } from "../../types";
 import { useCurrentUser } from "../../context/CurrentUserContext";
@@ -57,6 +58,7 @@ export function NewActionItemCard({
 }) {
   const currentUser = useCurrentUser();
   const { status: statusOptions } = useActionItemFieldOptions();
+  const { label: statusLabel } = useStatusLabels();
   const [form, setForm] = useState<Partial<AirtableActionItem>>(BLANK_NEW_FORM());
   const [saving, setSaving] = useState(false);
   const { reportError } = useAppError();
@@ -89,7 +91,7 @@ export function NewActionItemCard({
   return (
     <div
       className="rounded-xl flex flex-col overflow-hidden select-none"
-      style={{ background: "#F4F4F6", width: "240px", flexShrink: 0, boxShadow: "0 1px 3px rgba(0,0,0,0.08)" }}
+      style={{ background: "var(--surface-subtle-4)", width: "240px", flexShrink: 0, boxShadow: "0 1px 3px rgba(0,0,0,0.08)" }}
     >
       {/* Task title */}
       <div className="px-4 pt-3 pb-2">
@@ -113,6 +115,7 @@ export function NewActionItemCard({
         <AccPillSelect
           value={form.status}
           options={statusOptions as AirtableActionItem["status"][]}
+          format={statusLabel}
           colorMap={NEW_AI_STATUS_COLORS}
           placeholder="Status"
           onChange={(v) => set({ status: v })}

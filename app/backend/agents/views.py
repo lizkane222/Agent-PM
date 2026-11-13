@@ -406,6 +406,15 @@ class AgentSessionViewSet(viewsets.ModelViewSet):
             else:
                 history.append(turn)
 
+        # A message that launches a saved skill carries its run id. Only the caller's own recent,
+        # unfinished run is honoured; anything else is treated as an ordinary message.
+        claimed_run = None
+        if serializer.validated_data.get("skill_run_id"):
+            from skills.skill_console import claim_run
+
+            claimed_run = claim_run(request.user, serializer.validated_data["skill_run_id"])
+        run_kwargs = {"skill_run_id": str(claimed_run.pk)} if claimed_run else {}
+
         # An *async* generator is deliberate. Handing StreamingHttpResponse a sync
         # generator under ASGI makes Django fall back to sync_to_async(list), which
         # buffers the entire response before sending a single byte.
@@ -413,9 +422,10 @@ class AgentSessionViewSet(viewsets.ModelViewSet):
             orchestrator = AgentOrchestrator()
             full_response_parts: list[str] = []
             token_usage: dict = {"input_tokens": 0, "output_tokens": 0}
+            stream_failed = False
 
             try:
-                async for item in orchestrator.run(user_message, history, user=request.user):
+                async for item in orchestrator.run(user_message, history, user=request.user, **run_kwargs):
                     if isinstance(item, dict) and item.get("__token_usage__"):
                         token_usage["input_tokens"] = item["input_tokens"]
                         token_usage["output_tokens"] = item["output_tokens"]
@@ -432,6 +442,8 @@ class AgentSessionViewSet(viewsets.ModelViewSet):
                             "input_tokens": item["input_tokens"],
                             "output_tokens": item["output_tokens"],
                             "model": item.get("model", ""),
+                            "cost_usd": str(await sync_to_async(token_budget.usage_usd)(
+                                item["input_tokens"], item["output_tokens"])),
                             "budget": turn_state.as_dict(),
                         })
                         yield f"\x00TOKEN_USAGE:{payload}\x00".encode()
@@ -439,6 +451,7 @@ class AgentSessionViewSet(viewsets.ModelViewSet):
                         full_response_parts.append(item)
                         yield item.encode()
             except Exception as exc:
+                stream_failed = True
                 ref = uuid.uuid4().hex[:8]
                 logger.exception(
                     "Agent stream failed (session=%s ref=%s backend=%s model=%s)",
@@ -461,6 +474,14 @@ class AgentSessionViewSet(viewsets.ModelViewSet):
                         logger.exception(
                             "Could not persist assistant message for session %s", session.pk
                         )
+                if claimed_run is not None:
+                    # Close the skill's Console run (this turn is the run). Never raises.
+                    from skills.skill_console import finish_run
+
+                    await sync_to_async(finish_run)(
+                        claimed_run.pk, failed=stream_failed,
+                        input_tokens=token_usage["input_tokens"], output_tokens=token_usage["output_tokens"],
+                    )
 
         return StreamingHttpResponse(
             _generate(),

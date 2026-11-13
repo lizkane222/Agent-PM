@@ -6,13 +6,14 @@ import json
 
 
 def loads_object(raw: str) -> dict:
-    """Parse the first JSON object in `raw`, tolerating code fences and surrounding prose."""
+    """
+    Parse the JSON object in `raw`, tolerating a code-fence wrapper or surrounding prose.
+
+    Takes the first "{" to the last "}" rather than stripping fences by splitting on
+    triple-backticks: a string *inside* the object (markdown instructions, say) can contain
+    its own code blocks, and splitting on those cuts the object off mid-string.
+    """
     text = (raw or "").strip()
-    if text.startswith("```"):
-        parts = text.split("```")
-        text = parts[1] if len(parts) > 1 else parts[0]
-        if text.startswith("json"):
-            text = text[4:]
     start, end = text.find("{"), text.rfind("}")
     if start == -1 or end <= start:
         raise ValueError("No JSON object in the model reply.")

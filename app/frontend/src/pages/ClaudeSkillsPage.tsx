@@ -40,7 +40,7 @@ const STATUS_STYLES: Record<ClaudeSkillStatus, { bg: string; color: string; labe
   reviewing:      { bg: "rgba(59,130,246,0.15)", color: "#3b82f6", label: "Reviewing…",     strip: "REVIEW"  },
   approved:       { bg: "rgba(34,197,94,0.15)",  color: "#16a34a", label: "Approved",        strip: "APPROVED"},
   rejected:       { bg: "rgba(239,68,68,0.15)",  color: "#dc2626", label: "Rejected",        strip: "REJECTED"},
-  disabled:       { bg: "rgba(107,114,128,0.15)",color: "#6b7280", label: "Disabled",        strip: "DISABLED"},
+  disabled:       { bg: "rgba(107,114,128,0.15)",color: "var(--text-gray-500)", label: "Disabled",        strip: "DISABLED"},
 };
 
 function StatusBadge({ status, fontSize = "22px" }: { status: ClaudeSkillStatus; fontSize?: string }) {
@@ -629,7 +629,7 @@ function SkillDetail({
           <button onClick={handleToggle} disabled={toggling} style={{
             padding: "7px 16px", borderRadius: "7px", fontSize: "0.875rem", fontWeight: 600,
             background: skill.status === "approved" ? "rgba(107,114,128,0.12)" : "rgba(34,197,94,0.12)",
-            color: skill.status === "approved" ? "#6b7280" : "#16a34a",
+            color: skill.status === "approved" ? "var(--text-gray-500)" : "#16a34a",
             border: `1px solid ${skill.status === "approved" ? "rgba(107,114,128,0.25)" : "rgba(34,197,94,0.25)"}`,
             cursor: toggling ? "not-allowed" : "pointer", opacity: toggling ? 0.7 : 1,
             fontFamily: "var(--font-base)",
@@ -1908,6 +1908,19 @@ const AGENT_SKILL_DEFS: SkillDef[] = [
     ],
     deleteNote: "Leaving a note needs your confirmation first. Emailing only opens a draft link and sends nothing.",
   },
+  {
+    icon: "📚",
+    name: "Saved Skills",
+    description: "Run a saved skill by name. When a skill's looked-up records and attached documents are too big for one chat message, they are stored with the run instead of pasted in, and the agent reads them one part at a time (the prompt says how many parts there are). You only see your own runs' data.",
+    ops: [
+      { op: "Read", label: "list_skills / load_skill" },
+      { op: "Read", label: "get_skill_run_data" },
+    ],
+    examples: [
+      "What saved skills do I have?",
+      "Run the weekly-update skill for Acme",
+    ],
+  },
 ];
 
 const OP_COLORS: Record<string, { bg: string; color: string }> = {
@@ -2218,7 +2231,7 @@ function usePlatformTools(): string[] {
 // ── Agent Skill status styles ─────────────────────────────────────────────────
 
 const AGENT_STATUS_STYLES: Record<AgentSkillStatus, { bg: string; color: string; label: string }> = {
-  draft:          { bg: "rgba(107,114,128,0.12)", color: "#6b7280", label: "Draft" },
+  draft:          { bg: "rgba(107,114,128,0.12)", color: "var(--text-gray-500)", label: "Draft" },
   pending_review: { bg: "rgba(234,179,8,0.15)",  color: "#ca8a04", label: "Pending Review" },
   approved:       { bg: "rgba(34,197,94,0.15)",  color: "#16a34a", label: "Approved" },
   rejected:       { bg: "rgba(239,68,68,0.15)",  color: "#dc2626", label: "Rejected" },
@@ -2261,6 +2274,9 @@ function NewAgentSkillForm({
   const [needsScript, setNeedsScript]   = useState(false);
   const [script, setScript]             = useState("");
   const [generating, setGenerating]     = useState(false);
+  // Shown beside the Generate button itself: the form-level banner is at the bottom of a long
+  // form, so a failure there looked like "nothing happened".
+  const [generateError, setGenerateError] = useState<string | null>(null);
   const [saving, setSaving]             = useState(false);
   const [reviewing, setReviewing]       = useState(false);
   const [error, setError]               = useState<string | null>(null);
@@ -2295,7 +2311,7 @@ function NewAgentSkillForm({
 
   async function handleGenerate() {
     if (!description.trim()) return;
-    setGenerating(true); setError(null);
+    setGenerating(true); setError(null); setGenerateError(null);
     try {
       const { data } = await agentSkillsApi.generate(description.trim(), {
         capabilities: allowedTools,
@@ -2306,6 +2322,11 @@ function NewAgentSkillForm({
         slack: slackSources.map((x) => x.label),
         needs_accounts: needsAccounts,
       });
+      if (!data.instructions?.trim()) {
+        // The server should refuse an incomplete reply, but never treat "no instructions" as success.
+        setGenerateError("Claude's reply didn't include any instructions. Please try again.");
+        return;
+      }
       if (data.name && !displayName.trim()) setDisplayName(
         data.name.replace(/-/g, " ").replace(/\b\w/g, c => c.toUpperCase())
       );
@@ -2317,8 +2338,10 @@ function NewAgentSkillForm({
         if (valid.length > 0) setAllowedTools(valid);
       }
       if (data.needs_script) { setNeedsScript(true); setScript(data.script ?? ""); }
-    } catch {
-      setError("Generation failed — check server logs.");
+    } catch (err) {
+      console.error("Skill generation failed", err);
+      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+      setGenerateError(detail ?? "Generation failed — check server logs.");
     } finally { setGenerating(false); }
   }
 
@@ -2502,6 +2525,16 @@ function NewAgentSkillForm({
             <><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>Generate instructions with Claude</>
           )}
         </button>
+        {generating && (
+          <span style={{ marginLeft: "10px", fontSize: "0.75rem", color: "var(--text-secondary, #888)" }}>
+            This usually takes 15–25 seconds.
+          </span>
+        )}
+        {generateError && (
+          <p role="alert" data-testid="generate-error" style={{ margin: "8px 0 0", fontSize: "0.8125rem", color: "#dc2626" }}>
+            {generateError}
+          </p>
+        )}
       </div>
 
       {/* Instructions */}

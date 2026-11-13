@@ -79,6 +79,7 @@ class AirtableActionItemSerializer(serializers.ModelSerializer):
     class Meta:
         model = AirtableActionItem
         fields = "__all__"
+        read_only_fields = ["status_changed_at"]
 
     def get_waiting_on(self, obj):
         deps = obj.waiting_on_deps.select_related("waiting_on_item").all()
@@ -139,6 +140,9 @@ class ManualCategorizationSerializer(serializers.Serializer):
     account_id = serializers.IntegerField(allow_null=True, required=False)
     account_name = serializers.CharField(allow_blank=True, required=False, default="")
     categorization = serializers.CharField(allow_blank=True, default="")
+    # Recurring meetings: both off unless the calendar's Accounts sidebar toggles them on.
+    update_subsequent = serializers.BooleanField(required=False, default=False)
+    update_historical = serializers.BooleanField(required=False, default=False)
 
 
 class EventContextSerializer(serializers.Serializer):

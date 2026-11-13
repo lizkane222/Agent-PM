@@ -5,7 +5,7 @@
  * Dispatches "chat-inject" with selected records as context when the user
  * submits from the bottom chat bar.
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { searchApi, type SearchResult } from "../lib/api";
 import { useExport, searchResultToExportItem } from "../context/ExportContext";
@@ -37,12 +37,33 @@ interface Props {
   pageContext?: string; // e.g. "action_items", "calendar", "accounts"
 }
 
+const SELECTION_KEY = "agentpm_search_selection";
+
+function loadSelection(): Record<string, SearchResult> {
+  try {
+    const raw = localStorage.getItem(SELECTION_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch { return {}; }
+}
+
+function saveSelection(map: Record<string, SearchResult>) {
+  try {
+    if (Object.keys(map).length) localStorage.setItem(SELECTION_KEY, JSON.stringify(map));
+    else localStorage.removeItem(SELECTION_KEY);
+  } catch { /* storage full */ }
+}
+
 export default function GlobalSearch({ pageContext = "" }: Props) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchResult[]>([]);
   const [loading, setLoading] = useState(false);
-  const [selected, setSelected] = useState<Set<string>>(new Set());
+  // The picked results themselves (not just ids): they must outlive `results`, which is
+  // replaced on every query, and survive "Add to tray" / "Export to Layouts" / reloads.
+  const [selectedMap, setSelectedMap] = useState<Record<string, SearchResult>>(loadSelection);
+  const selected = useMemo(() => new Set(Object.keys(selectedMap)), [selectedMap]);
+  useEffect(() => { saveSelection(selectedMap); }, [selectedMap]);
   const [chatInput, setChatInput] = useState("");
   const [sending, setSending] = useState(false);
   const [focusedIdx, setFocusedIdx] = useState(0);
@@ -59,7 +80,7 @@ export default function GlobalSearch({ pageContext = "" }: Props) {
    * un-adding anything. Opens the tray if it was closed so the user can see what landed.
    */
   function addSelectedToTray() {
-    const toAdd = results.filter((r) => selected.has(resultKey(r)));
+    const toAdd = Object.values(selectedMap);
     if (!exportMode) toggleMode();
     toAdd.forEach((r) => {
       const item = searchResultToExportItem(r);
@@ -113,10 +134,10 @@ export default function GlobalSearch({ pageContext = "" }: Props) {
 
   const toggleSelect = useCallback((r: SearchResult) => {
     const k = resultKey(r);
-    setSelected((prev) => {
-      const next = new Set(prev);
-      if (next.has(k)) next.delete(k);
-      else next.add(k);
+    setSelectedMap((prev) => {
+      const next = { ...prev };
+      if (k in next) delete next[k];
+      else next[k] = r;
       return next;
     });
   }, []);
@@ -138,7 +159,7 @@ export default function GlobalSearch({ pageContext = "" }: Props) {
   }, [focusedIdx]);
 
   function buildContextText(): string {
-    const items = results.filter((r) => selected.has(resultKey(r)));
+    const items = Object.values(selectedMap);
     if (items.length === 0) return "";
     const lines = items.map((r) =>
       `[${r.type_label}] "${r.title}"${r.account ? ` (${r.account})` : ""}${r.meta ? ` — ${r.meta}` : ""}`
@@ -156,7 +177,7 @@ export default function GlobalSearch({ pageContext = "" }: Props) {
     // Reset everything after send — this is the intended clear point
     setQuery("");
     setResults([]);
-    setSelected(new Set());
+    setSelectedMap({});
     setChatInput("");
     setFocusedIdx(0);
     setSending(false);
@@ -234,7 +255,7 @@ export default function GlobalSearch({ pageContext = "" }: Props) {
           )}
           {(query || selected.size > 0 || chatInput) && (
             <button
-              onClick={() => { setQuery(""); setResults([]); setSelected(new Set()); setChatInput(""); setFocusedIdx(0); inputRef.current?.focus(); }}
+              onClick={() => { setQuery(""); setResults([]); setSelectedMap({}); setChatInput(""); setFocusedIdx(0); inputRef.current?.focus(); }}
               className="text-[11px] px-2 py-0.5 rounded border border-gray-200 text-gray-400 hover:text-red-500 hover:border-red-200 transition-colors shrink-0"
               title="Clear search, selections, and chat"
             >
@@ -368,8 +389,8 @@ export default function GlobalSearch({ pageContext = "" }: Props) {
           {selected.size > 0 && (
             <p className="text-[11px] text-indigo-600 mb-2">
               {selected.size} item{selected.size > 1 ? "s" : ""} selected as context
-              <button onClick={() => setSelected(new Set())} className="ml-2 text-gray-400 hover:text-red-400">
-                ✕ clear
+              <button onClick={() => setSelectedMap({})} className="ml-2 text-gray-400 hover:text-red-400">
+                Clear selection
               </button>
             </p>
           )}
@@ -388,7 +409,7 @@ export default function GlobalSearch({ pageContext = "" }: Props) {
                   : "Select items above, then ask the agent to act on them…"
               }
               className="flex-1 text-sm rounded-lg border border-gray-200 px-3 py-2 resize-none outline-none focus:border-indigo-300 focus:ring-1 focus:ring-indigo-200 bg-white"
-              style={{ color: "var(--twilio-navy)" }}
+              style={{ color: "var(--text-ink)" }}
             />
             <div className="flex flex-col gap-1.5 shrink-0">
               <button
@@ -403,7 +424,7 @@ export default function GlobalSearch({ pageContext = "" }: Props) {
                 <>
                   <button
                     title="Put every selected item in the export tray so you can drag them into a working session"
-                    onClick={() => { addSelectedToTray(); setSelected(new Set()); setOpen(false); }}
+                    onClick={() => { addSelectedToTray(); setOpen(false); }}
                     className="px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors"
                     style={{
                       background: "rgba(2,99,224,0.08)",

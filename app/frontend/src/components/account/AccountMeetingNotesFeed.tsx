@@ -5,6 +5,7 @@ import { parseBullets, GongBulletRow, _strHash } from "./GongSummaryPanel";
 import type { GongItem } from "./GongSummaryPanel";
 import type { AirtableActionItem, AirtableMeeting, CalendarEvent, MeetingNote } from "../../types";
 
+import { instantDayKey } from "../../lib/timelineDay";
 // ── Gong summary section — renders parsed bullets with per-bullet action buttons ──
 
 /** Notes for a meeting, preferring Gong and falling back to Zoom. */
@@ -40,7 +41,7 @@ function GongSummaryRow({
           if (item.kind === "heading") {
             return (
               <div key={i} style={{ padding: "5px 10px 3px", borderBottom: "1px solid rgba(0,0,0,0.05)", background: "rgba(99,102,241,0.04)" }}>
-                <p style={{ fontSize: "0.6875rem", fontWeight: 700, textTransform: "capitalize", color: "var(--twilio-navy)", margin: 0, letterSpacing: "0.01em" }}>
+                <p style={{ fontSize: "0.6875rem", fontWeight: 700, textTransform: "capitalize", color: "var(--text-ink)", margin: 0, letterSpacing: "0.01em" }}>
                   {item.text}
                 </p>
               </div>
@@ -204,7 +205,7 @@ export function AccountMeetingNotesFeed({
     const groupMap = new Map<string, MeetingEntry[]>();
     for (const entry of entries) {
       const dateKey = entry.event
-        ? new Date(entry.event.start_datetime).toISOString().slice(0, 10)
+        ? instantDayKey(entry.event.start_datetime)
         : (entry.meeting?.date?.slice(0, 10) ?? "no-date");
       if (!groupMap.has(dateKey)) groupMap.set(dateKey, []);
       groupMap.get(dateKey)!.push(entry);
@@ -273,11 +274,11 @@ export function AccountMeetingNotesFeed({
                 zIndex: 1,
               }}
             >
-              <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" style={{ width: "10px", height: "10px", color: "#121C2D", opacity: 0.6, flexShrink: 0 }}>
+              <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" style={{ width: "10px", height: "10px", color: "var(--text-ink)", opacity: 0.6, flexShrink: 0 }}>
                 <rect x="1" y="2" width="12" height="11" rx="1.5"/>
                 <path d="M1 5.5h12M4.5 1v3M9.5 1v3" strokeLinecap="round"/>
               </svg>
-              <span style={{ fontSize: "0.7rem", fontWeight: 700, color: "#121C2D", letterSpacing: "0.03em" }}>
+              <span style={{ fontSize: "0.7rem", fontWeight: 700, color: "var(--text-ink)", letterSpacing: "0.03em" }}>
                 {dateLabel}
               </span>
             </div>
@@ -294,10 +295,10 @@ export function AccountMeetingNotesFeed({
                   alignItems: "center",
                   gap: "5px",
                 }}>
-                  <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.4" style={{ width: "9px", height: "9px", color: "#121C2D", opacity: 0.45, flexShrink: 0 }}>
+                  <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.4" style={{ width: "9px", height: "9px", color: "var(--text-ink)", opacity: 0.45, flexShrink: 0 }}>
                     <path d="M7 1.5a5.5 5.5 0 100 11 5.5 5.5 0 000-11zM7 4v3.5l2.5 1.5" strokeLinecap="round" strokeLinejoin="round"/>
                   </svg>
-                  <span style={{ fontSize: "0.7rem", fontWeight: 600, color: "#121C2D", opacity: 0.75 }}>
+                  <span style={{ fontSize: "0.7rem", fontWeight: 600, color: "var(--text-ink)", opacity: 0.75 }}>
                     {title}
                   </span>
                 </div>

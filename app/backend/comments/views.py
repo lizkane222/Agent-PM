@@ -26,6 +26,25 @@ def _user_can_see_resource(user, resource_type: str, resource_id) -> bool:
     """
     if not resource_type or not resource_id:
         return False
+    if resource_type == "account_ticket":
+        # Handled before the staff bypass: a needs_review ticket is private to its finder.
+        try:
+            from accounts.models import AccountTicket
+            from django.db.models import Q as _TQ
+
+            t = AccountTicket.objects.filter(pk=int(resource_id)).first()
+            if t is None:
+                return False
+            if t.account_id is None or t.review_state == "needs_review":
+                return t.found_by_id == user.pk
+            return (
+                getattr(user, "is_staff", False)
+                or AccountTicket.objects.filter(pk=t.pk).filter(
+                    _TQ(account__team_members__user=user) | _TQ(account__admin_owner=user)
+                ).exists()
+            )
+        except Exception:
+            return False
     if getattr(user, "is_staff", False):
         return True
     try:

@@ -1,3 +1,4 @@
+import { labelForStatus, type CanonicalStatus, type StatusLabelPrefs } from "./statusLabels";
 import type { AirtableActionItem } from "../types";
 
 /**
@@ -38,6 +39,19 @@ export const SIDEBAR_GROUPS: { key: SidebarGroupKey; label: string; flagLabel: s
   { key: "open", label: "Open", flagLabel: "Open" },
   { key: "done", label: "Done", flagLabel: "Done" },
 ];
+
+/** Groups that are a plain status; their text follows the user's status-name preference. */
+const GROUP_STATUS: Partial<Record<SidebarGroupKey, CanonicalStatus>> = {
+  in_progress: "In Progress",
+  open: "Open",
+  done: "Done",
+};
+
+/** Display text for a section header / chip. Positional groups keep their own names. */
+export function sidebarGroupLabel(key: SidebarGroupKey, base: string, prefs?: StatusLabelPrefs | null): string {
+  const status = GROUP_STATUS[key];
+  return status ? labelForStatus(status, prefs) : base;
+}
 
 /**
  * How far back the Done group reaches. Done items are fetched in full — the endpoint is
@@ -172,3 +186,11 @@ export function groupActionItems(
     return [{ key, label, items: sorted }];
   });
 }
+
+/** The status whose shared column-sort direction a sidebar section follows. Positional sections
+ *  (tracking / staged / pinned) are not status columns and have no entry. */
+export const SIDEBAR_SECTION_STATUS: Partial<Record<SidebarGroupKey, string>> = {
+  open: "Open",
+  in_progress: "In Progress",
+  done: "Done",
+};

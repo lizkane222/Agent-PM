@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { parseEmailList } from "../lib/teamEmails";
+import { useSearchParams } from "react-router-dom";
 import axios from "axios";
 import { permissionMessage } from "../lib/permissions";
 import { useAppError } from "../context/AppErrorContext";
@@ -13,14 +14,20 @@ import { useLogGlow } from "../hooks/useLogGlow";
 import { useCurrentUser } from "../context/CurrentUserContext";
 import { useTeam } from "../hooks/useTeam";
 import { useTeamMemberDocs } from "../hooks/useTeamMemberDocs";
+import PublicSection from "../components/profile/PublicSection";
 
 type ViewMode = "cards" | "list" | "table";
 
+/** Wrapped rows of account chips a member card shows before cutting off with "…". */
+const ACCOUNT_CHIP_ROWS = 3;
+const ACCOUNT_CHIP_HEIGHT_PX = 22;
+const ACCOUNT_CHIP_GAP_PX = 6;
+
 const ACCOUNT_STATUS_STYLE: Record<string, { background: string; color: string }> = {
-  prospect: { background: "#fef9c3", color: "#a16207" },
-  active:   { background: "#dcfce7", color: "#15803d" },
+  prospect: { background: "var(--tint-yellow-100)", color: "var(--ink-amber)" },
+  active:   { background: "#dcfce7", color: "var(--ink-green)" },
   inactive: { background: "var(--bg, #f5f5f5)", color: "var(--text-secondary, #888)" },
-  churned:  { background: "#fee2e2", color: "#dc2626" },
+  churned:  { background: "var(--tint-red-100)", color: "#dc2626" },
 };
 
 const EMPTY_FORM: Partial<TeamMember> = {
@@ -31,6 +38,14 @@ const EMPTY_FORM: Partial<TeamMember> = {
   slack_handle: "",
   avatar_url: "",
 };
+
+/** Fields a member may change on their own card; the rest is Admin-only (mirrors the server). */
+const SELF_EDITABLE_KEYS = ["full_name", "slack_handle", "avatar_url", "additional_emails"] as const;
+
+/** Only people whose title says "manager" are offered as someone's manager. */
+export function isManagerTitle(title: string | null | undefined): boolean {
+  return /manager/i.test(title ?? "");
+}
 
 // DRF validation errors come back as {field: ["message", ...]} or {detail: "message"}.
 function apiErrorMessage(err: unknown, fallback: string): string {
@@ -112,6 +127,76 @@ function ViewToggle({ value, onChange }: { value: ViewMode; onChange: (v: ViewMo
   );
 }
 
+function RoleSortMenu({
+  options,
+  selected,
+  onChange,
+}: {
+  options: { key: string; label: string; color: string }[];
+  selected: string[];
+  onChange: (next: string[]) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const close = (e: MouseEvent) => { if (!ref.current?.contains(e.target as Node)) setOpen(false); };
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, [open]);
+  const toggle = (key: string) =>
+    onChange(selected.includes(key) ? selected.filter((k) => k !== key) : [...selected, key]);
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-haspopup="true"
+        aria-expanded={open}
+        className="card-btn flex items-center gap-1.5 px-3 py-2 text-sm"
+        style={{
+          border: "1px solid var(--border, rgba(0,0,0,0.08))", borderRadius: "6px",
+          background: selected.length ? "var(--twilio-red, #e22)" : "var(--surface, #fff)",
+          color: selected.length ? "#fff" : "var(--text-primary, #111)",
+        }}
+      >
+        <svg viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5">
+          <path d="M2 3h12a1 1 0 010 2H2a1 1 0 010-2zm2 4h8a1 1 0 010 2H4a1 1 0 010-2zm2 4h4a1 1 0 010 2H6a1 1 0 010-2z" />
+        </svg>
+        Sort{selected.length > 0 && ` (${selected.length})`}
+      </button>
+      {open && (
+        <div
+          role="menu"
+          aria-label="Sort by role"
+          className="absolute right-0 mt-1 z-20 w-60 rounded-lg shadow-xl p-2"
+          style={{ background: "var(--surface, #fff)", border: "1px solid var(--border, rgba(0,0,0,0.1))" }}
+        >
+          <p className="px-2 pb-1 text-[11px] text-[var(--twilio-gray-60)]">
+            Selected roles are listed first, in the order you pick them.
+          </p>
+          {options.map((o) => {
+            const rank = selected.indexOf(o.key);
+            return (
+              <label key={o.key} className="flex items-center gap-2 px-2 py-1.5 rounded-md text-sm cursor-pointer hover:bg-gray-50">
+                <input type="checkbox" checked={rank >= 0} onChange={() => toggle(o.key)} />
+                <span className="inline-block w-2 h-2 rounded-full shrink-0" style={{ background: o.color }} />
+                <span className="flex-1 truncate">{o.label}</span>
+                {rank >= 0 && <span className="text-[11px] font-semibold text-[var(--twilio-gray-60)]">{rank + 1}</span>}
+              </label>
+            );
+          })}
+          {selected.length > 0 && (
+            <button type="button" onClick={() => onChange([])} className="mt-1 w-full text-left px-2 py-1.5 text-xs underline text-[var(--twilio-gray-60)]">
+              Clear sort
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Draggable account chip (used in the Accounts sidebar) ────────────────────
 
 function DraggableAccountChip({
@@ -189,6 +274,69 @@ function DraggableAccountChip({
   );
 }
 
+/** The current time in an IANA zone, e.g. "3:42 PM"; "" for a zone the browser doesn't know. */
+export function timeInZone(timeZone: string, now: Date): string {
+  try {
+    return new Intl.DateTimeFormat(undefined, { timeZone, hour: "numeric", minute: "2-digit" }).format(now);
+  } catch {
+    return "";
+  }
+}
+
+const CLOCK_TICK_MS = 30_000;
+
+function ZoneClock({ memberId, timezone }: { memberId: number; timezone: string }) {
+  const [now, setNow] = useState(() => new Date());
+  useEffect(() => {
+    const id = setInterval(() => setNow(new Date()), CLOCK_TICK_MS);
+    return () => clearInterval(id);
+  }, []);
+  const time = timeInZone(timezone, now);
+  return (
+    <span data-testid={`member-timezone-${memberId}`} title="Time zone and current local time" style={{ fontSize: "0.75rem", color: "var(--text-secondary, #888)" }}>
+      🕓 {timezone.replace(/_/g, " ")}{time && <> · <strong style={{ fontWeight: 600 }} data-testid={`member-time-${memberId}`}>{time}</strong></>}
+    </span>
+  );
+}
+
+function AccountChips({ memberId, accounts }: { memberId: number; accounts: Account[] }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [cutOff, setCutOff] = useState(false);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const measure = () => setCutOff(el.scrollHeight > el.clientHeight + 1);
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [accounts]);
+  if (accounts.length === 0) return null;
+  const maxHeight = ACCOUNT_CHIP_ROWS * ACCOUNT_CHIP_HEIGHT_PX + (ACCOUNT_CHIP_ROWS - 1) * ACCOUNT_CHIP_GAP_PX;
+  return (
+    <div style={{ marginTop: "8px" }}>
+      <div ref={ref} data-testid={`member-accounts-${memberId}`} style={{ display: "flex", flexWrap: "wrap", gap: `${ACCOUNT_CHIP_GAP_PX}px`, maxHeight, overflow: "hidden" }}>
+        {accounts.map((a) => (
+          <span
+            key={a.id}
+            title={a.company_name}
+            style={{ display: "inline-flex", alignItems: "center", gap: "5px", maxWidth: "100%", height: `${ACCOUNT_CHIP_HEIGHT_PX}px`, boxSizing: "border-box", padding: "0 7px 0 4px", borderRadius: "7px", background: "var(--bg, #f5f5f5)" }}
+          >
+            <span style={{ height: "16px", width: "16px", borderRadius: "5px", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(226,34,34,0.08)", color: "var(--twilio-red, #e22)" }}>
+              <CorporateIcon style={{ width: "10px", height: "10px" }} />
+            </span>
+            <span style={{ fontSize: "0.6875rem", fontWeight: 600, color: "var(--text-primary, #111)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{a.company_name}</span>
+          </span>
+        ))}
+      </div>
+      {cutOff && (
+        <span data-testid={`member-accounts-more-${memberId}`} title="Open this member to see all their accounts" style={{ fontSize: "0.8125rem", fontWeight: 700, color: "var(--text-secondary, #888)", lineHeight: 1 }}>…</span>
+      )}
+    </div>
+  );
+}
+
 function MemberCard({
   member,
   onSelect,
@@ -199,8 +347,10 @@ function MemberCard({
   roleMeta,
   isOverridden,
   onClearOverride,
+  accounts = [],
 }: {
   member: TeamMember;
+  accounts?: Account[];
   onSelect: (m: TeamMember) => void;
   dropTarget: boolean;
   onDragOver: (e: React.DragEvent) => void;
@@ -243,7 +393,7 @@ function MemberCard({
       {/* Role colour bar */}
       <div style={{ height: "4px", background: colors.border }} />
 
-      <div style={{ padding: "16px 20px 14px" }}>
+      <div style={{ padding: "12px 16px 10px" }}>
         {/* Avatar + name row */}
         <div style={{ display: "flex", alignItems: "flex-start", gap: "14px" }}>
           {member.avatar_url ? (
@@ -263,12 +413,12 @@ function MemberCard({
         </div>
 
         {/* Divider */}
-        <div style={{ margin: "12px 0 10px", height: "1px", background: "var(--border, rgba(0,0,0,0.06))" }} />
+        <div style={{ margin: "10px 0 8px", height: "1px", background: "var(--border, rgba(0,0,0,0.06))" }} />
 
-        {/* Contact row */}
-        <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+        {/* Contact row: one line, wrapping when it does not fit */}
+        <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", columnGap: "12px", rowGap: "2px" }}>
           {member.email && (
-            <span style={{ fontSize: "0.75rem", color: "var(--twilio-red, #e22)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{member.email}</span>
+            <span style={{ fontSize: "0.75rem", color: "var(--twilio-red, #e22)", maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{member.email}</span>
           )}
           {member.slack_handle && (
             <span style={{ fontSize: "0.75rem", color: "var(--text-secondary, #888)" }}>@{member.slack_handle}</span>
@@ -276,7 +426,11 @@ function MemberCard({
           {member.manager_name && (
             <span style={{ fontSize: "0.75rem", color: "var(--text-secondary, #aaa)" }}>↳ {member.manager_name}</span>
           )}
+          {member.timezone && <ZoneClock memberId={member.id} timezone={member.timezone} />}
         </div>
+
+        {/* Accounts preview: names only, at most three wrapped rows */}
+        <AccountChips memberId={member.id} accounts={accounts} />
 
         {/* Tags + override badge */}
         {(member.tags.length > 0 || isOverridden) && (
@@ -313,14 +467,18 @@ function MemberModal({
   onClose,
   onSave,
   onDelete,
+  selfOnly = false,
 }: {
   member: Partial<TeamMember> | null;
+  /** A non-Admin editing their own card: only the personal fields are editable. */
+  selfOnly?: boolean;
   allMembers: TeamMember[];
   onClose: () => void;
   onSave: (data: Partial<TeamMember>) => Promise<void>;
   onDelete: (id: number) => Promise<void>;
 }) {
   const [form, setForm] = useState<Partial<TeamMember>>(member ?? EMPTY_FORM);
+  const [extraEmails, setExtraEmails] = useState((member?.additional_emails ?? []).join(", "));
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -340,7 +498,11 @@ function MemberModal({
     setSaving(true);
     setError(null);
     try {
-      await onSave(form);
+      const full = { ...form, additional_emails: parseEmailList(extraEmails) };
+      // The server refuses anything beyond the personal fields from a non-Admin, so send only those.
+      await onSave(selfOnly
+        ? (Object.fromEntries(SELF_EDITABLE_KEYS.map((k) => [k, full[k]])) as Partial<TeamMember>)
+        : full);
     } catch (err) {
       setError(apiErrorMessage(err, "Couldn't save this team member. Double-check the fields and try again."));
     } finally {
@@ -390,14 +552,27 @@ function MemberModal({
             <input
               id="member-email"
               type="email"
+              disabled={selfOnly}
               value={form.email ?? ""}
               onChange={(e) => set("email", e.target.value)}
               className="w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-red-400 focus:outline-none focus:ring-1 focus:ring-red-100"
             />
           </div>
+          <div className="col-span-2">
+            <label htmlFor="member-additional-emails" className="block text-sm font-medium text-[var(--twilio-navy)] mb-1">Other email addresses</label>
+            <input
+              id="member-additional-emails"
+              value={extraEmails}
+              onChange={(e) => setExtraEmails(e.target.value)}
+              placeholder="e.g. name@segment.com, name@sendgrid.com"
+              className="w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-red-400 focus:outline-none focus:ring-1 focus:ring-red-100"
+            />
+            <p className="mt-1 text-[11px] text-[var(--twilio-gray-60)]">Comma-separated. Emails to this person use their twilio.com address when they have one.</p>
+          </div>
           <div>
             <label className="block text-sm font-medium text-[var(--twilio-navy)] mb-1">Title</label>
             <input
+              disabled={selfOnly}
               value={form.title ?? ""}
               onChange={(e) => set("title", e.target.value)}
               className="w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-red-400 focus:outline-none focus:ring-1 focus:ring-red-100"
@@ -406,6 +581,7 @@ function MemberModal({
           <div>
             <label className="block text-sm font-medium text-[var(--twilio-navy)] mb-1">Department</label>
             <input
+              disabled={selfOnly}
               value={form.department ?? ""}
               onChange={(e) => set("department", e.target.value)}
               className="w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-red-400 focus:outline-none focus:ring-1 focus:ring-red-100"
@@ -421,15 +597,17 @@ function MemberModal({
             />
           </div>
           <div className="col-span-2">
-            <label className="block text-sm font-medium text-[var(--twilio-navy)] mb-1">Manager</label>
+            <label htmlFor="member-manager" className="block text-sm font-medium text-[var(--twilio-navy)] mb-1">Manager</label>
             <select
+              id="member-manager"
+              disabled={selfOnly}
               value={form.manager ?? ""}
               onChange={(e) => set("manager", e.target.value ? Number(e.target.value) : null)}
               className="w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-red-400 focus:outline-none focus:ring-1 focus:ring-red-100"
             >
               <option value="">No manager</option>
               {allMembers
-                .filter((m) => m.id !== member?.id)
+                .filter((m) => m.id !== member?.id && (isManagerTitle(m.title) || m.id === form.manager))
                 .map((m) => (
                   <option key={m.id} value={m.id}>{m.full_name}</option>
                 ))}
@@ -438,7 +616,7 @@ function MemberModal({
         </div>
 
         <div className="flex items-center justify-between mt-6">
-          {!isNew ? (
+          {!isNew && !selfOnly ? (
             confirmDelete ? (
               <div className="flex gap-2">
                 <span className="text-sm text-[var(--twilio-navy)] self-center">Sure?</span>
@@ -495,6 +673,8 @@ function MemberDetailSidebar({
   member,
   accounts,
   canManageDocs,
+  canEdit,
+  isSelf,
   onClose,
   onEdit,
   onRemoveFromAccount,
@@ -502,6 +682,9 @@ function MemberDetailSidebar({
   member: TeamMember;
   accounts: Account[];
   canManageDocs: boolean;
+  /** Admin, or the member looking at their own card. */
+  canEdit: boolean;
+  isSelf: boolean;
   onClose: () => void;
   onEdit: () => void;
   onRemoveFromAccount: (accountId: number) => void;
@@ -539,7 +722,7 @@ function MemberDetailSidebar({
       />
       {/* Drawer */}
       <div
-        className="fixed top-0 right-0 h-full z-40 flex flex-col shadow-2xl w-96"
+        className="fixed top-0 right-0 h-full z-40 flex flex-col shadow-2xl w-full max-w-[34rem]"
         style={{ background: "var(--surface, #fff)", borderLeft: "1px solid var(--border, rgba(0,0,0,0.08))" }}
       >
         {/* Role colour bar */}
@@ -588,6 +771,11 @@ function MemberDetailSidebar({
                 <a href={`mailto:${member.email}`} className="text-sm truncate" style={{ color: "var(--twilio-red, #e22)" }}>{member.email}</a>
               </div>
             )}
+            {(member.additional_emails ?? []).map((e) => (
+              <div key={e} className="flex items-center gap-2 pl-[22px]">
+                <a href={`mailto:${e}`} className="text-sm truncate" style={{ color: "var(--twilio-red, #e22)" }}>{e}</a>
+              </div>
+            ))}
             {member.slack_handle && (
               <div className="flex items-center gap-2">
                 <svg viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5 shrink-0" style={{ color: "var(--text-secondary, #aaa)" }}>
@@ -602,6 +790,12 @@ function MemberDetailSidebar({
                   <path d="M8 8a3 3 0 100-6 3 3 0 000 6zm1 2.25a.75.75 0 01-1.5 0V10a.75.75 0 011.5 0v.25zM3 13c0-2.21 2.239-4 5-4s5 1.79 5 4H3z"/>
                 </svg>
                 <span className="text-sm text-[var(--twilio-navy)]">Reports to {member.manager_name}</span>
+              </div>
+            )}
+            {member.timezone && (
+              <div className="flex items-center gap-2">
+                <span className="w-3.5 text-center shrink-0 text-xs">🕓</span>
+                <span className="text-sm" style={{ color: "var(--text-secondary, #888)" }}>{member.timezone.replace(/_/g, " ")}</span>
               </div>
             )}
             {member.joined_at && (
@@ -633,6 +827,18 @@ function MemberDetailSidebar({
               </div>
             </div>
           )}
+
+          {/* Public: what others see of this person, plus call / email / note actions */}
+          <div data-testid="member-public-section">
+            <p className="text-[11px] font-bold uppercase tracking-wider mb-2" style={{ color: "var(--text-secondary, #888)" }}>Public</p>
+            <PublicSection
+              memberId={member.id}
+              personName={member.full_name}
+              personEmail={member.email}
+              isSelf={isSelf}
+              accent={colors}
+            />
+          </div>
 
           {/* Linked accounts */}
           <div>
@@ -725,7 +931,7 @@ function MemberDetailSidebar({
                   onClick={handleAddDoc}
                   disabled={addingDoc || !newDocName.trim() || !newDocUrl.trim()}
                   className="w-full text-sm font-semibold rounded-md px-2.5 py-1.5 disabled:opacity-50"
-                  style={{ background: "var(--bg, #f5f5f5)", color: "var(--twilio-navy)", border: "1px solid var(--border, rgba(0,0,0,0.12))" }}
+                  style={{ background: "var(--bg, #f5f5f5)", color: "var(--text-ink)", border: "1px solid var(--border, rgba(0,0,0,0.12))" }}
                 >
                   + Add doc
                 </button>
@@ -734,24 +940,24 @@ function MemberDetailSidebar({
           </div>
         </div>
 
-        {/* Footer — edit button */}
-        <div className="shrink-0 px-5 py-4" style={{ borderTop: "1px solid var(--border, rgba(0,0,0,0.08))" }}>
-          <button
-            onClick={onEdit}
-            className="w-full py-2 text-sm font-semibold rounded-lg transition-opacity hover:opacity-90"
-            style={{ background: "var(--twilio-red, #e22)", color: "#fff", border: "none" }}
-          >
-            Edit Member
-          </button>
-        </div>
+        {/* Footer — edit button (Admins, or the member editing their own card) */}
+        {canEdit && (
+          <div className="shrink-0 px-5 py-4" style={{ borderTop: "1px solid var(--border, rgba(0,0,0,0.08))" }}>
+            <button
+              onClick={onEdit}
+              className="w-full py-2 text-sm font-semibold rounded-lg transition-opacity hover:opacity-90"
+              style={{ background: "var(--twilio-red, #e22)", color: "#fff", border: "none" }}
+            >
+              Edit Member
+            </button>
+          </div>
+        )}
       </div>
     </>
   );
 }
 
 export default function TeamPage() {
-  const navigate = useNavigate();
-  const openProfile = (m: TeamMember) => navigate(`/profile/${m.id}`);
   const [searchParams, setSearchParams] = useSearchParams();
   const { reportError } = useAppError();
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -767,6 +973,8 @@ export default function TeamPage() {
 
   const currentUser = useCurrentUser();
   const isStaffAdmin = !!(currentUser?.is_staff && currentUser?.staff_view_override);
+  const isAdmin = (currentUser?.access_level ?? (currentUser?.is_staff ? "admin" : "basic")) === "admin";
+  const [roleSort, setRoleSort] = useState<string[]>([]);
 
   const {
     data: members,
@@ -807,6 +1015,12 @@ export default function TeamPage() {
   useEffect(() => {
     if (isStaffAdmin) localStorage.setItem("team_custom_groups", JSON.stringify(customGroups));
   }, [customGroups, isStaffAdmin]);
+
+  const accountsByMember = useMemo(() => {
+    const map = new Map<number, Account[]>();
+    for (const a of accounts) for (const m of a.team_members ?? []) map.set(m.id, [...(map.get(m.id) ?? []), a]);
+    return map;
+  }, [accounts]);
 
   function effectiveRole(member: TeamMember): string {
     return roleOverrides[member.id] ?? getTitleRole(member.title);
@@ -1010,7 +1224,13 @@ export default function TeamPage() {
               placeholder="Search by name, email, title…"
               className="rounded-md border border-gray-300 px-3 py-2 text-sm placeholder-gray-400 focus:border-red-400 focus:outline-none focus:ring-1 focus:ring-red-100 w-72"
             />
-            <div className="ml-auto">
+            <div className="ml-auto flex items-center gap-2">
+              <RoleSortMenu
+                options={[...ROLE_ORDER.map((k) => ({ key: k as string, label: getRoleMeta(k).label, color: getRoleMeta(k).border })),
+                  ...customGroups.map((g) => ({ key: g.key, label: g.label, color: g.border }))]}
+                selected={roleSort}
+                onChange={setRoleSort}
+              />
               <ViewToggle value={viewMode} onChange={setViewMode} />
             </div>
           </div>
@@ -1038,7 +1258,11 @@ export default function TeamPage() {
                 .sort((a, b) => a.full_name.localeCompare(b.full_name));
               return acc;
             }, {} as Record<string, TeamMember[]>);
-            const activeRoles = allRoleKeys.filter((key) => grouped[key].length > 0);
+            // Sort: roles picked in the Sort menu come first, in the order they were picked.
+            const rank = (key: string) => { const i = roleSort.indexOf(key); return i < 0 ? roleSort.length : i; };
+            const activeRoles = allRoleKeys
+              .filter((key) => grouped[key].length > 0)
+              .sort((a, b) => rank(a) - rank(b));
             const sorted = activeRoles.flatMap((role) => grouped[role]);
 
             if (viewMode === "cards") {
@@ -1160,11 +1384,12 @@ export default function TeamPage() {
                               <MemberCard
                                 key={member.id}
                                 member={member}
-                                onSelect={openProfile}
+                                onSelect={setSelectedMember}
                                 dropTarget={dropTargetMemberId === member.id}
                                 onDragOver={(e) => { e.stopPropagation(); e.preventDefault(); setDropTargetMemberId(member.id); }}
                                 onDragLeave={() => setDropTargetMemberId(null)}
                                 onDrop={(e) => { e.stopPropagation(); void handleAccountDrop(e, member); }}
+                                accounts={accountsByMember.get(member.id)}
                                 roleMeta={hasOverride ? meta : undefined}
                                 isOverridden={isStaffAdmin && hasOverride}
                                 onClearOverride={isStaffAdmin && hasOverride ? () => clearOverride(member.id) : undefined}
@@ -1189,7 +1414,7 @@ export default function TeamPage() {
                     return (
                       <button
                         key={member.id}
-                        onClick={() => openProfile(member)}
+                        onClick={() => setSelectedMember(member)}
                         onDragOver={(e) => { e.preventDefault(); setDropTargetMemberId(member.id); }}
                         onDragLeave={() => setDropTargetMemberId(null)}
                         onDrop={(e) => void handleAccountDrop(e, member)}
@@ -1238,7 +1463,7 @@ export default function TeamPage() {
                       return (
                         <tr
                           key={member.id}
-                          onClick={() => openProfile(member)}
+                          onClick={() => setSelectedMember(member)}
                           onDragOver={(e) => { e.preventDefault(); setDropTargetMemberId(member.id); }}
                           onDragLeave={() => setDropTargetMemberId(null)}
                           onDrop={(e) => void handleAccountDrop(e, member)}
@@ -1282,6 +1507,8 @@ export default function TeamPage() {
         <MemberDetailSidebar
           member={selectedMember}
           accounts={accounts}
+          canEdit={isAdmin || (selectedMember.user !== null && selectedMember.user === currentUser?.id)}
+          isSelf={selectedMember.user !== null && selectedMember.user === currentUser?.id}
           canManageDocs={isStaffAdmin || selectedMember.user === currentUser?.id}
           onClose={() => setSelectedMember(null)}
           onEdit={() => { setModal(selectedMember); setSelectedMember(null); }}
@@ -1300,6 +1527,7 @@ export default function TeamPage() {
       {modal !== null && (
         <MemberModal
           member={modal === "new" ? null : modal}
+          selfOnly={modal !== "new" && !isAdmin}
           allMembers={members}
           onClose={() => setModal(null)}
           onSave={handleSave}

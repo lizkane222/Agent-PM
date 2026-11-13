@@ -2,6 +2,8 @@
  * CalendarPage — interactive FullCalendar view connected to the backend events API.
  */
 
+import { CalendarAttendees } from "../components/calendar/CalendarAttendees";
+import { useStatusLabels } from "../hooks/useStatusLabels";
 import FullCalendar from "@fullcalendar/react";
 import CorporateIcon from "../assets/icons/Corporate.svg?react";
 import CalendarIcon from "../assets/icons/Calendar.svg?react";
@@ -23,17 +25,20 @@ import { useCommentContext } from "../components/comments/CommentContext";
 import CommentCountBadge from "../components/comments/CommentCountBadge";
 import CommentIcon from "../components/CommentIcon";
 import { useAppError } from "../context/AppErrorContext";
+import { useNotificationDefaults } from "../context/NotificationDefaultsContext";
 import { ContextMenu, FocusPinBadge, focusPinMenuItem } from "../components/action-items/ContextMenu";
 import { ActionItemModal } from "../components/account/ActionItemModal";
 import { useFocusPins } from "../hooks/useFocusPins";
 import { useActionItemZoneSets } from "../hooks/useActionItemZoneSets";
-import { groupActionItems, DONE_WINDOW_DAYS, isRecentlyDone, type SidebarGroupKey } from "../lib/actionItemSidebarOrder";
+import { SIDEBAR_SECTION_STATUS, groupActionItems, sidebarGroupLabel, DONE_WINDOW_DAYS, isRecentlyDone, type SidebarGroupKey } from "../lib/actionItemSidebarOrder";
+import { useColumnSort } from "../hooks/useStatusArrivalOrder";
+import ColumnSortButton from "../components/account/ColumnSortButton";
 import SidebarFilterFlags from "../components/calendar/SidebarFilterFlags";
 import CalendarSearch from "../components/calendar/CalendarSearch";
 import { eventMatchesQuery } from "../lib/calendarSearch";
 import { useLiveTimers } from "../hooks/useLiveTimers";
 import { useGoogleCalendarAutoSync } from "../hooks/useGoogleCalendarAutoSync";
-import { AccountRecordLink, ActionItemRecordButton } from "../components/calendar/EventRecordLinks";
+import { AccountRecordLink, ActionItemRecordButton, ProjectRecordLinks } from "../components/calendar/EventRecordLinks";
 import { useAvailability } from "../hooks/useAvailability";
 import ComparePeoplePicker, { type ComparedPerson } from "../components/calendar/ComparePeoplePicker";
 import { findFreeSlots, isCompareEvent, isFreeSlotBand, overlayEvents } from "../lib/availability";
@@ -76,17 +81,24 @@ import {
 import {
   REMINDERS_CALENDAR_ID,
   hasActionItemAt,
-  hasReminderAt,
   migrateLegacyScheduledItems,
   scheduleActionItem,
-  scheduleReminder,
 } from "../lib/calendarScheduling";
-import type { AirtableActionItem, AirtableAccount, CalendarEvent, LogTimeDayAssignment, Reminder, SalesforceProject } from "../types";
+import { fromLocalDatetimeValue, nextHourLocalValue, sameInstant, toLocalDatetimeValue } from "../lib/datetimeLocal";
+import ReminderRecipientsPicker from "../components/calendar/ReminderRecipientsPicker";
+import ReminderSnoozeMenu, { type SnoozeRequest } from "../components/calendar/ReminderSnoozeMenu";
+import ReminderLinksField from "../components/shared/ReminderLinksField";
+import ReminderChannelsField from "../components/shared/ReminderChannelsField";
+import { buildReminderPayload, channelsFromDefaults, channelsOf, reminderSaveError, REMINDER_CHANNELS, type ReminderChannels } from "../lib/reminderDraft";
+import { groupReminders, REMINDER_CLOCK_TICK_MS, type ReminderSection } from "../lib/reminderSections";
+import type { AirtableActionItem, AirtableAccount, CalendarEvent, LogTimeDayAssignment, Reminder, ReminderLink, SalesforceProject } from "../types";
 import type { AccountArtifact, AccountProject } from "../types/accounts";
 import type { TeamMember } from "../types/team";
 import type { ContentView, EventCategory, NewEventDraft } from "../types/calendar";
 import { getRsvp, dateToLocalISO, toLocalISO, addMsToLocalISO } from "twilio-agent-pm-shared";
 import type { RsvpStatus } from "twilio-agent-pm-shared";
+import PinnedSkillsSection from "../components/skills/PinnedSkillsSection";
+import { instantDayKey, localDateKey } from "../lib/timelineDay";
 
 const PRIORITY_COLORS_CAL: Record<string, string> = {
   Critical: "bg-red-50 text-red-700",
@@ -144,6 +156,11 @@ const SURFACE_TINT = 0.9;
 function isScheduledReminderEvent(e: CalendarEvent): boolean {
   return e.calendar_id === REMINDERS_CALENDAR_ID
     || !!e.google_event_id?.startsWith("scheduled-reminder-");
+}
+
+/** A reminder's real calendar block (a `reminders` row with an id) — as opposed to the legacy synthetic. */
+function isDbReminderBlock(e: CalendarEvent): boolean {
+  return e.calendar_id === "reminders" && !!e.reminder && e.id > 0;
 }
 
 /**
@@ -260,14 +277,19 @@ function toFullCalendarEvent(e: CalendarEvent, colors: ColorResolver, compareCol
   const textColor = readableTextColor(backgroundColor);
   return {
     id: String(e.id),
-    title: isScheduled ? e.title : isWorkSession ? `⏱ ${e.title}` : e.title,
+    title: isScheduled ? e.title
+      : isWorkSession ? `⏱ ${e.title}`
+      : isScheduledReminder && !e.title.startsWith("🔔") ? `🔔 ${e.title}`
+      : e.title,
     start: e.start_datetime,
     end: e.end_datetime,
     allDay: e.all_day,
     backgroundColor,
     borderColor,
     textColor,
-    editable: isScheduled || isDbWorkTracking || (!isWorkSession && !isScheduledReminder),
+    // A reminder block can be dragged to another time but not stretched: every block is 15 minutes.
+    editable: isScheduled || isDbWorkTracking || isDbReminderBlock(e) || (!isWorkSession && !isScheduledReminder),
+    durationEditable: !isDbReminderBlock(e),
     extendedProps: { ...e },
   };
 }
@@ -297,7 +319,7 @@ interface EventDetailPanelProps {
   onUnlink?: () => void;
   onRemove?: () => void;
   onDelete?: () => void;
-  onUpdateReminder?: (reminderId: number, patch: { title?: string; body?: string; due_at?: string }) => void;
+  onUpdateReminder?: (reminderId: number, patch: { title?: string; body?: string; start?: string; eventId?: number }) => void;
   actionItem?: AirtableActionItem | null;
   onUpdateActionItem?: (patch: Partial<AirtableActionItem>) => void;
   onUpdateScheduleTime?: (newStart: string, newEnd: string) => void;
@@ -318,6 +340,7 @@ type EventDetailsPatch = Partial<Pick<CalendarEvent,
   "title" | "description" | "location" | "start_datetime" | "end_datetime" | "event_category" | "artifact_ids">>;
 
 function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAccount, onUnlink, onRemove, onDelete, onUpdateReminder, actionItem, onUpdateActionItem, onUpdateScheduleTime, onOpenActionItemModal, onUpdateEvent, editRequestId, colors, resolveAccountId }: EventDetailPanelProps) {
+  const { label: statusLabel } = useStatusLabels();
   const [dropOver, setDropOver] = useState(false);
   const isWorkSession = event.calendar_id === "work_tracking";
   const isScheduledReminder = isScheduledReminderEvent(event);
@@ -344,7 +367,8 @@ function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAcc
       })();
   const [editTitle, setEditTitle] = useState(event.title.replace(/^🔔\s*/, ""));
   const [editBody, setEditBody] = useState("");
-  const [editDueAt, setEditDueAt] = useState(event.start_datetime.slice(0, 16));
+  // The user's local wall clock — `start_datetime` is a UTC instant, so slicing it showed UTC.
+  const [editDueAt, setEditDueAt] = useState(toLocalDatetimeValue(event.start_datetime));
   const [saving, setSaving] = useState(false);
 
   // "Set reminder for this event" inline form (only shown for regular events)
@@ -354,8 +378,8 @@ function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAcc
     try {
       const t = new Date(event.start_datetime);
       t.setMinutes(t.getMinutes() - 15);
-      return t.toISOString().slice(0, 16);
-    } catch { return event.start_datetime.slice(0, 16); }
+      return toLocalDatetimeValue(t.toISOString());
+    } catch { return toLocalDatetimeValue(event.start_datetime); }
   });
   const [newRemSaving, setNewRemSaving] = useState(false);
   const [newRemDone, setNewRemDone] = useState(false);
@@ -438,14 +462,14 @@ function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAcc
     if (!newRemTitle.trim() || !newRemDueAt) return;
     setNewRemSaving(true);
     try {
-      const due_at = newRemDueAt.length === 16 ? `${newRemDueAt}:00` : newRemDueAt;
       await schedulerApi.createReminder({
         title: newRemTitle.trim().slice(0, 200),
         resource_type: "calendar_event",
         resource_id: event.id,
-        due_at: new Date(due_at).toISOString(),
-        notify_in_app: true,
+        due_at: fromLocalDatetimeValue(newRemDueAt),
+        // No channels named: the server applies the user's own Settings defaults.
       } as Parameters<typeof schedulerApi.createReminder>[0]);
+      window.dispatchEvent(new StorageEvent("storage", { key: "remindersUpdated", newValue: "1" }));
       setNewRemDone(true);
       setTimeout(() => { setNewRemOpen(false); setNewRemDone(false); }, 1500);
     } catch {
@@ -542,7 +566,7 @@ function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAcc
   // Keep edit fields in sync when the event prop changes (e.g. after drag)
   useEffect(() => {
     setEditTitle(event.title.replace(/^🔔\s*/, ""));
-    setEditDueAt(event.start_datetime.slice(0, 16));
+    setEditDueAt(toLocalDatetimeValue(event.start_datetime)); // local clock, as on the grid
   }, [event.google_event_id, event.start_datetime, event.title]);
   const cleanDescription = event.description
     ? DOMPurify.sanitize(event.description, {
@@ -643,7 +667,7 @@ function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAcc
             />
           </div>
           <div>
-            <p className="text-[11px] text-amber-700 uppercase tracking-wide font-semibold mb-1">Due</p>
+            <p className="text-[11px] text-amber-700 uppercase tracking-wide font-semibold mb-1">Reminds at (15 min)</p>
             <input
               type="datetime-local"
               value={editDueAt}
@@ -705,12 +729,12 @@ function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAcc
             <p className="text-[var(--twilio-navy)] font-medium leading-snug">{actionItem.task}</p>
             {actionItem.task_details && (
               <div
-                className="text-[var(--twilio-gray-80)] text-[13px] leading-relaxed prose prose-sm max-w-none"
+                className="text-[var(--twilio-gray-80)] text-[13px] leading-relaxed prose prose-sm max-w-none rich-text"
                 dangerouslySetInnerHTML={{ __html: sanitizeHtml(plainToHtml(actionItem.task_details)) }}
               />
             )}
             <div className="flex flex-wrap gap-1.5">
-              <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full ${STATUS_COLORS_CAL[actionItem.status] ?? "bg-gray-100 text-gray-700"}`}>{actionItem.status}</span>
+              <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full ${STATUS_COLORS_CAL[actionItem.status] ?? "bg-gray-100 text-gray-700"}`}>{statusLabel(actionItem.status)}</span>
               <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full ${PRIORITY_COLORS_CAL[actionItem.priority] ?? "bg-gray-100 text-gray-600"}`}>{actionItem.priority}</span>
               {actionItem.due_date && (
                 <span className="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-amber-50 text-amber-700">
@@ -870,20 +894,15 @@ function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAcc
           {descriptionWithLinks && (
             <div>
               <p className="text-sm text-[var(--twilio-gray-60)] uppercase tracking-wide mb-1">Description</p>
-              <div className="text-[var(--twilio-gray-80)] text-sm [&_a]:text-indigo-600 [&_a]:underline [&_a]:break-all hover:[&_a]:text-indigo-800" dangerouslySetInnerHTML={{ __html: descriptionWithLinks }} />
+              <div className="rich-text text-[var(--twilio-gray-80)] text-sm [&_a]:text-indigo-600 [&_a]:underline [&_a]:break-all hover:[&_a]:text-indigo-800" dangerouslySetInnerHTML={{ __html: descriptionWithLinks }} />
             </div>
           )}
           {!isWorkSession && event.attendees.length > 0 && (
-            <div>
-              <p className="text-sm text-[var(--twilio-gray-60)] uppercase tracking-wide mb-1">Attendees ({event.attendees.length})</p>
-              <ul className="space-y-1">
-                {event.attendees.map((a) => (
-                  <li key={a.email} className="flex items-center gap-2">
-                    <span className={["h-2 w-2 rounded-full shrink-0", a.responseStatus === "accepted" ? "bg-green-500" : a.responseStatus === "declined" ? "bg-red-500" : "bg-gray-300"].join(" ")} />
-                    <span className="text-[var(--twilio-gray-80)] truncate">{a.displayName ?? a.email}</span>
-                  </li>
-                ))}
-              </ul>
+            <div className="text-sm text-[var(--twilio-gray-80)]">
+              <CalendarAttendees
+                attendees={event.attendees}
+                accountId={(linkedAccount ? resolveAccountId?.(linkedAccount.accountName) : null) ?? event.account ?? null}
+              />
             </div>
           )}
           {!isWorkSession && event.meet_link && (
@@ -905,6 +924,8 @@ function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAcc
               <p className="text-[var(--twilio-gray-60)] text-center">Drop an account here to link</p>
             )}
           </div>
+
+          <ProjectRecordLinks meetingAirtableId={event.agentpm_airtable_id} />
 
           {/* Artifacts — only when an account is linked to this event */}
           {canEditEvent && linkedAccount && (
@@ -986,8 +1007,10 @@ function EventDetailPanel({ event, onClose, onCollapse, linkedAccount, onDropAcc
             disabled={saving}
             onClick={async () => {
               setSaving(true);
-              const due_at = editDueAt.length === 16 ? `${editDueAt}:00` : editDueAt;
-              await onUpdateReminder(reminderIdFromUid, { title: editTitle, body: editBody || undefined, due_at });
+              // The field holds local wall-clock time; send the instant. `start` is this block's
+              // own time — a reminder can be on the calendar several times.
+              const start = fromLocalDatetimeValue(editDueAt);
+              await onUpdateReminder(reminderIdFromUid, { title: editTitle, body: editBody || undefined, start, eventId: event.id });
               setSaving(false);
             }}
             className="w-full text-[12px] font-semibold py-2 rounded-lg transition-colors text-white disabled:opacity-50"
@@ -1251,9 +1274,11 @@ const BLANK_FORM: CalCreateForm = {
 
 // ── Pill helpers (self-contained, matching ActionItemsPage style) ─────────────
 
-function CalPillSelect<T extends string>({ value, options, colorMap, placeholder, onChange }: {
+function CalPillSelect<T extends string>({ value, options, colorMap, placeholder, onChange, format }: {
   value: T | undefined; options: readonly T[]; colorMap: Record<string, string>; placeholder: string;
   onChange: (v: T) => void;
+  /** Display-only text for a value (e.g. status names); the option VALUE stays canonical. */
+  format?: (v: string) => string;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLSelectElement>(null);
@@ -1263,12 +1288,12 @@ function CalPillSelect<T extends string>({ value, options, colorMap, placeholder
     <select ref={ref} value={value ?? ""} onChange={(e) => { onChange(e.target.value as T); setOpen(false); }}
       onBlur={() => setOpen(false)} onClick={(e) => e.stopPropagation()}
       className="rounded-full border border-indigo-400 bg-white px-2.5 py-0.5 text-[12px] font-semibold focus:outline-none cursor-pointer"
-    >{options.map((o) => <option key={o} value={o}>{o}</option>)}</select>
+    >{options.map((o) => <option key={o} value={o}>{format ? format(o) : o}</option>)}</select>
   );
   return (
     <button type="button" onClick={(e) => { e.stopPropagation(); setOpen(true); }}
       className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[12px] font-semibold cursor-pointer hover:opacity-75 transition-opacity ${cls}`}
-    >{value ?? placeholder}<svg viewBox="0 0 8 5" fill="currentColor" className="w-1.5 h-1.5 opacity-50"><path d="M0 0l4 5 4-5z"/></svg></button>
+    >{value != null ? (format ? format(value) : value) : placeholder}<svg viewBox="0 0 8 5" fill="currentColor" className="w-1.5 h-1.5 opacity-50"><path d="M0 0l4 5 4-5z"/></svg></button>
   );
 }
 
@@ -1355,6 +1380,7 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onO
   /** The user's action-item color — the same one the grid paints scheduled items with. */
   accent: string;
 }) {
+  const { label: statusLabel } = useStatusLabels();
   const [ctxPos, setCtxPos] = useState<{ x: number; y: number } | null>(null);
   const { isPinned, toggle: toggleFocusPin } = useFocusPins();
 
@@ -1414,7 +1440,7 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onO
       {/* Row 1: badges + actions */}
       <div className="flex items-center gap-1.5 flex-wrap">
         <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded whitespace-nowrap ${PRIORITY_COLORS_CAL[item.priority] ?? "bg-gray-100 text-gray-600"}`}>{item.priority}</span>
-        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded whitespace-nowrap ${STATUS_COLORS_CAL[item.status] ?? "bg-gray-100 text-gray-700"}`}>{item.status}</span>
+        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded whitespace-nowrap ${STATUS_COLORS_CAL[item.status] ?? "bg-gray-100 text-gray-700"}`}>{statusLabel(item.status)}</span>
         {item.due_date && (
           <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded whitespace-nowrap bg-amber-50 text-amber-700">
             {new Date(item.due_date).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
@@ -1425,7 +1451,7 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onO
             onClick={(e) => { e.stopPropagation(); onReminderToggle(); }}
             title={hasReminder ? `Reminder: ${new Date(item.reminder_due_at!).toLocaleString()}` : "Set reminder"}
             className="rounded p-0.5 hover:bg-gray-200 transition-colors"
-            style={{ color: hasReminder ? "#f59e0b" : "#9ca3af" }}
+            style={{ color: hasReminder ? "#f59e0b" : "var(--text-gray-400)" }}
           >
             <svg viewBox="0 0 16 16" width="12" height="12" fill={hasReminder ? "currentColor" : "none"} stroke="currentColor" strokeWidth="1.5">
               <path strokeLinecap="round" d="M8 1a5 5 0 00-5 5v2.5L1.5 10h13L13 8.5V6a5 5 0 00-5-5z"/>
@@ -1492,6 +1518,7 @@ function ActionItemsSidebar({ expandItemId, colors, accountFilter = null }: {
   const reminderAccent = colors.colorFor("reminder");
   const currentUser = useCurrentUser();
   const { status: statusOptions } = useActionItemFieldOptions();
+  const { label: statusLabel } = useStatusLabels();
   const [items, setItems] = useState<AirtableActionItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [modalItem, setModalItem] = useState<AirtableActionItem | null>(null);
@@ -1627,8 +1654,8 @@ function ActionItemsSidebar({ expandItemId, colors, accountFilter = null }: {
     if (!reminderDate) return;
     setReminderSaving(true);
     try {
-      const due_at = `${reminderDate}T${reminderTime}:00`;
-      const { data } = await airtableApi.setActionItemReminder(item.id, { due_at, notify_in_app: true });
+      const due_at = fromLocalDatetimeValue(`${reminderDate}T${reminderTime}`);
+      const { data } = await airtableApi.setActionItemReminder(item.id, { due_at });
       setItems((prev) => prev.map((i) => i.airtable_id === item.airtable_id ? data : i));
       setReminderItemId(null);
       const reminderLabel = new Date(due_at).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
@@ -1709,6 +1736,8 @@ function ActionItemsSidebar({ expandItemId, colors, accountFilter = null }: {
     : accountScoped;
 
   // Text box and flag chips compose: a card must satisfy both.
+  const { prefs: statusPrefs } = useStatusLabels();
+  const { sortDirection: colSortDirection, toggleSort: toggleColSort, applySort: applyColSort } = useColumnSort();
   const groups = groupActionItems(textMatched, { trackingIds, stagedIds, pinnedIds, selectedFlags });
   const visibleCount = groups.reduce((n, g) => n + g.items.length, 0);
   const isNarrowed = !!filterTerm.trim() || selectedFlags.size > 0 || !!accountKey;
@@ -1774,10 +1803,13 @@ function ActionItemsSidebar({ expandItemId, colors, accountFilter = null }: {
             {/* Section header — the same micro-header vocabulary the card's "On calendar"
                 label uses, so it reads as part of the sidebar rather than a new surface. */}
             <p data-section={group.key} className="text-[9px] font-semibold uppercase tracking-wide text-[var(--twilio-gray-60)] flex items-center gap-1">
-              <span>{group.key === "done" ? `${group.label} · last ${DONE_WINDOW_DAYS} days` : group.label}</span>
+              <span>{group.key === "done" ? `${sidebarGroupLabel(group.key, group.label, statusPrefs)} · last ${DONE_WINDOW_DAYS} days` : sidebarGroupLabel(group.key, group.label, statusPrefs)}</span>
               <span className="opacity-60">{group.items.length}</span>
+              {SIDEBAR_SECTION_STATUS[group.key] && (
+                <ColumnSortButton status={SIDEBAR_SECTION_STATUS[group.key]!} direction={colSortDirection(SIDEBAR_SECTION_STATUS[group.key]!)} onToggle={toggleColSort} className="ml-auto" />
+              )}
             </p>
-            {group.items.map((item) => {
+            {(SIDEBAR_SECTION_STATUS[group.key] ? applyColSort(group.items, SIDEBAR_SECTION_STATUS[group.key]!) : group.items).map((item) => {
             const isStaged = stagedIds.has(item.airtable_id);
             return (
               <div key={item.airtable_id} className="relative">
@@ -1802,7 +1834,7 @@ function ActionItemsSidebar({ expandItemId, colors, accountFilter = null }: {
                       setReminderItemId(null);
                     } else {
                       setReminderItemId(item.airtable_id);
-                      setReminderDate(item.reminder_due_at ? item.reminder_due_at.slice(0, 10) : new Date().toISOString().slice(0, 10));
+                      setReminderDate(item.reminder_due_at ? instantDayKey(item.reminder_due_at) : localDateKey(new Date()));
                       setReminderTime(item.reminder_due_at ? item.reminder_due_at.slice(11, 16) : "09:00");
                     }
                   }}
@@ -1817,11 +1849,11 @@ function ActionItemsSidebar({ expandItemId, colors, accountFilter = null }: {
                     <div className="flex gap-1.5">
                       <input type="date" value={reminderDate} onChange={(e) => setReminderDate(e.target.value)}
                         className="flex-1 text-[11px] rounded px-1.5 py-1 focus:outline-none"
-                        style={{ background: "#fff", border: `1px solid ${tint(reminderAccent, 0.55)}` }}
+                        style={{ background: "var(--surface-card)", border: `1px solid ${tint(reminderAccent, 0.55)}` }}
                       />
                       <input type="time" value={reminderTime} onChange={(e) => setReminderTime(e.target.value)}
                         className="w-20 text-[11px] rounded px-1.5 py-1 focus:outline-none"
-                        style={{ background: "#fff", border: `1px solid ${tint(reminderAccent, 0.55)}` }}
+                        style={{ background: "var(--surface-card)", border: `1px solid ${tint(reminderAccent, 0.55)}` }}
                       />
                     </div>
                     <div className="flex gap-1.5">
@@ -1877,6 +1909,7 @@ function ActionItemsSidebar({ expandItemId, colors, accountFilter = null }: {
               <CalPillSelect
                 value={form.status}
                 options={statusOptions as AirtableActionItem["status"][]}
+                format={statusLabel}
                 colorMap={STATUS_COLORS_CAL}
                 placeholder="Status"
                 onChange={(v) => setForm((f) => ({ ...f, status: v }))}
@@ -1900,6 +1933,7 @@ function ActionItemsSidebar({ expandItemId, colors, accountFilter = null }: {
                 <CalPillSelect
                   value={form.status}
                   options={statusOptions as AirtableActionItem["status"][]}
+                  format={statusLabel}
                   colorMap={STATUS_COLORS_CAL}
                   placeholder="Status"
                   onChange={(v) => setForm((f) => ({ ...f, status: v }))}
@@ -2003,25 +2037,37 @@ function ActionItemsSidebar({ expandItemId, colors, accountFilter = null }: {
 
 // ── Reminder card ─────────────────────────────────────────────────────────────
 
-function ReminderCard_Cal({ reminder, onDragStart, onDelete, onUpdate, accent }: {
+function ReminderCard_Cal({ reminder, shownAt, now, onSnooze, onDragStart, onDelete, onUpdate, onRemoveOccurrence, accent }: {
   reminder: Reminder;
+  /** The time this card sits under: the next unfinished one, else the most recent. */
+  shownAt: Date;
+  /** Current time, re-read every 30s by the list, so snooze options stay accurate. */
+  now: Date;
+  /** Reschedule. Resolves to an error message to show, or null when it worked. */
+  onSnooze: (request: SnoozeRequest) => Promise<string | null>;
   onDragStart: (e: React.DragEvent) => void;
   onDelete: () => void;
   onUpdate: (patch: Partial<Reminder>) => void;
+  /** Take one of the reminder's calendar blocks off the calendar (the reminder stays). */
+  onRemoveOccurrence: (occurrenceId: number) => void;
   /** The user's reminder color — the same one the grid paints scheduled reminders with. */
   accent: string;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [editTitle, setEditTitle] = useState(reminder.title);
   const [editBody, setEditBody] = useState(reminder.body);
-  const [editDueAt, setEditDueAt] = useState(reminder.due_at.slice(0, 16)); // "YYYY-MM-DDTHH:MM"
+  const [editDueAt, setEditDueAt] = useState(toLocalDatetimeValue(reminder.due_at)); // local wall clock
+  // Which channels this reminder notifies on. Settings' defaults only apply when a reminder is
+  // created, so an older one needs a way to be switched to Laptop or Phone.
+  const [editChannels, setEditChannels] = useState(channelsOf(reminder));
   const cardRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!expanded) {
       setEditTitle(reminder.title);
       setEditBody(reminder.body);
-      setEditDueAt(reminder.due_at.slice(0, 16));
+      setEditDueAt(toLocalDatetimeValue(reminder.due_at));
+      setEditChannels(channelsOf(reminder));
     }
   }, [reminder, expanded]);
 
@@ -2031,8 +2077,12 @@ function ReminderCard_Cal({ reminder, onDragStart, onDelete, onUpdate, accent }:
     const patch: Partial<Reminder> = {};
     if (editTitle !== reminder.title) patch.title = editTitle;
     if (editBody !== reminder.body) patch.body = editBody;
-    const newDueAt = editDueAt.length === 16 ? `${editDueAt}:00` : editDueAt;
-    if (newDueAt !== reminder.due_at) patch.due_at = newDueAt;
+    // The input holds local wall-clock time; the server stores the instant.
+    const newDueAt = fromLocalDatetimeValue(editDueAt);
+    if (newDueAt && !sameInstant(newDueAt, reminder.due_at)) patch.due_at = newDueAt;
+    for (const ch of REMINDER_CHANNELS) {
+      if (editChannels[ch.key] !== reminder[ch.key]) patch[ch.key] = editChannels[ch.key];
+    }
     if (Object.keys(patch).length > 0) onUpdate(patch);
   }
 
@@ -2044,10 +2094,11 @@ function ReminderCard_Cal({ reminder, onDragStart, onDelete, onUpdate, accent }:
     document.addEventListener("pointerdown", onPointerDown);
     return () => document.removeEventListener("pointerdown", onPointerDown);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [expanded, editTitle, editBody, editDueAt]);
+  }, [expanded, editTitle, editBody, editDueAt, editChannels]);
 
   const statusLabel = reminder.status.charAt(0).toUpperCase() + reminder.status.slice(1);
-  const dueLabel = new Date(reminder.due_at).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+  const dueLabel = shownAt.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+  const [snoozeOpen, setSnoozeOpen] = useState(false);
 
   if (expanded) {
     return (
@@ -2083,6 +2134,7 @@ function ReminderCard_Cal({ reminder, onDragStart, onDelete, onUpdate, accent }:
             style={{ borderColor: tint(accent, 0.55) }}
           />
         </div>
+        <ReminderChannelsField value={editChannels} onChange={setEditChannels} showTeammateNote={false} />
         <div className="flex items-center justify-between pt-0.5">
           <button
             onClick={(e) => { e.stopPropagation(); onDelete(); }}
@@ -2117,8 +2169,16 @@ function ReminderCard_Cal({ reminder, onDragStart, onDelete, onUpdate, accent }:
         >{statusLabel}</span>
         <span className="text-[10px] text-[var(--twilio-gray-60)]">{dueLabel}</span>
         <button
+          type="button"
+          aria-label={`Snooze ${reminder.title}`}
+          aria-expanded={snoozeOpen}
+          onClick={(e) => { e.stopPropagation(); setSnoozeOpen((v) => !v); }}
+          className="ml-auto text-[10px] font-semibold px-1.5 py-0.5 rounded hover:bg-white/70 transition-colors"
+          style={{ color: darken(accent, 0.35) }}
+        >Snooze</button>
+        <button
           onClick={(e) => { e.stopPropagation(); onDelete(); }}
-          className="ml-auto rounded p-0.5 opacity-0 group-hover:opacity-100 hover:bg-red-100 transition-all text-gray-400 hover:text-red-500"
+          className="rounded p-0.5 opacity-0 group-hover:opacity-100 hover:bg-red-100 transition-all text-gray-400 hover:text-red-500"
         >
           <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="M3 3l10 10M13 3L3 13"/></svg>
         </button>
@@ -2131,43 +2191,87 @@ function ReminderCard_Cal({ reminder, onDragStart, onDelete, onUpdate, accent }:
           {reminder.body}
         </p>
       )}
-      {/* Scheduled occurrences */}
-      {(() => {
-        const occurrences = readScheduledReminders().filter((r) => r.reminderId === reminder.id && new Date(r.start) >= new Date(new Date().setHours(0,0,0,0)));
-        if (occurrences.length === 0) return null;
-        return (
-          <div className="mt-1 pt-1.5 border-t" style={{ borderColor: tint(accent, 0.6) }}>
-            <p className="text-[10px] font-semibold uppercase tracking-wide mb-0.5" style={{ color: darken(accent, 0.25) }}>On calendar</p>
-            {occurrences.map((o) => (
-              <span key={o.start} className="text-[10px] block" style={{ color: darken(accent, 0.4) }}>
-                {new Date(o.start).toLocaleString(undefined, { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}
-              </span>
-            ))}
-          </div>
-        );
-      })()}
+      {snoozeOpen && (
+        <ReminderSnoozeMenu
+          now={now}
+          hasAccount={reminder.resource_type === "account" || reminder.resource_type === "calendar_event"}
+          accent={accent}
+          onClose={() => setSnoozeOpen(false)}
+          onSnooze={async (request) => {
+            // `from` is the time this card sits under, so that calendar block is the one that moves.
+            const message = await onSnooze({ ...request, from: shownAt.toISOString() });
+            if (!message) setSnoozeOpen(false);
+            return message;
+          }}
+        />
+      )}
+      {/* Every time this reminder is on the calendar (each a 15-minute block, each notifies) */}
+      <div className="mt-0.5" data-testid="reminder-occurrences">
+        <p className="text-[10px] font-semibold uppercase tracking-wide" style={{ color: darken(accent, 0.25) }}>
+          {reminder.occurrences.length === 0 ? "Not on the calendar — drag it onto a time" : "On the calendar"}
+        </p>
+        {reminder.occurrences.map((o) => (
+          <span key={o.id} className="flex items-center gap-1 text-[10px]" style={{ color: darken(accent, 0.4) }}>
+            {new Date(o.start).toLocaleString(undefined, { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}
+            <button
+              type="button"
+              aria-label={`Remove from the calendar at ${new Date(o.start).toLocaleString()}`}
+              onClick={(e) => { e.stopPropagation(); onRemoveOccurrence(o.id); }}
+              className="ml-auto leading-none text-gray-400 hover:text-red-500"
+            >✕</button>
+          </span>
+        ))}
+      </div>
+      {/* Account link and who else is notified */}
+      {(reminder.resource_type === "account" && reminder.resource_label) && (
+        <span className="text-[10px] text-[var(--twilio-gray-60)]">{reminder.resource_label}</span>
+      )}
+      {reminder.recipient_details.length > 0 && (
+        <span className="text-[10px] text-[var(--twilio-gray-60)]" data-testid="reminder-also-notifying">
+          Also notifying {reminder.recipient_details.map((r) => r.name).join(", ")}
+        </span>
+      )}
     </div>
   );
 }
+
+/** Past reminders shown before "Show all". */
+const HISTORICAL_PREVIEW = 10;
 
 // ── Reminders tab content ─────────────────────────────────────────────────────
 
 function RemindersTabContent({ colors }: { onDropToast: (msg: string, type: "success" | "warn") => void; colors: ColorResolver }) {
   const accent = colors.colorFor("reminder");
+  // The channels the user picked in Settings → Reminder notification defaults.
+  const { defaults: notifDefaults } = useNotificationDefaults();
   const [reminders, setReminders] = useState<Reminder[]>([]);
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
   const [newTitle, setNewTitle] = useState("");
   const [newBody, setNewBody] = useState("");
-  const [newDueAt, setNewDueAt] = useState(() => {
-    const d = new Date(); d.setMinutes(0, 0, 0); d.setHours(d.getHours() + 1);
-    return d.toISOString().slice(0, 16);
-  });
+  // The input holds the user's local wall clock; see lib/datetimeLocal.ts.
+  const [newDueAt, setNewDueAt] = useState(() => nextHourLocalValue());
   const [saving, setSaving] = useState(false);
   const [filterTerm, setFilterTerm] = useState("");
+  // Re-read the clock so a reminder moves to Historical on its own once its time is over.
+  const [now, setNow] = useState(() => new Date());
+  useEffect(() => {
+    const t = setInterval(() => setNow(new Date()), REMINDER_CLOCK_TICK_MS);
+    return () => clearInterval(t);
+  }, []);
+  const [showAllHistorical, setShowAllHistorical] = useState(false);
+  // The same fields as the Reminders page (see lib/reminderDraft): what it links to, who else to
+  // notify, and how the creator is told. Default: nothing linked, only me, my Settings channels.
+  const [newLinks, setNewLinks] = useState<ReminderLink[]>([]);
+  const [newChannels, setNewChannels] = useState<ReminderChannels>(() => channelsFromDefaults(notifDefaults));
+  useEffect(() => { if (!creating) setNewChannels(channelsFromDefaults(notifDefaults)); }, [notifDefaults, creating]);
+  const [newRecipients, setNewRecipients] = useState<number[]>([]);
+  const [recipientNames, setRecipientNames] = useState<string[]>([]);
+  const [confirmingNotify, setConfirmingNotify] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
 
   const load = () =>
-    schedulerApi.listReminders({ status: "pending", page_size: "200" })
+    schedulerApi.listReminders({ page_size: "500" }) // every reminder; the sections decide where each sits
       .then(({ data }) => setReminders(data.results ?? []))
       .catch(() => {})
       .finally(() => setLoading(false));
@@ -2190,46 +2294,78 @@ function RemindersTabContent({ colors }: { onDropToast: (msg: string, type: "suc
     w[`${CALENDAR_DRAG_REMINDER_KEY}_title`] = reminder.title;
   }
 
+  const announce = () => window.dispatchEvent(new StorageEvent("storage", { key: "remindersUpdated", newValue: "1" }));
+
   async function handleDelete(reminder: Reminder) {
     setReminders((prev) => prev.filter((r) => r.id !== reminder.id));
-    // Remove all calendar occurrences for this reminder from localStorage
-    const pruned = readScheduledReminders().filter((s) => s.reminderId !== reminder.id);
-    localStorage.setItem(SCHEDULED_REMINDERS_KEY, JSON.stringify(pruned));
-    window.dispatchEvent(new StorageEvent("storage", { key: SCHEDULED_REMINDERS_KEY, newValue: JSON.stringify(pruned) }));
     try {
-      await schedulerApi.deleteReminder(reminder.id);
+      await schedulerApi.deleteReminder(reminder.id); // the server removes its calendar marker too
+      announce();
     } catch {
       setReminders((prev) => [...prev, reminder]);
     }
+  }
+
+  /** Reschedule a reminder. Returns an error message to show in the menu, or null on success. */
+  async function handleSnooze(reminder: Reminder, request: SnoozeRequest): Promise<string | null> {
+    try {
+      const { data } = await schedulerApi.snoozeReminder(reminder.id, request);
+      setReminders((prev) => prev.map((r) => r.id === reminder.id ? data : r));
+      announce(); // the calendar block moved with it
+      return null;
+    } catch (err) {
+      return reminderSaveError(err);
+    }
+  }
+
+  async function handleRemoveOccurrence(reminder: Reminder, occurrenceId: number) {
+    try {
+      const { data } = await schedulerApi.removeReminderOccurrence(reminder.id, occurrenceId);
+      setReminders((prev) => prev.map((r) => r.id === reminder.id ? data : r));
+      announce();
+    } catch { /* the list is unchanged; the block is still on the calendar */ }
   }
 
   async function handleUpdate(reminder: Reminder, patch: Partial<Reminder>) {
     setReminders((prev) => prev.map((r) => r.id === reminder.id ? { ...r, ...patch } : r));
     try {
       await schedulerApi.updateReminder(reminder.id, patch);
+      announce(); // a new due time or title moves the marker on the grid
     } catch {
       setReminders((prev) => prev.map((r) => r.id === reminder.id ? reminder : r));
     }
   }
 
-  async function handleCreate() {
+  function resetForm() {
+    setNewTitle(""); setNewBody("");
+    setNewDueAt(nextHourLocalValue());
+    setNewLinks([]); setNewRecipients([]); setRecipientNames([]);
+    setNewChannels(channelsFromDefaults(notifDefaults));
+    setConfirmingNotify(false); setCreateError(null);
+  }
+
+  /** Save. Notifying other people needs a second, explicit yes before anything is sent. */
+  async function handleCreate(confirmed = false) {
     if (!newTitle.trim()) return;
+    if (newRecipients.length > 0 && !confirmed) {
+      setConfirmingNotify(true);
+      return;
+    }
     setSaving(true);
+    setCreateError(null);
     try {
-      const due_at = newDueAt.length === 16 ? `${newDueAt}:00` : newDueAt;
-      const { data } = await schedulerApi.createReminder({
-        title: newTitle.trim(),
-        body: newBody.trim(),
-        due_at,
-        resource_type: "general",
-        notify_in_app: true,
-      });
+      // Same request the Reminders page sends. Approval for new recipients was just given.
+      const { data } = await schedulerApi.createReminder(buildReminderPayload({
+        title: newTitle, body: newBody, dueLocal: newDueAt, links: newLinks, channels: newChannels, recipients: newRecipients,
+      }));
+      // The server puts the marker on the calendar at the due time; announce so the grid re-reads.
       setReminders((prev) => [data, ...prev]);
-      setNewTitle(""); setNewBody("");
-      const d = new Date(); d.setMinutes(0, 0, 0); d.setHours(d.getHours() + 1);
-      setNewDueAt(d.toISOString().slice(0, 16));
+      resetForm();
       setCreating(false);
-      window.dispatchEvent(new StorageEvent("storage", { key: "remindersUpdated", newValue: "1" }));
+      announce();
+    } catch (err) {
+      setConfirmingNotify(false);
+      setCreateError(reminderSaveError(err));
     } finally {
       setSaving(false);
     }
@@ -2238,6 +2374,31 @@ function RemindersTabContent({ colors }: { onDropToast: (msg: string, type: "suc
   const filtered = filterTerm.trim()
     ? reminders.filter((r) => r.title.toLowerCase().includes(filterTerm.toLowerCase()) || r.body?.toLowerCase().includes(filterTerm.toLowerCase()))
     : reminders;
+  const sections = groupReminders(filtered, now);
+  const total = sections.today.length + sections.upcoming.length + sections.historical.length;
+  const historical = showAllHistorical ? sections.historical : sections.historical.slice(0, HISTORICAL_PREVIEW);
+
+  const renderCard = (c: { reminder: Reminder; at: Date }) => (
+    <ReminderCard_Cal
+      key={c.reminder.id}
+      reminder={c.reminder}
+      shownAt={c.at}
+      now={now}
+      accent={accent}
+      onDragStart={(e) => handleReminderDragStart(e, c.reminder)}
+      onDelete={() => void handleDelete(c.reminder)}
+      onUpdate={(patch) => void handleUpdate(c.reminder, patch)}
+      onSnooze={(request) => handleSnooze(c.reminder, request)}
+      onRemoveOccurrence={(id) => void handleRemoveOccurrence(c.reminder, id)}
+    />
+  );
+  const sectionHeader = (key: ReminderSection, label: string, count: number) => (
+    <h3
+      data-section={key}
+      className="text-[10px] font-semibold uppercase tracking-wide pt-1"
+      style={{ color: darken(accent, 0.3) }}
+    >{label} <span className="font-normal opacity-70">({count})</span></h3>
+  );
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
@@ -2257,23 +2418,35 @@ function RemindersTabContent({ colors }: { onDropToast: (msg: string, type: "suc
         </div>
       </div>
 
-      {/* List */}
+      {/* List: Today, Upcoming, Historical */}
       <div className="flex-1 overflow-y-auto px-3 py-2 space-y-2">
         {loading ? (
           <p className="text-sm text-[var(--twilio-gray-60)] py-2">Loading…</p>
-        ) : filtered.length === 0 && !creating ? (
-          <p className="text-sm text-[var(--twilio-gray-60)] py-2">{filterTerm ? "No matches." : "No pending reminders."}</p>
+        ) : total === 0 && !creating ? (
+          <p className="text-sm text-[var(--twilio-gray-60)] py-2">{filterTerm ? "No matches." : "No reminders yet."}</p>
         ) : (
-          filtered.map((r) => (
-            <ReminderCard_Cal
-              key={r.id}
-              reminder={r}
-              accent={accent}
-              onDragStart={(e) => handleReminderDragStart(e, r)}
-              onDelete={() => void handleDelete(r)}
-              onUpdate={(patch) => void handleUpdate(r, patch)}
-            />
-          ))
+          <>
+            {sectionHeader("today", "Today", sections.today.length)}
+            {sections.today.length === 0
+              ? <p className="text-[11px] text-[var(--twilio-gray-60)]">Nothing else today.</p>
+              : sections.today.map(renderCard)}
+            {sectionHeader("upcoming", "Upcoming", sections.upcoming.length)}
+            {sections.upcoming.length === 0
+              ? <p className="text-[11px] text-[var(--twilio-gray-60)]">Nothing coming up.</p>
+              : sections.upcoming.map(renderCard)}
+            {sectionHeader("historical", "Historical", sections.historical.length)}
+            {sections.historical.length === 0
+              ? <p className="text-[11px] text-[var(--twilio-gray-60)]">No past reminders.</p>
+              : historical.map(renderCard)}
+            {sections.historical.length > HISTORICAL_PREVIEW && (
+              <button
+                type="button"
+                onClick={() => setShowAllHistorical((v) => !v)}
+                className="w-full text-[11px] font-semibold py-1 rounded hover:bg-gray-50"
+                style={{ color: darken(accent, 0.3) }}
+              >{showAllHistorical ? "Show fewer" : `Show all ${sections.historical.length}`}</button>
+            )}
+          </>
         )}
       </div>
 
@@ -2309,12 +2482,44 @@ function RemindersTabContent({ colors }: { onDropToast: (msg: string, type: "suc
                   style={{ borderColor: tint(accent, 0.55) }}
                 />
               </div>
+              {/* The same fields as the Reminders page: link to any records, pick who else to notify,
+                  and choose how *you* are told (teammates are reached their own way). */}
+              <div className="flex flex-col gap-1">
+                <span className="text-[10px] text-[var(--twilio-gray-60)]">Link to:</span>
+                <ReminderLinksField value={newLinks} onChange={setNewLinks} />
+              </div>
+              <ReminderRecipientsPicker
+                links={newLinks}
+                selected={newRecipients}
+                accent={tint(accent, 0.55)}
+                onChange={(ids, names) => { setNewRecipients(ids); setRecipientNames(names); setConfirmingNotify(false); }}
+              />
+              <ReminderChannelsField value={newChannels} onChange={setNewChannels} />
+              {createError && <p role="alert" className="text-[11px] text-red-600">{createError}</p>}
+              {confirmingNotify && (
+                <div role="alertdialog" aria-label="Confirm notifying other users" className="rounded-md border border-amber-300 bg-amber-50 px-2.5 py-2 flex flex-col gap-1.5">
+                  <p className="text-[11px] font-semibold text-[var(--twilio-navy)]">Are you sure you want to notify these users?</p>
+                  <p className="text-[11px] text-[var(--twilio-navy)]">
+                    {recipientNames.join(", ")} will be notified when this reminder is due, in addition to you.
+                  </p>
+                  <div className="flex items-center gap-2 justify-end">
+                    <button type="button" onClick={() => setConfirmingNotify(false)} className="text-[11px] text-[var(--twilio-gray-60)] hover:text-[var(--twilio-navy)]">Go back</button>
+                    <button
+                      type="button"
+                      onClick={() => void handleCreate(true)}
+                      disabled={saving}
+                      className="px-2.5 py-1 text-[11px] font-semibold rounded-md disabled:opacity-40"
+                      style={{ background: accent, color: readableTextColor(accent) }}
+                    >Yes, notify them</button>
+                  </div>
+                </div>
+              )}
             </div>
             <div className="px-4 py-3 flex items-center justify-between rounded-b-xl">
-              <button onClick={() => setCreating(false)} className="text-[11px] text-[var(--twilio-gray-60)] hover:text-[var(--twilio-navy)] transition-colors">Cancel</button>
+              <button onClick={() => { resetForm(); setCreating(false); }} className="text-[11px] text-[var(--twilio-gray-60)] hover:text-[var(--twilio-navy)] transition-colors">Cancel</button>
               <button
                 onClick={() => void handleCreate()}
-                disabled={saving || !newTitle.trim()}
+                disabled={saving || !newTitle.trim() || confirmingNotify}
                 className="px-3 py-1 text-[11px] font-semibold uppercase tracking-wide rounded-md disabled:opacity-40 transition-colors"
                 style={{ background: accent, color: readableTextColor(accent) }}
               >{saving ? "Saving…" : "Save"}</button>
@@ -2422,8 +2627,16 @@ interface LogTimeDayColumnProps {
   onLogDay: (date: string, projectSfId: string, minutes: number, description: string) => Promise<void>;
   loggedDays: Set<string>;
   manuallyLogged: boolean;
-  onMarkManuallyLogged: (date: string) => void;
+  /** Mark/unmark the whole day (the grid fades the account's events on a marked day). */
+  onSetDayMarked: (date: string, marked: boolean) => void;
+  /** Flip one group's logged state without writing anywhere (used while Salesforce isn't connected). */
+  onSetGroupLogged: (groupKey: string, logged: boolean) => void;
+  /** Per user. Until it's true there is no Salesforce to write to, so Log is a plain on/off toggle. */
+  salesforceConnected: boolean;
 }
+
+/** A logged group's button: grey and inert, so a second click can't write the same hours twice. */
+const LOGGED_BUTTON_CLASS = "bg-gray-200 border-gray-300 text-gray-500 cursor-default";
 
 function CopyButton({ buildText }: { buildText: () => string }) {
   const [copied, setCopied] = useState(false);
@@ -2448,11 +2661,45 @@ function CopyButton({ buildText }: { buildText: () => string }) {
 function LogTimeDayColumn({
   date, dayCalEvents, dayItems, itemSeconds, onRemoveRow, projects, assignments,
   timeOverrides, itemAssignments, onOverrideChange, onAddProject, onRemoveProject, onPinItem, onAssignItem, onLogDay, loggedDays,
-  manuallyLogged, onMarkManuallyLogged,
+  manuallyLogged, onSetDayMarked, onSetGroupLogged, salesforceConnected,
 }: LogTimeDayColumnProps) {
   const [isDragOver, setIsDragOver] = useState(false);
   const [isDragOverProject, setIsDragOverProject] = useState<number | null>(null);
   const [loggingKey, setLoggingKey] = useState<string | null>(null);
+  const { reportError } = useAppError();
+
+  /**
+   * The one Log button (it used to be Mark + Log). "Logged" is per group (`date::project`):
+   * Mark was a per-DAY toggle, so marking one project greyed every project that day.
+   *
+   * Salesforce connected: write the hours, then mark the group. A group can be logged once,
+   * so the button is inert afterwards and the same hours can't be written twice. A failed
+   * write marks nothing and stays "Log" for a retry.
+   * Not connected (no credentials yet): there is nothing to write to, so the button just
+   * toggles the group's logged mark on and off.
+   * The day itself is marked, for the calendar grid, only while every group on it is logged.
+   */
+  async function logGroup(groupKey: string, projectSfId: string, minutes: number, description: string) {
+    const groupKeys = hasProjects ? assignments.map((x) => `${date}::${x.project_sf_id}`) : [blankKey];
+    const dayDone = (thisLogged: boolean) => groupKeys.every((k) => (k === groupKey ? thisLogged : loggedDays.has(k)));
+    if (!salesforceConnected) {
+      const next = !loggedDays.has(groupKey);
+      onSetGroupLogged(groupKey, next);
+      onSetDayMarked(date, next && dayDone(true));
+      return;
+    }
+    setLoggingKey(groupKey);
+    try {
+      await onLogDay(date, projectSfId, minutes, description);
+      if (dayDone(true)) onSetDayMarked(date, true);
+    } catch {
+      // Not marked: the button stays "Log" so it can be retried. Say so, since the
+      // write to Salesforce is what failed.
+      reportError("Could not log this time to Salesforce. Nothing was marked as logged — please try again.");
+    } finally {
+      setLoggingKey(null);
+    }
+  }
 
   function secsForEvent(e: CalendarEvent) {
     const key = `${date}::e::${e.id}`;
@@ -2653,7 +2900,7 @@ function LogTimeDayColumn({
       <div className="flex flex-col gap-2 px-3 py-2 flex-1">
         {/* No projects configured: auto-group all items in a General block with Copy/Mark/Log */}
         {!hasProjects && noProjectsConfigured && (
-          <div className={["rounded-lg border transition-colors", manuallyLogged ? "border-emerald-200 bg-emerald-50/40" : "border-emerald-200 bg-emerald-50/60"].join(" ")}>
+          <div className={["rounded-lg border transition-colors", blankLogged ? "border-emerald-200 bg-emerald-50/40" : "border-emerald-200 bg-emerald-50/60"].join(" ")}>
             {!hasActivity && (
               <p className="mx-2 mt-2 mb-1 text-[11px] text-gray-400 italic">{isDragOver ? "Drop here to add" : "No calendar activity for this day"}</p>
             )}
@@ -2666,17 +2913,11 @@ function LogTimeDayColumn({
               </span>
               <CopyButton buildText={buildBlankDescription} />
               <button
-                onClick={() => onMarkManuallyLogged(date)}
-                className={["shrink-0 rounded-lg px-2 py-1 text-[10px] font-semibold border transition-colors", manuallyLogged ? "bg-emerald-600 border-emerald-600 text-white" : "bg-white border-gray-200 text-gray-400 hover:border-emerald-400 hover:text-emerald-700"].join(" ")}
+                onClick={() => void logGroup(blankKey, BLANK_SF_ID, blankMins, buildBlankDescription())}
+                disabled={loggingKey === blankKey || (salesforceConnected && (blankMins === 0 || blankLogged))}
+                className={["shrink-0 rounded-lg px-2 py-1 text-[10px] font-semibold transition-colors border", blankLogged ? LOGGED_BUTTON_CLASS : "bg-white border-emerald-400 text-emerald-700 hover:bg-emerald-100 disabled:opacity-40 disabled:cursor-not-allowed"].join(" ")}
               >
-                {manuallyLogged ? "✓" : "Mark"}
-              </button>
-              <button
-                onClick={async () => { setLoggingKey(blankKey); try { await onLogDay(date, BLANK_SF_ID, blankMins, buildBlankDescription()); } finally { setLoggingKey(null); } }}
-                disabled={loggingKey === blankKey || blankMins === 0}
-                className={["shrink-0 rounded-lg px-2 py-1 text-[10px] font-semibold transition-colors border", blankLogged ? "bg-emerald-600 border-emerald-600 text-white" : "bg-white border-emerald-400 text-emerald-700 hover:bg-emerald-100 disabled:opacity-40 disabled:cursor-not-allowed"].join(" ")}
-              >
-                {loggingKey === blankKey ? "…" : blankLogged ? "✓ Logged" : "Log"}
+                {loggingKey === blankKey ? "…" : blankLogged ? "Logged" : "Log"}
               </button>
             </div>
           </div>
@@ -2736,7 +2977,7 @@ function LogTimeDayColumn({
               key={a.id}
               className={[
                 "rounded-lg border transition-colors",
-                isDropTarget ? "border-indigo-400 bg-indigo-50/60" : (manuallyLogged ? "border-emerald-200 bg-emerald-50/40" : "border-emerald-200 bg-emerald-50/60"),
+                isDropTarget ? "border-indigo-400 bg-indigo-50/60" : (logged ? "border-emerald-200 bg-emerald-50/40" : "border-emerald-200 bg-emerald-50/60"),
               ].join(" ")}
               onDragOver={(e) => { e.preventDefault(); if (e.dataTransfer.types.includes("logtimeitemkey")) setIsDragOverProject(a.id); }}
               onDragLeave={() => setIsDragOverProject(null)}
@@ -2770,9 +3011,9 @@ function LogTimeDayColumn({
               {projEvents.map((e) => {
                 const ikey = eventItemKey(e);
                 return (
-                  <div key={e.id} className={["flex items-center gap-2 mx-2 mb-1 rounded px-2 py-1 group", manuallyLogged ? "bg-white/60 opacity-60" : "bg-white/80"].join(" ")}>
+                  <div key={e.id} className={["flex items-center gap-2 mx-2 mb-1 rounded px-2 py-1 group", logged ? "bg-white/60 opacity-60" : "bg-white/80"].join(" ")}>
                     <div className="h-1.5 w-1.5 rounded-full bg-blue-400 shrink-0" />
-                    <p className={["text-[11px] text-[var(--twilio-navy)] truncate flex-1", manuallyLogged ? "line-through text-gray-400" : ""].join(" ")}>{e.title}</p>
+                    <p className={["text-[11px] text-[var(--twilio-navy)] truncate flex-1", logged ? "line-through text-gray-400" : ""].join(" ")}>{e.title}</p>
                     <TimeInput valueKey={ikey} defaultSecs={eventSeconds(e)} />
                     {multiProject && <button onClick={() => onAssignItem(ikey, null)} className="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-indigo-400 text-xs leading-none shrink-0 transition-opacity" title="Unassign from project">↩</button>}
                     <button onClick={() => onRemoveRow(ikey)} className="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-red-400 text-xs leading-none shrink-0 transition-opacity" title="Remove from log">×</button>
@@ -2784,10 +3025,10 @@ function LogTimeDayColumn({
               {projItems.map((item) => {
                 const ikey = actionItemKey(item);
                 return (
-                  <div key={item.airtable_id} className={["flex items-start gap-2 mx-2 mb-1 rounded px-2 py-1 group", manuallyLogged ? "bg-white/60 opacity-60" : "bg-white/80"].join(" ")}>
+                  <div key={item.airtable_id} className={["flex items-start gap-2 mx-2 mb-1 rounded px-2 py-1 group", logged ? "bg-white/60 opacity-60" : "bg-white/80"].join(" ")}>
                     <div className="h-1.5 w-1.5 rounded-full bg-violet-400 shrink-0 mt-1" />
                     <div className="flex-1 min-w-0">
-                      <p className={["text-[11px] font-medium truncate", manuallyLogged ? "line-through text-gray-400" : "text-[var(--twilio-navy)]"].join(" ")}>{item.task}</p>
+                      <p className={["text-[11px] font-medium truncate", logged ? "line-through text-gray-400" : "text-[var(--twilio-navy)]"].join(" ")}>{item.task}</p>
                     </div>
                     <TimeInput valueKey={ikey} defaultSecs={timeOverrides[ikey] !== undefined ? timeOverrides[ikey] : secsForItem(item)} />
                     {multiProject && <button onClick={() => onAssignItem(ikey, null)} className="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-indigo-400 text-xs leading-none shrink-0 transition-opacity" title="Unassign from project">↩</button>}
@@ -2813,24 +3054,15 @@ function LogTimeDayColumn({
                 </span>
                 <CopyButton buildText={buildProjectDescription} />
                 <button
-                  onClick={() => onMarkManuallyLogged(date)}
-                  className={[
-                    "shrink-0 rounded-lg px-2 py-1 text-[10px] font-semibold border transition-colors",
-                    manuallyLogged ? "bg-emerald-600 border-emerald-600 text-white" : "bg-white border-gray-200 text-gray-400 hover:border-emerald-400 hover:text-emerald-700",
-                  ].join(" ")}
-                >
-                  {manuallyLogged ? "✓" : "Mark"}
-                </button>
-                <button
-                  onClick={async () => { setLoggingKey(key); try { await onLogDay(date, a.project_sf_id, projMins, buildProjectDescription()); } finally { setLoggingKey(null); } }}
-                  disabled={loggingKey === key || projMins === 0}
+                  onClick={() => void logGroup(key, a.project_sf_id, projMins, buildProjectDescription())}
+                  disabled={loggingKey === key || (salesforceConnected && (projMins === 0 || logged))}
                   className={[
                     "shrink-0 rounded-lg px-2 py-1 text-[10px] font-semibold transition-colors border",
-                    logged ? "bg-emerald-600 border-emerald-600 text-white"
+                    logged ? LOGGED_BUTTON_CLASS
                     : "bg-white border-emerald-400 text-emerald-700 hover:bg-emerald-100 disabled:opacity-40 disabled:cursor-not-allowed",
                   ].join(" ")}
                 >
-                  {loggingKey === key ? "…" : logged ? "✓ Logged" : "Log"}
+                  {loggingKey === key ? "…" : logged ? "Logged" : "Log"}
                 </button>
               </div>
             </div>
@@ -2879,6 +3111,13 @@ function LogTimePanel({
   }
 
   const [projects, setProjects] = useState<SalesforceProject[]>([]);
+  // Per-user: only a connected Salesforce (Settings → Integrations) can be written to.
+  const [salesforceConnected, setSalesforceConnected] = useState(false);
+  useEffect(() => {
+    integrationsApi.getStatus()
+      .then(({ data }) => setSalesforceConnected(data.connected.some((c) => c.provider === "salesforce" && c.is_active)))
+      .catch(() => {});
+  }, []);
   const [assignments, setAssignments] = useState<LogTimeDayAssignment[]>(() => lsGet<LogTimeDayAssignment[]>("pseudoAssignments", []));
   const [allActionItems, setAllActionItems] = useState<AirtableActionItem[]>([]);
   // Own fetch of calendar events for this week so we always have work_tracking records
@@ -3423,9 +3662,17 @@ function LogTimePanel({
             onLogDay={handleLogDay}
             loggedDays={loggedDays}
             manuallyLogged={manuallyLoggedDays.has(date)}
-            onMarkManuallyLogged={(d) => setManuallyLoggedDays((prev) => {
+            salesforceConnected={salesforceConnected}
+            onSetGroupLogged={(k, logged) => setLoggedDays((prev) => {
               const next = new Set(prev);
-              if (next.has(d)) next.delete(d); else next.add(d);
+              if (logged) next.add(k); else next.delete(k);
+              lsSet("loggedDays", [...next]);
+              return next;
+            })}
+            onSetDayMarked={(d, marked) => setManuallyLoggedDays((prev) => {
+              if (prev.has(d) === marked) return prev;
+              const next = new Set(prev);
+              if (marked) next.add(d); else next.delete(d);
               lsSet("manuallyLoggedDays", [...next]);
               window.dispatchEvent(new StorageEvent("storage", { key: LOGGED_DATES_EVENT }));
               return next;
@@ -3587,6 +3834,10 @@ export default function CalendarPage() {
   const [meetingDetailReloadTrigger, setMeetingDetailReloadTrigger] = useState(0);
   const [calendarExpanded, setCalendarExpanded] = useState(false);
   // Stable ref so eventDidMount closures never go stale
+  // Recurring meetings: the Accounts sidebar's two switches. Off until the user turns them on,
+  // and deliberately not persisted, so a link never reaches other weeks by surprise.
+  const [updateHistorical, setUpdateHistorical] = useState(false);
+  const [updateSubsequent, setUpdateSubsequent] = useState(false);
   const linkEventToAccountRef = useRef<(accountId: number, accountName: string, eventUid: string) => void>(() => {});
   const pageRef = useRef<HTMLDivElement>(null);
   const eventsRef = useRef<CalendarEvent[]>([]);
@@ -3618,7 +3869,9 @@ export default function CalendarPage() {
   // Scheduled action items dragged onto the calendar (persisted in localStorage)
   const [scheduledItems, setScheduledItems] = useState<ScheduledItem[]>(() => readScheduledItems());
   // Scheduled reminders dragged onto the calendar
-  const [scheduledReminders, setScheduledReminders] = useState<ScheduledReminder[]>(() => readScheduledReminders());
+  // Legacy browser-only reminder schedulings. Nothing renders from this any more — a reminder's
+  // marker is a server row at its due time — but the setter still serves the old handlers.
+  const [, setScheduledReminders] = useState<ScheduledReminder[]>(() => readScheduledReminders());
   // Running Live Tracking timers — server-owned, so they show on every device.
   const { timers: liveTimers, now: liveNow } = useLiveTimers();
 
@@ -3898,34 +4151,45 @@ export default function CalendarPage() {
     return created;
   }, [refetchVisibleRange]);
 
-  /** Persist a dropped reminder occurrence. Same contract as the action-item helper. */
+  /**
+   * A reminder dropped on the grid is added to the calendar at that slot — a 15-minute block.
+   * It can be dropped any number of times; each block notifies at its own start, and the
+   * reminder's due time is left alone. Dropping on a minute it is already at changes nothing.
+   */
   const persistScheduledReminder = useCallback(async (input: {
     reminderId: number;
-    title: string;
+    /** Local wall-clock slot, `YYYY-MM-DDTHH:MM[:SS]`. */
     start: string;
-    end?: string;
-  }): Promise<CalendarEvent | null> => {
-    if (hasReminderAt(eventsRef.current, input.reminderId, input.start)) {
-      setDropToast({ msg: "Already scheduled at that time", type: "warn" });
-      setTimeout(() => setDropToast(null), 3000);
-      return null;
-    }
-    let created: CalendarEvent;
+  }): Promise<boolean> => {
+    const start = fromLocalDatetimeValue(input.start.slice(0, 16));
+    let alreadyThere = false;
     try {
-      created = await scheduleReminder(input);
+      const { status } = await schedulerApi.addReminderOccurrence(input.reminderId, start);
+      alreadyThere = status === 200;
     } catch {
-      setDropToast({ msg: "Could not add the reminder — nothing was saved", type: "warn" });
+      setDropToast({ msg: "Could not add the reminder to the calendar — nothing was saved", type: "warn" });
       setTimeout(() => setDropToast(null), 4000);
-      return null;
+      return false;
     }
-    const label = new Date(input.start).toLocaleString(undefined, {
+    const label = new Date(start).toLocaleString(undefined, {
       weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
     });
-    setDropToast({ msg: `Reminder scheduled for ${label}`, type: "success" });
+    setDropToast(alreadyThere
+      ? { msg: `Already on the calendar at ${label}`, type: "warn" }
+      : { msg: `Reminder added to the calendar at ${label}`, type: "success" });
     setTimeout(() => setDropToast(null), 3000);
-    await refetchVisibleRange();
-    window.dispatchEvent(new StorageEvent("storage", { key: "calendarUpdated", newValue: "1" }));
-    return created;
+    window.dispatchEvent(new StorageEvent("storage", { key: "remindersUpdated", newValue: "1" }));
+    return true;
+  }, []);
+
+  // Any reminder change — created, edited or deleted, from this page's sidebar, the Reminders
+  // page or the right-click menu — moves or adds a marker server-side, so re-read the grid.
+  useEffect(() => {
+    function onStorage(e: StorageEvent) {
+      if (e.key === "remindersUpdated") void refetchVisibleRange();
+    }
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
   }, [refetchVisibleRange]);
 
   // On mount: move any surviving localStorage-only schedulings into the database.
@@ -4103,7 +4367,24 @@ export default function CalendarPage() {
     setLastLinkedEventName(evTitle);
     setTimeout(() => setLastLinkedEventName(null), 2500);
     try {
-      await airtableApi.categorizeEvent({ event_uid: uid, account_id: accountId, account_name: accountName });
+      const { data: linked } = await airtableApi.categorizeEvent({
+        event_uid: uid, account_id: accountId, account_name: accountName,
+        update_subsequent: updateSubsequent, update_historical: updateHistorical,
+      });
+      const series = linked.series_updated;
+      if (series && series.uids.length > 0) {
+        setEventAccountLinks((prev) => {
+          const next = new Map(prev);
+          for (const siblingUid of series.uids) {
+            next.set(siblingUid, { accountId, accountName });
+            const row = events.find((e) => e.google_event_id === siblingUid);
+            if (row) next.set(String(row.id), { accountId, accountName });
+          }
+          return next;
+        });
+        setLastLinkedEventName(`${evTitle} (+${series.uids.length} recurring)`);
+        setTimeout(() => setLastLinkedEventName(null), 2500);
+      }
       // Increment trigger so MeetingDetail re-fetches now that the DB is updated
       setMeetingDetailReloadTrigger((n) => n + 1);
       addLog({
@@ -4120,7 +4401,7 @@ export default function CalendarPage() {
       });
       setLastLinkedEventName(null);
     }
-  }, [selectedEvent, events]);
+  }, [selectedEvent, events, updateSubsequent, updateHistorical]);
 
   // Keep ref in sync so eventDidMount closures never stale
   useEffect(() => {
@@ -4415,7 +4696,6 @@ export default function CalendarPage() {
               resource_id: created.data.id,
               resource_label: draft.title.trim(),
               due_at: dueAt,
-              notify_in_app: true,
             }).catch(() => {});
           }
         }
@@ -4463,7 +4743,7 @@ export default function CalendarPage() {
     delete w[`${CALENDAR_DRAG_KEY}_task`];
     delete w[`${CALENDAR_DRAG_KEY}_account`];
 
-    const today = new Date().toISOString().slice(0, 10);
+    const today = localDateKey(new Date());
     const droppedDate = info.dateStr.slice(0, 10);
     if (droppedDate === today) {
       stageItemActive(airtableId);
@@ -4611,6 +4891,29 @@ export default function CalendarPage() {
     const newEnd = info.event.end ? dateToLocalISO(info.event.end) : info.event.endStr;
     if (uid.startsWith("scheduled-reminder-")) {
       if (!updateScheduledReminderTime(uid, newStart, newEnd)) info.revert();
+      return;
+    }
+    // A reminder's calendar block: move just that block (15 minutes, same length). Must come
+    // before the "regular calendar event" branch below, which would push it to Google as a meeting.
+    if (isDbReminderBlock(ev) && info.event.start) {
+      const startIso = info.event.start.toISOString();
+      const endIso = new Date(info.event.start.getTime() + 15 * 60_000).toISOString();
+      const original = { start_datetime: ev.start_datetime, end_datetime: ev.end_datetime };
+      localMutationRef.current = true;
+      const apply = (patch: { start_datetime: string; end_datetime: string }) => {
+        setEvents((prev) => prev.map((e) => e.id === ev.id ? { ...e, ...patch } : e));
+        setSelectedEvent((prev) => prev && prev.id === ev.id ? { ...prev, ...patch } : prev);
+      };
+      apply({ start_datetime: startIso, end_datetime: endIso });
+      schedulerApi.moveReminderOccurrence(ev.reminder!, ev.id, startIso)
+        .then(() => window.dispatchEvent(new StorageEvent("storage", { key: "remindersUpdated", newValue: "1" })))
+        .catch((err) => {
+          info.revert();
+          apply(original);
+          setDropToast({ msg: reminderSaveError(err).replace("Couldn't save the reminder.", "Couldn't move the reminder."), type: "warn" });
+          setTimeout(() => setDropToast(null), 4000);
+        })
+        .finally(() => { releaseLocalMutation(); });
       return;
     }
     // DB-backed synced action item — persist updated times to the DB + Airtable due_date
@@ -4970,7 +5273,6 @@ export default function CalendarPage() {
       if (reminderIdStr) {
         e.preventDefault();
         const reminderId = parseInt(reminderIdStr, 10);
-        const title = w[`${CALENDAR_DRAG_REMINDER_KEY}_title`] || "Reminder";
         delete w[CALENDAR_DRAG_REMINDER_KEY];
         delete w[`${CALENDAR_DRAG_REMINDER_KEY}_title`];
 
@@ -4984,7 +5286,7 @@ export default function CalendarPage() {
           const r = cell.getBoundingClientRect();
           if (e.clientX >= r.left && e.clientX <= r.right) { dropDate = cell.getAttribute("data-date"); break; }
         }
-        if (!dropDate) dropDate = view.activeStart.toISOString().slice(0, 10);
+        if (!dropDate) dropDate = localDateKey(view.activeStart);
 
         // Hit-test each slot row by its viewport rect — immune to scroll position
         let dropHour = 9, dropMinute = 0;
@@ -5001,7 +5303,7 @@ export default function CalendarPage() {
         }
 
         const start = `${dropDate}T${String(dropHour).padStart(2, "0")}:${String(dropMinute).padStart(2, "0")}:00`;
-        void persistScheduledReminderRef.current({ reminderId, title, start });
+        void persistScheduledReminderRef.current({ reminderId, start });
         return;
       }
 
@@ -5035,7 +5337,7 @@ export default function CalendarPage() {
         }
       }
       // Fallback: use the first visible date
-      if (!dropDate) dropDate = view.activeStart.toISOString().slice(0, 10);
+      if (!dropDate) dropDate = localDateKey(view.activeStart);
 
       // Hit-test each slot row by its viewport rect — immune to scroll position
       let dropHour = 9;
@@ -5191,30 +5493,6 @@ export default function CalendarPage() {
   // the same work twice and double-counted it in the daily footer.
   const liveBlockIds = new Set(Object.values(liveTimers).map((t) => t.calendar_event).filter((v): v is number => v != null));
 
-  // Synthesize scheduled reminders as calendar events (amber)
-  const scheduledReminderCalEvents: CalendarEvent[] = scheduledReminders.map((r) => ({
-    id: -(Math.abs((String(r.reminderId) + r.start).split("").reduce((a, c) => a + c.charCodeAt(0), 0)) + 2),
-    owner: 0,
-    owner_username: "",
-    account: null,
-    account_name: null,
-    google_event_id: `scheduled-reminder-${r.reminderId}__${r.start.slice(0, 16)}`,
-    title: `🔔 ${r.title}`,
-    description: "",
-    location: "",
-    start_datetime: r.start,
-    end_datetime: new Date(new Date(r.start).getTime() + 15 * 60 * 1000).toISOString(),
-    all_day: false,
-    status: "confirmed" as const,
-    attendees: [],
-    meet_link: "",
-    calendar_id: "work_tracking",
-    is_synced: false,
-    agentpm_airtable_id: "",
-    created_at: "",
-    updated_at: "",
-  }));
-
   // An event with no account-link entry (by google_event_id or numeric id) is "unlinked".
   function isEventUnlinked(e: CalendarEvent): boolean {
     const link = (e.google_event_id ? eventAccountLinks.get(e.google_event_id) : undefined)
@@ -5227,12 +5505,20 @@ export default function CalendarPage() {
   // Filter events by content view — in accounts view, further filter to selected account
   const filteredEvents = (() => {
     const base = events.filter((e) => {
-      if (e.calendar_id === "reminders") return false; // never show reminders as standalone events
+      // A scheduled reminder is a real `reminders` row (the legacy browser-only copies are
+      // synthesized separately below). It is neither a meeting nor an action item, so it
+      // shows in All, Reminders, and Accounts (when linked) — and nowhere else. These rows
+      // used to be dropped here unconditionally, which hid every reminder from the grid.
+      if (e.calendar_id === "reminders") {
+        if (contentView === "reminders" || contentView === "all") return true;
+        if (contentView !== "accounts") return false;
+      } else if (contentView === "reminders") {
+        return false;
+      }
       if (liveBlockIds.has(e.id)) return false; // drawn by its running timer instead
       if (contentView === "all") return true;
       if (contentView === "meetings") return e.calendar_id !== "work_tracking";
       if (contentView === "action-items") return e.calendar_id === "work_tracking";
-      if (contentView === "reminders") return false; // only show scheduled reminders (amber events)
       if (contentView === "unlinked") return isEventUnlinked(e);
       if (contentView === "accounts") {
         const link = (e.google_event_id ? eventAccountLinks.get(e.google_event_id) : undefined)
@@ -5244,10 +5530,8 @@ export default function CalendarPage() {
     });
     // Always include scheduled + active-timer + reminder events depending on view
     const workEvents = contentView === "all" || contentView === "action-items"
-      ? [...scheduledCalEvents, ...activeTimerCalEvents, ...scheduledReminderCalEvents]
-      : contentView === "reminders"
-        ? [...scheduledReminderCalEvents]
-        : [];
+      ? [...scheduledCalEvents, ...activeTimerCalEvents]
+      : [];
     const extraFiltered = contentView === "accounts"
       ? accountMeetingEvents.filter((e) =>
           selectedAccountName === null || e.owner_username === selectedAccountName
@@ -5302,7 +5586,7 @@ export default function CalendarPage() {
     const cur = new Date(visibleRange.start);
     const end = new Date(visibleRange.end);
     while (cur < end) {
-      days.push(cur.toISOString().slice(0, 10));
+      days.push(localDateKey(cur));
       cur.setDate(cur.getDate() + 1);
     }
     return days.filter((d) => {
@@ -5338,6 +5622,10 @@ export default function CalendarPage() {
         onToggle={() => setAccountPanelOpen((v) => !v)}
         eventAccountLinks={eventAccountLinks}
         onLink={linkEventToAccount}
+        updateHistorical={updateHistorical}
+        onUpdateHistoricalChange={setUpdateHistorical}
+        updateSubsequent={updateSubsequent}
+        onUpdateSubsequentChange={setUpdateSubsequent}
         selectedAccountName={selectedAccountName}
         onSelectAccount={(name) => {
           setSelectedAccountName(name);
@@ -5512,30 +5800,21 @@ export default function CalendarPage() {
               }
             } : undefined}
             onUpdateReminder={async (reminderId, patch) => {
-              await schedulerApi.updateReminder(reminderId, patch as Partial<import("../types").Reminder>);
-              // Update the title in localStorage so the calendar event label refreshes
-              if (patch.title !== undefined || patch.due_at !== undefined) {
-                const newStart = patch.due_at ? patch.due_at.slice(0, 19) : selectedEvent.start_datetime;
-                const newEnd = patch.due_at
-                  ? new Date(new Date(patch.due_at).getTime() + (new Date(selectedEvent.end_datetime).getTime() - new Date(selectedEvent.start_datetime).getTime())).toISOString()
-                  : selectedEvent.end_datetime;
-                const items = readScheduledReminders();
-                const uid = selectedEvent.google_event_id ?? "";
-                const body = uid.slice("scheduled-reminder-".length);
-                const sep = body.lastIndexOf("__");
-                const startMin = sep === -1 ? "" : body.slice(sep + 2);
-                const idx = items.findIndex((r) =>
-                  r.reminderId === reminderId && (startMin === "" || r.start.slice(0, 16) === startMin)
-                );
-                if (idx !== -1) {
-                  if (patch.title !== undefined) items[idx] = { ...items[idx], title: patch.title };
-                  if (patch.due_at !== undefined) items[idx] = { ...items[idx], start: newStart, end: newEnd };
-                  localStorage.setItem(SCHEDULED_REMINDERS_KEY, JSON.stringify(items));
-                  setScheduledReminders([...items]);
-                  window.dispatchEvent(new StorageEvent("storage", { key: SCHEDULED_REMINDERS_KEY, newValue: JSON.stringify(items) }));
-                }
-                setSelectedEvent((prev) => prev ? { ...prev, title: `🔔 ${patch.title ?? prev.title.replace(/^🔔\s*/, "")}`, start_datetime: newStart, end_datetime: newEnd } : prev);
+              // Title and notes belong to the reminder; the time belongs to *this* calendar
+              // block (a reminder can be on the calendar several times).
+              if (patch.title !== undefined || patch.body !== undefined) {
+                await schedulerApi.updateReminder(reminderId, { title: patch.title, body: patch.body });
               }
+              if (patch.start && patch.eventId && !sameInstant(patch.start, selectedEvent.start_datetime)) {
+                await schedulerApi.moveReminderOccurrence(reminderId, patch.eventId, patch.start);
+              }
+              setSelectedEvent((prev) => prev ? {
+                ...prev,
+                title: patch.title ?? prev.title,
+                start_datetime: patch.start ?? prev.start_datetime,
+                end_datetime: patch.start ? new Date(new Date(patch.start).getTime() + 15 * 60_000).toISOString() : prev.end_datetime,
+              } : prev);
+              window.dispatchEvent(new StorageEvent("storage", { key: "remindersUpdated", newValue: "1" }));
             }}
             onOpenActionItemModal={(item) => setGridModalItem(item)}
             onUpdateScheduleTime={(newStart, newEnd) => {
@@ -5843,7 +6122,7 @@ export default function CalendarPage() {
               {menuBtn("Add reminder", "🔔", () => {
                 const due = new Date(ev.start_datetime);
                 due.setMinutes(due.getMinutes() - 10);
-                const dueStr = due.toISOString().slice(0, 16) + ":00";
+                const dueStr = due.toISOString();
                 schedulerApi.createReminder({
                   title: `Reminder: ${ev.title}`,
                   body: "",
@@ -5851,13 +6130,8 @@ export default function CalendarPage() {
                   resource_type: "calendar_event",
                   resource_id: ev.id > 0 ? ev.id : null,
                   resource_label: ev.title,
-                  notify_in_app: true,
-                }).then(async ({ data: r }) => {
-                  const startLocal = toLocalISO(due.toISOString().slice(0, 19));
-                  const endLocal = addMsToLocalISO(due.toISOString().slice(0, 19), 15 * 60 * 1000);
-                  await persistScheduledReminder({
-                    reminderId: r.id, title: r.title, start: startLocal, end: endLocal,
-                  });
+                }).then(() => {
+                  // The server puts the marker on the calendar; announce it so the grid re-reads.
                   window.dispatchEvent(new StorageEvent("storage", { key: "remindersUpdated", newValue: "1" }));
                 }).catch(() => {});
               })}
@@ -6369,6 +6643,10 @@ export default function CalendarPage() {
           >
             {calendarExpanded ? "↑" : "↓"}
           </button>
+        </div>
+        {/* Pinned Claude skills: a white-button row under the calendar, scrolling sideways when it overflows */}
+        <div className="mt-3" data-testid="calendar-skills-row">
+          <PinnedSkillsSection page="calendar" variant="row" chipBackground="#fff" />
         </div>
         </div>{/* end outer relative wrapper */}
 

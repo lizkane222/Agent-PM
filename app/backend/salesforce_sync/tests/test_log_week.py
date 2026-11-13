@@ -239,6 +239,14 @@ class EventFilteringTest(LogWeekTestBase):
         self.assertEqual(plan.unlinked_events, [])
         self.assertEqual(plan.not_attended_events, [])
 
+    def test_a_scheduled_reminder_is_never_billed_as_time(self):
+        self.event(account=self.account, calendar_id="reminders", hour=9)
+
+        plan = plan_week(self.user, MONDAY)
+
+        self.assertEqual(plan.entries, [])
+        self.assertEqual(plan.unlinked_events, [])
+
     def test_another_users_events_never_appear(self):
         other = User.objects.create_user(username="bob", email="bob@example.com", password="p")
         self.event(account=self.account, owner=other)

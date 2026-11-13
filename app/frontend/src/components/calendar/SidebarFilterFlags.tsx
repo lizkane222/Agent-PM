@@ -1,4 +1,5 @@
-import { SIDEBAR_GROUPS, type SidebarGroupKey } from "../../lib/actionItemSidebarOrder";
+import { SIDEBAR_GROUPS, sidebarGroupLabel, type SidebarGroupKey } from "../../lib/actionItemSidebarOrder";
+import { useStatusLabels } from "../../hooks/useStatusLabels";
 import { readableTextColor, tint } from "../../lib/eventColors";
 
 /**
@@ -18,9 +19,11 @@ export default function SidebarFilterFlags({ selected, onToggle, onClear, accent
   onClear: () => void;
   accent: string;
 }) {
+  const { prefs } = useStatusLabels();
   return (
     <div className="flex flex-wrap items-center gap-1" role="group" aria-label="Filter by">
-      {SIDEBAR_GROUPS.map(({ key, flagLabel }) => {
+      {SIDEBAR_GROUPS.map(({ key, flagLabel: baseFlag }) => {
+        const flagLabel = sidebarGroupLabel(key, baseFlag, prefs);
         const isOn = selected.has(key);
         return (
           <button
@@ -34,7 +37,7 @@ export default function SidebarFilterFlags({ selected, onToggle, onClear, accent
             style={
               isOn
                 ? { background: accent, color: readableTextColor(accent), border: `1px solid ${accent}` }
-                : { background: tint(accent, 0.88), color: "var(--twilio-navy)", border: "1px solid #e5e7eb" }
+                : { background: tint(accent, 0.88), color: "var(--text-ink)", border: "1px solid var(--border-subtle)" }
             }
           >
             {flagLabel}

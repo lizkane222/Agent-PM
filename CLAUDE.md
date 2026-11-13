@@ -82,6 +82,10 @@ All data-fetching hooks are built on `useResource<T>` in `src/hooks/useResource.
 | `useNotifications` | `hooks/useNotifications.ts` | `AppNotification[]` (the caller's own history, any channel) |
 | `usePublicItems` | `hooks/usePublicItems.ts` | `PublicItem[]` for one member (`"me"` or a TeamMember id) |
 | `useMyTokenBudget` | `hooks/useMyTokenBudget.ts` | The caller's own daily token state — one object, **not** `useResource` |
+| `usePagePins` | `hooks/usePagePins.ts` | `PagePin[]` — Claude skills pinned to one page |
+| `useSkillRuns` | `hooks/useSkillRuns.ts` | `SkillRunRow[]` — the Console's skill runs |
+| `useAgentSkillList` | `hooks/useAgentSkillList.ts` | `AgentSkill[]` the caller can see |
+| `useAccountProjects` | `hooks/useAccountProjects.ts` | `AccountProject[]` — every project **and goal** (`kind`) the caller can see, one request; `setActionIds` moves action items |
 
 ---
 
@@ -4636,3 +4640,920 @@ ones. Frontend 2051/2051 (x3), build clean.
 broken. A handoff test must run against the state users actually have (a saved draft), through the real
 component.
 
+
+---
+
+### 2026-11-06 (2) — Data entered on a mini-canvas component now shows on it and reaches the full builder
+
+**Reported (screenshot).** A Rich Text component, double-clicked; Title and Description filled in the
+picker and saved ("2" on the General badge) — the canvas still read "Rich text content…" and the full
+builder would have received nothing.
+
+**Two gaps.** (1) The canvas only ever drew field *names* as chips, and only for container components;
+a text component drew nothing. (2) `miniNodesToCanvasNodes` ignored `fields` completely.
+
+**Fix.**
+- `components/profile/miniFields.ts` (new): the field catalog moved out of `ProfilePage.tsx`, plus
+  `fieldLabel` / `fieldType`, so the picker, the preview and the converter share one source.
+- `miniCanvas.ts`: `filledFields(node)` (values only; a field picked but left blank is not data),
+  `fieldsToHtml` (HTML-escaped, newlines kept).
+- `MiniNodePreview` draws every filled field as label-over-value on **every** component type (inside a
+  container, beneath a text component) and the box grows to fit instead of clipping
+  (`MiniFieldList`; `data-mini-fields` / `data-mini-field=<key>`). The label-only chips are gone.
+- **Hand-off.** The builder has no "fields" concept, so fields become visible content: a container gets a
+  Rich Text *child* listing them; a Rich Text component has them *appended to its body*; any other component
+  (Heading, Text, Label, Divider) is followed by a Rich Text *sibling* directly beneath it (nested ones stay
+  inside their parent). Blank fields are not carried. Values are escaped, so data cannot inject HTML.
+- **Reachability.** Heading/Text/Label edit their text on double-click, which left the picker reachable only by
+  right-click. A selected one now has a small **Fields** button.
+
+**Tests.** 7 end-to-end tests in `ProfilePage.test.tsx` drive the real UI: drag a palette item onto the
+canvas, double-click, add fields, type, Save, read the canvas, click "Open full builder", read the handoff
+(the screenshot's scenario is the first). They need a `PointerEvent` stand-in and a bounding box (jsdom has
+neither) and must **wait ~80ms after a drag**: dnd-kit swallows the first click for 50ms after a drag so a
+drag is not taken for a click; without the wait, "+ Add" silently does nothing. Scope picker lookups to the
+open dialog (other page controls also say "Add"). Sabotage-checked both ways (preview draws nothing: 22
+fail; converter drops fields: 8 fail). Frontend 2095/2095 (x3), build clean.
+
+**Left open.** The builder renders fields as one Rich Text block, not as editable per-field components;
+editing a value later in the builder edits that block's text, not the mini-canvas field.
+
+
+
+---
+
+### 2026-11-06 — Recurring meetings: assign an account once, reach the rest of the series
+
+**What was asked.** Linking an account to one instance of a recurring meeting should be able to reach later
+instances and (on the user's say-so) earlier ones, without a pop-up per assignment, so past meetings can be
+picked up by the meeting-notes extraction.
+
+**UI.** Two small toggle buttons at the top of the calendar's Accounts sidebar: **update historical** and
+**update subsequent recurring** (`aria-pressed`). Both **off by default**, held in `CalendarPage` state and
+**not persisted** (a link must never reach other weeks by surprise). Both glow for 2 seconds (`OPTION_GLOW_MS`)
+every time the sidebar opens. Every path that assigns an account (drop an account on an event, drag an event
+onto an account, the event panel) goes through `linkEventToAccount`, so the switches apply to all of them. When
+other instances were linked the existing toast reads "(+N recurring)".
+
+**Backend (`airtable_sync`).** `POST /airtable/categorize/` accepts `update_subsequent` / `update_historical`
+(default false); the response gains `series_updated` only when one was sent. `airtable_sync/series.py` derives the
+series from the Google instance id (`<series>_<YYYYMMDD[...]>`, there is no stored series id) and compares dates
+from the ids. It touches only **the requesting user's own synced events**.
+- *Historical / subsequent* write `CalendarEventAccountLink` rows (`match_method="series"`) for the instances
+  already synced.
+- *Subsequent also covers instances that sync later:* the first link is flagged `apply_to_future`
+  (migration `airtable_sync/0020`) and `inherit_series_link` copies it onto an unlinked later instance from the
+  nearest earlier flagged link, in `match_event_to_account`, `get_event_link` and `batch_event_links`. Re-linking
+  the same event with the option off clears the flag.
+- `integrations/meeting_notes.py::candidate_events` now also honours `CalendarEventAccountLink`. A scoped scan used
+  only the `CalendarEvent.account` FK, which nothing in the app populates, so a linked series was invisible to it;
+  this is what makes "update historical" useful for notes extraction.
+
+**Key decisions.** The toggle is the confirmation (no per-assignment dialog), as requested. An explicit link on an
+individual later instance is overwritten only if "update subsequent" was on at the time. Links are keyed by event id and
+are global across users (pre-existing), so a teammate's copy of the same series would see an inherited link for the
+same series id; only the assigning user's own events are written eagerly.
+
+**Verified.** Backend `airtable_sync` + `integrations` + `accounts`: 797 tests, one failure
+(`ActionItemSelectOptionMappingTests`, "Backlogged", not touched here). 12 new tests; sabotage-checked (removing the
+subsequent/historical gate and the scan's link clause turns three red). Frontend: new tests in
+`AccountsSidebar.test.tsx` and `CalendarPage.test.tsx`; migration applied to the dev DB (backup in `/tmp`).
+**Daphne must be restarted** (`npm run agent-pm`). Not exercised in a real browser or against real recurring events.
+
+**Sign in with Google (2026-11-06).** `core/google_login.py`: `GET /api/v1/auth/google/start/` and `/callback/`.
+Google's signed ID token is verified (signature, audience, `nonce`), then `email_verified`, the `@twilio.com`
+suffix **and** the `hd` claim are all required; `hd` in the request is only a hint. The email must match an existing
+active user (`GOOGLE_LOGIN_AUTO_CREATE` is off); two users sharing an email are refused, never guessed. Tokens
+return in the URL **fragment** to `/auth/callback`; failures return `/login?error=<fixed code>`, never detail.
+The login page shows only "Sign in with Google" (`?local=1` is the password break-glass). `AUTH_PASSWORD_LOGIN_DISABLED`
+turns `/auth/token/` off; it is deliberately off until a Google sign-in has been proven end to end.
+Needs `http://localhost:8000/api/v1/auth/google/callback/` registered on the Google OAuth client.
+
+
+---
+
+### 2026-11-06 (3) — Mini-canvas: Rich Text edits in place, the canvas persists, Save makes a draggable button
+
+**Why Rich Text and Text differed.** Text/Heading/Label were edited in place (plain `<textarea>`);
+Rich Text was left out, so double-click opened the *field picker*, and its content (default
+`<p>Rich text content…</p>`) was unreachable and looked identical to Text. Now Rich Text edits in place too,
+with the notes editor (`RichTextMentionEditor`): bold, italic, strikethrough, bullet/numbered/check lists,
+links, and **underline** (see below). It floats wider than the node (a toolbar does not fit in 200px), saves as
+you type, and ends on **Done**, **Escape**, or selecting another node. Text stays a plain in-place edit.
+The field picker for Text/Heading/Label/Rich Text is the **Fields** button on a selected node (right-click too);
+containers still open it on double-click.
+- **Underline** is an opt-in prop on the shared editor (`showUnderline`), on only for this component. The notes
+  and action-item editors have no underline button (TipTap's StarterKit includes the extension, so Cmd/Ctrl+U
+  works there); adding the button everywhere was a visible change nobody asked for.
+
+**Persistence.** The canvas is stored per browser **and per user** (`profileMiniCanvas-v1:<userId>`; two people
+sharing a browser must not see each other's record titles). Nothing is read or written until the user is known,
+and the first (empty) render must not erase storage - writes are gated on a `restored` flag, and the restore
+merges *in front of* anything already dropped. Written on every change, not debounced (a debounced write is lost
+if "Open full builder" navigates immediately). `parseMiniNodes` distrusts storage: malformed entries dropped,
+numbers clamped, <=200 nodes, depth <=8, string-only field values. **Node ids** were `mini-<counter>` restarting
+at 1 every load; with persistence that would collide with restored nodes, so ids now carry a random part.
+
+**Clear** already existed but hid itself when empty. It is now always shown (disabled when empty) and asks first,
+since a refresh no longer undoes it.
+
+**Save.** Saves a deep copy of the canvas as a draggable button (`Canvas - <date>` + count; up to 12; persisted at
+`profileMiniCanvasSaved-v1:<userId>`; removable). The note under the header says so. The button drags with the
+export-tray payload (`EXPORT_ITEM_DRAG_KEY`), so a working session's canvas accepts it with **no new drop code**;
+it lands as a `mini_canvas` card with a readable summary (count + one line per component, fields included) and
+an **Open in builder** button that reopens it via the single-use handoff. Its `content` is the canvas already
+converted to builder nodes. The mini-canvas itself refuses the button (a second drag type,
+`application/x-mini-canvas`, marks it) so a canvas cannot nest in itself.
+- Saving does not clear the canvas, and a saved button cannot be loaded back *onto the mini-canvas* - only opened
+  in the builder through a session card.
+
+**Test notes.**
+- A role query for "Open in builder" matches two things: dnd-kit gives each draggable card `role="button"`, whose
+  accessible name includes all its text. Query by the button's own text.
+- Scope palette lookups to the palette: a node on the canvas also prints its type name.
+- `timeout` does not exist on macOS; a loop using it silently ran nothing.
+- Sabotage-checked: no persistence write (3 fail), Rich Text not in-place (12 fail), canvas accepting its own
+  snapshot (1 fails). Frontend 2200/2200 (x3), build clean.
+
+
+
+---
+
+### 2026-11-09 — Bullet, numbered and Steps lists did nothing: Preflight + no typography plugin
+
+**Symptom:** bold/italic/underline/strike worked, but the ordered list, unordered list and Steps
+(checklist) buttons appeared to do nothing, in every editor and on every page showing saved text.
+
+**Root cause — display, not the editor.** Tailwind v4's Preflight sets `ol, ul { list-style: none }`
+and zeroes padding, so a real `<ul><li>` renders as bare lines. `prose` would normally restore
+them, but `@tailwindcss/typography` is **not installed** (no `@plugin` either), so `prose` is a
+no-op in ~13 files. Steps was worse: TipTap's task item is `<li><label><input></label><div>…</div></li>`,
+so the checkbox sat on its own line, and in display it looked clickable but saved nothing.
+New real-TipTap tests confirm the buttons always produced correct HTML.
+
+**Fix (one place):** `src/styles/rich-text.css`, imported from `index.css` right after
+`@import "tailwindcss"`, in `@layer base` (later than Preflight, still beaten by utilities), scoped
+to `:is(.ProseMirror, .rich-text, .prose)`: bullets/numbers with nested styles, indentation, task
+lists as an inline checkbox + text, done steps struck through. Under `.rich-text` (display) the
+checkboxes are `pointer-events: none`. The editor itself is never `.rich-text`, so ticking works there.
+Typography plugin deliberately **not** installed (it would restyle every `prose` site).
+
+**Rules for new code**
+- Anything rendered with `dangerouslySetInnerHTML` must be inside `.rich-text` (or `.prose`).
+  `styles/__tests__/richTextCoverage.test.ts` scans `src/` and fails if a site lacks it.
+- `lib/noteHelpers.tsx::renderNoteWithReferences` now keeps element attributes (`elementProps`)
+  and never gives void tags children; it previously dropped `data-type`/`type="checkbox"`. It has no
+  callers today.
+- Public notes: `core/html_sanitize` strips `input`/`label`/`data-*` (it also guards uploaded HTML),
+  so `team/serializers.py::flatten_task_lists` turns Steps into `<li>☑ / ☐ text</li>` before
+  sanitizing. The allowlist was not loosened. Existing saved checklists that were already sanitized
+  are not recoverable.
+
+**Verified:** frontend 2038+ tests, `npm run build` clean, backend suite OK (see run below); sabotage
+(removing the `ol` rule and task-list flex) reds 6 CSS tests.
+**Left open:** not seen in a real browser (jsdom doesn't lay out); tests check computed list-style/display only.
+
+
+---
+
+### 2026-11-09 — SMS reminders: carrier verdict read back; email notification option removed
+
+**Finding (Twilio CLI, read-only).** `+14157070208` has SMS capability, but the account has **no A2P 10DLC
+brand, no campaign, no toll-free verification**, and the number is in no Messaging Service. All 11 historical
+outbound messages (Oct 2025, Aug 2026) ended `undelivered` with **error 30034** (US 10DLC number, unregistered).
+Twilio accepts the request, so `messages.create` succeeded and the app recorded **"sent"** every time. This is a
+Twilio-console compliance step, not a code fault: register an A2P brand + campaign for the number, or buy and verify a
+toll-free number and set `TWILIO_PHONE_NUMBER`. Not done from the CLI: it needs business details and has fees.
+
+**What changed.**
+- `scheduler/sms_delivery.py` (new): `fetch_outcome`, `wait_for_outcome`, `describe_error` (fixed sentence per Twilio
+  error code; never exception text, which carries the account SID).
+- `_send_sms` now returns the message SID. A delivered reminder schedules `scheduler.check_sms_delivery`
+  (45s / 2m / 5m); a refusal flips the `Notification` to `failed` with the reason. A carrier that sends no receipt
+  stays "sent". A broker outage is logged, never fails the reminder.
+- The Settings test button waits up to ~8s for the verdict, so a refused text reports `failed` with the reason.
+- Email: the "Email notifications" checkbox, its `notification_email` save payload and the `email` test channel are
+  gone from the frontend. The model field, serializer field and API `email` channel are untouched (no contract change).
+- Slack is paused (no bot token yet); nothing changed there.
+
+**Left open.** Registration above. The call channel was never built. `integrations/availability/` has no default MSW
+handler, which logs an "unhandled request" warning in `SettingsPage.test.tsx` (pre-existing).
+
+
+---
+
+### 2026-11-10 — "Generate instructions with Claude" did nothing (no error, no instructions)
+
+**Symptom.** Spinner ("Designing instructions…"), then back to normal, Instructions box still empty, no
+console error.
+
+**Root cause — two defects in `_claude_generate_agent_skill` that predate the new picker, plus a silent UI.**
+1. It stripped the reply's ```` ```json ```` wrapper with `raw.split("```")[1]`, which ends at the *first*
+   triple-backtick — including one **inside** the instructions (a report template in a code block is
+   common). The JSON was cut off mid-string.
+2. Even correctly unwrapped, the model's hand-written JSON was sometimes invalid (an unescaped quote in
+   the markdown). Asking a model to emit one large JSON string containing markdown is fragile.
+3. The "truncated JSON" repair then dropped the unfinished top-level key — `instructions` — and the view
+   returned **HTTP 200** with only `name` and `description`. The form ignores a missing field and its
+   `catch {}` swallowed everything else, so nothing happened and nothing was reported. Intermittent: it
+   depends on whether that run's instructions contained a code block, so a first attempt could succeed.
+Reproduced against the live server (341-byte reply, no `instructions`); Claude had finished normally
+(1,452 of 4,096 tokens) so it was **not** truncation.
+
+**Fix.**
+- Generation now uses a **forced tool call** (`define_skill`, `tool_choice`) so the API returns the skill
+  as already-valid structured data. A text reply is still accepted as a fallback.
+- `_skill_from_response` returns the whole skill or raises `GenerationIncomplete`: `max_tokens` stop,
+  or a blank/missing `name`/`description`/`instructions`, becomes a **502 with a message the author can
+  read** — never a 200 without instructions.
+- `skills/claude_json.loads_object` (used by recommend-tools and token estimates) had the *same*
+  split-on-backticks flaw; it now takes the first `{` to the last `}`. A test caught this.
+- The form shows the server's reason **beside the Generate button** (the old banner was at the bottom of a
+  long form), logs to the console, treats an empty `instructions` as a failure, and says it takes 15–25 s.
+- Verified against the real model on three descriptions whose output contains code blocks (3.5k–7.6k
+  characters of instructions each). Sabotage-checked: dropping the validation and reintroducing the
+  backtick split each turn tests red.
+
+**Not changed:** `_claude_review_agent_skill` still strips fences by splitting on backticks. Its reply is a
+small verdict object, so it hasn't been hit, but it has the same weakness if the findings ever quote code.
+
+**Needs a backend restart** (Daphne has no autoreload) before the running app uses the fix.
+
+
+
+---
+
+### 2026-11-10 — Profile page: live action items/reminders, no GET Meeting Notes, frozen allocation axes, Admin row
+
+- **Action items and reminders were read once.** They were part of the mount-time `Promise.all`, so
+  anything changed afterwards (on another page, by the agent, in another tab) stayed stale until a reload.
+  `ProfilePage` now has its own effect that re-reads both lists when the tab regains focus
+  (`focus` / `visibilitychange`), on the `actionItemsUpdated` storage broadcast (the same signal other
+  pages use; `lib/api.ts` fires it after any action-item write), and every 30s while the tab is visible
+  (`PROFILE_REFRESH_MS`). Reminders have **no change broadcast**, so for them focus + the timer are the
+  only triggers (up to 30s stale). Not silent-loading related: the lists are replaced in place, no spinner.
+  Tests that refresh need `resetRequestCache()` first because `lib/requestCache.ts` serves a repeat GET
+  from memory for 10s (in production the broadcast follows a write, which already clears it).
+- **GET Meeting Notes removed from My Skills** (the backend imports notes on its own). The component
+  `components/shared/GetMeetingNotesButton.tsx` is untouched; the account detail page still uses it.
+- **Time Allocation, frozen axes** (`components/TimeAllocationPanel.tsx`): the bar chart's hours axis and
+  the heatmap's account list are separate SVGs outside the horizontal scroller (not CSS sticky inside an
+  SVG, which does not work); the table's Account column is `position: sticky; left: 0` with a solid
+  background so scrolled cells do not show through. Tooltip clamps use the scrolling SVG's width.
+- **Admin row.** The panel always lists "Admin" first, even with zero time. The server reports one label for
+  it: `time_allocation.display_account` folds the Django `Admin` and the Airtable mirror `ADMIN` into
+  "Admin" (before, an event linked via an Admin action item would have shown as `ADMIN` next to `Admin`).
+  What counts as Admin: logged entries on the user's Admin workspace, calendar events linked to it, and blocks
+  for action items filed under it. **Unlinked internal meetings are still "unlinked", not Admin** - say so if
+  that should change. The header count is "N accounts" with time (Admin at zero is not counted).
+- Tests: 5 backend (`AdminTimeTests`), 5 frontend profile-refresh, 5 panel (frozen + Admin); each sabotage-checked.
+
+
+---
+
+### 2026-11-10 — Reminders: one marker at the due time, account link, notifying teammates
+
+**Reported.** A reminder created in the calendar sidebar was not added to the calendar; dragging it
+there only toasted "added"; the Reminders view listed nothing. Then: a reminder appeared with a start/end
+the form could not set.
+
+**Causes (three, stacked).**
+1. `CalendarPage.filteredEvents` dropped every `calendar_id === "reminders"` row ("never show reminders as
+   standalone events"), left over from when reminders were browser-only synthetics. Drops *did* create rows;
+   nothing drew them.
+2. Creating a reminder never put it on the calendar at all.
+3. The sidebar form sent `datetime-local` as a naive string and displayed `toISOString().slice(0,16)` (a UTC
+   clock in a local field), so a reminder set for 3 PM local was stored as 3 PM **UTC**. `lib/datetimeLocal.ts`
+   now owns both conversions (the Reminders page already did this right). Reminders saved by the old form are
+   stored at the wrong instant; nothing can repair that automatically.
+
+**Design.** A reminder has one moment. `scheduler/reminder_calendar.py::sync_reminder_block` keeps exactly one
+`reminders` `CalendarEvent` per live reminder with `start == end == due_at`, called from the reminder viewset's
+create/update/dismiss. So the sidebar, the Reminders page and the agent's `create_reminder` all agree. Pending, sent
+and snoozed reminders show; dismissed ones don't; delete removes the marker (and a Google copy, if any).
+Dropping a reminder on the grid now **sets its due time** (PATCH `due_at`); the client creates no block. Data
+migration `scheduler/0014` backfilled markers and collapsed the old 15-minute blocks (10 markers in dev; backup
+`/tmp/db.sqlite3.pre-reminder-markers`).
+- **Reminders are no longer mirrored to Google.** Google gives every event a duration and the next pull would
+  write it back, turning the marker into a block. `_push_new_agentpm_events` excludes them and the pull ignores
+  `agentpm_source: reminder` copies. This replaced the test that pinned the old "reminder row is pushed" behaviour.
+- `salesforce_sync/log_week.py` now excludes `reminders` (a marker is not time spent); without that every reminder
+  would have been billed to Cloud Coach as a 15-minute meeting. Time Allocation and availability already skipped them.
+
+**Account link + notifying other users.**
+- `Reminder.recipients` (M2M to User; empty = only the creator) and `UserProfile.allow_reminders_from_others`
+  (default on; Settings → "Allow other users to notify me"). Migrations `scheduler/0013`, `team/0013`.
+- Rules live in `scheduler/reminder_recipients.py` and `ReminderSerializer.validate`: only on an account-linked reminder;
+  the creator must be on the account; recipients must be on its team and have a login; an opted-out person is refused
+  (400 with the reason); **adding anyone requires `confirm_notify_others: true`** (the UI sets it only after "Are you sure
+  you want to notify these users?"); re-linking to another account drops recipients; the creator is never stored as one.
+  Only *newly added* people are checked, so an existing recipient who opts out later doesn't break unrelated edits.
+- Delivery (`scheduler/tasks.py::_deliver_to`) notifies the creator, then each recipient over the reminder's channels using the
+  recipient's own contact details, recording a `Notification` for each. Opt-out is re-checked at delivery. A recipient's copy is
+  "Set by <name> — …". The agent tools expose no recipients argument (schema rejects unknown keys), so the agent cannot
+  notify anyone else; tested.
+- `GET /scheduler/reminders/recipients/?account=<id>` lists teammates with `available` + `reason`. The UI lists opted-out people
+  disabled, with the reason as a tooltip on the wrapper (a disabled input swallows hover).
+
+**Verified.** Sabotage-checked: approval rule, opt-out at create, opt-out at delivery, marker end time, marker filter, local-time
+send, confirmation step, opted-out selectable, Google-copy import.
+
+**Left open.**
+- Dropping/editing sets the due time; the Reminders *page* form has no account/recipients fields (only the calendar sidebar was asked for).
+- The sidebar form offers in-app delivery only; teammates get the same channels as the reminder (in-app).
+- Dead legacy code for browser-only reminders (drag/resize/delete branches for `scheduled-reminder-*`) remains in `CalendarPage.tsx`; unreachable now.
+- Reminder dropping on the real grid is covered only by the unit-level PATCH; jsdom can't exercise the native drop hit-testing.
+- Daphne must be restarted for the new route/fields (`npm run agent-pm`).
+
+**Sidebar profile entry (2026-11-10).** The user-card link to `/profile` at the bottom of the sidebar was
+rendered only `{profile && …}`, and `useUserProfile` swallowed a failed `GET /team/profiles/me/`, so one
+dropped or throttled request removed the whole entry until a reload. It is now always rendered (generic
+"Profile" label and a dot avatar until the name loads) and a failed fetch is retried once after 3s
+(`PROFILE_RETRY_MS`). `Layout.tsx` had no test before; `components/__tests__/LayoutProfileLink.test.tsx`
+covers loaded / failed / retried (sabotage-checked). The actual cause of the reported disappearance was not
+reproduced: the endpoint answered 200 for a fresh token, and `Layout.tsx` itself had no uncommitted change.
+
+
+---
+
+### 2026-11-10 (2) — Reminders: many 15-minute occurrences, each notifies at its start; panel time zone
+
+**Supersedes the "one marker, start == end" design in the entry above.** The owner wanted a reminder on the
+calendar *several times*, each only 15 minutes long. A zero-length event is also what made the grid draw an
+hour-tall block (FullCalendar treats `end == start` as "no end" and applies its 1-hour default).
+
+- Each calendar block of a reminder is an **occurrence**: a `reminders` `CalendarEvent` with `reminder` set and
+  `end = start + 15 min` (`scheduler/reminder_calendar.py::OCCURRENCE_MINUTES`). The reminder form, Reminders page and
+  agent create the first one at `due_at`; dragging adds more via `POST /scheduler/reminders/<id>/occurrences/` (same
+  minute twice = one block, 200 instead of 201). `PATCH|DELETE …/occurrences/<event_id>/` moves or removes one.
+  `ReminderSerializer.occurrences` lists them (the sidebar card shows the list, each removable).
+- Changing `due_at` moves only the block that sat at the old due time; other blocks stay. Moving the block at the due
+  time moves the due time. A block the user deleted does not come back on an unrelated edit; re-arming a dismissed
+  reminder restores its first block. A `sent` reminder moved to the future is re-armed to `pending` (it used to never fire again).
+- **Each occurrence notifies at its own start**, with the reminder's details and channels (and its recipients):
+  `tasks.deliver_due_occurrences`, called from the end of `deliver_due_reminders` (same every-minute beat; no new schedule
+  entry). `CalendarEvent.reminder_notified_at` is claimed with a conditional UPDATE (no double send); the block at `due_at` is
+  skipped (the reminder's own `status` notifies for it); blocks added to a past moment, or more than 10 minutes stale, are
+  marked handled without notifying so a late worker never floods anyone. Moving a block re-arms it. Migration `scheduler/0015`.
+- **Panel time zone:** the event panel seeded its time field from `event.start_datetime.slice(0, 16)` in *two* places
+  (initial state and a re-seed effect), i.e. the UTC clock; the screenshot's 08:15 PM for a 12:15 PM block. Now
+  `toLocalDatetimeValue`. The same slice was in "Set reminder for this event". The panel's time field edits **that block**
+  (`Reminds at (15 min)`); title/notes go to the reminder.
+- The calendar form and "Set reminder for this event" now use the channels from Settings → Reminder notification defaults.
+  They hard-coded in-app only, so a user with Laptop push or SMS on still got nothing but a feed entry.
+- Tests: `scheduler/tests/test_reminder_calendar.py` rewritten (36), sabotage-checked (no occurrence delivery, no length,
+  double send at the due time).
+
+**What a user should expect at a reminder's start time.** For each block (including the first), the reminder is delivered on
+the channels ticked in Settings (and ticked on that reminder): **in-app** is an entry in the activity feed and in the
+profile's Notifications history — it is *not* a popup; **Laptop (push)** is the OS notification and needs the browser registered;
+**SMS** needs the Twilio number registered for US A2P/toll-free (see 2026-11-09); **Slack** is paused. Nothing shows a toast
+while the app is open.
+
+**Left open.** No in-app toast/banner when a reminder fires. Dragging a reminder onto the real grid is untested in jsdom
+(the unit-level add-occurrence call is). Blocks on the grid are not draggable; move one from its panel.
+
+
+---
+
+### 2026-11-10 (3) — Reminders sidebar: Today / Upcoming / Historical, and a real Snooze
+
+- **Sections** (`lib/reminderSections.ts`, pure): a reminder is filed by its **next unfinished time** — its due time plus every
+  calendar block (each 15 minutes). That time today (incl. in progress) → Today; a later day → Upcoming; every time over, or
+  dismissed → Historical. The sidebar fetches every reminder (it used to ask for `status=pending` only, so sent and dismissed
+  ones vanished) and re-reads the clock every 30 s (`REMINDER_CLOCK_TICK_MS`), so a card moves to Historical when its 15 minutes
+  end without a reload. Today/Upcoming run soonest first, Historical most recent first, capped at 10 with "Show all N".
+- **Snooze** (`ReminderSnoozeMenu`, `lib/reminderSnooze.ts`): **Custom… first**, then 15 minutes later, Before end of day
+  (5:00 PM local; disabled once past), Tomorrow morning (9:00 AM), Before next account meeting. Available on every card, including
+  Historical (it brings the reminder back).
+- **`POST /scheduler/reminders/<id>/snooze/` now takes `{until}` or `{preset: "next_account_meeting"}`** and reschedules: `due_at`
+  moves, status goes back to `pending` (delivery only picks up pending), and the calendar block at the old due time moves with it
+  (other blocks stay). Past or invalid times are 400 and change nothing. It used to set status `snoozed` without touching any time,
+  which silently stopped the reminder ever firing; no UI called it. A bare call is now a 400.
+- **Before next account meeting** is resolved on the server (`scheduler/reminder_snooze.py`): the owner's next meeting on the
+  reminder's account (directly linked, or via the meeting it is about), skipping reminders/work-tracking blocks, cancelled,
+  all-day and did-not-attend; fires 15 minutes before, or a minute from now if that is already past. No account or no upcoming
+  meeting → a readable 400 shown in the menu.
+- Tests: `reminderSections` (11) and `reminderSnooze` (6) unit; 14 page tests; 17 backend; sabotage-checked re-arming, meeting
+  filters, the clock tick and past-time refusal.
+- **Left open:** a snoozed reminder shows no "Snoozed" badge (status goes to `pending` so it fires); the dashboard/account
+  panels still list `snoozed` status that nothing sets any more. "End of day" is a fixed 5:00 PM, not a per-user setting.
+  Daphne must be restarted for the changed `snooze` route (`npm run agent-pm`).
+
+
+---
+
+### 2026-11-10 (2) — Profile: lists that were really stale, artifact browse controls, Notepad linked to accounts
+
+**Why the Action Items / Reminders lists were still "not current" (the refresh added earlier was not the
+cause).** Both read the wrong thing:
+- *Action Items (In Progress)* read `scheduler.ActionItem` (the agent's own follow-ups), not the Airtable
+  action items every other page shows, so almost nothing the user works on appeared. It now reads
+  `airtableApi.listActionItems({status: "In Progress"})` and keeps the ones assigned to the caller
+  (`isAssignedTo`: Airtable collaborator id **or** `String(TeamMember.pk)`, the two id shapes in the data,
+  same as `_can_write_action_item`). Unassigned items are not "mine" here. The row click now opens the
+  modal directly (the old "look the Airtable record up by `airtable_record_id`" step is gone).
+- *Reminders (Today / Tomorrow)* asked for `status=pending`. A reminder that has fired is `sent`, so
+  everything due earlier today vanished. New additive `due_after` / `due_before` params on
+  `GET /scheduler/reminders/` (unparseable -> nothing, owner-scoped as before); the page asks for
+  `due_before = end of tomorrow` ordered newest first and keeps today/tomorrow reminders of any status
+  except dismissed, plus still-pending/snoozed overdue ones (`visibleReminder`). Default page size is 50
+  (the global paginator ignores `page_size`).
+- Lists still refresh on focus, on the `actionItemsUpdated` broadcast and every 30s. Reminders have no
+  broadcast, so they can lag up to 30s.
+
+**My Artifacts** now has the account page's search / sort / category / creator / "linked to action item"
+bar (`ArtifactBrowseBar` + `browseArtifacts`, unchanged). One addition: `browseArtifacts` / `matchesQuery`
+take an optional `extraText` so the profile (which mixes accounts) can search by account name; the
+account page passes nothing, so its behaviour is identical.
+
+**Notepad notes can be linked to an account.** `layouts.UserPageNote.account` (FK, `SET_NULL`,
+migration `layouts/0003`, which also links old name-only labels when exactly one of the owner's accounts has
+that exact name; dev DB backup `/tmp/db.sqlite3.pre-notepad-account`). The serializer only accepts an
+account the writer is on (or their own Admin workspace) and keeps `account_ref_label` = the account name
+(the Notepad tab text). `GET /layouts/page-notes/?account=<id>` returns the caller's linked notes only
+(owner-scoped always). The Notepad dropdown now sends the account id and **saves as soon as it changes**
+(no empty note is created by picking an account). On the account detail page, `LinkedNotepadNotes` shows
+those notes read-only under the Account Notes list ("From your Notepad ... Only you can see these").
+- **Decision to confirm:** linked notes stay **private to their owner**. They are derived on read, not
+  copied into `AccountNote`, so editing/unlinking in the Notepad updates the account page and nothing goes
+  stale. Making them visible to the account's team is a product decision, not done.
+- `layouts` had no tests; `layouts/tests/test_page_notes.py` (13) covers the link rules, owner scoping,
+  the filter, SET_NULL and the backfill.
+
+**Not mine, seen while verifying:** `AccountDetailPage.tsx` imports `components/account/AccountTicketsSection`
+(a file that does not exist yet) and `LinkedRecordsList.tsx` is missing an `account_ticket` key - another
+session's in-flight work. They make `tsc` / `AccountDetailPage` tests red until it lands.
+Daphne must be restarted for the new filter params and the `account` field.
+
+
+---
+
+### 2026-11-10 (4) — "No notification arrived", snooze that moves the block, draggable reminders, ordered Reminders page, multi-record links
+
+**Why nothing arrived (diagnosed from the dev DB and worker log, not guessed).**
+1. The user snoozed while the running server still had the *old* snooze, which set status `snoozed` and no time; delivery only picks up
+   `pending`, so the 21:30 reminder never fired. Daphne had been started before the fixed snooze was written. **A change to a view is
+   invisible until daphne restarts** (see "Key commands"). Migration `scheduler/0016` re-arms any reminder stuck in `snoozed`.
+2. In-app *did* fire (two Notification rows) but "in-app" only writes a history row and a Twilio Sync feed entry — nothing on screen.
+   New `useReminderAlerts` (app shell) polls the user's in-app reminder notifications every 20 s and shows a toast that stays until
+   dismissed (`ReminderAlertToast`). First run records a baseline and shows nothing, so history is never replayed; anything older than 6 h is skipped.
+3. That reminder had only In-app ticked: it was created before the calendar form used Settings' channel defaults, and the sidebar card had no way to
+   change channels. The expanded card now has Notify via checkboxes (only changed channels are sent).
+4. The live feed itself was failing: `Failed to publish event … to Twilio Sync: HTTP 404` — the per-user list (`agent-feed-<id>`) was only ever created by
+   the browser's Sync client. `realtime/sync.py` now creates the list on a 404 and retries once.
+5. SMS still cannot be delivered until the Twilio number is A2P/toll-free registered (2026-11-09 entry).
+
+**Snooze** now takes `from` — the time the card is under. That calendar block moves to the new time; if it is the block at `due_at`, the due time
+moves and the reminder is re-armed; an extra block moves alone and notifies at its new start. A target minute that already has a block is a 400.
+**Draggable blocks:** a reminder block on the grid can be dragged (not resized: always 15 min); `handleEventDrop` intercepts it *before* the meeting path,
+which would push it to Google. Optimistic, reverted with a message if the server refuses.
+
+**Reminders page:** `ordering=-due_at` and `page_size=500`. `ReminderViewSet` now uses `ClientPageSizePagination` — it ignored `page_size`, so both this
+page and the calendar sidebar silently stopped at the first 50 oldest reminders.
+
+**Links to several records.** `Reminder.links` (JSON, `[{resource_type, resource_id, resource_label}]`, max 10); `resource_*` mirror the primary (the account if any,
+else the first). `GET /scheduler/reminders/link-options/?type=&q=` feeds the picker and `normalize_links` validates on save, both through
+`scheduler/reminder_links.py::visible_queryset`: accounts the user is on (all for an Admin with the staff view), what the Action Items page lists for them
+(`_exclude_private_admin_items`), their own meetings (not reminder/work blocks), tasks assigned to them. Labels come from the DB. "Doesn't exist" and "isn't yours"
+return the same error. Everything that read the single link (recipients, snooze-before-meeting, block account, Notification account) now goes through
+`reminder_links.linked_account`, so an account among several links is found. UI: `ReminderLinksField` — pick a type, choose from the list, type to filter (server-side).
+
+**Ops mistake worth recording:** `pkill -f "daphne -b 0.0.0.0 -p 8000"` also matched the `concurrently` parent (its argv contains that string) and took Vite and
+ngrok down with it. Match the interpreter instead (`Python.app/Contents/MacOS/Python .venv/bin/daphne`), or just re-run `npm run agent-pm`. Vite was restarted
+standalone; ngrok is not running (Zscaler blocks it anyway, so voice/webhooks are unavailable).
+
+**Left open.** The sidebar's single-account form and the agent still use the single-link fields (server mirrors them into `links`). Recipient notification
+(other users) is unchanged: it needs an *account* among the links. The Reminders page form has no teammate picker.
+
+
+---
+
+### 2026-11-10 (5) — Reminder alerts stay until answered; teammates through any linked record; teammate picker on the Reminders page
+
+**Alerts.** An in-app reminder now stays on screen until the user **acknowledges** it or **snoozes** the reminder; there is no timeout and no close
+button. The state is server-side — an *unread* in-app reminder `Notification` — so a reload, a second tab or a night away shows the same alerts
+(`useReminderAlerts` polls `?channel=in_app&kind=reminder&unread=1` every 20 s and on returning to the tab). The earlier version showed only what arrived
+after page load and dropped anything older than 6 h; that is how one gets missed (`lib/reminderAlerts.ts` now just filters unread).
+- `Notification.reminder` (FK, SET_NULL) and `fired_for` (the moment that fired: the due time or a calendar block's start) let the alert snooze the right
+  reminder and move the right block. `can_snooze` is false for someone notified through a teammate's reminder — they can acknowledge, not reschedule it.
+- Snoozing *or dismissing* a reminder, from anywhere (sidebar, alert, API), marks that reminder's unread alerts for its owner read (`_acknowledge_alerts`).
+  The profile's "mark all read" therefore also acknowledges alerts.
+- `team/0015` marks every existing reminder notification read: they predate this and would otherwise all appear at once. Dev DB backup `/tmp/db.sqlite3.pre-alerts`.
+- At most 5 alerts are drawn; the rest are counted ("+ N more waiting"), never dropped.
+
+**Teammates no longer need an account *link*.** They come from the team of any account the links *lead to* that the creator is on: an account link, or the account
+an action item or meeting is filed under (`reminder_links.reachable_accounts`, `reminder_recipients.candidates_for`). So linking "Draft QBR deck" is enough to reach the
+Acme team. Rules unchanged: creator must be on the account, recipient on its team, opt-outs refused, `confirm_notify_others` required for anyone newly added.
+Re-linking keeps whoever is still reachable and drops the rest (it used to drop everyone). `GET /scheduler/reminders/recipients/` takes repeated
+`?link=<type>:<id>` (or the old `?account=`), returns the accounts the people come from, and 404s on a link the caller cannot see. Nothing linked, or no linked
+record on an account the user is on → an explanatory hint, not a list.
+
+**Reminders page** has the same teammate picker and the same "Are you sure you want to notify these users?" step, on create and edit; save errors are shown
+instead of swallowed. Saving an unrelated edit to a reminder that already notifies someone does not ask again.
+
+**Slip caught by the suite:** replacing the `recipients` action in `scheduler/views.py` by slicing to the next `@action` also removed `perform_destroy` (it sat between
+them), so deleting a reminder stopped removing its calendar blocks. Restored. When replacing a method by range, check what else lives in the range.
+
+**Left open.** A person with no shared account cannot be notified (e.g. a colleague you only share a Team with). The sidebar form still has a single account
+dropdown (its teammates follow that account). No browser/OS notification is raised for an alert when the tab is in the background — that is the Laptop (push)
+channel's job.
+
+
+---
+
+### 2026-11-10 (3) — Profile page: action items scroll after five; every section opens full screen
+
+- **Action items (In Progress)** show five rows and scroll for the rest (previously capped at 5 / 8 by
+  `slice`, so the rest were unreachable). Row height and gap are constants (`ACTION_ROW_PX`,
+  `ACTION_ROW_GAP_PX`, `ACTION_ITEMS_VISIBLE`), and the scroll box's `max-height` is derived from them.
+- **Full screen, on every section.** `components/profile/fullscreen.tsx`:
+  - `ExpandableSection` wraps a section. A **double-click on its body** or the **icon at its bottom-right**
+    (`aria-label="Open <title> in full screen"`) opens a portalled `position: fixed` panel (z-index 45, below
+    the app's z-50 dialogs and the 9999 comment panel, so a card can open an action item/comment over it).
+    **Escape** or the **X** (top right) closes it; an Escape another handler already `preventDefault`ed is ignored.
+  - A double-click is ignored on `button, a, input, textarea, select, label, summary, [contenteditable],
+    .ProseMirror, [role=button], [data-no-fullscreen]`, so editing a word or double-clicking inside the mini
+    canvas / a session canvas (both marked `data-no-fullscreen`) never opens it. The icon always works.
+  - `CardList` is the panel's content: one card per record, click to open it, **any number open at once**,
+    plus Expand all / Collapse all. `fieldsOf(record, {html, seconds, hide, labels})` turns a record into rows
+    (every field, dash for empty, dates/durations formatted, rich text sanitized) so a card shows *all* of
+    the record's data without hand-listing fields.
+  - `CollapsibleSection` takes `full={() => …}`; the left-column cards and Notepad / Mini Canvas / Working
+    Sessions use `ExpandableSection` directly (the wrapper *is* the card, so the icon is inside it).
+  - Covered: Action Items, Reminders, Comments, Layouts, Quick create & links, My Skills, My Accounts,
+    My Artifacts (browse bar + cards, shares the inline filter state), Time Allocation (`showCards`: a card
+    per account with a day-by-day breakdown, Admin included), Notifications, Public (also on someone else's
+    profile), Notepad, Mini Canvas (read from its storage: current canvas + saved ones), Working Sessions.
+  - **Not covered:** `TicketsToReview` (another session's block; renders nothing when there is nothing to review).
+- Notes: the full-screen Mini Canvas view is a read-only snapshot taken when it opens; Notifications / Public /
+  Notepad full views load their own copy of the data.
+- Tests: `components/profile/__tests__/fullscreen.test.tsx` (24) and 14 in `ProfilePage.test.tsx`
+  ("full-screen sections"); sabotage-checked (Escape, double-click, the scroll box).
+
+
+---
+
+### 2026-11-10 (6) — Reminders: notify your manager, and colleagues for Admin-workspace reminders
+
+- **Manager.** The creator's manager (`TeamMember.manager` → their login) is offered for **every** reminder, with no link required and whether or not they
+  are on any of the creator's accounts. No manager, or a manager with no login, means no option. The usual rules still apply: opt-out is listed-but-refused,
+  and `confirm_notify_others` is required to add them.
+- **Colleagues, only for private Admin reminders.** Every user's Admin account is unshared and Admin action items are private to their assignee, so a reminder
+  about one has no account team to draw on. When a link goes into that workspace (`reminder_links.is_private_admin_link`: an `is_admin_account` account, an
+  action item under the Airtable "Admin" account, or a meeting filed under an Admin account), the pool adds the creator's **colleagues** = anyone sharing a
+  (non-Admin) account or a Team with them — the same circle the agent may text or call (`_allowed_phone_numbers`), so reminders do not invent a wider one.
+  Someone who shares neither is never offered, and an ordinary reminder does not get the colleague list. Interpretation to challenge: "colleague" is that
+  circle, not every user in the app.
+- One function decides the pool: `reminder_recipients.pool(user, links)` → `(candidates, sources)`; the serializer validates against it, the endpoint lists it,
+  and re-linking keeps whoever is still in it. `GET …/recipients/` now returns `sources` (e.g. `["Acme", "Your colleagues", "Your manager"]`) alongside `accounts`.
+- The picker asks the server even with nothing linked (the manager may be there) and labels each person's source when there is more than one.
+- Reminder text goes to recipients, not the private item: they get "Set by <name> — <title/body>" and cannot read the reminder or its links. Do not put the
+  linked record's contents into that notification.
+- Tests: 22 in `scheduler/tests/test_reminder_pool.py`, sabotage-checked (colleagues offered to all, colleagues = everyone, manager needing a linked account).
+- **Left open.** Which colleagues are offered is a policy call (shared account or Team); widening it to everyone, or narrowing to the Team only, is one function.
+
+
+**Correction (2026-11-10 (4)) — the profile lists still did not match the app.**
+- *Action Items (In Progress)* showed 4 where the Action Items page's In Progress column showed 21: I had kept
+  only items assigned to the caller (`isAssignedTo`, now deleted). That column lists every In Progress item the
+  caller can see, so the profile now does too. The section scrolls (five rows in view) and full screen lists all.
+- *Reminders (Today / Tomorrow)* showed 1 where the Reminders page showed 2: the second was due weeks ago but has a
+  calendar block today. A reminder is now listed if its due time **or any calendar block** (`reminderTimes`, from
+  `lib/reminderSections.ts`) falls today/tomorrow, or it is still pending/snoozed and overdue; never dismissed. The
+  server filter stays a loose `due_before` (end of tomorrow); the rest is decided client-side. The card and tile no
+  longer cap the list (they scroll).
+- Lesson: when a profile section is meant to mirror another page, copy that page's query, do not add a filter.
+
+
+---
+
+### 2026-11-11 — Ticket sections on the Profile page; unmatched emails pinned to their list
+
+The account detail page, the Gmail ticket scanner (`integrations/ticket_scan.py`, read-only toward Gmail) and
+the `AccountTicket` model already existed from an earlier session: JIRAs / Engineering Tickets, Zendesk /
+Support Tickets and Product Gaps sit above "Email Chain Summary" there, and an email that matches no account is
+filed `needs_review` for its finder with one in-app `ticket_review` notification linking to
+`/profile#ticket-review`. This change adds the rest of the request:
+
+- **Profile sections** `jira_tickets`, `zendesk_tickets`, `product_gaps` (`ProfileTicketsSection`), right after
+  My Accounts by default, with the account page's configuration (same headings, empty text, status filter
+  pills, cards via the exported `TicketCard`, paste-a-link) plus the account each record belongs to (linked) and
+  an account picker for new links. They list the caller's records across accounts - the API already scopes by
+  team membership, so there is no client filter. Each has a full-screen view (`TicketsFull`).
+- **Unmatched emails are pinned.** A `needs_review` record appears at the front of *its kind's* list, above the
+  confirmed ones and regardless of the status filter, as an amber "Pinned · needs an account" card (`ReviewRow
+  pinned`) with the controls to file it on an account (and change its kind) or dismiss it. Following the
+  notification link scrolls to the first pinned card.
+- The stand-alone "Tickets to review" block now takes `kinds` and shows only kinds whose section is *not* on the
+  page, so a card is never shown twice and removing a section does not hide its review cards.
+- **Existing layouts:** the visible-sections list is saved in localStorage, so people with a saved layout would
+  never have seen the new sections. They are added once (after My Accounts; flag `profileTicketSectionsAdded-v1`),
+  and a later removal sticks.
+- The three sections refresh each other through the `accountTicketsChanged` window event (filing a record can
+  move it to another kind).
+- Tests: 13 in `ProfileTicketsSection.test.tsx`, 6 in `ProfilePage.test.tsx`, 2 in `TicketsToReview.test.tsx`;
+  sabotage-checked (pinning, the one-time layout migration).
+- Housekeeping: a CLAUDE.md note from an earlier turn had been written to `app/frontend/CLAUDE.md` (wrong cwd);
+  moved here and the stray file deleted. Append from the repo root with an absolute path.
+- **Needs Celery worker + beat** (`scan_tickets_all_users`, every 10 minutes) for emails to be picked up at all;
+  nothing here sends or modifies mail.
+
+
+---
+
+### 2026-11-11 — Reminders: one set of fields everywhere, teammates who haven't signed in, channels per person, opens on All
+
+**The bug: "none of the linked records belongs to an account you are on" for an account the user IS on.** Real data: 65 of 66 `TeamMember` rows have
+no AgentPM login (the team is synced from Airtable; only `lizkane` has signed in). `candidates()` required a login, so a 7-person account looked empty and the
+picker blamed the account. Now everyone on the account's team (except the user and inactive members) is listed; those without a login come back
+`available: false, user_id: null` with "… hasn't signed in to AgentPM yet, so there is no way to notify them in the app." and are not choosable (they have no
+preferences and no way to be reached; a Slack DM would be the route, and Slack is paused). The same for a manager with no login. The empty-state message now
+distinguishes "you are the only person on X" from "none of the linked records is on an account you are on". Option rows are keyed `user_id ?? "m"+member_id`.
+
+**Channels belong to the person.** "Notify via" is now **"Notify me via"** and applies to the creator only. Everyone under "Also notify" is reached by *their own* Settings
+→ Reminder notification defaults (`reminder_recipients.channels_for`; if all are off they still get it in-app, because they were approved and a silent no-op is worse).
+`_dispatch_reminder` builds each recipient's channel flags from their profile, never from the reminder's.
+
+**Consistent fields.** The Reminders page and the calendar sidebar now offer identical fields — title, notes, due, *Link to* (any records), *Also notify*, *Notify me via* — and
+send the same request, built by `lib/reminderDraft.ts::buildReminderPayload` (one shape; a test pins both forms to it). `ReminderChannelsField` and `REMINDER_CHANNELS` are
+shared by the page, the sidebar form and the card editor. The sidebar's single account dropdown is gone (it was a subset of the link picker).
+**Every other way of making a reminder** (event panel, meeting/note/account-note actions, action-item reminder, account page, the agent) no longer hard-codes in-app only: with no
+channels named, `ReminderSerializer.create` fills them from the creator's Settings (`channels_from_request`), a channel that is named — true or false — still wins, and editing never rewrites them.
+The action-item `set-reminder` and account `reminders` endpoints also now create the calendar block and `links` (they did neither), and replacing an action item's reminder removes the old one's blocks.
+`components/calendar/RemindersTabContent.tsx` and `ItemsSidebar.tsx` are an unused stale copy of the sidebar; left alone.
+
+**Reminders page opens on All** (it was Pending); Pending and Dismissed remain.
+
+**Left open.** People without a login can't be notified until they sign in (or Slack DM is wired up). A teammate's preferences are read from their profile defaults, so a per-reminder
+choice for them is not possible by design.
+
+
+---
+
+### 2026-11-11 — Action Items: "Projects" became "Accounts"; a new Projects view reads the account page's projects
+
+**What changed (visible, requested).** The old Views grid (cards per account, Mine/Team, completed decks,
+focus ghosts) is gone. The view tabs are now **Accounts** (the former Projects view: one status board per
+account; the account's **star** moved into each account header) · By Status · By Due Date · **Projects** (new).
+Stored view: `actionItemsView-v2`; the old ids `kanban` and `projects` both open Accounts (an old "projects"
+meant the boards, which are now "accounts"). `status` / `due` carry over.
+
+**Projects view** (`components/action-items/ProjectsTreeView.tsx`, pure grouping in `lib/projectTree.ts`).
+Account > Project > Goal > action items, read from `AccountProject` (`kind`, `goal_ids`, `action_ids`;
+action ids are Airtable ids, goal ids are `String(AccountProject.id)`). Per account a toggle switches
+**By project** and **Project > Status** (status headings under every project, goal and the "No project"
+bucket); stored per account in `actionItemsProjectsLayout-v1`. Items are compact rows; a click opens the modal.
+- **An item is listed once.** A goal wins over its project; between two owners the first by `position` wins.
+  Items no project/goal claims sit under "No project". Goals nothing references (and goal cycles) are still shown.
+- **Drag to assign** is a MOVE: the item is added to the target and taken off every other project/goal of that
+  account (`moveActionItem`), then the rows are PATCHed (`useAccountProjects.setActionIds`, one refetch). Only
+  rows of the item's own account accept it; a "No project" row takes it off everything. Cross-account filing is
+  still the Accounts view's account header. A failed write is reported and the view re-reads.
+- Projects load in ONE request: `AccountProjectViewSet` got `ClientPageSizePagination` (additive; `?page_size=500`).
+  Projects are keyed by Django `Account.id`; the page joins on the lowercased account name.
+
+**Gotcha worth keeping.** The tree's row/header helpers are plain render functions, not components defined inside
+the render: a component defined in render remounts on every state change, which cancels an in-flight drag.
+
+**Verified.** Frontend: 17 new unit tests (`projectTree`, `useAccountProjects`) + 15 page tests; 26 old Views-grid
+tests were rewritten or deleted (the grid is gone). Sabotage-checked: same-account drop rule, status layer.
+Backend `accounts` 204 OK (1 new page-size test). `npm run build` clean.
+
+**Left open.** `actionItemPinned` (completed-deck pins) is no longer read or written. Goals nested deeper than one
+level render recursively but the account page only creates one level. Daphne must be restarted for the pagination.
+
+
+
+---
+
+### 2026-11-11 (2) — Page Sections panel, Run Skill bar, full-screen grid, Category sort, ticket card notes/comments
+
+- **Page Sections panel** (`components/profile/PageSectionsPanel.tsx`, replaces the inline `PageSectionsSidebar`).
+  Two ordered lists, **Main column** and **Side column**. Sections on the page come first, in page order, with a
+  `−` (remove), ▲ ▼ and drag (HTML5 drag-and-drop) to reorder; sections not on the page follow with `+`. The order in
+  the panel *is* the page order (`visibleSections` / `sideSections`, persisted in `profileVisibleSections-v1` /
+  `profileSideSections-v1`). Feedback on every click: the row flashes, the button flips `+`↔`−`, and a polite
+  `role="status"` line says what happened. Clicking a name (`Go to …`) or adding a section calls `revealSection(id)`
+  (`sectionLayout.ts`): smooth-scroll to `[data-section-id]` and a **3-second purple glow** (`[data-glow]` in
+  `index.css`, restarted if re-triggered). Added sections reveal after they render (`pendingReveal` ref + effect).
+  Sections carry `data-section-id` via `CollapsibleSection`/`ExpandableSection` `sectionId`.
+- **Side column** (Action Items, Reminders, Comments, Layouts, Quick create & links) is now an orderable, removable
+  list (`SIDE_TILES`, ids `side_*`; the column hides when empty). The old right-column `action_items` / `reminders` /
+  `comments` tiles duplicated these cards and were **removed**; a saved layout that still lists them has them dropped
+  by `loadVisibleSections` (unknown ids are filtered).
+- **My Skills.** Saved skills are now selectable chips with **no per-skill buttons**. One **Run Skill** bar at the
+  bottom (`data-testid="run-skill-bar"`) holds Use in Chat / Use in Voice Session (the existing `SkillLaunchButtons`,
+  disabled until a skill is picked): skill first, then action. Also fixed: saved skills were hidden unless the role
+  also had classic skills.
+- **Full screen** cards are a responsive grid (`repeat(auto-fill, minmax(340px, 1fr))`, `align-items: start`); a card
+  still opens in place, several at once.
+- **My Artifacts** (shared `ArtifactBrowseBar`, so the account page too): new **Category** sort (`category`), and
+  clicking the Category button also applies it (a removable "Sort: Category" chip).
+- **Ticket cards** (JIRAs / Zendesk / Product Gaps, account page and profile): the title wraps (auto-height
+  `textarea`, Enter commits); **Notes** is hidden behind its heading (shows the saved note while closed; Enter saves;
+  a click outside closes it and saves anything typed); **Comments** has a heading that opens a composer
+  (`CommentComposer`, Enter posts to `account_ticket`; click outside closes it) above the existing preview list.
+  Notes stay a single rich-text field (the model has one `notes` column), not a list of separate entries.
+- Tests: `sectionLayout.test.ts`, `PageSectionsPanel.test.tsx`, 10 + 6 new in `ProfilePage.test.tsx`, 10 in
+  `AccountTicketsSection.test.tsx`, 4 in `ArtifactBrowseBar.test.tsx`, grid test in `fullscreen.test.tsx`.
+
+- **Run Skill is a real button** (follow-up, 2026-11-11): in the My Skills bar it sits first, then Use in Chat and
+  Use in Voice Session; all three are disabled until a skill is picked. Run Skill always opens the skill's run dialog
+  (`SkillRunDialog`: accounts, template, free-text request) and then sends it to chat; the other two launch directly
+  when the skill needs no input.
+
+**Skill keyword placeholders were treated as literal names (2026-11-11, Gen Csat).** A skill whose
+instructions contain `@#--all-meeting-notes-${account_name}-${date_range}` launched with "No account of yours
+matches 'account_name'" and "Could not read the date range 'date_range'": `skills/keywords.py` read the markers as
+real values. Now (`find_keywords` flags `account_placeholder` / `range_placeholder`; `assemble_run` binds them):
+- `${account_name}` (and `account`, `company_name`, `customer`…) expands **once per account the runner picked**
+  (only accounts they are on); with none picked it reports "Choose an account to fill in this lookup".
+- `${date_range}` (also `date-range`, `range`, `period`…) takes the new `date_range` input ("last 30 days",
+  "October", "2026-10-01..2026-10-31"); blank means **last 30 days** (the header of each lookup prints the dates).
+  An unreadable range is a 400 with help text, not a silent miss.
+- A braced real value (`${Acme}`, `${2026-10}`) and unbraced values are still literal and are never overridden.
+- Both `run` and `voice-start` use `assemble_run`, so voice gets the same substitution. Lookups per run are capped
+  at `MAX_EXPANSIONS = 20`.
+- `SkillRunDialog` shows a **Date range** field only when the skill uses a range placeholder (`usesDateRange`).
+- Tests: 12 in `skills/test_skill_context.py::PlaceholderRunTests` (+4 parsing), sabotage-checked; 8 in
+  `SkillLaunch.test.tsx`. **Daphne must be restarted** for the backend change.
+
+
+---
+
+### 2026-11-11 — Claude skills pinned to any page; the skill-run Console
+
+**Why.** Skills could only be pinned to the profile page, and once launched they were invisible: the
+prompt went into the chat bar, the results lived only in the chat transcript, and nothing recorded what a
+skill created or changed. **Where results went before:** the chat transcript (`AgentMessage`) and, for voice
+only, `ToolCall` rows nobody could see. Chat never wrote `ToolCall`, and a chat turn had no link to the skill
+that started it. Decisions from the owner: a non-admin's pin is personal; an **admin chooses "just me" or
+"everyone"**; the Console records **skill runs only**.
+
+**Page pins** — `skills.SkillPagePin(user nullable, skill, page)`; `user=NULL` is an everyone-pin. Pages:
+`calendar`, `action-items`, `reminders`, `account-detail` (**one list, shown on every account page**),
+`layouts`, `activity-log`. `GET|POST /skills/page-pins/`, `DELETE /skills/page-pins/<id>/` (`skills/page_views.py`).
+- Only `_skill_scope(user)` skills (approved, and the caller's own or public) can be pinned or are listed; a skill
+  that stops being approved or is deleted drops out silently.
+- `everyone` needs `core.mixins.is_admin` (403 otherwise); only an admin removes an everyone-pin. An everyone-pin
+  absorbs a personal pin of the same skill so it never shows twice. Pinning is idempotent. The older profile
+  "Pin to my page" (`AgentSkill.pinned_to_users`) is untouched.
+- Frontend: `components/skills/PinnedSkillsSection.tsx` (`row` | `column` | `collapsible`). Chips keep the "Pinned to
+  my page" look (the calendar row passes a white background); click runs it in chat, 🎙 starts voice, × removes
+  (only when `can_remove`). `useSkillLauncher` was extracted from `SkillLaunchButtons` so chips and buttons share
+  one launch path. On an account page the skill runs **for that account**: `account_ids` are supplied, so a skill
+  that needs accounts skips the dialog.
+- Placements: calendar (row under the card, scrolls sideways), action items (centred `flex-1 min-w-0` row between
+  the title and the buttons; inner `w-max mx-auto` so it centres when it fits and scrolls from the left edge when it
+  doesn't — plain `justify-center` would clip the first button), reminders and activity log (sticky right column; the
+  page root became a flex row), account detail (left nav under Quick Links), layouts (below Layers, **always rendered,
+  closed by default** — the Layers block is conditional on a non-empty canvas, the skills section deliberately is not).
+
+**Console** — `SkillRun` + `SkillRunEvent` (migration `skills/0011`); `skills/skill_console.py`.
+- `run` / `voice-start` open a run and return `run_id`. Chat: `chat-inject` carries it; `TranscriptFooter` sends it
+  once as `skill_run_id`, **only if the outgoing message still starts with the skill's own `/name` line** (a different
+  message typed instead gets none). Voice: `run_id` rides in `VoiceLaunchContext.payload`.
+- Server side `claim_run` accepts only the caller's own, recent (<6h), unfinished run; anything else (including a
+  malformed id) is "no run". A malformed UUID raised Django's `ValidationError`, which would have 500'd chat —
+  the id is parsed explicitly.
+- **Capture is one wrapper**: `MCPServer.dispatch` now calls `_dispatch` (the unchanged protection) and, only when the
+  new `active_skill_run` ContextVar is set, writes the Console line — so chat, voice, spoken confirmations
+  (`dispatch_confirmed` takes `skill_run_id`) and every policy refusal are covered without touching the policy code.
+  Approval prompts (`confirmation_required`) are not logged; they aren't something the skill did.
+- Args are stored **summarised**: free-text and contact-looking fields (`content`, `email`, `phone`, `note`, …) are
+  reduced to a length, long strings cut. Results are never stored — only the record a create/update touched
+  (type, id, label, link), found by one helper over both result shapes. Logging never raises into a tool call.
+- Runs close with token totals (chat: end of stream, `failed` on error; voice: on disconnect, summing the call's
+  assistant messages). `GET /skills/runs/` is owner-only; an admin may add `?scope=all` (`admin_wants_all`).
+- Frontend: a **Console** tab right after Activity on the Activity Log (`components/logs/ConsolePanel.tsx`): one
+  expandable row per run, timeline of tools with created/changed records linked, admin "Everyone's runs".
+
+**Not changed / limits.** Skill-less chat is not logged (owner's choice). A hand-typed `/skill` that wasn't launched
+from the app has no run. The existing chat `tool_call`/`tool_result` activity events are left alone. Author-side helper
+calls and ordinary chat are unaffected (the wrapper does nothing without a run).
+
+**Test-harness notes.**
+- Default MSW handlers for `GET /skills/page-pins/` and `/skills/runs/` live in `test/handlers/skills.ts`
+  (`pagePinsFor(page, pins)` answers only for one page, like the server). Without them the pages still render —
+  the section degrades quietly — which is exactly why they're there: it would hide real failures.
+- Chip queries must be anchored (`/^Weekly Update/`): the mic and × buttons' names contain the skill name too.
+- Decorative glyphs are `aria-hidden`, so they're not part of a button's accessible name — assert `aria-expanded`.
+- A folded sidebar's contents sit in a `hidden` wrapper: query with `{ hidden: true }`.
+- Sabotage-checked: admin-only option, who can remove an everyone-pin, running for the current account, Layouts
+  closed-by-default and always-present, run ownership, the dispatch hook only firing inside a run, and the footer's
+  prefix/once rules each turn a test red.
+
+**A test-suite change you should know about.** Adding ~360 tests tipped the full backend run over DRF's 200-requests-a-minute
+per-user throttle: in tests the first user always gets the same id, so every test shares one counter, and the 429s landed
+on unrelated tests (`skills` + `sync_review` alone gave 16 × `429 != 200`; reproduced before fixing). `core/test_runner.py`
+(`TEST_RUNNER = "core.test_runner.FreshCacheRunner"`) now clears the cache before every test via the result object's
+`startTest` hook, so counters can't leak. Thirty-three files were already calling `cache.clear()` by hand; they still work.
+`core/tests/test_test_runner.py` fails if the runner isn't in use (verified with the default runner as a control).
+
+**Verified.** Backend 2725/2725; frontend 2908/2908 (239 files); `npm run build` clean; `makemigrations --check` clean.
+New: ~60 backend tests (`skills/test_page_pins_console.py`), and frontend tests for the section (24), hook (7), Console (11), the
+footer's run-id rule (7) and each page's placement. Dev DB migrated (`skills.0011`), backup `/tmp/db.sqlite3.pre-page-pins`.
+Two frontend failures seen mid-way (TeamPage, a Project Goals modal) were 5-second timeouts while the backend suite was using the CPU;
+both pass when the machine is quiet.
+
+**Left open.** Daphne must be restarted (new routes `page-pins/`, `runs/`; a changed `dispatch`). The Console isn't
+exercised against a real voice call. Pinned lists are per page *type*, not per account (as requested: "every
+account detail page").
+
+
+
+---
+
+### 2026-11-11 — Pinned skill chips slide to Run / Chat / Voice; "Pin a Claude Skill"; Layouts section always visible
+
+- The page picker is now **"Pin a Claude Skill"** (button "Pin"), styled per page via `PAGE_SELECT_CLASS` in
+  `components/skills/PinnedSkillsSection.tsx` so it matches that page's own controls.
+- A pinned chip shows only its name. Clicking it slides the name left and reveals three icon buttons: **Run**
+  (inject the prompt and send it), **Chat** (inject only), **Voice** (start the session). Pointer-leave, Escape
+  and focus-out slide it back; hidden panels use `visibility:hidden` so they are not focusable. New launch mode
+  `"run"` (`useSkillLauncher`, `SkillRunDialog`); `chat-inject` accepts `send: true`, which `TranscriptFooter`
+  sends once (`autoSendRef`) after the input updates.
+- Layouts: `PageBuilder` took `calc(100vh - 56px)` and ignored the sticky chat footer, so the sidebar's bottom
+  was hidden. The route now passes `fillParent` (height 100% of `<main>`); the ChatPage embed is unchanged. The
+  skills section sits **outside** the sidebar's scrolling area (`shrink-0`, own `max-h-56` scroll).
+- Frontend only. Not checked in a real browser (slide animation, footer overlap).
+
+**Run dialog offers all three launches (2026-11-11).** `SkillRunDialog` now shows **Run skill** (put the prompt in
+chat and send it), **Send to chat** (put it in the box to edit first) and **Start voice session** together, all
+sharing the same input; the `mode` prop only says which one is filled. Another session added the `run` launch mode
+(`LaunchMode`, `injectToChat(…, send)`) in the same files at the same time - re-read before editing them. A failed
+launch now says why (`describeLaunchError`: the server's message, else throttling / session expired / server
+error / connection) instead of always "Couldn't run this skill", and logs the error to the console. The reported
+"Couldn't run this skill" on `last 30 days` was **not reproducible**: the endpoint returned 200 for that input
+through Vite and Daphne; the likely cause was a response with no message (a throttle or an HTML error page), which
+the new text would have named. Tests: `SkillRunDialogButtons.test.tsx` (11).
+
+**Root cause of "The server rejected the request (400)" on a skill run (2026-11-11).** The REST bridge
+(`agents/rest_bridge.py`) built its in-process requests with `APIRequestFactory`, whose default host is
+`testserver`. Django's **test runner** adds that host to `ALLOWED_HOSTS`; a **running server** does not. Any view that
+asks the request for its host (an uploaded file's absolute `file_url`, a pagination link) raised `DisallowedHost`.
+Result: a skill with an `@#--all-artifacts-…` lookup returned an HTML 400 for every account that had an uploaded
+file (9 of 17 of the dev user's accounts), and any agent tool that read such records failed the same way. Every
+test passed because tests allow `testserver`.
+- `rest_bridge._request_environ()` now presents the first concrete allowed host (`localhost:8000`, or `https` for a
+  real domain; `localhost` if only wildcards are configured).
+- `skills/keywords.expand_keyword` also catches any unexpected error per lookup and reports "Couldn't look up …"
+  (no exception text) instead of failing the whole run.
+- **Lesson:** a test that exercises code which reads the request host must run with `override_settings(ALLOWED_HOSTS=[...])`
+  of real hosts. Tests: `agents/tests/test_rest_bridge_host.py` (5) and `ArtifactLookupOnARealServerTests` (3),
+  sabotage-checked (6 fail without the fix). **Daphne must be restarted.**
+
+**Timeframe buttons in the run dialog (2026-11-11).** The free-text date field is now a row of buttons
+(`lib/timeframes.ts::TIMEFRAME_PRESETS`): Last 7 / 14 / 30 / 90 days, This / Last week, This / Last month,
+This / Last quarter, This / Last year, and **Custom…** (From / To date pickers, sent as `YYYY-MM-DD..YYYY-MM-DD`;
+launch is disabled until both are set). **Last 30 days is preselected and always sent** (it is also the server
+default). Only shown for skills that use a `${date_range}`-style placeholder. Backend: `parse_date_range` learned
+`this-quarter`, `last-quarter`, `this-year`, `last-year`. Every preset value must stay readable by
+`parse_date_range` (a test pins the names). Tests: 12 in `SkillLaunch.test.tsx`, 4 in
+`skills/test_skill_context.py::QuarterAndYearRangeTests`. Daphne restart needed for the new range names.
+
+
+---
+
+### 2026-11-11 — Skill runs too big for one chat message: data is staged and read in parts
+
+**Why.** The chat takes at most 10,000 characters a message (`AgentMessageInputSerializer`), but a skill run's
+prompt is built under looser caps: up to 40,000 characters of attachments plus up to 20 keyword lookups of 40 rows.
+A big run would be rejected by the chat.
+
+**What changed.**
+- `assemble_run(..., stage_data=True)` (chat `run` only; voice is unchanged) compares the prompt with
+  `PROMPT_INLINE_LIMIT` (7,000, leaving room for what the user adds). Over it, the looked-up data and attachment
+  text leave the prompt and become parts of at most `PART_CHARS` (12,000) characters, split on whole items and then
+  line breaks, nothing dropped, `MAX_PARTS` 40. The prompt keeps the instructions and a note: how many parts, a
+  one-line label for each, and "read them all with `get_skill_run_data` before you start". Instructions that alone
+  pass the limit are not staged (they are the skill itself).
+- Parts live on `SkillRun.data_parts` (migration `skills/0012`). The run view substitutes the real run id for
+  `{{run_id}}` and returns `data_staged: {parts, characters}`; the launcher says so under the button.
+  If the run could not be stored, the full prompt is pasted as before (no silent loss).
+- `GET /skills/runs/<id>/data/?part=N` returns one part. **Owner only, no admin widening** (the content is the
+  caller's own lookups).
+- Agent tool `get_skill_run_data(run_id, part)` (`group="skills"`, `skill_safe=False`, in `SKILL_ALWAYS_ALLOWED`
+  like `load_skill`), through the REST bridge, so it gets the endpoint's rules. The run id is parsed as a UUID first.
+  Documented on a new "Saved Skills" card. The Console logs each call like any tool.
+
+**Not changed.** The 20,000-per-attachment and 40,000-total caps and the 40-row-per-lookup cap still apply (staging
+moves what is included, it does not raise those). Each part is read as a tool result, so it still spends tokens
+against the user's daily budget. Skill-less chat is unchanged.
+
+**Verified.** 22 new backend tests (`skills/test_run_data_parts.py`), sabotage-checked (owner filter, staging
+condition); 2 frontend tests. **Daphne must be restarted** for the new route and tool.
+
+**Follow-up 2026-11-11 — Gen Csat still overflowed, and the failure left nothing to review.**
+- *Why it still happened:* the running Daphne (started 13:51) predated the staging code (14:15). Daphne has no autoreload.
+  Reproduced against the dev DB: Gen Csat (4,961-character instructions, three lookups per account) was a 10,028-character
+  prompt for three accounts; with staging it is 5,533. Restarted Daphne standalone; the data route answers 401.
+- *Why there was no conversation:* `TranscriptFooter.handleSend` cleared the box first, never checked `response.ok`, and
+  printed the 400's raw JSON as the "assistant" reply. The server had refused the message, so no session existed, and the text
+  was gone. Now: a message over `CHAT_MESSAGE_MAX` (`lib/chatSend.ts`, 10,000) is not sent, says so, and stays in the box; a
+  count appears from 8,000 characters (red when over); any server refusal is shown in words and the text, attachments and the
+  skill's run id are put back so it can be edited and resent.
+- Prompt index capped at 8 parts; when the skill's own instructions alone exceed the chat cap the run returns a warning
+  instead of a prompt that cannot be sent. The other raw-`fetch` chat sites (`ChatPage`, `ThreadChatPanel`, `AccountDetailPage`)
+  were not changed.

@@ -85,3 +85,42 @@ class AgentSkillSerializer(serializers.ModelSerializer):
         if request and request.user.is_authenticated:
             return obj.pinned_to_users.filter(pk=request.user.pk).exists()
         return False
+
+
+# ── Page pins & the skill-run Console ──────────────────────────────────────────────────
+
+from .models import SkillPagePin, SkillRun, SkillRunEvent  # noqa: E402
+
+
+class SkillRunEventSerializer(serializers.ModelSerializer):
+    record = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SkillRunEvent
+        fields = ["id", "ts", "kind", "tool_name", "status", "error_code", "summary", "args", "duration_ms", "record"]
+        read_only_fields = fields
+
+    def get_record(self, obj):
+        if not obj.record_type:
+            return None
+        return {"type": obj.record_type, "id": obj.record_id, "label": obj.record_label, "url": obj.record_url}
+
+
+class SkillRunSerializer(serializers.ModelSerializer):
+    user_username = serializers.CharField(source="user.username", read_only=True)
+
+    class Meta:
+        model = SkillRun
+        fields = [
+            "id", "skill", "skill_name", "surface", "page", "params", "status", "started_at", "finished_at",
+            "tool_count", "records_created", "records_updated", "input_tokens", "output_tokens", "user_username",
+        ]
+        read_only_fields = fields
+
+
+class SkillRunDetailSerializer(SkillRunSerializer):
+    events = SkillRunEventSerializer(many=True, read_only=True)
+
+    class Meta(SkillRunSerializer.Meta):
+        fields = SkillRunSerializer.Meta.fields + ["events"]
+        read_only_fields = fields

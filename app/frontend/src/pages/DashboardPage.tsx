@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useStatusLabels } from "../hooks/useStatusLabels";
 import { Link, useNavigate } from "react-router-dom";
 import { airtableApi, schedulerApi } from "../lib/api";
 import { logActionItemUpdate } from "../lib/actionItemLog";
@@ -49,6 +50,7 @@ function readZones(): Record<string, string> {
 }
 
 export default function DashboardPage() {
+  const { label: statusLabel } = useStatusLabels();
   const navigate = useNavigate();
   const [actionItems, setActionItems] = useState<AirtableActionItem[]>([]);
   const [todayEvents, setTodayEvents] = useState<CalendarEvent[]>([]);
@@ -324,7 +326,7 @@ export default function DashboardPage() {
                       {item.priority}
                     </span>
                     <span className={`text-xs font-medium px-1.5 py-0.5 rounded ${STATUS_BADGE[item.status] ?? "bg-green-50 text-green-700"}`}>
-                      {item.status}
+                      {statusLabel(item.status)}
                     </span>
                   </div>
                 </div>

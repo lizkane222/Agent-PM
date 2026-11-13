@@ -29,7 +29,6 @@ export function useAccountMeetingReminders(): UseAccountMeetingRemindersResult {
         resource_type: "calendar_event",
         resource_id: calendarEventId,
         resource_label: calTitle,
-        notify_in_app: true,
       });
       setMeetingReminders((prev) => ({
         ...prev,

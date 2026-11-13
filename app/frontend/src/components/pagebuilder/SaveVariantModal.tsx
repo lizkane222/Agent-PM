@@ -32,9 +32,9 @@ export default function SaveVariantModal({ baseType, onSave, onClose }: Props) {
     >
       <div
         style={{
-          background: "#fff",
+          background: "var(--surface-card)",
           borderRadius: 12,
-          border: "1px solid #E5E7EB",
+          border: "1px solid var(--border-subtle)",
           boxShadow: "0 8px 32px rgba(0,0,0,0.16)",
           padding: "24px",
           width: 320,
@@ -44,10 +44,10 @@ export default function SaveVariantModal({ baseType, onSave, onClose }: Props) {
         }}
       >
         <div>
-          <p style={{ fontSize: 14, fontWeight: 700, color: "#121C2D", margin: 0 }}>
+          <p style={{ fontSize: 14, fontWeight: 700, color: "var(--text-ink)", margin: 0 }}>
             Save variant
           </p>
-          <p style={{ fontSize: 11, color: "#6B7280", margin: "4px 0 0 0" }}>
+          <p style={{ fontSize: 11, color: "var(--text-gray-500)", margin: "4px 0 0 0" }}>
             {baseType} · Give it a name
           </p>
         </div>
@@ -62,7 +62,7 @@ export default function SaveVariantModal({ baseType, onSave, onClose }: Props) {
           style={{
             padding: "8px 10px",
             fontSize: 13,
-            border: "1px solid #D1D5DB",
+            border: "1px solid var(--border-subtle-2)",
             borderRadius: 6,
             outline: "none",
             width: "100%",
@@ -82,8 +82,8 @@ export default function SaveVariantModal({ baseType, onSave, onClose }: Props) {
                 fontWeight: scope === s ? 700 : 400,
                 border: `1.5px solid ${scope === s ? "#0263E0" : "#D1D5DB"}`,
                 borderRadius: 6,
-                background: scope === s ? "#EFF6FF" : "#fff",
-                color: scope === s ? "#0263E0" : "#374151",
+                background: scope === s ? "#EFF6FF" : "var(--surface-card)",
+                color: scope === s ? "#0263E0" : "var(--text-gray-700)",
                 cursor: "pointer",
               }}
             >
@@ -99,10 +99,10 @@ export default function SaveVariantModal({ baseType, onSave, onClose }: Props) {
               padding: "7px 16px",
               fontSize: 12,
               fontWeight: 600,
-              border: "1px solid #D1D5DB",
+              border: "1px solid var(--border-subtle-2)",
               borderRadius: 6,
-              background: "#fff",
-              color: "#374151",
+              background: "var(--surface-card)",
+              color: "var(--text-gray-700)",
               cursor: "pointer",
             }}
           >

@@ -8,6 +8,7 @@ from django.contrib import admin
 from django.http import FileResponse, JsonResponse
 from django.urls import include, path, re_path
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
+from core import google_login
 from rest_framework.throttling import AnonRateThrottle
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
@@ -19,7 +20,11 @@ def vapid_public_key(request):
 
 def oidc_status(request):
     """Return whether Okta OIDC is enabled so the frontend can show/hide the SSO button."""
-    return JsonResponse({"okta_enabled": bool(settings.OIDC_RP_CLIENT_ID)})
+    from core import google_login
+    return JsonResponse({
+        "okta_enabled": bool(settings.OIDC_RP_CLIENT_ID),
+        "google_enabled": google_login.enabled(),
+    })
 
 
 def oidc_logout_fallback(request):
@@ -38,6 +43,8 @@ class ThrottledTokenObtainPairView(TokenObtainPairView):
     throttle_classes = [LoginRateThrottle]
 
     def post(self, request, *args, **kwargs):
+        if getattr(settings, "AUTH_PASSWORD_LOGIN_DISABLED", False):
+            return JsonResponse({"detail": "Password sign-in is disabled. Sign in with Google."}, status=403)
         response = super().post(request, *args, **kwargs)
         if response.status_code == 200:
             try:
@@ -73,6 +80,8 @@ urlpatterns = [
     *([path("oidc/", include("mozilla_django_oidc.urls"))] if os.environ.get("OKTA_CLIENT_ID") else []),
     *([path("oidc/logout/", oidc_logout_fallback, name="oidc-logout-fallback")] if not os.environ.get("OKTA_CLIENT_ID") else []),
     path("api/v1/auth/oidc-status/", oidc_status, name="oidc-status"),
+    path("api/v1/auth/google/start/", google_login.start, name="google-login-start"),
+    path("api/v1/auth/google/callback/", google_login.callback, name="google-login-callback"),
 
     # OpenAPI schema + Swagger UI
     path("api/schema/", SpectacularAPIView.as_view(), name="schema"),

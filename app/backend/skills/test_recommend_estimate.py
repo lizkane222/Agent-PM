@@ -43,6 +43,10 @@ class LoadsObjectTests(SimpleTestCase):
         self.assertEqual(loads_object('```json\n{"a": 1}\n```'), {"a": 1})
         self.assertEqual(loads_object('Sure! {"a": 1} hope that helps'), {"a": 1})
 
+    def test_a_code_block_inside_a_string_does_not_end_the_object_early(self):
+        inner = '{"instructions": "Use this shape:\\n```\\n## Title\\n```\\nDone."}'
+        self.assertEqual(loads_object("```json\n" + inner + "\n```")["instructions"].count("```"), 2)
+
     def test_garbage_raises(self):
         for bad in ("", "no json here", "[1, 2]", "{broken"):
             with self.assertRaises(Exception):
