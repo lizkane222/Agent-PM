@@ -324,10 +324,37 @@ def _send_sms(profile, reminder) -> None:
         logger.debug("No phone_number on profile — skipping SMS reminder")
         return False
 
+    from core.phone_safety import check_number
+
+    try:
+        phone = check_number(phone)
+    except ValueError:
+        logger.warning("SMS reminder skipped: number on profile %s is not sendable", getattr(profile, "pk", "?"))
+        return False
+
+    # Hourly cap per destination: a runaway loop or a flood of reminders aimed at one
+    # person must not become a bill or harassment.
+    from django.core.cache import cache
+
+    key = f"sms-reminder-rate:{phone}"
+    cache.add(key, 0, timeout=3600)
+    try:
+        sent = cache.incr(key)
+    except ValueError:
+        sent = 1
+    if sent > getattr(settings, "SMS_REMINDERS_PER_HOUR", 20):
+        logger.warning("SMS reminder to profile %s suppressed: hourly limit reached", getattr(profile, "pk", "?"))
+        return False
+
     from twilio.rest import Client
 
-    body_text = f": {reminder.body}" if reminder.body else ""
-    message_body = f"Reminder: {reminder.title}{body_text}"
+    # Titles and bodies can be written by another user (teammate reminders): strip control
+    # characters and bound the length so a message stays one or two segments.
+    def _plain(value, limit):
+        return "".join(ch for ch in str(value or "") if ch.isprintable() or ch in "\n ")[:limit]
+
+    body_text = f": {_plain(reminder.body, 300)}" if reminder.body else ""
+    message_body = f"Reminder: {_plain(reminder.title, 140)}{body_text}"
 
     client = Client(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
     message = client.messages.create(

@@ -19,10 +19,12 @@ from realtime.sync import publish_activity_event
 from scheduler.models import Reminder
 from scheduler.serializers import ActionItemSerializer, CalendarEventSerializer, ReminderSerializer
 
-from .artifact_images import image_upload_error
+from .artifact_images import PREVIEW_IMAGE_MAX_BYTES, delete_preview_file, extension_for, image_upload_error, sniff_image_type
+from .artifact_notes import html_to_text
+from .artifact_preview import build_preview
 from .artifact_links import used_in_map
-from .models import Account, AccountArtifact, AccountNote, AccountProject, AccountQuickLink, AccountRole, AccountTicket, CustomerContact, CustomerContactNote, ProjectMember
-from .serializers import AccountArtifactSerializer, AccountNoteSerializer, AccountProjectSerializer, AccountTicketSerializer, AccountQuickLinkSerializer, AccountRoleSerializer, AccountSerializer, CustomerContactNoteSerializer, CustomerContactSerializer, ProjectMemberSerializer
+from .models import Account, AccountArtifact, ArtifactNote, AccountNote, AccountProject, AccountQuickLink, AccountRole, AccountTicket, CustomerContact, CustomerContactNote, ProjectMember
+from .serializers import AccountArtifactSerializer, ArtifactNoteSerializer, AccountNoteSerializer, AccountProjectSerializer, AccountTicketSerializer, AccountQuickLinkSerializer, AccountRoleSerializer, AccountSerializer, CustomerContactNoteSerializer, CustomerContactSerializer, ProjectMemberSerializer
 
 logger = logging.getLogger(__name__)
 
@@ -458,7 +460,7 @@ class AccountViewSet(viewsets.ModelViewSet):
         artifacts = list(account.artifacts.select_related("uploaded_by").all())
         context = {
             "request": request,
-            "used_in_map": used_in_map([a.id for a in artifacts], [account.id]),
+            "used_in_map": used_in_map([a.id for a in artifacts], [account.id], user=request.user),
         }
         return Response(AccountArtifactSerializer(artifacts, many=True, context=context).data)
 
@@ -500,7 +502,7 @@ class AccountViewSet(viewsets.ModelViewSet):
         context = {
             "request": request,
             "used_in_map": used_in_map(
-                [a.id for a in artifacts], visible.values_list("id", flat=True)
+                [a.id for a in artifacts], visible.values_list("id", flat=True), user=request.user
             ),
         }
         return Response(
@@ -631,6 +633,31 @@ class AccountNoteViewSet(mixins.UpdateModelMixin, mixins.DestroyModelMixin, view
         )
 
 
+def _artifacts_visible_to(user):
+    """Artifacts `user` can see: those on an account they are on or own, ones they uploaded, and
+    everything for an Admin with the staff view. The same people the comments system lets in."""
+    from django.db.models import Q
+    if _staff_sees_all(user):
+        return AccountArtifact.objects.all()
+    return AccountArtifact.objects.filter(
+        Q(account__team_members__user=user) | Q(account__admin_owner=user) | Q(uploaded_by=user)
+    ).distinct()
+
+
+def _artifacts_for_discussion(user):
+    """Artifacts whose notes and comments `user` can read and write.
+
+    Notes and comments are one conversation, so they share one audience. Comments let every
+    Admin in (the comments app's visibility check), while `_artifacts_visible_to` only widens
+    for an Admin who switched the staff view on; using that alone for notes meant an Admin saw
+    an artifact's comments but not its notes. Everyone who could open the artifact is still in.
+    """
+    from core.mixins import is_admin
+    if is_admin(user):
+        return AccountArtifact.objects.all()
+    return _artifacts_visible_to(user)
+
+
 class AccountArtifactViewSet(
     mixins.CreateModelMixin,
     mixins.UpdateModelMixin,
@@ -660,7 +687,7 @@ class AccountArtifactViewSet(
                 .values_list("account_id", flat=True)
                 .first()
             )
-            context["used_in_map"] = used_in_map([pk], [account_id] if account_id else [])
+            context["used_in_map"] = used_in_map([pk], [account_id] if account_id else [], user=self.request.user)
         return context
 
     def perform_create(self, serializer):
@@ -725,6 +752,49 @@ class AccountArtifactViewSet(
         except Exception:
             logger.exception("Airtable write-through failed for artifact update '%s'", instance.name)
 
+    # ── Preview overlay support ────────────────────────────────────────────────
+
+    def _visible_artifact_or_404(self, pk):
+        artifact = _artifacts_visible_to(self.request.user).filter(pk=pk).first()
+        if artifact is None:
+            from rest_framework.exceptions import NotFound
+            raise NotFound()
+        return artifact
+
+    @action(detail=True, methods=["get"], url_path="preview")
+    def preview(self, request, pk=None):
+        """GET /accounts/artifacts/<id>/preview/ — what the overlay shows for a file the browser
+        can't render itself (text, CSV, HTML, Office, archives). Visible to anyone who can see
+        the artifact; an invisible or unknown id is a 404."""
+        artifact = self._visible_artifact_or_404(pk)
+        return Response(build_preview(artifact))
+
+    @action(detail=True, methods=["post", "delete"], url_path="preview-image")
+    def preview_image(self, request, pk=None):
+        """POST (multipart ``image``) sets, DELETE removes, the user-supplied screenshot that
+        replaces the type-based preview. Same edit rule as updating the artifact: its uploader,
+        or an Admin with the staff view. Someone who can see but not edit gets 403."""
+        artifact = self._visible_artifact_or_404(pk)
+        if not (artifact.uploaded_by_id == request.user.id or _staff_sees_all(request.user)):
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("You cannot change this artifact's preview.")
+        if request.method == "DELETE":
+            delete_preview_file(artifact)
+            artifact.save(update_fields=["preview_image", "updated_at"])
+        else:
+            upload = request.FILES.get("image")
+            if upload is None:
+                return Response({"error": "Choose an image to use as the preview."}, status=400)
+            error = image_upload_error(upload, PREVIEW_IMAGE_MAX_BYTES)
+            if error:
+                return Response({"error": error}, status=400)
+            kind = sniff_image_type(upload.read(12))
+            upload.seek(0)
+            delete_preview_file(artifact)
+            artifact.preview_image.save(f"preview-{artifact.pk}.{extension_for(kind)}", upload, save=False)
+            artifact.save(update_fields=["preview_image", "updated_at"])
+        return Response(self.get_serializer(artifact).data)
+
     def perform_destroy(self, instance):
         account_label = instance.account.company_name if instance.account_id else "unassigned"
         detail = f"{account_label} — {instance.name}"
@@ -740,6 +810,59 @@ class AccountArtifactViewSet(
             "**Deleted** Artifact",
             detail=detail,
         )
+
+
+class ArtifactNoteViewSet(
+    mixins.ListModelMixin,
+    mixins.CreateModelMixin,
+    mixins.UpdateModelMixin,
+    mixins.DestroyModelMixin,
+    viewsets.GenericViewSet,
+):
+    """Notes (and threaded replies) on an artifact, for whoever can see the artifact.
+
+    List needs ``?artifact=<id>`` or ``?artifact__in=1,2``. Only the author edits a note; the
+    author or an Admin deletes it, which also deletes its replies.
+    """
+    serializer_class = ArtifactNoteSerializer
+    permission_classes = [IsAuthenticated]
+    pagination_class = ClientPageSizePagination
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
+
+    def get_queryset(self):
+        from django.db.models import Count
+        qs = (
+            ArtifactNote.objects.filter(artifact__in=_artifacts_for_discussion(self.request.user).values("pk"))
+            .select_related("author__profile")
+            .annotate(reply_total=Count("replies"))
+            .order_by("-created_at", "-id")  # Meta.ordering is ignored once annotated
+        )
+        if self.action == "list":
+            params = self.request.query_params
+            ids = csv_int_params(params.get("artifact")) + csv_int_params(params.get("artifact__in"))
+            qs = qs.filter(artifact_id__in=ids) if ids else qs.none()
+        return qs
+
+    def perform_create(self, serializer):
+        artifact = serializer.validated_data["artifact"]
+        if not _artifacts_for_discussion(self.request.user).filter(pk=artifact.pk).exists():
+            from rest_framework.exceptions import NotFound
+            raise NotFound()
+        serializer.save(author=self.request.user, text=html_to_text(serializer.validated_data["html"]))
+
+    def perform_update(self, serializer):
+        if serializer.instance.author_id != self.request.user.id:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("You can only edit your own notes.")
+        extra = {"text": html_to_text(serializer.validated_data["html"])} if "html" in serializer.validated_data else {}
+        serializer.save(**extra)
+
+    def perform_destroy(self, instance):
+        from core.mixins import is_admin
+        if instance.author_id != self.request.user.id and not is_admin(self.request.user):
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("You can only delete your own notes.")
+        instance.delete()
 
 
 class CustomerContactViewSet(viewsets.ModelViewSet):

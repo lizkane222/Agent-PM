@@ -104,6 +104,8 @@ export type {
   AccountNote,
   AccountQuickLink,
   AccountArtifact,
+  ArtifactNote,
+  ArtifactPreviewResult,
   AccountProject,
   ProjectMember,
   AccountTicket,
@@ -382,7 +384,7 @@ export type {
 export type { FeedbackStatus, FeedbackComment, FeedbackItem } from "./feedback";
 
 // ── Discover (moved to types/discover.ts — re-exported here for backwards compat) ────
-export type { DiscoverApplet, AppletCategory, ItemType, UrlStatus } from "./discover";
+export type { DiscoverApplet, AppletCategory, ItemType, UrlStatus, DiscoverTag, AppletPin } from "./discover";
 
 // ── Action item steps ─────────────────────────────────────────────────────────
 export type { StepStatus, ActionItemStep } from "./action_items";

@@ -11,6 +11,11 @@ from .models import AgentSkill, AgentSkillAttachment
 
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 MAX_ATTACHMENTS = 20
+BLOCKED_EXTENSIONS = {
+    ".py", ".sh", ".bash", ".exe", ".bat", ".cmd", ".ps1",
+    ".php", ".rb", ".pl", ".js", ".jsx", ".ts", ".tsx",
+    ".svg", ".xml",
+}
 
 
 def _account_for(user, account_id):
@@ -35,6 +40,22 @@ def create_attachment(skill: AgentSkill, user, *, upload=None, url: str = "", na
         raise ValueError("That file is larger than 15 MB.")
     if url and not url.lower().startswith(("http://", "https://")):
         raise ValueError("url must be http(s).")
+
+    if upload:
+        # Same upload rules as the account artifact endpoint: script-capable or executable
+        # types are refused and HTML is sanitized, because the file is served from /media/.
+        from pathlib import Path
+
+        from accounts.views import _sanitized_html_upload
+        from core.html_sanitize import is_html_filename
+
+        ext = Path(upload.name).suffix.lower()
+        if ext in BLOCKED_EXTENSIONS:
+            raise ValueError(f"File type '{ext}' is not permitted.")
+        if is_html_filename(upload.name):
+            upload = _sanitized_html_upload(upload)
+            if upload is None:
+                raise ValueError("That HTML file could not be read as text.")
 
     account = _account_for(user, account_id)
     if account_id and account is None:

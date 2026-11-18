@@ -17,6 +17,7 @@ import SettingsPage from "./pages/SettingsPage";
 import TeamPage from "./pages/TeamPage";
 import ClaudeSkillsPage from "./pages/ClaudeSkillsPage";
 import DiscoverPage from "./pages/DiscoverPage";
+import DiscoverRedirect from "./components/DiscoverRedirect";
 import ProfilePage from "./pages/ProfilePage";
 import AdminDataPage from "./pages/AdminDataPage";
 import { clearTokens, getAccessToken, getRefreshToken, isTokenExpired, storeTokens } from "./lib/auth";
@@ -39,10 +40,10 @@ const PAGE_NAMES: Record<string, string> = {
   "/team": "Team",
   "/reminders": "Reminders",
   "/skills": "Claude Skills",
-  "/discover": "Discover",
+  "/discovery": "Discovery",
   "/settings": "Settings",
   "/logs": "Logs",
-  "/edit-preview": "Edit Preview",
+  "/layouts": "Edit Preview",
 };
 
 function PageTracker() {
@@ -124,13 +125,14 @@ export default function App() {
           <Route path="role/:roleSlug" element={<Navigate to="/profile" replace />} />
           <Route path="reminders" element={<RemindersPage />} />
           <Route path="skills" element={<ClaudeSkillsPage />} />
-          <Route path="discover" element={<DiscoverPage />} />
+          <Route path="discovery" element={<DiscoverPage />} />
+          <Route path="discover" element={<DiscoverRedirect />} />
           <Route path="settings" element={<SettingsPage />} />
           <Route path="settings/admin-data" element={<AdminDataPage />} />
           {/* Old location — Admin Data now lives under Settings. */}
           <Route path="admin-data" element={<Navigate to="/settings/admin-data" replace />} />
           <Route path="logs" element={<LogsPage />} />
-          <Route path="edit-preview" element={<div className="h-full"><PageBuilder fillParent /></div>} />
+          <Route path="layouts" element={<div className="h-full"><PageBuilder fillParent /></div>} />
           <Route path="profile" element={<ProfilePage />} />
           <Route path="profile/:memberId" element={<ProfilePage />} />
         </Route>

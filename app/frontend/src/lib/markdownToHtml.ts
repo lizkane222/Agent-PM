@@ -80,5 +80,5 @@ export function markdownToHtml(markdown: string): string {
     para.push(line.trim());
   }
   flushPara(); closeLists();
-  return DOMPurify.sanitize(out.join(""));
+  return DOMPurify.sanitize(out.join(""), { FORBID_TAGS: ["style", "form"] });
 }

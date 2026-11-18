@@ -254,3 +254,19 @@ describe("AccountsPage — Cloud Coach member push", () => {
     expect(reportError.mock.calls[0][0]).toMatch(/Salesforce rejected/);
   });
 });
+
+describe("AccountsPage — account links use the name", () => {
+  it("opens /accounts/<slug> when a card is clicked", async () => {
+    server.use(
+      http.get("/api/v1/accounts/accounts/", () =>
+        HttpResponse.json({ results: [{ ...ACME, company_name: "Festival Foods & Schnucks" }], count: 1 })
+      ),
+    );
+    const { default: AccountsPage } = await import("../AccountsPage");
+    const { useLocation } = await import("react-router-dom");
+    function Where() { return <span data-testid="where">{useLocation().pathname}</span>; }
+    render(<MemoryRouter><AccountsPage /><Where /></MemoryRouter>);
+    fireEvent.click(await screen.findByText("Festival Foods & Schnucks"));
+    await waitFor(() => expect(screen.getByTestId("where").textContent).toBe("/accounts/festivalfoodsschnucks"));
+  });
+});

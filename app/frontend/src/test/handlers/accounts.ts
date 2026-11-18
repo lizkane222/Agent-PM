@@ -2,6 +2,7 @@ import { http, HttpResponse } from "msw";
 import type {
   Account,
   AccountArtifact,
+  ArtifactNote,
   AccountNote,
   AccountProject,
   AccountQuickLink,
@@ -107,6 +108,19 @@ export const mockArtifact: AccountArtifact = {
   used_in: [],
   uploaded_by: null,
   uploaded_by_username: null,
+  created_at: "2026-01-01T00:00:00Z",
+  updated_at: "2026-01-01T00:00:00Z",
+};
+
+export const mockArtifactNote: ArtifactNote = {
+  id: 1,
+  artifact: 1,
+  parent: null,
+  html: "<p>Use this for the QBR</p>",
+  text: "Use this for the QBR",
+  author: 1,
+  author_display: "Alice",
+  reply_count: 0,
   created_at: "2026-01-01T00:00:00Z",
   updated_at: "2026-01-01T00:00:00Z",
 };
@@ -331,6 +345,25 @@ export const accountHandlers = [
   http.delete("/api/v1/accounts/artifacts/:id/", () =>
     new HttpResponse(null, { status: 204 })
   ),
+  // Preview overlay: by default the server says "the browser can render this itself" and the
+  // artifact has no notes. Tests override these with `server.use(...)`.
+  http.get("/api/v1/accounts/artifacts/:id/preview/", () => HttpResponse.json({ kind: "native" })),
+  http.post("/api/v1/accounts/artifacts/:id/preview-image/", ({ params }) =>
+    HttpResponse.json({ ...mockArtifact, id: Number(params.id), preview_image_url: "http://localhost/media/shot.png" })
+  ),
+  http.delete("/api/v1/accounts/artifacts/:id/preview-image/", ({ params }) =>
+    HttpResponse.json({ ...mockArtifact, id: Number(params.id), preview_image_url: null })
+  ),
+  http.get("/api/v1/accounts/artifact-notes/", () => HttpResponse.json({ count: 0, next: null, previous: null, results: [] })),
+  http.post("/api/v1/accounts/artifact-notes/", async ({ request }) => {
+    const body = (await request.json()) as Partial<ArtifactNote>;
+    return HttpResponse.json({ ...mockArtifactNote, id: 99, text: "", ...body }, { status: 201 });
+  }),
+  http.patch("/api/v1/accounts/artifact-notes/:id/", async ({ request, params }) => {
+    const body = (await request.json()) as Partial<ArtifactNote>;
+    return HttpResponse.json({ ...mockArtifactNote, id: Number(params.id), ...body });
+  }),
+  http.delete("/api/v1/accounts/artifact-notes/:id/", () => new HttpResponse(null, { status: 204 })),
   // Airtable meetings + accounts used by useAccountDetail Layer 2
   http.get("/api/v1/airtable/meetings/", () =>
     HttpResponse.json({ results: [mockAirtableMeeting] })

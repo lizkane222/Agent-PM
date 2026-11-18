@@ -1,11 +1,14 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { useStatusLabels } from "../../hooks/useStatusLabels";
 import { useCurrentUser } from "../../context/CurrentUserContext";
 import { useActionItemFieldOptions } from "../../hooks/useActionItemFieldOptions";
 import { useScheduledOccurrences } from "../../hooks/useScheduledOccurrences";
-import { airtableApi, teamApi } from "../../lib/api";
+import { useActionItemList } from "../../hooks/useActionItemList";
+import { airtableApi, schedulerApi, teamApi } from "../../lib/api";
 import { addLog } from "../../lib/appLog";
 import { logActionItemUpdate } from "../../lib/actionItemLog";
+import { htmlToPreviewText } from "../../lib/noteHelpers";
+import { DEFAULT_CATEGORY_COLORS, darken, readableTextColor, tint, type ColorableEventType } from "../../lib/eventColors";
 import type { AirtableActionItem, AirtableAccount } from "../../types";
 import type { TeamMember } from "../../types/team";
 import { ContextMenu, FocusPinBadge, focusPinMenuItem, type ContextMenuItem } from "../action-items/ContextMenu";
@@ -16,6 +19,7 @@ import { SIDEBAR_SECTION_STATUS, groupActionItems, sidebarGroupLabel, DONE_WINDO
 import { useColumnSort } from "../../hooks/useStatusArrivalOrder";
 import ColumnSortButton from "../account/ColumnSortButton";
 import SidebarFilterFlags from "./SidebarFilterFlags";
+import RichTextMentionEditor from "../shared/RichTextMentionEditor";
 import CommentPreviewList from "../comments/CommentPreviewList";
 import { useCommentMenuItem } from "../comments/commentMenuItem";
 import { useExportTray } from "../../hooks/useExportTray";
@@ -23,7 +27,6 @@ import {
   CALENDAR_DRAG_KEY,
   CALENDAR_DRAG_ACCOUNT_KEY,
   SCHEDULED_ITEMS_KEY,
-  WORK_TRACKING_COLOR,
   PRIORITY_COLORS_CAL,
   STATUS_COLORS_CAL,
   BLANK_FORM,
@@ -35,6 +38,21 @@ import {
 } from "./calendarHelpers";
 import { instantDayKey, localDateKey } from "../../lib/timelineDay";
 import { fromLocalDatetimeValue } from "../../lib/datetimeLocal";
+import SensitiveText from "../../components/shared/SensitiveText";
+import { actionItemMarkId } from "../../hooks/useSensitiveMarks";
+
+/** How much white is mixed into an accent to get a card surface behind text. */
+const SURFACE_TINT = 0.9;
+
+/** The subset of useCalendarColors this sidebar needs. */
+export type ColorResolver = {
+  colorFor: (type: ColorableEventType) => string;
+};
+
+const DEFAULT_COLORS: ColorResolver = { colorFor: (t) => DEFAULT_CATEGORY_COLORS[t] };
+
+/** The statuses the sidebar shows. Done is fetched for the Done section and bounded on render. */
+const SIDEBAR_STATUS_PARAMS = { status: "Open,In Progress,Done" };
 
 function OccurrencesList({ airtableId }: { airtableId: string }) {
   const occurrences = useScheduledOccurrences(airtableId);
@@ -64,7 +82,7 @@ function OccurrencesList({ airtableId }: { airtableId: string }) {
  * `onUpdate` survives for the one-click "Mark as Done" / "Reopen" context-menu entry, which is a
  * single known field rather than field editing.
  */
-function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onUpdate, onOpenModal, onAccountDrop }: {
+function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onUpdate, onOpenModal, onAccountDrop, accent }: {
   item: AirtableActionItem;
   onDragStart: (e: React.DragEvent) => void;
   onDelete: () => void;
@@ -72,6 +90,8 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
   onUpdate: (patch: Partial<AirtableActionItem>) => void;
   onOpenModal: (item: AirtableActionItem) => void;
   onAccountDrop: (accountId: number, accountName: string) => void;
+  /** The user's action-item color — the same one the grid paints scheduled items with. */
+  accent: string;
 }) {
   const { label: statusLabel } = useStatusLabels();
   const [ctxPos, setCtxPos] = useState<{ x: number; y: number } | null>(null);
@@ -147,10 +167,11 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
         }
       }}
       className="rounded-lg select-none cursor-pointer group"
+      data-accent={accent}
       style={{
         position: "relative",
-        background: "var(--tint-violet-50)",
-        borderLeft: "3px solid #a78bfa",
+        background: tint(accent, SURFACE_TINT),
+        borderLeft: `3px solid ${accent}`,
         padding: "8px 10px",
         display: "flex",
         flexDirection: "column",
@@ -195,7 +216,7 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
 
       {/* Row 2: task title */}
       <p className="text-[13px] font-medium text-[var(--twilio-navy)] leading-snug" style={{ overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" as const }}>
-        {item.task || <span className="italic opacity-40">Untitled</span>}
+        {item.task ? <SensitiveText resourceType="action_item" resourceId={actionItemMarkId(item)} field="task" text={item.task} /> : <span className="italic opacity-40">Untitled</span>}
       </p>
 
       {/* Row 3: details + meta */}
@@ -203,7 +224,7 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
         <div className="flex flex-col gap-0.5">
           {item.task_details && (
             <p className="text-[11px] text-[var(--twilio-navy)] opacity-60 leading-snug" style={{ overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" as const }}>
-              {item.task_details}
+              {htmlToPreviewText(item.task_details)}
             </p>
           )}
           <div className="flex gap-2 flex-wrap">
@@ -234,17 +255,49 @@ function ActionItemCard_Cal({ item, onDragStart, onDelete, onReminderToggle, onU
   );
 }
 
-export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (msg: string, type: "success" | "warn") => void; expandItemId?: string | null }) {
+export default function ActionItemsSidebar({ expandItemId, colors = DEFAULT_COLORS, accountFilter = null }: {
+  onDropToast?: (msg: string, type: "success" | "warn") => void;
+  expandItemId?: string | null;
+  /** Colors the grid paints with, so a card and the block it becomes always match. */
+  colors?: ColorResolver;
+  /** Account selected in the open Accounts sidebar — narrows the list to its items. */
+  accountFilter?: string | null;
+}) {
+  const accent = colors.colorFor("action_item");
+  const reminderAccent = colors.colorFor("reminder");
   const currentUser = useCurrentUser();
   const { status: statusOptions } = useActionItemFieldOptions();
   const { label: statusLabel } = useStatusLabels();
-  const [items, setItems] = useState<AirtableActionItem[]>([]);
-  const [loading, setLoading] = useState(true);
-  // `expandItemId` used to force a card into its inline expanded editor. Editing now happens
-  // only in the shared ActionItemModal, so the same request opens that instead.
+
+  // Server data comes from the hook. Exactly what the sidebar shows is asked for (no Blocked /
+  // Backlogged discarded client-side, no "Complete" status that is not in the model); Done joins for
+  // the Done section — rendering is bounded to DONE_WINDOW_DAYS, the fetch is not (unpaginated).
+  // The hook reloads silently on an `actionItemsUpdated` broadcast, so the list never blanks itself.
+  const { items: fetched, loading, updateFields, remove: removeItem, create: createItem } =
+    useActionItemList(SIDEBAR_STATUS_PARAMS);
+  const visible = useMemo(
+    () => fetched.filter((i) => i.status === "Open" || i.status === "In Progress" || (i.status === "Done" && isRecentlyDone(i))),
+    [fetched],
+  );
+
+  // Optimistic edits (remove on delete, patch on drop, prepend on create) live here, on top of the
+  // hook's data. They are tied to the `visible` array they were made against, so the moment fresh
+  // server data arrives they fall away and the server's answer wins.
+  const [local, setLocal] = useState<{ base: AirtableActionItem[]; items: AirtableActionItem[] } | null>(null);
+  const visibleRef = useRef(visible);
+  visibleRef.current = visible;
+  const items = local && local.base === visible ? local.items : visible;
+  function setItems(update: (prev: AirtableActionItem[]) => AirtableActionItem[]) {
+    setLocal((cur) => {
+      const base = visibleRef.current;
+      const prev = cur && cur.base === base ? cur.items : base;
+      return { base, items: update(prev) };
+    });
+  }
+
   const [modalItem, setModalItem] = useState<AirtableActionItem | null>(null);
 
-  // When a new expandItemId is pushed in, adopt it
+  // A pushed-in expandItemId opens the shared modal for that item, once it has loaded.
   useEffect(() => {
     if (!expandItemId) return;
     const match = items.find((i) => i.airtable_id === expandItemId);
@@ -254,6 +307,7 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
   const { trackingIds, stagedIds } = useActionItemZoneSets();
   const { pinnedIds } = useFocusPins();
   const [selectedFlags, setSelectedFlags] = useState<Set<SidebarGroupKey>>(() => new Set());
+
   // Create form state
   const [creating, setCreating] = useState(false);
   const [form, setForm] = useState({ ...BLANK_FORM });
@@ -269,64 +323,9 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
   const [accounts, setAccounts] = useState<AirtableAccount[]>([]);
   const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
 
-  const fetchItems = () =>
-    airtableApi
-      // Ask for exactly what the sidebar shows. The old filter listed Blocked/Backlogged
-      // and then discarded them client-side, plus a "Complete" status that does not exist
-      // in the model (Open / In Progress / Done / Blocked / Backlogged) and so matched
-      // nothing. Done joined the list for the Done section — rendering is bounded to the
-      // last DONE_WINDOW_DAYS, the fetch is not (the endpoint is unpaginated).
-      // `fresh` because this also runs on an actionItemsUpdated broadcast, which
-      // can originate in another tab and leave this tab's GET cache warm.
-      .listActionItems({ status: "Open,In Progress,Done" }, { fresh: true })
-      .then(({ data }) => {
-        const all = data ?? [];
-        // Computed before the keep-filter, so pruning below sees every live record.
-        const liveIds = new Set(all.map((i: AirtableActionItem) => i.airtable_id));
-        setItems(all.filter((i: AirtableActionItem) =>
-          i.status === "Open" || i.status === "In Progress" || (i.status === "Done" && isRecentlyDone(i))
-        ));
-        // Prune stale activeTimers
-        try {
-          const timers: Record<string, unknown> = JSON.parse(localStorage.getItem("activeTimers") ?? "{}");
-          const pruned = Object.fromEntries(Object.entries(timers).filter(([id]) => liveIds.has(id)));
-          if (Object.keys(pruned).length !== Object.keys(timers).length) {
-            localStorage.setItem("activeTimers", JSON.stringify(pruned));
-            window.dispatchEvent(new StorageEvent("storage", { key: "activeTimers", newValue: JSON.stringify(pruned) }));
-          }
-        } catch { /* best effort */ }
-        // Prune scheduledActionItems — remove any entry whose backing record no longer exists
-        try {
-          const scheduled = readScheduledItems();
-          const pruned = scheduled.filter((s) => liveIds.has(s.airtableId));
-          if (pruned.length !== scheduled.length) {
-            localStorage.setItem(SCHEDULED_ITEMS_KEY, JSON.stringify(pruned));
-            window.dispatchEvent(new StorageEvent("storage", { key: SCHEDULED_ITEMS_KEY, newValue: JSON.stringify(pruned) }));
-          }
-        } catch { /* best effort */ }
-      })
-      .catch(() => {})
-      .finally(() => setLoading(false));
-
   useEffect(() => {
-    void fetchItems();
-    airtableApi.listAccounts().then(({ data }) => setAccounts(data.results)).catch(() => {});
+    airtableApi.listAccounts({ page_size: "500" }).then(({ data }) => setAccounts(data.results)).catch(() => {});
     teamApi.listMembers().then(({ data }) => setTeamMembers(data.results)).catch(() => {});
-  }, []);
-
-  useEffect(() => {
-    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
-    function onStorage(e: StorageEvent) {
-      // Zone changes are handled by useActionItemZoneSets, which owns that key's listener.
-      if (e.key !== "actionItemsUpdated") return;
-      if (debounceTimer) clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(() => { void fetchItems(); }, 500);
-    }
-    window.addEventListener("storage", onStorage);
-    return () => {
-      window.removeEventListener("storage", onStorage);
-      if (debounceTimer) clearTimeout(debounceTimer);
-    };
   }, []);
 
   function handleDragStart(e: React.DragEvent, item: AirtableActionItem) {
@@ -342,8 +341,8 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
       JSON.stringify({
         title: item.task,
         duration: "00:15",
-        backgroundColor: WORK_TRACKING_COLOR,
-        borderColor: WORK_TRACKING_COLOR,
+        backgroundColor: accent,
+        borderColor: accent,
         extendedProps: { airtableId: item.airtable_id, accountName: item.account_name ?? "" },
       })
     );
@@ -351,13 +350,29 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
 
   async function handleDelete(item: AirtableActionItem) {
     setItems((prev) => prev.filter((i) => i.airtable_id !== item.airtable_id));
-    // Remove all calendar occurrences for this item from localStorage
+    // Remove any legacy localStorage occurrences for this item.
     const pruned = readScheduledItems().filter((s) => s.airtableId !== item.airtable_id);
     localStorage.setItem(SCHEDULED_ITEMS_KEY, JSON.stringify(pruned));
     window.dispatchEvent(new StorageEvent("storage", { key: SCHEDULED_ITEMS_KEY, newValue: JSON.stringify(pruned) }));
     try {
-      await airtableApi.deleteActionItem(item.id);
+      await removeItem(item.airtable_id);
+      // Also delete the calendar rows for it. `agentpm_airtable_id` is a CharField, not a
+      // foreign key, so nothing cascades server-side — without this, deleting an action item
+      // leaves its scheduled blocks on the calendar pointing at a record that is gone.
+      //
+      // Deliberately only on an explicit delete: a *status* change (including Done) must never
+      // remove the record of when the work was scheduled. Conflating the two is what erased
+      // blocks before.
+      try {
+        const { data: rows } = await schedulerApi.listEvents({ agentpm_airtable_id: item.airtable_id });
+        await Promise.all(
+          rows
+            .filter((e) => e.calendar_id === "work_tracking")
+            .map((e) => schedulerApi.deleteEvent(e.id).catch(() => {})),
+        );
+      } catch { /* best effort — the action item is already gone */ }
       window.dispatchEvent(new StorageEvent("storage", { key: "actionItemsUpdated", newValue: "1" }));
+      window.dispatchEvent(new StorageEvent("storage", { key: "calendarUpdated", newValue: "1" }));
     } catch {
       setItems((prev) => [...prev, item]);
     }
@@ -398,11 +413,12 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
     setReminderItemId(null);
   }
 
+  /** One-click "Mark as Done" / "Reopen" from the card's context menu. */
   async function handleUpdate(item: AirtableActionItem, patch: Partial<AirtableActionItem>) {
     // Optimistic update
     setItems((prev) => prev.map((i) => i.airtable_id === item.airtable_id ? { ...i, ...patch } : i));
     try {
-      await airtableApi.updateActionItemFields(item.airtable_id, patch);
+      await updateFields(item.airtable_id, patch);
       logActionItemUpdate(item, patch);
       window.dispatchEvent(new StorageEvent("storage", { key: "actionItemsUpdated", newValue: "1" }));
     } catch {
@@ -419,7 +435,7 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
       const member = teamMembers.find((m) => m.full_name === form.assignee_name);
       const resolvedAssigneeName = member?.full_name ?? (form.assignee_name || currentUser?.display_name || "");
       const resolvedAssigneeId = member ? String(member.id) : (form.assignee_name ? "" : currentUser?.airtable_collaborator_id || "");
-      const { data } = await airtableApi.createActionItem({
+      const data = await createItem({
         task: form.task.trim(),
         task_details: form.task_details.trim(),
         priority: form.priority,
@@ -444,8 +460,13 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
   }
 
   const [filterTerm, setFilterTerm] = useState("");
+  // Same case-insensitive match the backend's ?account_name= uses ("Admin" vs "ADMIN").
+  const accountKey = accountFilter?.trim().toLowerCase() || null;
+  const accountScoped = accountKey
+    ? items.filter((i) => (i.account_name ?? "").trim().toLowerCase() === accountKey)
+    : items;
   const textMatched = filterTerm.trim()
-    ? items.filter((i) => {
+    ? accountScoped.filter((i) => {
         const q = filterTerm.toLowerCase();
         return (
           i.task?.toLowerCase().includes(q) ||
@@ -454,14 +475,14 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
           i.assignee_name?.toLowerCase().includes(q)
         );
       })
-    : items;
+    : accountScoped;
 
   // Text box and flag chips compose: a card must satisfy both.
   const { prefs: statusPrefs } = useStatusLabels();
   const { sortDirection: colSortDirection, toggleSort: toggleColSort, applySort: applyColSort } = useColumnSort();
   const groups = groupActionItems(textMatched, { trackingIds, stagedIds, pinnedIds, selectedFlags });
   const visibleCount = groups.reduce((n, g) => n + g.items.length, 0);
-  const isNarrowed = !!filterTerm.trim() || selectedFlags.size > 0;
+  const isNarrowed = !!filterTerm.trim() || selectedFlags.size > 0 || !!accountKey;
 
   function toggleFlag(key: SidebarGroupKey) {
     setSelectedFlags((prev) => {
@@ -501,9 +522,14 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
             selected={selectedFlags}
             onToggle={toggleFlag}
             onClear={() => setSelectedFlags(new Set())}
-            accent={WORK_TRACKING_COLOR}
+            accent={accent}
           />
         </div>
+        {accountKey && (
+          <p data-testid="sidebar-account-filter" className="pt-1.5 text-[11px] text-[var(--twilio-gray-60)] truncate">
+            Showing <span className="font-semibold text-[var(--twilio-navy)]">{accountFilter}</span> only
+          </p>
+        )}
       </div>
 
       <div className="flex-1 overflow-y-auto px-3 py-2 space-y-2">
@@ -534,13 +560,14 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
                 )}
                 <ActionItemCard_Cal
                   item={item}
+                  accent={accent}
                   onDragStart={(e) => handleDragStart(e, item)}
                   onDelete={() => handleDelete(item)}
                   onUpdate={(patch) => void handleUpdate(item, patch)}
-                  onOpenModal={(it) => setModalItem(it)}
+                  onOpenModal={(item) => setModalItem(item)}
                   onAccountDrop={(accountId, accountName) => {
                     setItems((prev) => prev.map((i) => i.airtable_id === item.airtable_id ? { ...i, account: accountId, account_name: accountName } : i));
-                    airtableApi.updateActionItemFields(item.airtable_id, { account: accountId, account_name: accountName }).catch(() => {
+                    updateFields(item.airtable_id, { account: accountId, account_name: accountName }).catch(() => {
                       setItems((prev) => prev.map((i) => i.airtable_id === item.airtable_id ? item : i));
                     });
                     window.dispatchEvent(new StorageEvent("storage", { key: "actionItemsUpdated", newValue: "1" }));
@@ -557,16 +584,19 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
                 />
                 {/* Reminder popover */}
                 {reminderItemId === item.airtable_id && (
-                  <div className="mt-1 rounded-lg border border-amber-200 bg-amber-50 p-2.5 flex flex-col gap-2">
-                    <p className="text-[11px] font-semibold text-amber-800">{item.reminder_due_at ? "Edit Reminder" : "Set Reminder"}</p>
+                  <div
+                    className="mt-1 rounded-lg p-2.5 flex flex-col gap-2"
+                    style={{ background: tint(reminderAccent, SURFACE_TINT), border: `1px solid ${tint(reminderAccent, 0.55)}` }}
+                  >
+                    <p className="text-[11px] font-semibold" style={{ color: darken(reminderAccent, 0.45) }}>{item.reminder_due_at ? "Edit Reminder" : "Set Reminder"}</p>
                     <div className="flex gap-1.5">
                       <input type="date" value={reminderDate} onChange={(e) => setReminderDate(e.target.value)}
-                        className="flex-1 text-[11px] rounded border border-amber-200 px-1.5 py-1 focus:outline-none focus:border-amber-400"
-                        style={{ background: "var(--surface-card)" }}
+                        className="flex-1 text-[11px] rounded px-1.5 py-1 focus:outline-none"
+                        style={{ background: "var(--surface-card)", border: `1px solid ${tint(reminderAccent, 0.55)}` }}
                       />
                       <input type="time" value={reminderTime} onChange={(e) => setReminderTime(e.target.value)}
-                        className="w-20 text-[11px] rounded border border-amber-200 px-1.5 py-1 focus:outline-none focus:border-amber-400"
-                        style={{ background: "var(--surface-card)" }}
+                        className="w-20 text-[11px] rounded px-1.5 py-1 focus:outline-none"
+                        style={{ background: "var(--surface-card)", border: `1px solid ${tint(reminderAccent, 0.55)}` }}
                       />
                     </div>
                     <div className="flex gap-1.5">
@@ -574,11 +604,12 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
                         onClick={() => void handleSetReminder(item)}
                         disabled={reminderSaving || !reminderDate}
                         className="flex-1 text-[11px] font-semibold py-1 rounded-md transition-colors disabled:opacity-40"
-                        style={{ background: "#f59e0b", color: "#fff" }}
+                        style={{ background: reminderAccent, color: readableTextColor(reminderAccent) }}
                       >{reminderSaving ? "…" : "Set"}</button>
                       <button
                         onClick={() => void handleClearReminder(item)}
-                        className="text-[11px] font-semibold px-2 py-1 rounded-md border border-amber-200 text-amber-700 hover:bg-amber-100 transition-colors disabled:opacity-30"
+                        className="text-[11px] font-semibold px-2 py-1 rounded-md transition-colors disabled:opacity-30"
+                        style={{ border: `1px solid ${tint(reminderAccent, 0.55)}`, color: darken(reminderAccent, 0.35) }}
                         disabled={!item.reminder_due_at}
                       >Clear</button>
                       <button onClick={() => setReminderItemId(null)} className="text-[11px] px-2 py-1 rounded-md border border-gray-200 text-gray-500 hover:bg-gray-100 transition-colors">✕</button>
@@ -596,7 +627,7 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
       {/* Create card — pinned at bottom */}
       {creating && (
         <div className="shrink-0 border-t border-gray-100">
-          <div className="rounded-xl flex flex-col overflow-hidden m-3" style={{ background: "var(--tint-violet-50)", border: "1px solid #ddd6fe" }}>
+          <div className="rounded-xl flex flex-col overflow-hidden m-3" style={{ background: tint(accent, SURFACE_TINT), border: `1px solid ${tint(accent, 0.55)}` }}>
             {/* Task title */}
             <div className="px-4 pt-3 pb-2">
               <input
@@ -604,7 +635,8 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
                 value={form.task}
                 onChange={(e) => setForm((f) => ({ ...f, task: e.target.value }))}
                 placeholder="Name or short description"
-                className="w-full text-xs font-semibold text-[var(--twilio-navy)] bg-transparent border-b border-violet-200 focus:border-violet-400 focus:outline-none pb-1 placeholder:text-[var(--twilio-gray-60)] placeholder:font-normal"
+                className="w-full text-xs font-semibold text-[var(--twilio-navy)] bg-transparent border-b focus:outline-none pb-1 placeholder:text-[var(--twilio-gray-60)] placeholder:font-normal"
+                style={{ borderBottomColor: tint(accent, 0.45) }}
               />
             </div>
 
@@ -632,12 +664,11 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
 
             {/* Body fields */}
             <div className="px-4 py-2 flex flex-col gap-2.5">
-              <textarea
+              <RichTextMentionEditor
                 value={form.task_details}
-                onChange={(e) => setForm((f) => ({ ...f, task_details: e.target.value }))}
-                rows={2}
+                onChange={(html) => setForm((f) => ({ ...f, task_details: html }))}
                 placeholder="Additional context or notes…"
-                className="w-full rounded-md border border-violet-100 bg-white px-2.5 py-1.5 text-xs text-[var(--twilio-navy)] placeholder:text-[var(--twilio-gray-60)] focus:bg-white focus:border-violet-300 focus:outline-none resize-none leading-relaxed"
+                minHeightClassName="min-h-[40px]"
               />
 
               {/* Status · Priority · Due date */}
@@ -698,8 +729,8 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
               <button
                 onClick={() => void handleCreate()}
                 disabled={saving || !form.task.trim()}
-                className="px-3 py-1 text-[11px] font-semibold uppercase tracking-wide rounded-md text-white disabled:opacity-40 transition-colors"
-                style={{ background: "#a78bfa" }}
+                className="px-3 py-1 text-[11px] font-semibold uppercase tracking-wide rounded-md disabled:opacity-40 transition-colors"
+                style={{ background: accent, color: readableTextColor(accent) }}
               >{saving ? "Saving…" : "Save"}</button>
             </div>
           </div>
@@ -711,13 +742,12 @@ export default function ActionItemsSidebar({ expandItemId }: { onDropToast?: (ms
         <div className="shrink-0 px-3 pb-3 pt-1 border-t border-gray-100">
           <button
             onClick={() => { setCreating(true); setForm({ ...BLANK_FORM }); }}
-            className="w-full text-[11px] font-semibold py-1.5 rounded-lg transition-colors text-white"
-            style={{ background: "#a78bfa" }}
+            className="w-full text-[11px] font-semibold py-1.5 rounded-lg transition-colors"
+            style={{ background: accent, color: readableTextColor(accent) }}
           >+ New Action Item</button>
         </div>
       )}
 
-      {/* The one place an action item's fields are edited. */}
       {modalItem && (
         <ActionItemModal
           item={modalItem}

@@ -94,7 +94,7 @@ describe("Calendar action items sidebar freshness", () => {
       await apiClient.post("/airtable/action-items/", { task: "Made elsewhere" });
     });
 
-    // The sidebar debounces its refetch by 500ms.
+    // useActionItemList debounces a broadcast-driven reload by 250ms.
     await waitFor(
       () => expect(screen.getByText("Made elsewhere")).toBeInTheDocument(),
       { timeout: 3000 }

@@ -2706,3 +2706,25 @@ class MeetingNotesScanHonoursCalendarLinksTests(TestCase):
         self.assertEqual(
             list(candidate_events(user, 30, account=str(acct.pk))), [linked])
         self.assertEqual(list(candidate_events(user, 30, account_name="Notes Scan Co")), [linked])
+
+
+class AddDependencyPrivateItemTests(AirtableActionItemVisibilityTests):
+    """add-dependency must not reveal or link another user's private Admin item."""
+
+    def test_cannot_wait_on_someone_elses_private_admin_item(self):
+        self.client.force_authenticate(self.alice)
+        r = self.client.post(
+            f"/api/v1/airtable/action-items/{self.acme_item.pk}/add-dependency/",
+            {"waiting_on_id": self.admin_bob.pk}, format="json",
+        )
+        self.assertEqual(r.status_code, 404)
+        self.assertNotIn(self.admin_bob.task, r.content.decode())
+        self.assertFalse(self.acme_item.waiting_on_deps.exists())
+
+    def test_can_wait_on_a_visible_item(self):
+        self.client.force_authenticate(self.alice)
+        r = self.client.post(
+            f"/api/v1/airtable/action-items/{self.acme_item.pk}/add-dependency/",
+            {"waiting_on_id": self.admin_alice.pk}, format="json",
+        )
+        self.assertEqual(r.status_code, 200)

@@ -1,12 +1,12 @@
 import { useState } from "react";
 import { accountsApi } from "../../lib/api";
 import { useAppError } from "../../context/AppErrorContext";
-import { sanitizeHtml, plainToHtml } from "../../lib/noteHelpers";
 import RichTextMentionEditor from "../shared/RichTextMentionEditor";
 import LinkedRecordsList from "../shared/LinkedRecordsList";
 import { ARTIFACT_ICON_CATALOG, ArtifactIconImg } from "./ArtifactIcon";
 import type { AccountArtifact } from "../../types/accounts";
 import type { CommentReference } from "../../types/comments";
+import SensitiveText from "../shared/SensitiveText";
 
 const inputCls = "w-full text-xs rounded-lg border border-gray-200 px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-200";
 const labelCls = "block text-[9px] font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide mb-1";
@@ -18,10 +18,12 @@ function fmtDate(iso: string | undefined): string {
 }
 
 /** Sidebar of the artifact viewer: read-only details, plus an edit form when `canEdit`. */
-export function ArtifactDetailsRail({ artifact, canEdit, onUpdated }: {
+export function ArtifactDetailsRail({ artifact, canEdit, onUpdated, embedded = false }: {
   artifact: AccountArtifact;
   canEdit: boolean;
   onUpdated: (a: AccountArtifact) => void;
+  /** Rendered inside a larger sidebar: no frame of its own (the parent supplies width and scroll). */
+  embedded?: boolean;
 }) {
   const { reportError } = useAppError();
   const [editing, setEditing] = useState(false);
@@ -61,10 +63,11 @@ export function ArtifactDetailsRail({ artifact, canEdit, onUpdated }: {
     }
   }
 
+  const Frame = embedded ? "div" : "aside";
   return (
-    <aside
+    <Frame
       data-testid="artifact-details"
-      style={{ width: "300px", flexShrink: 0, background: "var(--surface-card)", overflowY: "auto", padding: "16px", borderLeft: "1px solid rgba(0,0,0,0.08)" }}
+      style={embedded ? undefined : { width: "300px", flexShrink: 0, background: "var(--surface-card)", overflowY: "auto", padding: "16px", borderLeft: "1px solid rgba(0,0,0,0.08)" }}
     >
       {artifact.uploaded_by_username && (
         <div className="flex items-center gap-2 mb-1">
@@ -138,13 +141,13 @@ export function ArtifactDetailsRail({ artifact, canEdit, onUpdated }: {
         artifact.description?.trim() && (
           <div className="mb-3">
             <p className="text-[9px] font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide">Description</p>
-            <div className="mt-1 text-xs text-[var(--twilio-navy)] rich-text"
-              dangerouslySetInnerHTML={{ __html: sanitizeHtml(plainToHtml(artifact.description)) }} />
+            <SensitiveText resourceType="artifact" resourceId={artifact.id} field="description" html={artifact.description} as="div"
+              className="mt-1 text-xs text-[var(--twilio-navy)] rich-text" />
           </div>
         )
       )}
       <LinkedRecordsList title="Mentions in description" references={editing ? references : (artifact.references ?? [])} className="mb-3" />
       <LinkedRecordsList title="Used in" references={usedIn} />
-    </aside>
+    </Frame>
   );
 }

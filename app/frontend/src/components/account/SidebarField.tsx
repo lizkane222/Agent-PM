@@ -1,4 +1,6 @@
 import React, { useEffect, useState } from "react";
+import SensitiveText from "../shared/SensitiveText";
+import type { SensitiveResourceType } from "../../types/sensitive";
 
 export function SidebarField({
   label,
@@ -8,6 +10,7 @@ export function SidebarField({
   options,
   readOnly = false,
   renderValue,
+  sensitive,
 }: {
   label: string;
   value: string;
@@ -16,6 +19,8 @@ export function SidebarField({
   options?: { value: string; label: string }[];
   readOnly?: boolean;
   renderValue?: (val: string) => React.ReactNode;
+  /** Opt in to "hide for screen sharing": the record + field this value belongs to. */
+  sensitive?: { resourceType: SensitiveResourceType; resourceId: string | number | null | undefined; field: string };
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(value);
@@ -31,7 +36,11 @@ export function SidebarField({
   }
 
   const empty = <span style={{ color: "var(--twilio-gray-60)", fontStyle: "italic", fontSize: "0.75rem" }}>—</span>;
-  const display = renderValue ? renderValue(value) : (value ? <span className="text-xs">{value}</span> : empty);
+  const plainDisplay = renderValue ? renderValue(value) : (value ? <span className="text-xs">{value}</span> : empty);
+  const display = sensitive && value
+    ? <SensitiveText resourceType={sensitive.resourceType} resourceId={sensitive.resourceId} field={sensitive.field} text={value}
+        renderPlain={() => plainDisplay} />
+    : plainDisplay;
 
   return (
     <div>

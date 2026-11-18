@@ -1,0 +1,40 @@
+version: 0.2
+# CodeBuild: build the React app, bundle it into the Django app, emit one EB-ready artifact.
+env:
+  variables:
+    # Only so `collectstatic` can import settings at build time. Never used at runtime.
+    DJANGO_SECRET_KEY: "build-only-not-a-secret-build-only-not-a-secret"
+    FIELD_ENCRYPTION_KEY: "build-only-not-a-secret-build-only-0000="
+    DJANGO_DEBUG: "False"
+    RUN_BACKEND_TESTS: "0"
+phases:
+  install:
+    runtime-versions:
+      nodejs: 20
+      python: 3.12
+    commands:
+      - (cd twilio-agent-pm-shared && npm ci)
+      - (cd app/frontend && npm ci)
+      - python -m pip install -r app/backend/requirements.txt
+  pre_build:
+    commands:
+      - (cd app/frontend && npx vitest run)
+      - if [ "$RUN_BACKEND_TESTS" = "1" ]; then (cd app/backend && python manage.py test); fi
+  build:
+    commands:
+      - (cd app/frontend && npm run build)
+      - (cd app/backend && python manage.py collectstatic --noinput)
+      # After collectstatic: the SPA bundle must not be cleared or hashed by it.
+      - mkdir -p app/backend/staticfiles/frontend && cp -R app/frontend/dist/. app/backend/staticfiles/frontend/
+      - cp deploy/aws/eb/Procfile app/backend/Procfile
+      - cp -R deploy/aws/eb/.platform deploy/aws/eb/.ebextensions app/backend/
+      - chmod +x app/backend/.platform/hooks/*/*
+artifacts:
+  base-directory: app/backend
+  files:
+    - '**/*'
+  exclude-paths:
+    - '.venv/**/*'
+    - 'db.sqlite3*'
+    - 'media/**/*'
+    - '**/__pycache__/**/*'

@@ -819,8 +819,12 @@ class AirtableActionItemViewSet(viewsets.ModelViewSet):
         if not waiting_on_id:
             return Response({"error": "waiting_on_id is required"}, status=status.HTTP_400_BAD_REQUEST)
         try:
-            waiting_on = AirtableActionItem.objects.get(pk=waiting_on_id)
-        except AirtableActionItem.DoesNotExist:
+            # Only items the caller can see (Admin privacy rule applies); otherwise this would
+            # confirm the existence of, and echo back, another user's private item.
+            waiting_on = _exclude_private_admin_items(
+                AirtableActionItem.objects.all(), request.user
+            ).get(pk=waiting_on_id)
+        except (AirtableActionItem.DoesNotExist, ValueError, TypeError):
             return Response({"error": "Action item not found"}, status=status.HTTP_404_NOT_FOUND)
         if waiting_on.pk == blocked.pk:
             return Response({"error": "An item cannot wait on itself"}, status=status.HTTP_400_BAD_REQUEST)

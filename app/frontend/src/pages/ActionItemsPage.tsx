@@ -69,6 +69,8 @@ import RichTextMentionEditor from "../components/shared/RichTextMentionEditor";
 import UrlPillInput from "../components/shared/UrlPillInput";
 import { useSlackLinkAutosave } from "../hooks/useSlackLinkAutosave";
 import PinnedSkillsSection from "../components/skills/PinnedSkillsSection";
+import SensitiveText from "../components/shared/SensitiveText";
+import { actionItemMarkId } from "../hooks/useSensitiveMarks";
 
 // Unified account shape used in the kanban accounts zone.
 // Airtable accounts get prefix "at-", app accounts get prefix "app-".
@@ -1720,7 +1722,7 @@ function KanbanCard({
           <CollapseChevron collapsed />
         </button>
         <p className="flex-1 min-w-0 truncate text-xs font-semibold text-[var(--twilio-navy)]">
-          {item.task || <span className="italic opacity-50">Untitled</span>}
+          {item.task ? <SensitiveText resourceType="action_item" resourceId={actionItemMarkId(item)} field="task" text={item.task} /> : <span className="italic opacity-50">Untitled</span>}
         </p>
         <span className={`shrink-0 text-[10px] font-semibold uppercase px-1 py-0.5 rounded whitespace-nowrap ${STATUS_COLORS[statusKey] ?? STATUS_COLORS["Open"]}`}>
           {statusLabel(statusKey)}
@@ -2099,7 +2101,7 @@ function KanbanCard({
           </div>
         </div>
         <p className="text-xs font-medium text-[var(--twilio-navy)] leading-snug line-clamp-2">
-          {item.task || <span className="italic opacity-50">Untitled — click to edit</span>}
+          {item.task ? <SensitiveText resourceType="action_item" resourceId={actionItemMarkId(item)} field="task" text={item.task} /> : <span className="italic opacity-50">Untitled — click to edit</span>}
         </p>
         {item.account_name && (
           <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-indigo-700 bg-indigo-50 px-1.5 py-0.5 rounded-full w-fit max-w-full truncate">
@@ -2752,7 +2754,7 @@ function StatusBoardView({
                   )}
                   <div className="flex-1 min-w-0 flex flex-col gap-1.5">
                     <p className="text-sm text-[var(--twilio-navy)] leading-snug">
-                      {item.task || <span className="italic opacity-40">Untitled</span>}
+                      {item.task ? <SensitiveText resourceType="action_item" resourceId={actionItemMarkId(item)} field="task" text={item.task} /> : <span className="italic opacity-40">Untitled</span>}
                     </p>
                     <div className="flex flex-wrap gap-1.5 items-center">
                       <span className={`text-[11px] font-semibold px-2 py-0.5 rounded ${STATUS_PILL_COLORS[item.priority] ?? "bg-gray-100 text-gray-600"}`}>
@@ -2838,7 +2840,7 @@ function StatusBoardView({
                     )}
                     <div className="flex-1 min-w-0 flex flex-col gap-1.5">
                       <p className="text-sm text-[var(--twilio-navy)] leading-snug">
-                        {item.task || <span className="italic opacity-40">Untitled</span>}
+                        {item.task ? <SensitiveText resourceType="action_item" resourceId={actionItemMarkId(item)} field="task" text={item.task} /> : <span className="italic opacity-40">Untitled</span>}
                       </p>
                       <div className="flex flex-wrap gap-1.5 items-center">
                         <span className={`text-[11px] font-semibold px-2 py-0.5 rounded ${STATUS_PILL_COLORS[item.priority] ?? "bg-gray-100 text-gray-600"}`}>
@@ -2983,7 +2985,7 @@ function DueDateView({
                     />
                   )}
                   <p className="text-sm font-semibold text-[var(--twilio-navy)] leading-snug line-clamp-2">
-                    {item.task || <span className="italic opacity-40">Untitled</span>}
+                    {item.task ? <SensitiveText resourceType="action_item" resourceId={actionItemMarkId(item)} field="task" text={item.task} /> : <span className="italic opacity-40">Untitled</span>}
                   </p>
                   {item.account_name && (
                     <p className="text-[11px] font-medium text-[var(--twilio-navy)] opacity-60 truncate">{item.account_name}</p>

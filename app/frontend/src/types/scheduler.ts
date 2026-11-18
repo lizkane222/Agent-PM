@@ -40,7 +40,7 @@ export interface ReminderLink {
 }
 
 /** The record types a reminder can link to (the picker's types). */
-export type ReminderLinkType = "account" | "action_item" | "calendar_event" | "task";
+export type ReminderLinkType = "account" | "action_item" | "calendar_event" | "task" | "artifact";
 
 /** One choice in the link picker. `at` is set for calendar events. */
 export interface ReminderLinkOption {

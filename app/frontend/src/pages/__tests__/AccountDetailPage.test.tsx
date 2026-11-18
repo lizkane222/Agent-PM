@@ -4,7 +4,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { http, HttpResponse } from "msw";
 import { server } from "../../test/msw-server";
-import { mockAccount, mockAccountNote, mockAirtableAccount, mockArtifact, mockProject, mockProjectMember } from "../../test/handlers/accounts";
+import { mockAccount, mockAccountNote, mockAirtableAccount, mockArtifact, mockCodeArtifact, mockProject, mockProjectMember } from "../../test/handlers/accounts";
 import type { Account } from "../../types";
 import { mockTeamMembers } from "../../test/handlers/team";
 
@@ -1245,6 +1245,62 @@ describe("AccountDetailPage — editing an artifact from the viewer", () => {
     fireEvent.click(screen.getByText("Product Spec"));
     await screen.findByTestId("artifact-details");
     expect(screen.queryByTestId("artifact-edit-btn")).toBeNull();
+  });
+});
+
+// The page used to keep its own copy of the artifact viewer. It now renders the shared one, so
+// Escape, previews, notes and comments must all be there too.
+describe("AccountDetailPage — artifact preview overlay (shared viewer)", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    localStorage.clear();
+    registerHandlers();
+  });
+
+  async function openViewer() {
+    await renderPage();
+    await waitFor(() => screen.getByText("Product Spec"));
+    fireEvent.click(screen.getByText("Product Spec"));
+    return screen.findByTestId("artifact-sidebar");
+  }
+
+  it("Escape closes the overlay", async () => {
+    await openViewer();
+    expect(screen.getByRole("dialog", { name: /Preview of Product Spec/ })).toBeInTheDocument();
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: /Preview of Product Spec/ })).toBeNull());
+  });
+
+  it("has Notes and Comments in the sidebar, and a link card for a link artifact", async () => {
+    const sidebar = await openViewer();
+    expect(within(sidebar).getByRole("tab", { name: /Notes/ })).toBeInTheDocument();
+    expect(within(sidebar).getByRole("tab", { name: /Comments/ })).toBeInTheDocument();
+    expect(screen.getByTestId("link-card")).toBeInTheDocument();
+  });
+
+  it("lists the records the artifact is used in, reminders included", async () => {
+    server.use(
+      http.get("/api/v1/accounts/accounts/:id/artifacts/", () =>
+        HttpResponse.json([{ ...mockArtifact, used_in: [{ resource_type: "reminder", resource_id: 4, label: "Chase the SOW", url: "/reminders" }] }])
+      ),
+    );
+    await openViewer();
+    expect(screen.getByTestId("artifact-details")).toHaveTextContent("Chase the SOW");
+  });
+
+  it("offers the uploader a screenshot when a file has no preview", async () => {
+    server.use(
+      http.get("/api/v1/accounts/accounts/:id/artifacts/", () =>
+        HttpResponse.json([{ ...mockCodeArtifact, name: "mystery.xyz", mime_type: "application/octet-stream", file_url: "http://localhost/media/m.xyz", uploaded_by: 1 }])
+      ),
+      http.get("/api/v1/accounts/artifacts/:id/preview/", () => HttpResponse.json({ kind: "unsupported", reason: "type" })),
+    );
+    currentUserStub.me = { id: 1, access_level: "basic" };
+    await renderPage();
+    await waitFor(() => screen.getByText("mystery.xyz"));
+    fireEvent.click(screen.getByText("mystery.xyz"));
+    const fallback = await screen.findByTestId("preview-fallback");
+    expect(await within(fallback).findByTestId("screenshot-picker")).toBeInTheDocument();
   });
 });
 

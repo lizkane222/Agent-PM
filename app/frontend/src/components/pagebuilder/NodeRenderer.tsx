@@ -382,7 +382,7 @@ export default function NodeRenderer({ node, selectedId, multiSelectedIds, onSel
           <div
             className="prose prose-sm max-w-none rich-text"
             style={{ color: (p.color as string) || "#39476A" }}
-            dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize((p.html as string) || "<p>Rich text…</p>") }}
+            dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize((p.html as string) || "<p>Rich text…</p>", { FORBID_TAGS: ["style", "form"] }) }}
           />
         );
 

@@ -1221,7 +1221,7 @@ export default function SettingsPage() {
           </p>
           {editAppEnabled && (
             <Link
-              to="/edit-preview"
+              to="/layouts"
               className="inline-flex items-center gap-1.5 text-sm font-medium text-[var(--twilio-blue)] hover:underline"
             >
               Open Edit Page

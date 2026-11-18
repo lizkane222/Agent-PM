@@ -86,6 +86,10 @@ All data-fetching hooks are built on `useResource<T>` in `src/hooks/useResource.
 | `useSkillRuns` | `hooks/useSkillRuns.ts` | `SkillRunRow[]` — the Console's skill runs |
 | `useAgentSkillList` | `hooks/useAgentSkillList.ts` | `AgentSkill[]` the caller can see |
 | `useAccountProjects` | `hooks/useAccountProjects.ts` | `AccountProject[]` — every project **and goal** (`kind`) the caller can see, one request; `setActionIds` moves action items |
+| `useArtifactNotes` | `hooks/useArtifactNotes.ts` | `ArtifactNote[]` — notes and threaded replies on one artifact (flat list, `parent` ids); `addNote` / `editNote` / `removeNote` |
+| `useArtifactPreview` | `hooks/useArtifactPreview.ts` | The server's description of one artifact file (`GET /accounts/artifacts/<id>/preview/`) — one object, **not** `useResource` |
+| `useSensitiveMarks` | `hooks/useSensitiveMarks.ts` | `SensitiveMark[]` for one record (screen-share masking) — shared store `lib/sensitiveStore.ts`, **not** `useResource` |
+| `useActionItemList` | `hooks/useActionItemList.ts` | `AirtableActionItem[]` from `/airtable/action-items/` for a `params` object — silent reloads on the `actionItemsUpdated` broadcast (`loading` is first-load only), `updateFields` / `updateStatus` / `remove` / `create` (refetch + re-throw, `local-*` ids never sent). Not the zones/kanban hook: `useActionItems` + `useActionItemZones` (zero consumers) stay for ActionItemsPage's out-of-scope draft protocol |
 
 ---
 
@@ -4191,7 +4195,7 @@ extracted into pieces: the old ProfilePage (and its fixed left rail, stats row, 
 list) is replaced; its unique behaviours that survive are pinned-by-me skills (now merged into
 the skills section) and the server-side `assigned_to_me` action-item filter (the old client-side
 filter dropped items beyond the first 20). The role comes from `getTitleRole(profile.title)`, not
-the URL. `/build` links were pointed at the real `/edit-preview`. Section choices persist
+the URL. `/build` links were pointed at the real `/layouts`. Section choices persist
 (`profileVisibleSections-v1`). **Not carried over:** the old stats row and "Quick Open" doc grid
 (RolePage already has the quick-create links). `RolePage.test.tsx` and the old
 `ProfilePage.test.tsx` are merged into one file.
@@ -5557,3 +5561,201 @@ condition); 2 frontend tests. **Daphne must be restarted** for the new route and
 - Prompt index capped at 8 parts; when the skill's own instructions alone exceed the chat cap the run returns a warning
   instead of a prompt that cannot be sent. The other raw-`fetch` chat sites (`ChatPage`, `ThreadChatPanel`, `AccountDetailPage`)
   were not changed.
+
+
+---
+
+### 2026-11-12 — One calendar action-items sidebar, and `useActionItemList` under it
+
+**Why.** The sidebar users saw was a local function inside `pages/CalendarPage.tsx`; a diverged copy in
+`components/calendar/ActionItemsSidebar.tsx` was kept alive only by tests and by source-text parity tests. Every page also
+fetched action items by hand into its own state.
+
+**Hook** — `hooks/useActionItemList.ts` (24 tests, written first and green before any consumer changed): `useActionItemList(params, {enabled, broadcast, debounceMs})`
+on `useResource`, keyed by the *contents* of `params`; tolerates a bare array or a DRF envelope. `loading` is true only until the first
+result for the current params; `refreshing` covers every in-flight request, so a reload never blanks a page (the 2026-08-19 bug). The
+`actionItemsUpdated` broadcast triggers a 250 ms-debounced reload, skipped when the hook's own mutation already refetched after that broadcast.
+Mutations wait for the server, `refetch()`, and re-throw; no optimistic updates in the hook. Pages that want one keep it in their own state.
+
+**Sidebar** — extracted into `components/calendar/ActionItemsSidebar.tsx` (default export, props `expandItemId`, `colors?`, `accountFilter?`, `onDropToast?`) and
+imported by CalendarPage, which lost ~800 lines (local sidebar, card, `OccurrencesList`, the `CalPill*` helpers, `BLANK_FORM`). Live behaviour won: accent colors,
+account filter, deleting also removes the item's `work_tracking` blocks, `htmlToPreviewText`, accounts `page_size=500`. **Visible additions** (the stale copy's tested
+features, now on the real sidebar): right-click menu (Edit / Mark Done / Copy / Comment / Export tray / Delete), comment preview on cards. The old `activeTimers` prune is dropped:
+that localStorage key has no writer since Live Tracking became server-owned.
+Optimistic edits (delete, account drop, create, reminder) sit in the component on top of the hook's data and fall away when fresh data arrives.
+`CalendarPage.test.tsx` mocks `useExportTray` (the provider is mounted by `App`). `sidebarOrderingParity.test.ts` is replaced by `ActionItemsSidebarStructure.test.ts`
+(CalendarPage imports the component and defines no local copy; the one file keeps every ordering/modal-only assertion). `ActionItemsSidebarBehaviour.test.tsx` (6) covers props, silent reload and delete.
+
+**Adopted the hook:** `ProfilePage` In Progress list (own refresh cadence kept, hook broadcast off), `CreateEventModal` account items,
+`ArtifactsPanel` action-item attachments, CalendarPage Log Time `allActionItems`.
+
+**Left as-is, deliberately.** `ActionItemsPage` (`local-*` draft protocol, out of scope) and therefore `hooks/useActionItems.ts` + `useActionItemZones.ts` (zero consumers, tested, kept);
+`AccountDetailPage` (out of scope; its local ArtifactsPanel copy and kanban load stay); `DashboardPage` (one `Promise.all` over four entities with a single loading flag and an optimistic
+status flip with revert); `MeetingDetail`, CalendarPage's by-id lookup (imperative lookups inside handlers, not lists); `hooks/useAccountDetail.ts` (zero consumers, chained load).
+Mutation-only sites (`KanbanCard`, `ActionItemCard`, `AccountsSidebar`, `useSlackLinkAutosave`, `lib/actionItemAssign.ts`) keep calling `airtableApi` because each logs/patches locally.
+
+**Left open.** Not seen in a real browser: the sidebar's right-click menu and comment previews are new on the live calendar sidebar.
+
+
+
+---
+
+### 2026-11-13 — Sensitive text: hide a line or a selection for screen sharing, shared on the server
+
+Display-only masking (the data stays stored and readable via the API and exports; a screen-share aid, not access control).
+- Backend app `sensitive` (migration `sensitive/0001`): `SensitiveMark(resource_type, resource_id str, field, text, line_key, fingerprint, created_by)`;
+  `GET|POST /api/v1/sensitive/marks/`, `DELETE …/marks/<id>/`. Visibility = `sensitive/visibility.py::can_see` (delegates to
+  `comments.views._user_can_see_resource`, adds contacts, notes, projects/goals, meeting notes, applets, public items, team members, comments);
+  invisible/unknown record -> the same 404. Text <= 2000, <= 200 marks per record, batch <= 500 ids. The activity event carries the record label only.
+- Frontend: `lib/sensitiveStore.ts` (batched, 60s stale re-read), `hooks/useSensitiveMarks.ts`, `components/shared/SensitiveText.tsx` (read-only text/HTML),
+  `SensitiveEditable.tsx` (wraps an editor; a hidden field shows a mask + "Show to edit"), `sensitiveMenu.tsx` / `sensitiveRecent.ts` / `sensitiveContext.ts`.
+  The shared `ContextMenu` appends the hide entries automatically when the right-click landed on a `SensitiveText`.
+- Wrap new text-bearing record fields in `<SensitiveText resourceType resourceId field text|html />`; an editor in `<SensitiveEditable>`.
+
+
+---
+
+### 2026-11-13 — Artifact preview overlay: Esc, every file type, screenshot fallback, notes + comments sidebar
+
+**What was asked.** Esc closes the preview; a preview for all file types (with a user-supplied screenshot
+when none can be rendered); Comments and Notes in the sidebar with history, threaded replies and the
+create-action-item / reminder / meeting / copy buttons; show every record the artifact is linked to.
+
+**Key discovery.** The page had its own copy of `ArtifactViewer` (`AccountDetailPage.tsx`) that had drifted
+from the shared one (it had the edit rail but **no Escape handler**). The local copy is **deleted**; the page
+renders `components/account/ArtifactViewer.tsx` with the same props, so there is one overlay to maintain.
+`comments` already had the `artifact` resource type and its visibility rule, and `sensitive` already knew
+`artifact`, so no comments migration was needed.
+
+**Backend (`accounts`, migration `0030_artifact_preview_image_and_notes`).**
+- `AccountArtifact.preview_image` (screenshot) + read-only `preview_image_url`; `ArtifactNote` model.
+- `GET /accounts/artifacts/<id>/preview/` (`accounts/artifact_preview.py`): stdlib/python-docx parsing under hard
+  limits (25 MB refuse, 512 KB text, 200x50 tables, 500 archive entries, 5 sheets, 100 slides, 8 s budget,
+  zip-bomb and DOCTYPE/ENTITY refusal). Never raises, never returns exception text. Visible to whoever can see
+  the artifact (account team, owner, uploader, Admin with the staff view); anything else is 404.
+- `POST|DELETE /accounts/artifacts/<id>/preview-image/`: PNG/JPEG/GIF/WebP sniffed from the bytes, never SVG, 10 MB;
+  the stored name comes from the sniffed type, not the client. Edit rule = the artifact update rule (uploader, or
+  `_staff_sees_all`); someone who can see but not edit gets 403, an invisible artifact 404.
+- `/accounts/artifact-notes/` (`ArtifactNoteViewSet`): list needs `?artifact=` or `?artifact__in=`; create (visible
+  artifact only), PATCH by the author only (html is re-sanitized, `text` derived, artifact/parent immutable), DELETE by
+  the author or an Admin (`core.mixins.is_admin`), replies cascade. Flat list with `parent` ids and `reply_count`
+  (frontend builds the tree, any depth).
+- `used_in_map(..., user=None)` gained reminders: the caller's **own** reminders whose `links` contain the artifact
+  (4 queries total regardless of counts, test-guarded). Reminders can now link to an artifact:
+  `scheduler/reminder_links.py` has `artifact` in `LINK_TYPES` (visible = `_artifacts_visible_to`), so the reminder
+  link picker offers "Artifact" (a small visible addition, needed so a reminder made from a note can link back).
+- `sensitive/visibility.py`: `artifact_note` registered (visible iff its artifact is).
+
+**Frontend.**
+- `components/account/artifactPreview/` (`classify.ts`, `RemotePreview`, `LinkPreview`, `PreviewFallback`,
+  `ScreenshotPicker`, `index.tsx` with `renderArtifactPreview`), `ArtifactSidebar`, `ArtifactNotesPanel`,
+  hooks `useArtifactNotes` / `useArtifactPreview`. `ArtifactDetailsRail` got an `embedded` mode.
+- `NoteBulletActions` / `NoteActionTooltip` take an optional `source` (an artifact): the action item gets
+  `task_details` "From artifact: <name>", `references`, and an attachment link (`source_artifact`), the reminder gets
+  `links:[artifact]`, the meeting gets `artifact_ids` + the artifact's account; `onLinked` adds the new record to the
+  sidebar's "Used in" at once. `eventId` is now optional. `InlineCommentThread` gained `renderActions`, `heading`,
+  `listClassName` (comments reuse the existing thread, composer and `useComments`).
+
+**Decisions.**
+- *Esc rule* (`escapeAction`, exported and tested): ignore if the event is `defaultPrevented` or comes from an open
+  `role=menu|listbox|alertdialog`, `[data-esc-layer]`, or a nested `role=dialog`; if focus is in a text field **with
+  text in it** the first Esc only blurs the field (a half-written note is never lost), the next closes; else close.
+  Focus moves to the overlay on open and returns to the previous element on close.
+- *No third-party viewers.* Office/text/CSV/HTML/archives are parsed by our own backend, so files never leave the
+  platform and no cross-origin fetch of media is needed (the API and `/media/` are different origins in dev).
+  Images/PDF/video/audio use the file URL in native tags (SVG via `<img>` only; the PDF frame is not sandboxed because
+  browsers' PDF viewers do not run in a sandboxed frame). HTML runs in `sandbox=""` with `srcDoc` (re-sanitized).
+  Links are a card; only Google Docs/Sheets/Slides/Drive can be embedded, **after a click**, as `/preview` URLs.
+- *Notes vs comments.* Notes are a new artifact feature (rich text, any reply depth, collapsible chains); comments are
+  the shared comment system (one reply level, per its existing convention). Both appear as tabs with counts.
+- Legacy binary Office (`.doc/.xls/.ppt`), compressed tars and unknown types have no safe stdlib parser and fall back
+  to the "Add a screenshot" state.
+- The old "omits the details panel when there is nothing to show" test was changed: the sidebar is now always present.
+- Admin without the staff-view override can see an artifact's comments (comments use raw `is_staff`) but not its notes
+  (`_staff_sees_all`); not unified here.
+
+**Verified.** Backend: new `accounts/tests/test_artifact_preview.py`, `test_artifact_notes.py`; frontend 3270/3270
+(66 in `ArtifactViewer.test.tsx`, 6 hook, classify/tree/embed, 4 page tests), `tsc` and `npm run build` clean.
+Sabotage-checked: defaultPrevented guard, draft-blur rule, comment actions, threading.
+**Daphne must be restarted** (new routes `artifact-notes/`, `artifacts/<id>/preview/`, `preview-image/`). Dev DB migrated
+(`accounts.0030`), backup `/tmp/db.sqlite3.pre-artifact-sidebar`. Not exercised in a real browser (PDF/video playback,
+real clipboard paste, drag from the desktop, layout of the 360 px sidebar).
+
+
+
+---
+
+### 2026-11-13 — Artifact discussion audience; open decisions deferred
+
+**Decided (this session).** An artifact's notes and comments are one conversation with one audience:
+everyone who can see the artifact reads and writes both, and every Admin (by access level) does too, not
+only an Admin who switched the staff data view on. Notes use `accounts.views._artifacts_for_discussion`;
+comments' `_user_can_see_resource` accepts `is_admin` for the `artifact` type. Before, an Admin with the
+staff view off saw an artifact's comments but not its notes. Tests: `DiscussionAudienceTests` in
+`accounts/tests/test_artifact_notes.py` (sabotage-checked).
+
+**Deferred — we will decide these at a later time** (the owner chose not to decide now; do not treat any
+of them as approved, and do not implement them without asking):
+1. **Calendar sidebar right-click menu and comment previews.** The extracted
+   `components/calendar/ActionItemsSidebar.tsx` merged in the old copy's menu (Edit, Mark Done/Reopen,
+   Copy task name, Comment, Export tray, Delete) and comment previews on cards. That is a visible change
+   from the live sidebar. Keep, or remove to restore the previous look.
+2. **Shared cache.** `core/settings.py` has no `CACHES`, so every cache-based guard (the Google sync lock,
+   agent tool rate limits, chat confirmation tokens, the DRF throttle) is per process. The sync double-insert
+   was fixed without the cache (rows are claimed before the Google call), but the guards stay per process.
+   Options: (a) Redis, which the repo already needs for Celery. It needs its own database number and key
+   prefix, fail-closed behaviour for confirmation tokens and the guest-notification limits, fail-open for
+   the sync lock, and tests staying on the in-memory cache. (b) A database-backed lock for the sync only.
+3. **`?meeting=<id>` deep links on the account page.** `AccountDetailPage.tsx` has no code that reads the
+   parameter (the 2026-08-07 entry says it does; the committed file does not). Meeting chips and pin-note
+   links still reach the account page but do not open the meeting panel.
+4. **Unused hooks.** `hooks/useActionItems.ts` and `hooks/useActionItemZones.ts` have no consumers outside
+   their tests (only each other). They hold the zones logic the Action Items page would need if its
+   `local-*` draft protocol is ever migrated. Remove, or keep for that migration.
+5. **README deployment notes.** No AWS or Twilions deployment document exists in this repo (`README.md` has a
+   short "CORS / Deployment" section; `app/backend/Procfile` is written for Railway). Facts that hold anywhere,
+   for whoever writes it: Redis is required for Celery; the worker and beat must both run, beat exactly once;
+   Daphne has no autoreload; run migrations before the new code; `GOOGLE_WEBHOOK_BASE_URL` must be a public
+   HTTPS URL; keep `GOOGLE_GUEST_NOTIFICATIONS` governance as in "Outbound communication governance".
+   The AWS-specific steps need the platform team's input.
+
+**Also noticed, not acted on.** `DashboardPage` links with an Airtable account id (`/accounts/${acct.id}` on an
+`AirtableAccount`), which looks like an older mismatch. A few loading-state tests (`AccountDetailPage`,
+`ActionItemsPage`, `RemindersPage`, `TokenBudgetsPanel`) fail occasionally in a full run under load and pass
+alone; they are timing-sensitive, not broken.
+
+
+---
+
+### 2026-11-16 — Action items on the calendar appeared twice: stale Celery next to the new one
+
+**Cause (from the data).** Each pair is two `CalendarEvent` rows with the same `agentpm_airtable_id` and
+start: one `origin=agentpm` (the drop) and one `origin=google` (pulled back), with two `sync.push_new`
+inserts ~1s apart in `GoogleWriteLog`. `_push_new_agentpm_events` already claims a row with a conditional
+UPDATE, but a **stale Celery worker + beat from Nov 11, running pre-fix code**, were still alive beside the
+new ones: `npm run agent-pm`'s `pkill` matched the absolute celery path only. `app/scripts/stop-celery.sh`
+now matches by working directory and runs from `npm run agent-pm`. The original app runs the same
+`core.celery` module and must never be touched; the script must keep matching by this checkout's cwd.
+
+**Second line of defence (pull).** `_sync_google_calendar` (`integrations/views.py`) no longer imports a
+Google event that carries our private marker (`agentpm_airtable_id`) when this user already has a row with the
+same `agentpm_airtable_id`, calendar and start MINUTE but a different, fully linked `google_event_id`
+(`_original_for_twin`). It deletes the extra Google event through `google_calendar_gateway.delete_by_id`
+(source `sync.dedupe_twin`, `sendUpdates="none"`, audited; never emails) and keeps the linked row. Never the
+original (a `claiming:` row is not an original, since the incoming event may be that very insert); unmarked
+Google events are untouched; different start minutes are separate schedulings; capped at
+`MAX_TWIN_DELETES_PER_SYNC` (20); a gateway failure is logged and both rows are kept (clean up with the command).
+
+**Existing duplicates.** `manage.py dedupe_agentpm_calendar_twins` (dry run by default; `--commit`,
+`--username`). Keeps the `origin=agentpm` row, deletes the twin's Google event via the gateway, then the local
+row; keeps the row if Google fails; skips `claiming:` rows; never deletes every row of a group. Review the dry
+run before `--commit`: pairs from September or earlier may be old restored rows rather than this bug.
+
+**Frontend.** The calendar's native drop listener (`CalendarPage.tsx`) now detaches whatever it attached;
+before, the retry path could leave a listener behind so a re-run attached a second one, and a real drag
+(whose `dataTransfer` id persists) would then POST twice. Guard tests in `CalendarPage.test.tsx`
+("single-fire"): one drop is one POST, globals are cleared, a second drop with no new drag does nothing, and
+no `new Draggable(` exists (FullCalendar's `drop` would otherwise also fire).
+
+**Operational rule.** After pulling backend changes run `npm run agent-pm`, then confirm exactly one beat:
+`ps aux | grep 'celery.*beat'`.

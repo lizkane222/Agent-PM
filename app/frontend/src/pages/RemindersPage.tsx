@@ -16,6 +16,7 @@ import { useReminders } from "../hooks/useReminders";
 import type { Reminder } from "../types/scheduler";
 import { toLocalDatetimeValue } from "../lib/datetimeLocal";
 import PinnedSkillsSection from "../components/skills/PinnedSkillsSection";
+import SensitiveText from "../components/shared/SensitiveText";
 
 function statusColor(status: Reminder["status"]): string {
   if (status === "dismissed") return "rgba(0,0,0,0.25)";
@@ -502,14 +503,14 @@ function ReminderRow({
               <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12 }}>
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                    <span style={{ fontSize: "0.9375rem", fontWeight: 600, color: "var(--text-primary, #111)" }}>{r.title}</span>
+                    <span style={{ fontSize: "0.9375rem", fontWeight: 600, color: "var(--text-primary, #111)" }}><SensitiveText resourceType="reminder" resourceId={r.id} field="title" text={r.title} /></span>
                     <span style={{
                       fontSize: "0.6875rem", fontWeight: 600, padding: "2px 7px", borderRadius: 4,
                       background: statusColor(r.status), color: "#fff",
                     }}>{r.status}</span>
                   </div>
                   {r.body && (
-                    <p style={{ fontSize: "0.8125rem", color: "var(--text-secondary, #888)", margin: "4px 0 0" }}>{r.body}</p>
+                    <p style={{ fontSize: "0.8125rem", color: "var(--text-secondary, #888)", margin: "4px 0 0" }}><SensitiveText resourceType="reminder" resourceId={r.id} field="body" text={r.body ?? ""} /></p>
                   )}
                   <div style={{ display: "flex", gap: 12, marginTop: 8, flexWrap: "wrap" }}>
                     <span style={{ fontSize: "0.75rem", color: "var(--text-secondary, #888)" }}>

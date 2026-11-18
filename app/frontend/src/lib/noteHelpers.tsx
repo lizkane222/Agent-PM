@@ -53,16 +53,20 @@ export function plainToHtml(text: string): string {
   return text.split(/\n\n+/).map(paragraphToHtml).join("");
 }
 
+// DOMPurify's default allows <style> (CSS exfiltration / UI-redress overlays) and <form>
+// (phishing inside a note); neither is something rich text needs.
+export const SANITIZE_CONFIG = { FORBID_TAGS: ["style", "form"] };
+
 // Sanitizes rich-text HTML before rendering via dangerouslySetInnerHTML.
 export function sanitizeHtml(html: string): string {
-  return DOMPurify.sanitize(html);
+  return DOMPurify.sanitize(html, SANITIZE_CONFIG);
 }
 
 // Strips HTML tags down to plain text for compact single/multi-line previews
 // (card summaries, list rows) where full rich-text rendering doesn't fit.
 export function htmlToPreviewText(html: string): string {
   const div = document.createElement("div");
-  div.innerHTML = DOMPurify.sanitize(html);
+  div.innerHTML = DOMPurify.sanitize(html, SANITIZE_CONFIG);
   return (div.textContent ?? "").replace(/\s+/g, " ").trim();
 }
 

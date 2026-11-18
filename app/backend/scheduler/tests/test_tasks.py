@@ -288,3 +288,36 @@ class SmsDeliveryFollowUpTests(TestCase):
         self.assertIn("A2P", sms_delivery.describe_error(30034))
         self.assertEqual(sms_delivery.describe_error("nope"), sms_delivery.GENERIC_HELP)
         self.assertEqual(sms_delivery.describe_error(99999), sms_delivery.GENERIC_HELP)
+
+
+class SendSmsSafetyTests(TestCase):
+    def setUp(self):
+        from django.core.cache import cache
+        cache.clear()
+        self.user = _make_user()
+        self.reminder = _make_reminder(self.user)
+        self.profile = self.user.profile
+
+    @override_settings(**TWILIO_SETTINGS)
+    @patch("twilio.rest.Client")
+    def test_premium_number_is_never_texted(self, MockClient):
+        self.profile.phone_number = "+19005551234"
+        self.assertFalse(_send_sms(self.profile, self.reminder))
+        MockClient.return_value.messages.create.assert_not_called()
+
+    @override_settings(SMS_REMINDERS_PER_HOUR=2, **TWILIO_SETTINGS)
+    @patch("twilio.rest.Client")
+    def test_hourly_cap_per_number(self, MockClient):
+        results = [bool(_send_sms(self.profile, self.reminder)) for _ in range(4)]
+        self.assertEqual(results, [True, True, False, False])
+        self.assertEqual(MockClient.return_value.messages.create.call_count, 2)
+
+    @override_settings(**TWILIO_SETTINGS)
+    @patch("twilio.rest.Client")
+    def test_body_is_bounded_and_control_chars_stripped(self, MockClient):
+        self.reminder.title = "A\x00B" + "x" * 500
+        self.reminder.body = "y" * 2000
+        _send_sms(self.profile, self.reminder)
+        body = MockClient.return_value.messages.create.call_args.kwargs["body"]
+        self.assertNotIn("\x00", body)
+        self.assertLessEqual(len(body), 10 + 140 + 2 + 300)

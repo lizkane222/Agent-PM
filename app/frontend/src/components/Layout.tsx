@@ -3,7 +3,7 @@ import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { bottomNavItems } from "../lib/navItems";
 import { DndContext } from "@dnd-kit/core";
 import GlobalSearch from "./GlobalSearch";
-import { accountsApi, teamApi, agentApi, skillsApi } from "../lib/api";
+import { teamApi, agentApi, skillsApi } from "../lib/api";
 // import SyncRunner from "./SyncRunner"; // stick-figure sync animation — hidden from the sidebar
 import { initialsFor, sidebarTitle } from "../lib/initials";
 import type { Account, UserProfile } from "../types";
@@ -29,14 +29,16 @@ import MeetingNotesToast from "./MeetingNotesToast";
 import { useMeetingNotesAutoCheck } from "../hooks/useMeetingNotesAutoCheck";
 import { useReminderAlerts } from "../hooks/useReminderAlerts";
 import ReminderAlertToast from "./ReminderAlertToast";
+import { loadAccountDirectory } from "../lib/accountDirectory";
+import { accountPath } from "../lib/accountSlug";
 
 type SvgIcon = FC<SVGProps<SVGSVGElement>>;
 
 /** Nested links shown (collapsibly) under a top-level item. */
 const AGENT_CHILDREN = [{ to: "/skills", label: "Claude Skills", Icon: CodeIcon }];
 const BUILD_CHILDREN = [
-  { to: "/edit-preview", label: "Layouts", Icon: InnovationIcon },
-  { to: "/discover", label: "Discovery", Icon: InnovationIcon },
+  { to: "/layouts", label: "Layouts", Icon: InnovationIcon },
+  { to: "/discovery", label: "Discovery", Icon: InnovationIcon },
 ];
 
 /** Disclosure arrow — deliberately larger than the old 0.75rem glyph so it is easy to hit. */
@@ -146,28 +148,16 @@ function useUserProfile() {
 
 function useNavAccounts() {
   const [accounts, setAccounts] = useState<Account[]>([]);
+  // Everything the caller can see (inactive included): slug uniqueness is judged against this,
+  // so a sidebar link always resolves on the account page.
+  const [directory, setDirectory] = useState<Account[]>([]);
 
   const fetch = async (fresh = false) => {
     // Run independently so admin account always appears even if listAccounts fails (or vice versa)
-    const [listResult, adminResult] = await Promise.allSettled([
-      accountsApi.listAccounts(undefined, { fresh }),
-      accountsApi.getAdminAccount({ fresh }),
-    ]);
-
-    const regular: Account[] = listResult.status === "fulfilled"
-      ? listResult.value.data.results.filter((a) => !a.is_admin_account && a.status !== "inactive")
-      : [];
-
-    const adminAccount: Account | null = adminResult.status === "fulfilled"
-      ? adminResult.value.data
-      : null;
-
-    // Admin always pinned first; if getAdminAccount failed, fall back to whatever listAccounts returned
-    if (adminAccount) {
-      setAccounts([adminAccount, ...regular]);
-    } else {
-      setAccounts(regular);
-    }
+    const all = await loadAccountDirectory(fresh);
+    setDirectory(all);
+    // Admin always pinned first (loadAccountDirectory puts it there); inactive accounts stay out of the nav.
+    setAccounts(all.filter((a) => a.is_admin_account || a.status !== "inactive"));
   };
 
   useEffect(() => { void fetch(); }, []);
@@ -183,7 +173,7 @@ function useNavAccounts() {
       window.removeEventListener("accountsUpdated", onSameTab);
     };
   }, []);
-  return accounts;
+  return { accounts, directory };
 }
 
 function useTheme() {
@@ -207,7 +197,7 @@ export default function Layout() {
   const reminderAlerts = useReminderAlerts();
   const { dark, toggle } = useTheme();
   const profile = useUserProfile();
-  const navAccounts = useNavAccounts();
+  const { accounts: navAccounts, directory: accountDirectory } = useNavAccounts();
   const location = useLocation();
   const { pickMode } = useFeedback();
   const { exportMode, toggleMode, count: exportCount } = useExport();
@@ -237,7 +227,7 @@ export default function Layout() {
 
   // "Send to chat" lives in the tray itself (ExportBar), not on this button —
   // overloading the toggle with send is what stopped it closing the tray.
-  const buildPaths = ["/edit-preview", "/discover"];
+  const buildPaths = ["/layouts", "/discovery"];
   const [buildOpen, setBuildOpen] = useState(true);
   const [agentOpen, setAgentOpen] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false); // Admin Data hidden by default
@@ -312,7 +302,7 @@ export default function Layout() {
                   {navAccounts.map((acct) => (
                     <NavLink
                       key={acct.id}
-                      to={`/accounts/${acct.id}`}
+                      to={accountPath(acct, accountDirectory)}
                       style={({ isActive }) => ({
                         display: "flex",
                         alignItems: "center",
@@ -333,7 +323,7 @@ export default function Layout() {
                       }}
                       onMouseLeave={(e) => {
                         const el = e.currentTarget as HTMLAnchorElement;
-                        const isSelected = location.pathname === `/accounts/${acct.id}`;
+                        const isSelected = location.pathname === accountPath(acct, accountDirectory);
                         el.style.background = isSelected ? "rgba(255,255,255,0.12)" : "transparent";
                         el.style.color = isSelected ? "rgba(255,255,255,0.95)" : acct.is_admin_account ? "rgba(255,255,255,0.65)" : "rgba(255,255,255,0.45)";
                       }}

@@ -25,10 +25,13 @@ def sniff_image_type(head: bytes):
     return None
 
 
-def image_upload_error(upload):
+PREVIEW_IMAGE_MAX_BYTES = 10 * 1024 * 1024  # 10 MB: a full-screen screenshot can exceed 5 MB
+
+
+def image_upload_error(upload, max_bytes: int = MAX_IMAGE_BYTES):
     """Return a user-facing error string for an unacceptable image upload, else None."""
-    if upload.size > MAX_IMAGE_BYTES:
-        return "Image too large (max 5 MB)."
+    if upload.size > max_bytes:
+        return f"Image too large (max {max_bytes // (1024 * 1024)} MB)."
     head = upload.read(12)
     upload.seek(0)
     if sniff_image_type(head) is None:
@@ -40,3 +43,17 @@ def delete_image_file(artifact):
     """Remove the stored image file (if any) and clear the field. Does not save."""
     if artifact.custom_image:
         artifact.custom_image.delete(save=False)
+
+
+def delete_preview_file(artifact):
+    """Remove the stored preview screenshot (if any) and clear the field. Does not save."""
+    if artifact.preview_image:
+        artifact.preview_image.delete(save=False)
+
+
+_EXTENSIONS = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp"}
+
+
+def extension_for(mime: str) -> str:
+    """Canonical extension for a sniffed image type (never taken from the client's filename)."""
+    return _EXTENSIONS.get(mime, "bin")

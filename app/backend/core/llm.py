@@ -108,6 +108,19 @@ def model_for_tier(tier: str) -> str:
     return model
 
 
+def guard_model(model: str, tier: str = TIER_DEFAULT) -> str:
+    """
+    Apply the Opus block and the vendor guard to an *explicit* model id.
+
+    ``model_for_tier`` guards ids it resolves itself; a caller that names a model directly
+    (``complete(model=...)``, a module constant) would otherwise skip both rules.
+    """
+    if is_opus_blocked(model):
+        model = _non_opus_fallback(tier)
+    _assert_anthropic(model, tier)
+    return model
+
+
 def is_opus(model: str) -> bool:
     return _OPUS_MARKER in (model or "").lower()
 
@@ -158,9 +171,19 @@ def _raw_model_for_tier(tier: str) -> str:
     return model
 
 
+# Third-party model families that a gateway alias could hide behind a name containing
+# "claude" (e.g. "claude-kimi-proxy"). Any hit means the id is refused.
+_NON_ANTHROPIC_MARKERS = (
+    "router", "kimi", "moonshot", "gpt", "openai", "llama", "mistral", "gemini",
+    "deepseek", "qwen", "cohere", "grok", "titan", "nova",
+)
+
+
 def is_anthropic_model(model: str) -> bool:
     lowered = (model or "").lower()
     if lowered in _KNOWN_ROUTERS:
+        return False
+    if any(marker in lowered for marker in _NON_ANTHROPIC_MARKERS):
         return False
     return any(marker in lowered for marker in _ANTHROPIC_MARKERS)
 
@@ -339,8 +362,15 @@ def _gateway_kwargs() -> dict:
     # base_url is always explicit: Claude Code's managed settings export
     # ANTHROPIC_BASE_URL, so a bare client would silently inherit it from whichever
     # shell launched Django.
+    base = (settings.AGENT_GATEWAY_BASE_URL or "").strip()
+    # The bearer token is sent to this URL: never over cleartext to a remote host.
+    from urllib.parse import urlparse
+
+    parsed = urlparse(base)
+    if parsed.scheme != "https" and parsed.hostname not in ("localhost", "127.0.0.1"):
+        raise ImproperlyConfigured("AGENT_GATEWAY_BASE_URL must be an https URL.")
     return {
-        "base_url": settings.AGENT_GATEWAY_BASE_URL,
+        "base_url": base,
         # The gateway authenticates with a bearer token, not an x-api-key header.
         "auth_token": gateway_token(),
     }
@@ -425,7 +455,7 @@ def complete(
     """
     client = build_sync_client()
     kwargs = {
-        "model": model or model_for_tier(tier),
+        "model": guard_model(model, tier) if model else model_for_tier(tier),
         "max_tokens": max_tokens,
         "messages": [{"role": "user", "content": prompt}],
     }

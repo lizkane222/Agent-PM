@@ -1,8 +1,11 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import { http, HttpResponse } from "msw";
 import { server } from "../../../test/msw-server";
 import AccountMeetingNotesTimeline from "../AccountMeetingNotesTimeline";
+import { lineKeyFor } from "../../../lib/sensitiveMatch";
 import type { AirtableMeeting, CalendarEvent, MeetingNote } from "../../../types";
 
 const NOTES_PATH = "/api/v1/scheduler/meeting-notes/";
@@ -88,5 +91,94 @@ describe("AccountMeetingNotesTimeline", () => {
     render(<AccountMeetingNotesTimeline events={[e]} meetings={[]} onOpenEvent={onOpenEvent} onOpenMeeting={noop} />);
     fireEvent.click(screen.getByText("Event 3"));
     expect(onOpenEvent).toHaveBeenCalledWith(e);
+  });
+});
+
+describe("AccountMeetingNotesTimeline bullet actions", () => {
+  const setup = (gong = "Key Points:\n- pricing agreed with <b>Acme</b> @Jane") => {
+    track();
+    const e = ev(4, 12, { agentpm_airtable_id: "recQ" });
+    return render(
+      <AccountMeetingNotesTimeline events={[e]} meetings={[mtg(77, "recQ", { gong_notes: gong })]} onOpenEvent={noop} onOpenMeeting={noop} />,
+    );
+  };
+
+  it("gives each bullet the action buttons and a Copy button", () => {
+    setup();
+    const row = screen.getByTestId("summary-bullet-row");
+    for (const t of ["Create action item", "Set reminder", "Create meeting", "Copy text"]) {
+      expect(within(row).getByTitle(t)).toBeTruthy();
+    }
+    expect(row.querySelector("[data-note-text]")).toBeTruthy();
+  });
+
+  it("Copy writes the bullet's plain text and confirms", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    setup();
+    fireEvent.click(screen.getByTitle("Copy text"));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("pricing agreed with Acme @Jane"));
+    await waitFor(() => expect(screen.getByText("Copied")).toBeTruthy());
+  });
+
+  it("Copy failure shows a failure state instead of throwing", async () => {
+    Object.defineProperty(navigator, "clipboard", { value: { writeText: vi.fn().mockRejectedValue(new Error("no")) }, configurable: true });
+    setup();
+    fireEvent.click(screen.getByTitle("Copy text"));
+    await waitFor(() => expect(screen.getByText("Failed")).toBeTruthy());
+  });
+
+  it("creating an action item links it to the meeting", async () => {
+    let body: Record<string, unknown> | null = null;
+    server.use(http.post("*/api/v1/airtable/action-items/", async ({ request }) => {
+      body = (await request.json()) as Record<string, unknown>;
+      return HttpResponse.json({ id: 1, airtable_id: "recN", task: "x", status: "Open" }, { status: 201 });
+    }));
+    setup();
+    fireEvent.click(screen.getByTitle("Create action item"));
+    fireEvent.click(await screen.findByRole("button", { name: "Create Action Item" }));
+    await waitFor(() => expect(body).not.toBeNull());
+    expect(body!.linked_meeting).toBe(77);
+  });
+
+  it("masks a bullet hidden as sensitive (same meeting/field/line key as the sidebar), and not the others", async () => {
+    server.use(http.get("*/api/v1/sensitive/marks/", () => HttpResponse.json({
+      results: { "77": [{ id: 1, field: "summary", text: "", line_key: lineKeyFor("pricing agreed with <b>Acme</b> @Jane") }] },
+    })));
+    setup();
+    const row = screen.getByTestId("summary-bullet-row");
+    await waitFor(() => expect((row.querySelector("[data-note-text]") as HTMLElement).textContent).not.toContain("pricing"));
+    expect(row.textContent).not.toContain("Acme");
+  });
+
+  it("a bullet row gets a slightly darker background on hover only, so its far-away actions are easy to match", () => {
+    setup();
+    const row = screen.getByTestId("summary-bullet-row");
+    expect(row.className).toContain("hover:bg-[var(--row-hover)]");
+    // Not tinted at rest.
+    expect(row.style.background).toBe("");
+    expect(row.style.backgroundColor).toBe("");
+    // The variable exists for both themes: a dark tint on light, a light tint on dark.
+    const css = readFileSync(join(__dirname, "../../../index.css"), "utf8");
+    expect(css).toMatch(/:root \{[\s\S]*?--row-hover:\s*rgba\(15, 23, 42/);
+    expect(css).toMatch(/\[data-theme="dark"\] \{[\s\S]*?--row-hover:\s*rgba\(255, 255, 255/);
+  });
+
+  it("action buttons don't steal the selection (mousedown is default-prevented)", () => {
+    setup();
+    const btn = screen.getByTitle("Copy text");
+    expect(fireEvent.mouseDown(btn)).toBe(false);
+  });
+
+  it("text is selectable: not user-select none, and pressing it disarms row drag", () => {
+    setup();
+    const row = screen.getByTestId("summary-bullet-row");
+    const text = row.querySelector("[data-note-text]") as HTMLElement;
+    expect(getComputedStyle(text).userSelect).not.toBe("none");
+    expect(row.getAttribute("draggable")).toBe("true");
+    fireEvent.mouseDown(text);
+    expect(row.getAttribute("draggable")).toBe("false");
+    fireEvent.mouseUp(document);
+    expect(row.getAttribute("draggable")).toBe("true");
   });
 });

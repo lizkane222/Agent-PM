@@ -25,7 +25,7 @@ def sync_zendesk_all_users():
     from integrations.models import OAuthCredential
 
     user_ids = OAuthCredential.objects.filter(
-        provider="zendesk", is_active=True
+        provider="zendesk", is_active=True, user__is_active=True
     ).values_list("user_id", flat=True)
 
     for uid in user_ids:

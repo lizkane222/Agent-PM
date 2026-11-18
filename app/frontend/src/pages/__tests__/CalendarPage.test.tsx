@@ -28,6 +28,7 @@ import {
   withAlpha,
 } from "../../lib/eventColors";
 import CalendarPage from "../CalendarPage";
+import KanbanCard from "../../components/calendar/KanbanCard";
 import { OCCURRENCE_MS } from "../../lib/reminderSections";
 
 // A 30-second clock tick would make "moves to Historical by itself" a 30-second test.
@@ -161,6 +162,8 @@ vi.mock("@fullcalendar/react", async () => {
               "2026-07-30T09:00:00",
           }),
       }),
+      // The real time grid body, which CalendarPage attaches its native HTML5 drop listener to.
+      React.createElement("div", { className: "fc-timegrid-body", "data-testid": "fc-timegrid-body" }),
       events?.map((ev) =>
         React.createElement("div", {
           key: ev.id,
@@ -208,7 +211,6 @@ vi.mock("@fullcalendar/interaction", () => ({ default: {} }));
 
 // ── Mock sub-components that trigger their own API calls ──────────────────────
 vi.mock("../../components/calendar/DayBar", () => ({ default: () => null }));
-vi.mock("../../components/calendar/LogTimePanel", () => ({ default: () => null }));
 // Real MeetingDetail carries WebSocket + Gong-notes machinery irrelevant here.
 // The stub surfaces just the attendance pill so CalendarPage's wiring is exercised.
 vi.mock("../../components/calendar/MeetingDetail", async () => {
@@ -358,13 +360,17 @@ vi.mock("../../components/calendar/AccountsSidebar", async () => {
   };
 });
 vi.mock("../../components/calendar/EventDetailPanel", () => ({ default: () => null }));
-vi.mock("../../components/calendar/ItemsSidebar", () => ({ default: () => null }));
 vi.mock("../../components/calendar/RsvpDot", () => ({ default: () => null }));
 
 // ── Mock cross-cutting hooks / utilities ──────────────────────────────────────
 vi.mock("../../hooks/useLogGlow", () => ({ useLogGlow: () => {} }));
 vi.mock("../../components/comments/CommentContext", () => ({
   useCommentContext: () => ({ openComments: vi.fn() }),
+}));
+// The real action-items sidebar (components/calendar/ActionItemsSidebar) has an export-tray entry in
+// its card menu; the provider that backs it is mounted by App, not by this page.
+vi.mock("../../hooks/useExportTray", () => ({
+  useExportTray: () => ({ addToTray: vi.fn(), isSelected: vi.fn(() => false), exportMode: false }),
 }));
 vi.mock("../../lib/appLog", () => ({
   addLog: vi.fn(),
@@ -2485,8 +2491,7 @@ describe("CalendarPage — editing an event", () => {
 
   // ── Log Week → Cloud Coach ──────────────────────────────────────────────────
   //
-  // The panel under test is CalendarPage's own local `LogTimePanel` (~L2844), not the
-  // unreachable twin in components/calendar/LogTimePanel.tsx. Request counts are
+  // The panel under test is CalendarPage's own local `LogTimePanel` (~L2844). Request counts are
   // asserted at the network layer via MSW rather than by mocking lib/api.ts, because
   // "one request instead of N" is precisely the behaviour that changed.
   describe("Log Week", () => {
@@ -4117,5 +4122,105 @@ describe("CalendarPage — pinned Claude skills", () => {
     const row = await screen.findByTestId("calendar-skills-row");
     const card = document.querySelector("[data-content-view]") as HTMLElement;
     expect(row.parentElement).toBe(card.parentElement);
+  });
+});
+
+
+// 2026-11-16: an action item dragged onto the grid appeared twice. The cause was server side
+// (two stale Celery workers inserting the same row), but the browser must also be exactly
+// single-fire: one drop -> one POST, the drag globals are cleared, and a second drop event
+// with no new drag creates nothing.
+describe("dropping an action item on the grid is single-fire", () => {
+  const KEY = "calendarDragActionItemId";
+  const w = window as unknown as Record<string, string | undefined>;
+
+  function postCounter() {
+    const posted: Array<Record<string, unknown>> = [];
+    server.use(
+      http.post("/api/v1/scheduler/events/", async ({ request }) => {
+        const body = await request.json() as Record<string, unknown>;
+        posted.push(body);
+        return HttpResponse.json({ ...mockCalendarEvents[0], id: 900 + posted.length, ...body }, { status: 201 });
+      }),
+    );
+    return posted;
+  }
+
+  // A real drag also carries the id in dataTransfer "text/plain" (it persists across handlers,
+  // unlike the window globals), so a second listener on the grid WOULD double-fire on it.
+  function nativeDrop(target: HTMLElement, id = "") {
+    const ev = new Event("drop", { bubbles: true, cancelable: true });
+    Object.assign(ev, { dataTransfer: { getData: () => id }, clientX: 0, clientY: 0 });
+    target.dispatchEvent(ev);
+  }
+
+  beforeEach(() => {
+    localStorage.clear();
+    for (const k of [KEY, `${KEY}_task`, `${KEY}_account`, `${KEY}_est`]) delete w[k];
+  });
+
+  it("one native drop makes one POST, even after the grid effect has re-run", async () => {
+    const posted = postCounter();
+    renderPage();
+    const body = await screen.findByTestId("fc-timegrid-body");
+    // datesSet changes visibleRange, re-running the effect that attaches the listener.
+    fireEvent.click(screen.getByTestId("trigger-dates-set"));
+    fireEvent.click(screen.getByTestId("trigger-dates-set"));
+    await waitFor(() => expect(screen.getByTestId("fullcalendar")).toBeInTheDocument());
+
+    w[KEY] = "recDROP00000001";
+    w[`${KEY}_task`] = "Drop me once";
+    nativeDrop(body, "recDROP00000001");
+
+    await waitFor(() => expect(posted).toHaveLength(1));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(posted).toHaveLength(1);
+    expect(posted[0]).toMatchObject({ agentpm_airtable_id: "recDROP00000001", calendar_id: "work_tracking" });
+    expect(w[KEY]).toBeUndefined();
+    expect(w[`${KEY}_task`]).toBeUndefined();
+  });
+
+  it("a second drop event with no new drag creates nothing", async () => {
+    const posted = postCounter();
+    renderPage();
+    const body = await screen.findByTestId("fc-timegrid-body");
+    w[KEY] = "recDROP00000002";
+    nativeDrop(body);
+    await waitFor(() => expect(posted).toHaveLength(1));
+    nativeDrop(body);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(posted).toHaveLength(1);
+  });
+
+  it("a card dragged from the calendar KanbanCard drops once and clears the globals", async () => {
+    const posted = postCounter();
+    renderPage();
+    const body = await screen.findByTestId("fc-timegrid-body");
+    render(
+      <MemoryRouter>
+        <KanbanCard item={{ ...mockActionItem, airtable_id: "recKANBAN0000001", task: "From the kanban card" }}
+                    onStatusChange={() => {}} />
+      </MemoryRouter>,
+    );
+    const card = screen.getByText("From the kanban card").closest("[draggable]") as HTMLElement;
+    fireEvent.dragStart(card, { dataTransfer: { setData: () => {}, effectAllowed: "" } });
+    expect(w[KEY]).toBe("recKANBAN0000001");
+
+    nativeDrop(body);
+    await waitFor(() => expect(posted).toHaveLength(1));
+    expect(posted[0]).toMatchObject({ agentpm_airtable_id: "recKANBAN0000001", title: "From the kanban card" });
+    expect(w[KEY]).toBeUndefined();
+
+    nativeDrop(body);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(posted).toHaveLength(1);
+  });
+
+  it("FullCalendar's own drop callback is not wired to a Draggable, so it cannot double-fire the native drop", () => {
+    // `droppable` + `drop` only fire for elements registered with FullCalendar's Draggable API.
+    // If someone registers one, a single drop would reach both handlers.
+    const src = import.meta.glob("../../**/*.tsx", { query: "?raw", import: "default", eager: true });
+    const offenders = Object.entries(src).filter(([f, t]) => !f.includes("__tests__") && /new Draggable\(/.test(t as string));
+    expect(offenders.map(([f]) => f)).toEqual([]);
   });
 });

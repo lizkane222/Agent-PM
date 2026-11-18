@@ -136,7 +136,7 @@ def sync_gmail_history_for_user(user_id: int, new_history_id: str = ""):
 
     User = get_user_model()
     try:
-        user = User.objects.get(pk=user_id)
+        user = User.objects.get(pk=user_id, is_active=True)
     except User.DoesNotExist:
         return
 
@@ -320,7 +320,7 @@ def sync_all_google_calendars():
     from integrations.calendar_sync import ensure_watch, sync_user_calendar
     from integrations.models import OAuthCredential
 
-    for cred in OAuthCredential.objects.filter(provider="google", is_active=True).select_related("user"):
+    for cred in OAuthCredential.objects.filter(provider="google", is_active=True, user__is_active=True).select_related("user"):
         user = cred.user
         try:
             sync_user_calendar(user, source="schedule")
@@ -365,7 +365,7 @@ def check_meeting_notes_all_users():
     )
     from integrations.models import OAuthCredential
 
-    for cred in OAuthCredential.objects.filter(provider="google", is_active=True).select_related("user"):
+    for cred in OAuthCredential.objects.filter(provider="google", is_active=True, user__is_active=True).select_related("user"):
         user = cred.user
         try:
             report = sync_meeting_notes_from_email(
@@ -386,7 +386,7 @@ def scan_tickets_all_users():
 
     done: set = set()
 
-    for cred in OAuthCredential.objects.filter(provider__in=["google", "gmail"], is_active=True).select_related("user").order_by("user_id"):
+    for cred in OAuthCredential.objects.filter(provider__in=["google", "gmail"], is_active=True, user__is_active=True).select_related("user").order_by("user_id"):
         if cred.user_id in done:
             continue
         done.add(cred.user_id)

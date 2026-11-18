@@ -2,6 +2,7 @@ import { useState } from "react";
 import { accountsApi } from "../../lib/api";
 import type { CustomerContact, CustomerContactNote } from "../../types";
 import { ContactNoteRow } from "./ContactNoteRow";
+import SensitiveText from "../shared/SensitiveText";
 
 export function CustomerContactModal({
   contact,
@@ -78,7 +79,7 @@ export function CustomerContactModal({
             {editMode
               ? <input autoFocus value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
                   className="w-full text-sm font-semibold text-[var(--twilio-navy)] border-b border-indigo-300 focus:outline-none bg-transparent" />
-              : <p className="text-sm font-semibold text-[var(--twilio-navy)] truncate">{contact.name}</p>
+              : <p className="text-sm font-semibold text-[var(--twilio-navy)] truncate"><SensitiveText resourceType="customer_contact" resourceId={contact.id} field="name" text={contact.name} /></p>
             }
             {editMode
               ? <input value={form.role} onChange={(e) => setForm((f) => ({ ...f, role: e.target.value }))}

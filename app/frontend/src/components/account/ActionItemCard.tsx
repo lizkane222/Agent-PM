@@ -11,6 +11,7 @@ import CommentPreviewList from "../comments/CommentPreviewList";
 import { useCommentMenuItem } from "../comments/commentMenuItem";
 import { useExportTray } from "../../hooks/useExportTray";
 import { useFocusPins } from "../../hooks/useFocusPins";
+import SensitiveText from "../shared/SensitiveText";
 
 const PRIORITY_COLORS: Record<string, string> = {
   Critical: "bg-red-50 text-red-700",
@@ -176,12 +177,12 @@ export function ActionItemCard({
         }}
       >
         <p className="text-sm font-semibold text-[var(--twilio-navy)] leading-snug truncate">
-          {item.task || <span className="italic opacity-50">Untitled</span>}
+          {item.task ? <SensitiveText resourceType="action_item" resourceId={canPin ? item.id : null} field="task" text={item.task} /> : <span className="italic opacity-50">Untitled</span>}
         </p>
         {item.task_details && (
           <p className="text-[11px] text-[var(--twilio-navy)] opacity-60 leading-snug"
             style={{ overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>
-            {item.task_details}
+            <SensitiveText resourceType="action_item" resourceId={canPin ? item.id : null} field="task_details" text={item.task_details} />
           </p>
         )}
         <div className="flex flex-wrap gap-1">

@@ -18,17 +18,25 @@ load_dotenv(BASE_DIR.parent / ".env")
 
 SECRET_KEY = os.environ["DJANGO_SECRET_KEY"]
 DEBUG = os.getenv("DJANGO_DEBUG", "False") == "True"
+if not DEBUG and (len(SECRET_KEY) < 32 or SECRET_KEY.lower().startswith(("django-insecure", "changeme", "change-me"))):
+    # Fail closed: a weak or placeholder signing key lets anyone forge JWTs and sessions.
+    raise RuntimeError("DJANGO_SECRET_KEY must be a random value of at least 32 characters when DJANGO_DEBUG is off.")
 
 # OAUTHLIB_INSECURE_TRANSPORT must never be set here.
 # If needed for local development, set it in a developer-only .env.local that is gitignored.
 if DEBUG:
     os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
-ALLOWED_HOSTS = os.getenv("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
+ALLOWED_HOSTS = [h.strip() for h in os.getenv("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",") if h.strip()]
+# Origins allowed to submit unsafe requests with a CSRF cookie (needed once served over HTTPS).
+CSRF_TRUSTED_ORIGINS = [o.strip() for o in os.getenv("CSRF_TRUSTED_ORIGINS", "").split(",") if o.strip()]
 
 # Trust X-Forwarded-Host / X-Forwarded-Proto from ngrok (and any reverse proxy).
 # Without this, build_absolute_uri() returns http://localhost instead of the ngrok https URL,
 # which breaks Twilio signature validation.
-USE_X_FORWARDED_HOST = True
+# Only honour the forwarded host when explicitly told a trusted proxy sits in front (default on in
+# DEBUG for ngrok; off in production unless DJANGO_USE_X_FORWARDED_HOST is set), so a client cannot
+# spoof Host to poison absolute URLs (OAuth redirects, password links).
+USE_X_FORWARDED_HOST = os.getenv("DJANGO_USE_X_FORWARDED_HOST", "True" if DEBUG else "False").strip().lower() in ("true", "1", "on", "yes")
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 # ── Installed Apps ────────────────────────────────────────────────────────────
@@ -62,6 +70,7 @@ INSTALLED_APPS = [
     "zendesk_sync",
     "layouts",
     "comments",
+    "sensitive",
     "discover",
     "feedback",
     "account_feed",
@@ -82,6 +91,7 @@ MIDDLEWARE = [
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
+    "integrations.oauth_state.OAuthStateCookieMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
     "analytics_tracking.middleware.SegmentTrackingMiddleware",
 ]
@@ -177,9 +187,15 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 # In production, the React build output is copied into STATIC_ROOT by the Dockerfile.
 # WhiteNoise serves everything under STATIC_ROOT with compression + long-lived cache headers.
 STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
+# The React build (Vite base "/") references /assets/*, which is outside STATIC_URL. Serve the
+# bundled build from the site root; the SPA catch-all in core/urls.py handles index.html.
+if (STATIC_ROOT / "frontend").is_dir():
+    WHITENOISE_ROOT = STATIC_ROOT / "frontend"
+    WHITENOISE_INDEX_FILE = False
 
 MEDIA_URL = "/media/"
-MEDIA_ROOT = BASE_DIR / "media"
+# MEDIA_ROOT must be a path that survives a deploy (EB replaces the app dir each time).
+MEDIA_ROOT = Path(os.getenv("DJANGO_MEDIA_ROOT", str(BASE_DIR / "media")))
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # Cap upload size at 25 MB — enforced at the Django request layer before hitting any view.
@@ -199,6 +215,10 @@ REST_FRAMEWORK = {
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 50,
+    # Number of trusted reverse proxies in front of Django (1 behind an AWS load balancer). Left at
+    # 0, throttles key on REMOTE_ADDR; left unset DRF would trust the client-supplied
+    # X-Forwarded-For, letting an attacker dodge the login throttle by varying that header.
+    "NUM_PROXIES": int(os.getenv("DRF_NUM_PROXIES", "0")),
     "DEFAULT_THROTTLE_CLASSES": [
         "rest_framework.throttling.AnonRateThrottle",
         "rest_framework.throttling.UserRateThrottle",
@@ -210,6 +230,7 @@ REST_FRAMEWORK = {
         "google_login": "20/min",  # start + callback per sign-in, so 10 sign-ins a minute per IP
         "agent_stream": "30/min",
         "sync_token": "10/min",
+        "slack_dm": "30/hour",
     },
 }
 
@@ -252,13 +273,18 @@ SIMPLE_JWT = {
     "BLACKLIST_AFTER_ROTATION": True,
 }
 
+# OAuth callbacks require the browser that started the flow (cookie nonce); see integrations/oauth_state.py.
+OAUTH_STATE_BIND_ENFORCE = os.getenv("OAUTH_STATE_BIND_ENFORCE", "True").strip().lower() in ("true", "1", "on", "yes")
+
 # ── Field-level Encryption (OAuth tokens) ────────────────────────────────────
 FIELD_ENCRYPTION_KEY = os.environ["FIELD_ENCRYPTION_KEY"]
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
-CORS_ALLOWED_ORIGINS = os.environ.get(
-    "CORS_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
-).split(",")
+CORS_ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.environ.get("CORS_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
+    if o.strip()
+]
 CORS_ALLOW_CREDENTIALS = True
 
 # ── Segment Analytics ────────────────────────────────────────────────────────
@@ -270,6 +296,11 @@ SEGMENT_BACKEND_WRITE_KEY = os.getenv("SEGMENT_BACKEND_WRITE_KEY", "")
 # ── Celery ────────────────────────────────────────────────────────────────────
 CELERY_BROKER_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 CELERY_RESULT_BACKEND = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+# A rediss:// URL must verify the server certificate (the default is none, i.e. MITM-able).
+if CELERY_BROKER_URL.startswith("rediss://"):
+    import ssl as _ssl
+    CELERY_BROKER_USE_SSL = {"ssl_cert_reqs": _ssl.CERT_REQUIRED}
+    CELERY_REDIS_BACKEND_USE_SSL = {"ssl_cert_reqs": _ssl.CERT_REQUIRED}
 CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
@@ -381,6 +412,10 @@ AGENT_REQUIRE_ANTHROPIC_MODEL = os.getenv("AGENT_REQUIRE_ANTHROPIC_MODEL", "1") 
 # default -> strong as sonnet-4-6 -> sonnet-5, which is still a real step up.
 AGENT_BLOCK_OPUS = os.getenv("AGENT_BLOCK_OPUS", "1") not in ("0", "false", "False")
 
+# Default age (days) for `manage.py purge_ai_data` when no --older-than-days is given.
+# 0 = no retention policy (the command then refuses to run without an explicit age or user).
+AI_DATA_RETENTION_DAYS = int(os.getenv("AI_DATA_RETENTION_DAYS", "0") or 0)
+
 # ── No live LLM calls from the test suite ────────────────────────────────────
 # Under `manage.py test`, strip every gateway credential source so any code path
 # that reaches an LLM *without* being patched raises ImproperlyConfigured instead of
@@ -491,6 +526,12 @@ TWILIO_CONVERSATIONS_SERVICE_SID = os.getenv("TWILIO_CONVERSATIONS_SERVICE_SID",
 # embedded in the TwiML <ConversationRelay url="wss://host/ws/voice-relay/?relay_token=..."/>.
 # Leave empty in local dev to disable the check; MUST be set in production.
 VOICE_RELAY_TOKEN = os.getenv("VOICE_RELAY_TOKEN", "")
+# Refuse ConversationRelay sockets when VOICE_RELAY_TOKEN is unset (on unless DEBUG).
+VOICE_RELAY_REQUIRE_TOKEN = os.getenv("VOICE_RELAY_REQUIRE_TOKEN", "" if not DEBUG else "0") != "0"
+# Optional country-code allow-list for SMS / calls ("1,44"); empty = any country except blocked ranges.
+TWILIO_ALLOWED_COUNTRY_CODES = os.getenv("TWILIO_ALLOWED_COUNTRY_CODES", "")
+# Max reminder texts per phone number per hour (cost / harassment guard).
+SMS_REMINDERS_PER_HOUR = int(os.getenv("SMS_REMINDERS_PER_HOUR", "20"))
 
 # ── Voice agent loop ─────────────────────────────────────────────────────────
 # The model comes from AGENT_MODEL_TIERS[...]["voice"] above, not from a separate
@@ -687,10 +728,32 @@ CSP_FONT_SRC = ("'self'", "https:", "data:")
 CSP_FRAME_ANCESTORS = ("'none'",)
 
 # ── Production security settings ──────────────────────────────────────────────
+def _env_flag(name, default):
+    """Read a boolean env var ("on"/"true"/"1"/"yes" are true); `default` when unset."""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("on", "true", "1", "yes")
+
+
+# Secure by default whenever DEBUG is off. Each flag can be overridden from the environment so a
+# first launch over plain HTTP (e.g. an Elastic Beanstalk URL with no domain/ACM cert yet) still
+# works: set DJANGO_SECURE_SSL_REDIRECT=False and DJANGO_COOKIE_SECURE=False (and leave
+# DJANGO_SECURE_HSTS_SECONDS=0) until HTTPS is in place, then remove them. See aws_hosting.md Step 0.
 if not DEBUG:
-    SECURE_HSTS_SECONDS = 31536000
-    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
-    SECURE_HSTS_PRELOAD = True
-    SESSION_COOKIE_SECURE = True
-    CSRF_COOKIE_SECURE = True
-    SECURE_SSL_REDIRECT = True
+    SECURE_HSTS_SECONDS = int(os.getenv("DJANGO_SECURE_HSTS_SECONDS", "31536000"))
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = SECURE_HSTS_SECONDS > 0
+    SECURE_HSTS_PRELOAD = SECURE_HSTS_SECONDS > 0
+    SESSION_COOKIE_SECURE = _env_flag("DJANGO_COOKIE_SECURE", True)
+    CSRF_COOKIE_SECURE = _env_flag("DJANGO_COOKIE_SECURE", True)
+    SECURE_SSL_REDIRECT = _env_flag("DJANGO_SECURE_SSL_REDIRECT", True)
+    # Load-balancer health checks speak plain HTTP; never redirect them.
+    SECURE_REDIRECT_EXEMPT = [r"^health/?$", r"^api/v1/health/?$"]
+
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = "Lax"
+CSRF_COOKIE_SAMESITE = "Lax"
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SECURE_REFERRER_POLICY = "same-origin"
+X_FRAME_OPTIONS = "DENY"
+

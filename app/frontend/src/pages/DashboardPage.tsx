@@ -5,6 +5,8 @@ import { airtableApi, schedulerApi } from "../lib/api";
 import { logActionItemUpdate } from "../lib/actionItemLog";
 import HomeIcon from "../assets/icons/Home.svg?react";
 import type { AirtableActionItem, AirtableAccount, CalendarEvent, Reminder } from "../types";
+import SensitiveText from "../components/shared/SensitiveText";
+import { actionItemMarkId } from "../hooks/useSensitiveMarks";
 
 function StatCard({ label, value, sublabel, to }: {
   label: string;
@@ -307,7 +309,7 @@ export default function DashboardPage() {
                   )}
                   <div className="flex-1 min-w-0">
                     <p className={`text-sm font-medium truncate ${isDone ? "line-through opacity-50 text-[var(--twilio-gray-60)]" : "text-[var(--twilio-navy)]"}`}>
-                      {item.task || <span className="italic opacity-50">Untitled</span>}
+                      {item.task ? <SensitiveText resourceType="action_item" resourceId={actionItemMarkId(item)} field="task" text={item.task} /> : <span className="italic opacity-50">Untitled</span>}
                     </p>
                     <div className="flex items-center gap-1 mt-0.5 min-w-0">
                       {item.account_name && (

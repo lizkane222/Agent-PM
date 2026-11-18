@@ -27,7 +27,7 @@ function renderSearch() {
         <TrayProbe />
         <Routes>
           <Route path="/profile" element={<div>profile page</div>} />
-          <Route path="/edit-preview" element={<div>full builder</div>} />
+          <Route path="/layouts" element={<div>full builder</div>} />
         </Routes>
       </ExportProvider>
     </MemoryRouter>,

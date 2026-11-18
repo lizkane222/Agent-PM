@@ -439,7 +439,7 @@ export default function GlobalSearch({ pageContext = "" }: Props) {
                     onClick={() => {
                       addSelectedToTray();
                       setOpen(false);
-                      navigate("/edit-preview");
+                      navigate("/layouts");
                     }}
                     className="px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors"
                     style={{

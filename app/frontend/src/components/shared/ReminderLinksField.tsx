@@ -7,6 +7,7 @@ export const LINK_TYPE_LABELS: Record<ReminderLinkType, string> = {
   action_item: "Action item",
   calendar_event: "Calendar event",
   task: "Task",
+  artifact: "Artifact",
 };
 const TYPES = Object.keys(LINK_TYPE_LABELS) as ReminderLinkType[];
 

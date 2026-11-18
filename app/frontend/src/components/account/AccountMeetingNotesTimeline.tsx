@@ -1,10 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import { schedulerApi } from "../../lib/api";
-import { parseBullets } from "./GongSummaryPanel";
+import { parseBullets, detectMentions, _strHash } from "./GongSummaryPanel";
+import { NoteBulletActions } from "./NoteBulletActions";
+import SensitiveText from "../shared/SensitiveText";
+import { lineKeyFor } from "../../lib/sensitiveMatch";
 import { sanitizeHtml, plainToHtml } from "../../lib/noteHelpers";
 import { endOfWeek } from "../../lib/weekBounds";
 import { setNoteDragData, noteLabel, noteRefKey, summaryRefId, type NoteLinkIndex } from "../../lib/noteLinks";
-import type { AirtableMeeting, CalendarEvent, MeetingNote } from "../../types";
+import type { AirtableActionItem, AirtableMeeting, CalendarEvent, MeetingNote, TeamMember } from "../../types";
 
 export const MEETING_NOTES_TIMELINE_PAGE = 20;
 
@@ -49,6 +52,8 @@ export default function AccountMeetingNotesTimeline({
   onOpenEvent,
   onOpenMeeting,
   noteLinks,
+  teamMembers = [],
+  onCreatedActionItem,
 }: {
   events: CalendarEvent[];
   meetings: AirtableMeeting[];
@@ -56,10 +61,20 @@ export default function AccountMeetingNotesTimeline({
   onOpenMeeting: (m: AirtableMeeting) => void;
   /** noteRefKey → project/goal names the note is linked under (drives the "In:" chip). */
   noteLinks?: NoteLinkIndex;
+  /** Used to pick the assignee when a bullet names a teammate (same as the meeting sidebar). */
+  teamMembers?: TeamMember[];
+  onCreatedActionItem?: (item: AirtableActionItem) => void;
 }) {
   const [visible, setVisible] = useState(MEETING_NOTES_TIMELINE_PAGE);
   const [notes, setNotes] = useState<Record<number, MeetingNote[]>>({});
   const [loading, setLoading] = useState(false);
+  const [textGrab, setTextGrab] = useState(false);
+  useEffect(() => {
+    if (!textGrab) return;
+    const up = () => setTextGrab(false);
+    document.addEventListener("mouseup", up);
+    return () => document.removeEventListener("mouseup", up);
+  }, [textGrab]);
 
   const entries = useMemo<Entry[]>(() => {
     const byAirtable = new Map(meetings.map((m) => [m.airtable_id, m]));
@@ -148,12 +163,37 @@ export default function AccountMeetingNotesTimeline({
                     <li
                       key={`b${i}`}
                       data-testid="summary-bullet-row"
-                      draggable={!!meeting}
+                      className="group rounded transition-colors hover:bg-[var(--row-hover)]"
+                      draggable={!!meeting && !textGrab}
                       onDragStart={(e) => meeting && setNoteDragData(e, { kind: "summary", id: summaryRefId(meeting.airtable_id, b.text), meetingId: meeting.airtable_id, label: noteLabel(b.text) })}
-                      style={{ fontSize: "0.75rem", color: "var(--twilio-gray-80, #374151)", padding: "1px 0 1px 10px" }}
+                      style={{ fontSize: "0.75rem", color: "var(--twilio-gray-80, #374151)", padding: "1px 4px 1px 10px", display: "flex", alignItems: "flex-start", gap: 6 }}
                     >
-                      • {b.text}
+                      <span aria-hidden="true">•</span>
+                      {/* Text is selectable: pressing on it turns the row's drag-to-link off until
+                          release, otherwise the browser starts a drag instead of a selection. */}
+                      <span
+                        data-note-text
+                        onMouseDown={() => setTextGrab(true)}
+                        style={{ flex: 1, minWidth: 0, userSelect: "text", cursor: "text", overflowWrap: "anywhere" }}
+                      >
+                        {/* Same resource/field/line key as the sidebar's summary bullets, so a line hidden in
+                            either place is hidden in both. Without a meeting row there is nothing to key it to. */}
+                        {meeting
+                          ? <SensitiveText resourceType="meeting" resourceId={meeting.id} field="summary" lineKey={lineKeyFor(b.text)} text={b.text} />
+                          : b.text}
+                      </span>
                       <LinkedChip names={meeting ? noteLinks?.[noteRefKey({ kind: "summary", id: summaryRefId(meeting.airtable_id, b.text) })] : undefined} />
+                      <NoteBulletActions
+                        text={b.text}
+                        copyable
+                        eventId={event?.id ?? 0}
+                        accountName={meeting?.account_name}
+                        airtableAccountId={meeting?.account}
+                        linkedMeetingId={meeting?.id}
+                        mentionedMembers={detectMentions(b.text, teamMembers).members}
+                        persistKey={`gong-actions::${meeting?.id ?? event?.id}::${_strHash(b.text)}`}
+                        onCreatedActionItem={onCreatedActionItem}
+                      />
                     </li>
                   ),
                 )}

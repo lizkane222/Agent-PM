@@ -16,6 +16,7 @@
 import { useCommentContext } from "./CommentContext";
 import { useCommentSummary } from "../../hooks/useCommentSummary";
 import type { CommentResourceType } from "../../types";
+import SensitiveText from "../shared/SensitiveText";
 
 interface Props {
   resourceType: CommentResourceType;
@@ -95,7 +96,7 @@ export default function CommentPreviewList({
             }}
           >
             <span className="font-semibold opacity-90">{c.author_display}: </span>
-            {c.content}
+            <SensitiveText resourceType="comment" resourceId={c.id} field="content" text={c.content} />
           </p>
         </div>
       ))}

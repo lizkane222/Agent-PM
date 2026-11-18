@@ -144,6 +144,7 @@
   --surface-card:      #ffffff;
   --chat-agent-bubble: #ffffff;
   --surface-subtle:    #f9fafb;
+  --row-hover:         rgba(15, 23, 42, 0.07);  /* a hovered list row: slightly darker than its surface */
   --surface-subtle-2:  #f3f4f6;
   --surface-subtle-3:  #fafafa;
   --surface-subtle-4:  #f4f4f6;
@@ -198,6 +199,7 @@
   --surface-card:      #141c2f;
   --chat-agent-bubble: #28365e;
   --surface-subtle:    #1c2640;
+  --row-hover:         rgba(255, 255, 255, 0.09);
   --surface-subtle-2:  #212d4a;
   --surface-subtle-3:  #1c2640;
   --surface-subtle-4:  #212d4a;

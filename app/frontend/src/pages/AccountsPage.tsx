@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
+import { accountPath } from "../lib/accountSlug";
 import { useNavigate } from "react-router-dom";
 import { permissionMessage } from "../lib/permissions";
 import { accountsApi, teamApi } from "../lib/api";
@@ -613,7 +614,7 @@ export default function AccountsPage() {
       addLog({
         category: "account",
         message: `Account "${data.company_name}" updated`,
-        links: [{ label: "View account", path: `/accounts/${data.id}?glow=1` }],
+        links: [{ label: "View account", path: `${accountPath(data, accounts)}?glow=1` }],
         resource: { type: "account", id: data.id },
       });
     } else {
@@ -811,7 +812,7 @@ export default function AccountsPage() {
                       accountName: acct.company_name,
                     });
                   } else {
-                    navigate(`/accounts/${acct.id}`);
+                    navigate(accountPath(acct, accounts));
                   }
                 }}
                 onDragOver={(e) => { e.preventDefault(); setDropTargetId(acct.id); }}
@@ -832,7 +833,7 @@ export default function AccountsPage() {
                 e.dataTransfer.setData("accountTeamMemberIds", JSON.stringify((acct.team_members ?? []).map((m) => m.id)));
                 e.dataTransfer.effectAllowed = "copy";
               }}
-              onClick={() => navigate(`/accounts/${acct.id}`)}
+              onClick={() => navigate(accountPath(acct, accounts))}
               onDragOver={(e) => { e.preventDefault(); setDropTargetId(acct.id); }}
               onDragLeave={() => setDropTargetId(null)}
               onDrop={(e) => void handleMemberDrop(e, acct)}
@@ -894,7 +895,7 @@ export default function AccountsPage() {
                     e.dataTransfer.setData("accountTeamMemberIds", JSON.stringify((acct.team_members ?? []).map((m) => m.id)));
                     e.dataTransfer.effectAllowed = "copy";
                   }}
-                  onClick={() => navigate(`/accounts/${acct.id}`)}
+                  onClick={() => navigate(accountPath(acct, accounts))}
                   onDragOver={(e) => { e.preventDefault(); setDropTargetId(acct.id); }}
                   onDragLeave={() => setDropTargetId(null)}
                   onDrop={(e) => void handleMemberDrop(e, acct)}

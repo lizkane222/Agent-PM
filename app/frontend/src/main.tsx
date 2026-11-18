@@ -3,9 +3,12 @@ import { createRoot } from "react-dom/client";
 import "./index.css";
 import App from "./App";
 import { installPasswordManagerSuppression } from "./lib/suppressPasswordManagers";
+import { installLinkGuard } from "./lib/linkGuard";
 
 // Stop password managers (1Password etc.) offering to fill ordinary app fields.
 installPasswordManagerSuppression();
+// Refuse to follow javascript:/data: links wherever they come from.
+installLinkGuard();
 
 // Initialise Segment analytics.js with the project write key.
 // The snippet in index.html stubs the analytics object; .load() fetches the real SDK.

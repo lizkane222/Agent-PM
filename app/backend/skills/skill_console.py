@@ -30,6 +30,8 @@ _PRIVATE_ARG_HINTS = (
     "body", "content", "text", "note", "message", "description", "details", "email", "phone",
     "number", "to", "attendee", "address", "summary", "transcript",
 )
+# Credentials are never stored, whatever their length.
+_SECRET_ARG_HINTS = ("token", "secret", "password", "passwd", "api_key", "apikey", "authorization", "credential")
 _LABEL_KEYS = ("title", "task", "name", "subject", "label", "company_name", "full_name", "content", "note")
 _URL_KEYS = ("url", "link", "href")
 
@@ -41,7 +43,9 @@ def summarize_args(args: Any) -> dict:
     out: dict = {}
     for key, val in list(args.items())[:20]:
         k = str(key)
-        if isinstance(val, str):
+        if any(h in k.lower() for h in _SECRET_ARG_HINTS):
+            out[k] = "<redacted>"
+        elif isinstance(val, str):
             if any(h in k.lower() for h in _PRIVATE_ARG_HINTS) and len(val) > 12:
                 out[k] = f"<{len(val)} characters>"
             else:

@@ -6,6 +6,15 @@ import type { TeamMember } from "../types";
 import type { DiscoverApplet, AppletCategory, ItemType, UrlStatus } from "../types/discover";
 import { useDiscover } from "../hooks/useDiscover";
 import { useTeam } from "../hooks/useTeam";
+import { useDiscoverTags } from "../hooks/useDiscoverTags";
+import { usePinnedApplets } from "../hooks/usePinnedApplets";
+import { useAccounts } from "../hooks/useAccounts";
+import SiteFavicon from "../components/shared/SiteFavicon";
+import TagPicker from "../components/shared/TagPicker";
+import PinMenu from "../components/discover/PinMenu";
+import type { AppletPin } from "../types/discover";
+import type { Account } from "../types";
+import SensitiveText from "../components/shared/SensitiveText";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -20,7 +29,25 @@ const ALL_CATEGORIES: AppletCategory[] = [
   "Tool",
   "Game",
   "Utility",
+  "Documentation",
+  "Reference",
+  "Reporting",
+  "Communication",
+  "Data",
+  "AI",
+  "Security",
+  "Productivity",
 ];
+
+const ALL_TYPES: { value: ItemType; label: string; plural: string }[] = [
+  { value: "applet", label: "Applet", plural: "Applets" },
+  { value: "tool",   label: "Tool",   plural: "Tools" },
+  { value: "site",   label: "Site",   plural: "Sites" },
+  { value: "doc",    label: "Doc",    plural: "Docs" },
+  { value: "repo",   label: "Repo",   plural: "Repos" },
+];
+const TYPE_BY_VALUE = Object.fromEntries(ALL_TYPES.map((t) => [t.value, t])) as Record<ItemType, (typeof ALL_TYPES)[number]>;
+const TAGS_SHOWN_IN_FILTER = 12;
 
 const CATEGORY_COLORS: Record<AppletCategory, { bg: string; text: string }> = {
   Automation: { bg: "#ede9fe", text: "#5b21b6" },
@@ -30,12 +57,24 @@ const CATEGORY_COLORS: Record<AppletCategory, { bg: string; text: string }> = {
   Tool:       { bg: "#f1f5f9", text: "#334155" },
   Game:       { bg: "#fce7f3", text: "#9d174d" },
   Utility:    { bg: "#e0f2fe", text: "#0369a1" },
+  Documentation: { bg: "#ccfbf1", text: "#0f766e" },
+  Reference:  { bg: "#e0e7ff", text: "#3730a3" },
+  Reporting:  { bg: "#ffedd5", text: "#9a3412" },
+  Communication: { bg: "#fae8ff", text: "#86198f" },
+  Data:       { bg: "#cffafe", text: "#155e75" },
+  AI:         { bg: "#f3e8ff", text: "#6b21a8" },
+  Security:   { bg: "#fee2e2", text: "#991b1b" },
+  Productivity: { bg: "#ecfccb", text: "#3f6212" },
 };
 
 // ── Sub-components ────────────────────────────────────────────────────────────
 
-function AppletCard({ item, canEdit, canDelete, onEdit, onDelete }: {
+function AppletCard({ item, canEdit, canDelete, onEdit, onDelete, pins, accounts, onPin, onUnpin }: {
   item: DiscoverApplet;
+  pins: AppletPin[];
+  accounts: Account[];
+  onPin: (appletId: number, accountId: number | null) => Promise<unknown>;
+  onUnpin: (pinId: number) => Promise<unknown>;
   canEdit?: boolean;
   canDelete?: boolean;
   onEdit?: () => void;
@@ -43,31 +82,32 @@ function AppletCard({ item, canEdit, canDelete, onEdit, onDelete }: {
 }) {
   const cat = CATEGORY_COLORS[item.category as AppletCategory] ?? { bg: "#f3f4f6", text: "#6b7280" };
   const isRepo = item.type === "repo";
+  const typeIcon = isRepo ? (
+    <svg viewBox="0 0 16 16" fill="currentColor" style={{ width: 18, height: 18, color: "#16a34a" }}>
+      <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+    </svg>
+  ) : (
+    <svg viewBox="0 0 16 16" fill="currentColor" style={{ width: 18, height: 18, color: "#2563eb" }}>
+      <path d="M2 2.5A2.5 2.5 0 014.5 0h7A2.5 2.5 0 0114 2.5v13l-5-3-5 3V2.5z"/>
+    </svg>
+  );
 
   return (
     <div
-      className="bg-white rounded-xl flex flex-col gap-3 hover:shadow-blue-md transition-shadow"
+      className="bg-[var(--surface-card,#fff)] rounded-xl flex flex-col gap-3 hover:shadow-blue-md transition-shadow"
       style={{ border: "1px solid var(--border, rgba(0,0,0,0.08))", padding: "18px 20px 16px", boxShadow: "0 1px 4px rgba(0,0,0,0.05)" }}
     >
       {/* Header */}
       <div className="flex items-start justify-between gap-3">
         <div className="flex items-center gap-2.5 min-w-0">
-          {/* Icon */}
+          {/* Icon: the linked site's own favicon, falling back to the type icon */}
           <div
             className="shrink-0 flex items-center justify-center rounded-lg"
-            style={{ width: 36, height: 36, background: isRepo ? "var(--tint-green-50)" : "#eff6ff" }}
+            style={{ width: 36, height: 36, background: isRepo ? "var(--tint-green-50)" : "var(--surface-subtle-2)" }}
           >
-            {isRepo ? (
-              <svg viewBox="0 0 16 16" fill="currentColor" style={{ width: 18, height: 18, color: "#16a34a" }}>
-                <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
-              </svg>
-            ) : (
-              <svg viewBox="0 0 16 16" fill="currentColor" style={{ width: 18, height: 18, color: "#2563eb" }}>
-                <path d="M2 2.5A2.5 2.5 0 014.5 0h7A2.5 2.5 0 0114 2.5v13l-5-3-5 3V2.5z"/>
-              </svg>
-            )}
+            <SiteFavicon url={item.url} name={item.name} size={20} fallback={typeIcon} />
           </div>
-          <h3 className="text-sm font-semibold text-[var(--twilio-navy)] truncate">{item.name}</h3>
+          <h3 className="text-sm font-semibold text-[var(--twilio-navy)] truncate"><SensitiveText resourceType="applet" resourceId={item.id} field="name" text={item.name} /></h3>
         </div>
         <span
           className="shrink-0 text-[10px] font-semibold px-2 py-0.5 rounded-full"
@@ -79,7 +119,7 @@ function AppletCard({ item, canEdit, canDelete, onEdit, onDelete }: {
 
       {/* Description */}
       <p className="text-xs leading-relaxed" style={{ color: "var(--text-secondary, #6b7280)" }}>
-        {item.description}
+        <SensitiveText resourceType="applet" resourceId={item.id} field="description" text={item.description} />
       </p>
 
       {/* Tags */}
@@ -122,6 +162,8 @@ function AppletCard({ item, canEdit, canDelete, onEdit, onDelete }: {
             </button>
           )}
         </div>
+        <div className="flex items-center gap-2">
+        <PinMenu appletId={item.id} appletName={item.name} pins={pins} accounts={accounts} onPin={onPin} onUnpin={onUnpin} />
         <a
           href={item.url}
           target="_blank"
@@ -130,11 +172,12 @@ function AppletCard({ item, canEdit, canDelete, onEdit, onDelete }: {
           style={{ color: "var(--twilio-red, #e22)", textDecoration: "none" }}
           onClick={(e) => e.stopPropagation()}
         >
-          {isRepo ? "View repo" : "Open applet"}
+          {isRepo ? "View repo" : `Open ${TYPE_BY_VALUE[item.type]?.label.toLowerCase() ?? "link"}`}
           <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.8" style={{ width: 10, height: 10 }}>
             <path d="M2 10L10 2M10 2H5M10 2v5"/>
           </svg>
         </a>
+        </div>
       </div>
     </div>
   );
@@ -253,7 +296,9 @@ function AppletForm({
   defaultAuthor,
   initialValues,
   editingId,
+  tagOptions,
 }: {
+  tagOptions: { name: string; count?: number }[];
   onSave: (data: NewAppletData, id?: number) => void;
   onCancel: () => void;
   members: TeamMember[];
@@ -269,7 +314,7 @@ function AppletForm({
   const [type, setType] = useState<ItemType>((initialValues?.type as ItemType) ?? "applet");
   const [category, setCategory] = useState<AppletCategory>((initialValues?.category as AppletCategory) ?? "Tool");
   const [author, setAuthor] = useState(initialValues?.author ?? defaultAuthor);
-  const [tagsRaw, setTagsRaw] = useState(initialValues?.tags.join(", ") ?? "");
+  const [tags, setTags] = useState<string[]>(initialValues?.tags ?? []);
   const [urlStatus, setUrlStatus] = useState<UrlStatus>("idle");
   const [errors, setErrors] = useState<Record<string, string>>({});
 
@@ -286,7 +331,10 @@ function AppletForm({
     if (!description.trim()) e.description = "Description is required.";
     if (!url.trim()) e.url = "URL is required.";
     else {
-      try { new URL(url.trim()); } catch { e.url = "Must be a valid URL."; }
+      try {
+        const u = new URL(url.trim());
+        if (u.protocol !== "http:" && u.protocol !== "https:") e.url = "Must be an http(s) link.";
+      } catch { e.url = "Must be a valid URL."; }
     }
     if (!author.trim()) e.author = "Creator is required.";
     return e;
@@ -305,7 +353,6 @@ function AppletForm({
     }
     if (urlStatus === "unreachable") return;
 
-    const tags = tagsRaw.split(",").map((t) => t.trim()).filter(Boolean);
     onSave({ type, name: name.trim(), description: description.trim(), url: url.trim(), category, author: author.trim(), tags }, editingId);
   };
 
@@ -319,11 +366,11 @@ function AppletForm({
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" style={{ width: 12, height: 12 }}>
             <path d="M10 2L4 8l6 6"/>
           </svg>
-          Back to Discover
+          Back to Discovery
         </button>
 
-        <h1 className="text-2xl font-semibold text-[var(--twilio-navy)] mb-1">{isEdit ? "Edit Applet" : "Add an Applet"}</h1>
-        <p className="text-sm text-[var(--twilio-gray-60)] mb-8">{isEdit ? "Update the details below." : "Share a tool, bot, or repo you've built with your team."}</p>
+        <h1 className="text-2xl font-semibold text-[var(--twilio-navy)] mb-1">{isEdit ? "Edit item" : "Add to Discovery"}</h1>
+        <p className="text-sm text-[var(--twilio-gray-60)] mb-8">{isEdit ? "Update the details below." : "Share a tool, site, doc, applet or repo that is useful to many people, not just your own team."}</p>
 
         <form onSubmit={handleSubmit} className="space-y-5">
 
@@ -339,8 +386,7 @@ function AppletForm({
             <div>
               <label htmlFor={`${uid}-type`} className={labelCls}>Type *</label>
               <select id={`${uid}-type`} className={field} value={type} onChange={(e) => setType(e.target.value as ItemType)}>
-                <option value="applet">Applet</option>
-                <option value="repo">GitHub Repo</option>
+                {ALL_TYPES.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}
               </select>
             </div>
             <div>
@@ -354,7 +400,7 @@ function AppletForm({
           {/* Description */}
           <div>
             <label htmlFor={`${uid}-desc`} className={labelCls}>Description *</label>
-            <textarea id={`${uid}-desc`} className={`${field} resize-none`} rows={3} value={description} onChange={(e) => setDescription(e.target.value)} placeholder="What does it do? One or two sentences." />
+            <textarea id={`${uid}-desc`} className={`${field} resize-none`} rows={3} value={description} onChange={(e) => setDescription(e.target.value)} placeholder="What is it and who is it useful for? One or two sentences." />
             {errors.description && <p className="text-xs text-red-600 mt-1">{errors.description}</p>}
           </div>
 
@@ -404,10 +450,7 @@ function AppletForm({
           />
 
           {/* Tags */}
-          <div>
-            <label htmlFor={`${uid}-tags`} className={labelCls}>Tags <span className="font-normal text-[var(--twilio-gray-40)]">(optional, comma-separated)</span></label>
-            <input id={`${uid}-tags`} className={field} value={tagsRaw} onChange={(e) => setTagsRaw(e.target.value)} placeholder="e.g. sms, automation, python" />
-          </div>
+          <TagPicker value={tags} onChange={setTags} options={tagOptions} />
 
           {/* Actions */}
           <div className="flex items-center justify-end gap-3 pt-2">
@@ -415,7 +458,7 @@ function AppletForm({
               Cancel
             </button>
             <button type="submit" className="px-5 py-2 text-sm font-medium bg-indigo-600 text-white hover:bg-indigo-700 transition-colors">
-              {isEdit ? "Save Changes" : "Add Applet"}
+              {isEdit ? "Save Changes" : "Add to Discovery"}
             </button>
           </div>
 
@@ -434,10 +477,15 @@ export default function DiscoverPage() {
 
   const { data: items, loading, createApplet, updateApplet, deleteApplet } = useDiscover();
   const { data: members } = useTeam();
+  const { data: allTags, refetch: refetchTags } = useDiscoverTags();
+  const { data: pins, pin, unpin } = usePinnedApplets();
+  const { data: accounts } = useAccounts();
   const [showForm, setShowForm] = useState(false);
   const [editingItem, setEditingItem] = useState<DiscoverApplet | null>(null);
   const [search, setSearch] = useState("");
-  const [typeFilter, setTypeFilter] = useState<"all" | "applet" | "repo">("all");
+  const [typeFilter, setTypeFilter] = useState<"all" | ItemType>("all");
+  const [tagFilter, setTagFilter] = useState<string[]>([]);
+  const [showAllTags, setShowAllTags] = useState(false);
   const [categoryFilter, setCategoryFilter] = useState<string>("");
   const [authorFilter, setAuthorFilter] = useState("");
 
@@ -449,6 +497,7 @@ export default function DiscoverPage() {
     if (typeFilter !== "all" && item.type !== typeFilter) return false;
     if (categoryFilter && item.category !== categoryFilter) return false;
     if (authorFilter && item.author !== authorFilter) return false;
+    if (tagFilter.length && !tagFilter.every((t) => item.tags.some((x) => x.toLowerCase() === t.toLowerCase()))) return false;
     if (search) {
       const q = search.toLowerCase();
       return (
@@ -461,12 +510,14 @@ export default function DiscoverPage() {
     return true;
   });
 
-  const applets = filtered.filter((i) => i.type === "applet");
-  const repos   = filtered.filter((i) => i.type === "repo");
+  const grouped = ALL_TYPES
+    .map((t) => ({ ...t, items: filtered.filter((i) => i.type === t.value) }))
+    .filter((g) => g.items.length > 0);
 
   const handleFormSave = (data: NewAppletData, id?: number) => {
     const req = id ? updateApplet(id, data) : createApplet(data);
     req.then(() => {
+      refetchTags();
       setShowForm(false);
       setEditingItem(null);
     }).catch(() => {});
@@ -482,7 +533,7 @@ export default function DiscoverPage() {
           style={{ background: "var(--surface, #fff)", borderRight: "1px solid var(--border, rgba(0,0,0,0.08))" }}
         >
           <p className="text-xs text-[var(--twilio-gray-60)] px-2">
-            {editingItem ? "Update the fields and save." : "Fill in the form to add your applet to the directory."}
+            {editingItem ? "Update the fields and save." : "Fill in the form to add it to Discovery."}
           </p>
         </aside>
         <AppletForm
@@ -490,6 +541,7 @@ export default function DiscoverPage() {
           onCancel={handleFormCancel}
           members={members}
           defaultAuthor={defaultAuthor}
+          tagOptions={allTags}
           initialValues={editingItem ?? undefined}
           editingId={editingItem?.id}
         />
@@ -516,7 +568,7 @@ export default function DiscoverPage() {
               type="search"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search applets…"
+              placeholder="Search Discovery…"
               className="w-full rounded-lg border border-gray-200 pl-7 pr-3 py-1.5 text-xs focus:outline-none focus:border-red-300 focus:ring-1 focus:ring-red-100"
             />
           </div>
@@ -526,7 +578,7 @@ export default function DiscoverPage() {
         <div>
           <p className="text-[10px] font-bold uppercase tracking-widest mb-2" style={{ color: "var(--text-secondary, #9ca3af)" }}>Type</p>
           <div className="space-y-0.5">
-            {([["all", "All"], ["applet", "Applets"], ["repo", "GitHub Repos"]] as const).map(([v, label]) => (
+            {([["all", "All"], ...ALL_TYPES.map((t) => [t.value, t.plural])] as [("all" | ItemType), string][]).map(([v, label]) => (
               <button
                 key={v}
                 onClick={() => setTypeFilter(v)}
@@ -574,6 +626,37 @@ export default function DiscoverPage() {
           </div>
         </div>
 
+        {/* Tags */}
+        {allTags.length > 0 && (
+          <div>
+            <p className="text-[10px] font-bold uppercase tracking-widest mb-2" style={{ color: "var(--text-secondary, #9ca3af)" }}>Tags</p>
+            <div className="flex flex-wrap gap-1">
+              {(showAllTags ? allTags : allTags.slice(0, TAGS_SHOWN_IN_FILTER)).map((t) => {
+                const active = tagFilter.some((x) => x.toLowerCase() === t.name.toLowerCase());
+                return (
+                  <button
+                    key={t.name.toLowerCase()}
+                    type="button"
+                    aria-pressed={active}
+                    onClick={() => setTagFilter(active ? tagFilter.filter((x) => x.toLowerCase() !== t.name.toLowerCase()) : [...tagFilter, t.name])}
+                    className="text-[11px] px-2 py-0.5 rounded-full font-medium"
+                    style={active
+                      ? { background: "var(--twilio-red, #e22)", color: "#fff", border: "1px solid var(--twilio-red, #e22)" }
+                      : { background: "var(--surface-subtle-2)", color: "var(--text-primary, #111)", border: "1px solid var(--border-subtle, #e5e7eb)" }}
+                  >
+                    {t.name}
+                  </button>
+                );
+              })}
+            </div>
+            {allTags.length > TAGS_SHOWN_IN_FILTER && (
+              <button type="button" onClick={() => setShowAllTags((v) => !v)} className="mt-1 text-[11px] underline" style={{ color: "var(--twilio-red, #e22)" }}>
+                {showAllTags ? "Show fewer" : `Show all ${allTags.length}`}
+              </button>
+            )}
+          </div>
+        )}
+
         {/* Author */}
         <div>
           <p className="text-[10px] font-bold uppercase tracking-widest mb-2" style={{ color: "var(--text-secondary, #9ca3af)" }}>Creator</p>
@@ -613,7 +696,7 @@ export default function DiscoverPage() {
             <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2.2" style={{ width: 11, height: 11 }}>
               <path d="M6 1v10M1 6h10"/>
             </svg>
-            New Applet
+            Add to Discovery
           </button>
         </div>
       </aside>
@@ -624,9 +707,9 @@ export default function DiscoverPage() {
 
           {/* Page header */}
           <div className="mb-6">
-            <h1 className="text-3xl font-semibold text-[var(--twilio-navy)] flex items-center gap-2"><InnovationIcon width={24} height={24} style={{ flexShrink: 0 }} />Discover</h1>
+            <h1 className="text-3xl font-semibold text-[var(--twilio-navy)] flex items-center gap-2"><InnovationIcon width={24} height={24} style={{ flexShrink: 0 }} />Discovery</h1>
             <p className="text-sm text-[var(--twilio-navy)] mt-1">
-              Applets and repos built by Twilions — {filtered.length} result{filtered.length !== 1 ? "s" : ""}
+              Tools, sites, docs, applets and repos shared by Twilions — {filtered.length} result{filtered.length !== 1 ? "s" : ""}
             </p>
           </div>
 
@@ -638,20 +721,20 @@ export default function DiscoverPage() {
             <div className="flex flex-col items-center justify-center py-24 gap-3">
               {items.length === 0 ? (
                 <>
-                  <p className="text-sm" style={{ color: "var(--text-secondary, #9ca3af)" }}>No applets yet — be the first to add one.</p>
+                  <p className="text-sm" style={{ color: "var(--text-secondary, #9ca3af)" }}>Nothing here yet — be the first to add one.</p>
                   <button
                     onClick={() => setShowForm(true)}
                     className="text-xs font-semibold underline"
                     style={{ color: "var(--twilio-red, #e22)" }}
                   >
-                    Add an applet
+                    Add to Discovery
                   </button>
                 </>
               ) : (
                 <>
-                  <p className="text-sm" style={{ color: "var(--text-secondary, #9ca3af)" }}>No applets match your filters.</p>
+                  <p className="text-sm" style={{ color: "var(--text-secondary, #9ca3af)" }}>Nothing matches your filters.</p>
                   <button
-                    onClick={() => { setSearch(""); setTypeFilter("all"); setCategoryFilter(""); setAuthorFilter(""); }}
+                    onClick={() => { setSearch(""); setTypeFilter("all"); setCategoryFilter(""); setAuthorFilter(""); setTagFilter([]); }}
                     className="text-xs underline"
                     style={{ color: "var(--twilio-red, #e22)" }}
                   >
@@ -663,55 +746,30 @@ export default function DiscoverPage() {
           ) : (
             <div className="space-y-8">
 
-              {/* Applets section */}
-              {(typeFilter === "all" || typeFilter === "applet") && applets.length > 0 && (
-                <section>
+              {grouped.map((g) => (
+                <section key={g.value} data-testid={`section-${g.value}`}>
                   <div className="flex items-center gap-2 mb-4">
-                    <svg viewBox="0 0 16 16" fill="currentColor" style={{ width: 14, height: 14, color: "#2563eb" }}>
-                      <path d="M2 2.5A2.5 2.5 0 014.5 0h7A2.5 2.5 0 0114 2.5v13l-5-3-5 3V2.5z"/>
-                    </svg>
-                    <h2 className="text-sm font-bold uppercase tracking-widest text-[var(--twilio-navy)]">Applets</h2>
-                    <span className="text-xs font-semibold px-2 py-0.5 rounded-full" style={{ background: "#eff6ff", color: "#2563eb" }}>{applets.length}</span>
+                    <h2 className="text-sm font-bold uppercase tracking-widest text-[var(--twilio-navy)]">{g.plural}</h2>
+                    <span className="text-xs font-semibold px-2 py-0.5 rounded-full" style={{ background: "var(--surface-subtle-2)", color: "var(--text-gray-500, #6b7280)" }}>{g.items.length}</span>
                   </div>
                   <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-                    {applets.map((item) => (
+                    {g.items.map((item) => (
                       <AppletCard
                         key={item.id}
                         item={item}
+                        pins={pins}
+                        accounts={accounts}
+                        onPin={pin}
+                        onUnpin={unpin}
                         canEdit={item.submitted_by_username === currentUser?.username}
                         canDelete={item.submitted_by_username === currentUser?.username}
                         onEdit={() => setEditingItem(item)}
-                        onDelete={() => deleteApplet(item.id).catch(() => {})}
+                        onDelete={() => deleteApplet(item.id).then(refetchTags).catch(() => {})}
                       />
                     ))}
                   </div>
                 </section>
-              )}
-
-              {/* Repos section */}
-              {(typeFilter === "all" || typeFilter === "repo") && repos.length > 0 && (
-                <section>
-                  <div className="flex items-center gap-2 mb-4">
-                    <svg viewBox="0 0 16 16" fill="currentColor" style={{ width: 14, height: 14, color: "#16a34a" }}>
-                      <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
-                    </svg>
-                    <h2 className="text-sm font-bold uppercase tracking-widest text-[var(--twilio-navy)]">GitHub Repos</h2>
-                    <span className="text-xs font-semibold px-2 py-0.5 rounded-full" style={{ background: "var(--tint-green-50)", color: "#16a34a" }}>{repos.length}</span>
-                  </div>
-                  <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-                    {repos.map((item) => (
-                      <AppletCard
-                        key={item.id}
-                        item={item}
-                        canEdit={item.submitted_by_username === currentUser?.username}
-                        canDelete={item.submitted_by_username === currentUser?.username}
-                        onEdit={() => setEditingItem(item)}
-                        onDelete={() => deleteApplet(item.id).catch(() => {})}
-                      />
-                    ))}
-                  </div>
-                </section>
-              )}
+              ))}
 
             </div>
           )}

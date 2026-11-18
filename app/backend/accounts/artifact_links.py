@@ -1,18 +1,21 @@
 """Reverse lookup: which records reference a given AccountArtifact.
 
-Batched into exactly 3 queries regardless of how many artifacts/accounts are
+Batched into exactly 4 queries (3 without a user) regardless of how many artifacts/accounts are
 being resolved — the same batching discipline used for comment summaries and
 the artifacts-batch route (see CLAUDE.md's 2026-08-18 session log entries).
 """
 from __future__ import annotations
 
 
-def used_in_map(artifact_ids, account_ids):
+def used_in_map(artifact_ids, account_ids, user=None):
     """Return ``{artifact_id: [{resource_type, resource_id, label, url}]}``.
 
     ``artifact_ids`` / ``account_ids`` may be any iterable; both are coerced
     to sets. Artifacts with no known usage are simply absent from the
     returned dict — callers should default to ``[]`` via ``.get(id, [])``.
+
+    ``user`` enables the reminders lookup: reminders are personal, so only the caller's own
+    reminders that link to the artifact are listed, and without a user none are.
     """
     artifact_ids = {int(a) for a in artifact_ids}
     account_ids = {a for a in account_ids if a is not None}
@@ -90,5 +93,30 @@ def used_in_map(artifact_ids, account_ids):
             "label": item.task or "(Untitled)",
             "url": "/action-items",
         })
+
+    # 4. Reminders (the caller's own) that link to the artifact via Reminder.links
+    if user is not None:
+        from scheduler.models import Reminder
+
+        reminders = (
+            Reminder.objects.filter(created_by=user)
+            .exclude(links=[])
+            .only("id", "title", "links")
+        )
+        for rem in reminders:
+            for link in rem.links or []:
+                if not isinstance(link, dict) or link.get("resource_type") != "artifact":
+                    continue
+                try:
+                    aid_int = int(link.get("resource_id"))
+                except (TypeError, ValueError):
+                    continue
+                if aid_int in artifact_ids:
+                    _append(aid_int, {
+                        "resource_type": "reminder",
+                        "resource_id": rem.id,
+                        "label": rem.title or "(Untitled)",
+                        "url": "/reminders",
+                    })
 
     return result

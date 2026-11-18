@@ -47,6 +47,12 @@ def _create_field_in_airtable(field_name: str, field_type: str, table_id: str) -
     return resp.json().get("id", "")
 
 
+_AIRTABLE_FIELD_TYPES = frozenset({
+    "singleLineText", "multilineText", "url", "number", "checkbox", "date",
+    "singleSelect", "multipleSelects", "multipleAttachments",
+})
+
+
 def _bedrock_determine_type(field_name: str, field_value: str) -> str:
     """
     Ask Claude to pick the best Airtable field type for a custom field.
@@ -63,7 +69,9 @@ Field name: {field_name}
 Sample value: {field_value or "(none provided)"}
 
 Respond with ONLY the field type name, nothing else."""
-    return complete(prompt, max_tokens=32)
+    answer = complete(prompt, max_tokens=32).strip()
+    # The sample value is outside data; only a type from the fixed list is ever used.
+    return answer if answer in _AIRTABLE_FIELD_TYPES else "singleLineText"
 
 
 @shared_task(name="account_feed.tasks.create_airtable_field")
