@@ -101,7 +101,7 @@ export default function MiniNodePreview({ node, children }: { node: MiniNode; ch
           data-mini-preview="RichText"
           className="prose prose-sm max-w-none rich-text"
           style={{ color: str(p.color, "#39476A"), overflow: "hidden", fontSize: "0.8125rem" }}
-          dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(str(p.html, "<p>Rich text content…</p>")) }}
+          dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(str(p.html, "<p>Rich text content…</p>"), { FORBID_TAGS: ["style", "form"] }) }}
         />,
       );
 

@@ -6,13 +6,30 @@ logger = logging.getLogger(__name__)
 TABLE_APPLETS = getattr(settings, "AIRTABLE_TABLE_APPLETS", "")
 
 
+# Airtable single-selects reject options they do not already have. The Type and Category
+# columns only know the original values, so newer ones are written as the closest old one
+# (the local row keeps the real value). A failed push never fails the local save.
+AIRTABLE_TYPES = {"applet", "repo"}
+AIRTABLE_CATEGORIES = {
+    "Automation", "Dashboard", "Bot", "Integration", "Tool", "Game", "Utility",
+}
+
+
+def airtable_type(value: str) -> str:
+    return value if value in AIRTABLE_TYPES else "applet"
+
+
+def airtable_category(value: str) -> str:
+    return value if value in AIRTABLE_CATEGORIES else "Tool"
+
+
 def _applet_fields(applet) -> dict:
     return {
         "Name":        applet.name,
         "Description": applet.description,
         "URL":         applet.url,
-        "Type":        applet.type,
-        "Category":    applet.category,
+        "Type":        airtable_type(applet.type),
+        "Category":    airtable_category(applet.category),
         "Author":      applet.author,
         "Tags":        ", ".join(applet.tags) if applet.tags else "",
     }

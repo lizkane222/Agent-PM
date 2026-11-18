@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useStatusLabels } from "../hooks/useStatusLabels";
+import { useAccountRoute } from "../hooks/useAccountRoute";
 import { createPortal } from "react-dom";
 import { useParams, useNavigate } from "react-router-dom";
 import CorporateIcon from "../assets/icons/Corporate.svg?react";
@@ -33,7 +34,7 @@ import { AttendeeActionButton } from "../components/account/AttendeeActionButton
 import { guestName, knownFullName, matchAttendee } from "../lib/attendeeMatch";
 import { allEmails, preferredEmail } from "../lib/teamEmails";
 import { fullNameFromEmail } from "../lib/nameFromEmail";
-import { logActionItemUpdate, changedActionItemFields } from "../lib/actionItemLog";
+import { logActionItemUpdate } from "../lib/actionItemLog";
 import { assignActionItemToMember, isMemberDrag, readMemberDragData, setMemberDragData } from "../lib/actionItemAssign";
 import { useScheduledOccurrences } from "../hooks/useScheduledOccurrences";
 import { useActionItemFieldOptions } from "../hooks/useActionItemFieldOptions";
@@ -43,18 +44,15 @@ import CommentPreviewList from "../components/comments/CommentPreviewList";
 import CommentCountBadge from "../components/comments/CommentCountBadge";
 import { useCommentMenuItem } from "../components/comments/commentMenuItem";
 import { ContextMenu, FocusPinBadge, focusPinMenuItem } from "../components/action-items/ContextMenu";
-import StepsPanel from "../components/action-items/StepsPanel";
 import { ACTION_ITEMS_UPDATED_KEY } from "../lib/actionItemEvents";
-import ArtifactPicker from "../components/action-items/ArtifactPicker";
 import { useFocusPins } from "../hooks/useFocusPins";
 import { useStatusArrivalOrder } from "../hooks/useStatusArrivalOrder";
 import ColumnSortButton from "../components/account/ColumnSortButton";
 import { ArtifactBrowseBar } from "../components/account/ArtifactBrowseBar";
 import { LinkedNotepadNotes } from "../components/account/LinkedNotepadNotes";
-import { ArtifactDetailsRail } from "../components/account/ArtifactDetailsRail";
+import { ArtifactViewer } from "../components/account/ArtifactViewer";
 import { DEFAULT_ARTIFACT_BROWSE, browseArtifacts, type ArtifactBrowseState } from "../lib/artifactBrowse";
 import UrlPillInput from "../components/shared/UrlPillInput";
-import { useSlackLinkAutosave } from "../hooks/useSlackLinkAutosave";
 import InlineCommentThread from "../components/comments/InlineCommentThread";
 import AccountActivityLog from "../components/account/AccountActivityLog";
 import { EmailMessageBody } from "../components/account/EmailMessageBody";
@@ -71,6 +69,7 @@ import { setNoteDragData, noteLabel, noteRefKey, buildNoteLinkIndex, type NoteLi
 import type { NoteRef } from "../types/accounts";
 import AccountMeetingNotesTimeline from "../components/account/AccountMeetingNotesTimeline";
 import CollapsibleAccountSection from "../components/account/CollapsibleAccountSection";
+import AccountPinnedTools from "../components/account/AccountPinnedTools";
 import AccountTicketsSection from "../components/account/AccountTicketsSection";
 import SlackChannelsField from "../components/account/SlackChannelsField";
 import MaskedArrValue from "../components/account/MaskedArrValue";
@@ -79,6 +78,8 @@ import { timelineMeetingCount } from "../lib/accountMeetings";
 import { isPushOk, summarizePush, type CloudCoachPushResult } from "../lib/cloudCoachPush";
 import PinnedSkillsSection from "../components/skills/PinnedSkillsSection";
 import { toLocalDatetimeValue } from "../lib/datetimeLocal";
+import SensitiveText from "../components/shared/SensitiveText";
+import type { SensitiveResourceType } from "../types/sensitive";
 
 // ── Edit Modal ────────────────────────────────────────────────────────────────
 
@@ -624,12 +625,12 @@ function ActionItemCard({
       >
         {isPinnedToFocus && <FocusPinBadge />}
         <p className="text-sm font-semibold text-[var(--twilio-navy)] leading-snug truncate">
-          {item.task || <span className="italic opacity-50">Untitled</span>}
+          {item.task ? <SensitiveText resourceType="action_item" resourceId={canPin ? item.id : null} field="task" text={item.task} /> : <span className="italic opacity-50">Untitled</span>}
         </p>
         {item.task_details && (
           <p className="text-[11px] text-[var(--twilio-navy)] opacity-60 leading-snug"
             style={{ overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>
-            {htmlToPreviewText(item.task_details)}
+            <SensitiveText resourceType="action_item" resourceId={canPin ? item.id : null} field="task_details" text={htmlToPreviewText(item.task_details)} />
           </p>
         )}
         <div className="flex flex-wrap gap-1">
@@ -1766,7 +1767,6 @@ function CustomerContactModal({
 // ── Side detail panel ─────────────────────────────────────────────────────────
 
 type PanelItem =
-  | { kind: "action"; item: AirtableActionItem }
   | { kind: "meeting"; item: AirtableMeeting }
   | { kind: "member"; item: TeamMember }
   | { kind: "contact"; item: CustomerContact }
@@ -1997,322 +1997,6 @@ function CustomerContactQuickForm({
           className="px-3 py-1 text-[11px] font-semibold rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-40 transition-colors"
         >{saving ? "Adding…" : "Add"}</button>
       </div>
-    </div>
-  );
-}
-
-// ── Action item full-editor inside the right-hand side panel ─────────────────
-
-function ActionItemSidePanelContent({
-  item,
-  teamMembers = [],
-  onUpdated,
-}: {
-  item: AirtableActionItem;
-  teamMembers?: TeamMember[];
-  onUpdated?: (updated: AirtableActionItem) => void;
-}) {
-  const { status: statusOptions } = useActionItemFieldOptions();
-  const { label: statusLabel } = useStatusLabels();
-  const [form, setForm] = useState<Partial<AirtableActionItem>>({ ...item });
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
-  const [attachments, setAttachments] = useState<ActionItemAttachment[]>(item.attachments ?? []);
-  const [uploadingAttachment, setUploadingAttachment] = useState(false);
-  const [attachError, setAttachError] = useState<string | null>(null);
-  const attachFileRef = useRef<HTMLInputElement>(null);
-  const memberNames = ["Unassigned", ...teamMembers.map((m) => m.full_name)] as string[];
-
-  // Timer state
-  const [timerRunning, setTimerRunning] = useState(false);
-  const [timerElapsed, setTimerElapsed] = useState(0); // seconds this session
-  const timerStartRef = useRef<number | null>(null);
-  const timerRafRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    if (item.airtable_id.startsWith("local-")) return;
-    airtableApi.listAttachments(item.id).then(({ data }) => setAttachments(data)).catch(() => {});
-  }, [item.id, item.airtable_id]);
-
-  // Re-sync form when item prop changes (e.g. parent re-fetched)
-  useEffect(() => {
-    setForm((f) => ({ ...item, ...f }));
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [item.airtable_id]);
-
-  // Live timer tick
-  useEffect(() => {
-    if (!timerRunning) {
-      if (timerRafRef.current) cancelAnimationFrame(timerRafRef.current);
-      return;
-    }
-    function tick() {
-      if (timerStartRef.current != null) {
-        setTimerElapsed(Math.floor((Date.now() - timerStartRef.current) / 1000));
-      }
-      timerRafRef.current = requestAnimationFrame(tick);
-    }
-    timerRafRef.current = requestAnimationFrame(tick);
-    return () => { if (timerRafRef.current) cancelAnimationFrame(timerRafRef.current); };
-  }, [timerRunning]);
-
-  function handleTimerToggle() {
-    if (timerRunning) {
-      // Stop: accumulate elapsed seconds into time_spent
-      const added = timerElapsed;
-      const prev = form.time_spent ?? 0;
-      setForm((f) => ({ ...f, time_spent: prev + added }));
-      setTimerRunning(false);
-      setTimerElapsed(0);
-      timerStartRef.current = null;
-    } else {
-      timerStartRef.current = Date.now();
-      setTimerElapsed(0);
-      setTimerRunning(true);
-    }
-  }
-
-  function fmtTimer(s: number) {
-    const h = Math.floor(s / 3600);
-    const m = Math.floor((s % 3600) / 60);
-    const sec = s % 60;
-    return h > 0
-      ? `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`
-      : `${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
-  }
-
-  const set = (patch: Partial<AirtableActionItem>) => setForm((f) => ({ ...f, ...patch }));
-  // A pasted Slack link saves on its own — see hooks/useSlackLinkAutosave.ts.
-  const autosaveSlackLink = useSlackLinkAutosave();
-
-  async function handleSave() {
-    if (saving) return;
-    setSaving(true);
-    try {
-      const changes = changedActionItemFields(item, form);
-      const { data } = await airtableApi.updateActionItemFields(item.airtable_id, changes);
-      logActionItemUpdate(item, changes);
-      onUpdated?.(data);
-      setSaved(true);
-      setTimeout(() => setSaved(false), 2000);
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function handleAttachFiles(files: FileList | File[]) {
-    setUploadingAttachment(true);
-    setAttachError(null);
-    const failed: string[] = [];
-    let lastError: unknown = null;
-    for (const f of Array.from(files)) {
-      try {
-        const { data } = await airtableApi.uploadAttachmentFile(item.id, f);
-        setAttachments((prev) => [data, ...prev]);
-      } catch (err: unknown) {
-        // Never swallow this: silence here reads as "I picked a file and nothing happened".
-        failed.push(f.name);
-        lastError = err;
-      }
-    }
-    if (failed.length) {
-      const data = (lastError as { response?: { data?: { detail?: string; error?: string } } })?.response?.data;
-      setAttachError(`${data?.detail ?? data?.error ?? "Upload failed."} (${failed.join(", ")})`);
-    }
-    setUploadingAttachment(false);
-  }
-
-  async function handleDeleteAttachment(id: number) {
-    await airtableApi.deleteAttachment(item.id, id);
-    setAttachments((prev) => prev.filter((a) => a.id !== id));
-  }
-
-  const accent = PRIORITY_ACCENT[form.priority ?? item.priority] ?? "#9ca3af";
-
-  return (
-    <div className="flex flex-col gap-4">
-      {/* Title */}
-      <input
-        value={form.task ?? ""}
-        onChange={(e) => set({ task: e.target.value })}
-        placeholder="Task name…"
-        className="w-full text-sm font-semibold text-[var(--twilio-navy)] bg-transparent border-b border-transparent focus:border-indigo-400 focus:outline-none pb-0.5"
-        style={{ borderBottom: `2px solid ${accent}` }}
-      />
-
-      {/* Status · Priority · Due date pills */}
-      <div className="flex flex-wrap gap-1.5 items-center">
-        <AccPillSelect
-          value={form.status}
-          options={statusOptions as AirtableActionItem["status"][]}
-          format={statusLabel}
-          colorMap={NEW_AI_STATUS_COLORS}
-          placeholder="Status"
-          onChange={(v) => set({ status: v })}
-        />
-        <AccPillSelect
-          value={form.priority}
-          options={["Critical", "High", "Medium", "Low"] as const}
-          colorMap={NEW_AI_PRIORITY_COLORS}
-          placeholder="Priority"
-          onChange={(v) => set({ priority: v })}
-        />
-        <AccPillDate value={form.due_date} onChange={(v) => set({ due_date: v })} />
-      </div>
-
-      {/* Description. Steps live in the Checklist section below. */}
-      <div>
-        <p className="text-xs font-semibold uppercase tracking-wide text-[var(--twilio-gray-60)] mb-1.5">
-          Description
-        </p>
-        <RichTextMentionEditor
-          value={form.task_details ?? ""}
-          onChange={(html) => set({ task_details: html })}
-          placeholder="Additional context or notes…"
-          minHeightClassName="min-h-[64px]"
-        />
-      </div>
-
-      {/* Checklist — its own field, directly below the description. Real Airtable items
-          only: steps key off the numeric PK, which a local-* draft lacks until promoted. */}
-      {!item.airtable_id.startsWith("local-") && (
-        <div className="pt-3 border-t border-gray-100">
-          <StepsPanel actionItemId={item.id} />
-        </div>
-      )}
-
-      {/* Time tracking */}
-      <div className="rounded-lg border border-gray-200 bg-gray-50 p-3 flex flex-col gap-2.5">
-        <p className="text-[11px] font-semibold uppercase tracking-wide text-[var(--twilio-gray-60)]">Time Tracking</p>
-        {/* Live timer */}
-        <div className="flex items-center gap-3">
-          <span className={`font-mono text-lg tabular-nums font-semibold ${timerRunning ? "text-emerald-600" : "text-[var(--twilio-navy)]"}`}>
-            {fmtTimer(timerElapsed)}
-          </span>
-          <button
-            onClick={handleTimerToggle}
-            className={`px-3 py-1 rounded-lg text-xs font-semibold uppercase tracking-wide transition-colors ${
-              timerRunning
-                ? "bg-red-50 text-red-700 hover:bg-red-100 ring-1 ring-red-200"
-                : "bg-emerald-50 text-emerald-700 hover:bg-emerald-100 ring-1 ring-emerald-200"
-            }`}
-          >
-            {timerRunning ? "Stop" : "Track"}
-          </button>
-          {timerRunning && (
-            <span className="text-[10px] text-emerald-600 font-medium animate-pulse">● Recording</span>
-          )}
-        </div>
-        {/* Est / Spent / Prep pills */}
-        <div className="flex flex-wrap gap-1.5 items-center">
-          <AccPillNumber value={form.estimated_time} label="Est." onChange={(v) => set({ estimated_time: v ?? 0 })} />
-          <AccPillNumber value={form.time_spent} label="Spent" onChange={(v) => set({ time_spent: v ?? 0 })} />
-          <AccPillNumber value={form.prep_time} label="Prep" onChange={(v) => set({ prep_time: v ?? 0 })} />
-        </div>
-      </div>
-
-      {/* Assignee */}
-      {teamMembers.length > 0 && (
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-[var(--twilio-gray-60)] shrink-0">Assignee</span>
-          <AccPillSelect
-            value={(form.assignee_name || "Unassigned") as string}
-            options={memberNames as string[]}
-            colorMap={{}}
-            placeholder="Unassigned"
-            onChange={(v) => {
-              const member = teamMembers.find((m) => m.full_name === v);
-              set({ assignee_airtable_id: member ? String(member.id) : "", assignee_name: member?.full_name ?? "" });
-            }}
-          />
-        </div>
-      )}
-
-      {/* Slack URL */}
-      <div className="flex items-center gap-2">
-        <span className="text-xs text-[var(--twilio-gray-60)] shrink-0">Slack</span>
-        <AccPillUrl
-          value={form.slack_thread_url}
-          onChange={(v) => { set({ slack_thread_url: v }); autosaveSlackLink(item, v, onUpdated); }}
-        />
-      </div>
-
-      {/* Account badge */}
-      {item.account_name && (
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-[var(--twilio-gray-60)] shrink-0">Account</span>
-          <span className="inline-flex items-center gap-1 text-xs font-medium text-[var(--twilio-navy)] bg-gray-100 px-2 py-0.5 rounded-full">
-            <CorporateIcon width={10} height={10} className="shrink-0 opacity-60" />
-            {item.account_name}
-          </span>
-        </div>
-      )}
-
-      {/* Calendar occurrences */}
-      <ActionItemCardOccurrences airtableId={item.airtable_id} />
-
-      {/* Attachments */}
-      {!item.airtable_id.startsWith("local-") && (
-        <div>
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-[11px] font-semibold uppercase tracking-wide text-[var(--twilio-gray-60)]">
-              Attachments{attachments.length > 0 && ` (${attachments.length})`}
-            </span>
-            <div className="flex items-center gap-1">
-              {uploadingAttachment && <span className="text-[11px] text-gray-400 animate-pulse">Uploading…</span>}
-              <button
-                onClick={() => attachFileRef.current?.click()}
-                className="text-[11px] px-2 py-0.5 rounded border border-gray-200 text-[var(--twilio-navy)] hover:bg-gray-50 transition-colors"
-              >+ File</button>
-              <ArtifactPicker
-                actionItemId={item.id}
-                accountName={item.account_name}
-                onAttached={(a) => setAttachments((prev) => [a, ...prev])}
-                onError={setAttachError}
-              />
-              <input ref={attachFileRef} type="file" multiple className="hidden" onChange={(e) => e.target.files && void handleAttachFiles(e.target.files)} />
-            </div>
-          </div>
-          {attachError && (
-            <p role="alert" className="text-xs text-red-600 mb-2 bg-red-50 border border-red-200 rounded px-2 py-1">
-              {attachError}
-            </p>
-          )}
-          {attachments.length === 0 ? (
-            <p className="text-xs text-gray-400 italic">No attachments yet.</p>
-          ) : (
-            <div className="flex flex-col gap-1.5">
-              {attachments.map((a) => {
-                const href = a.file_url ?? a.url ?? "";
-                return (
-                  <div key={a.id} className="flex items-center gap-2 text-xs bg-gray-50 rounded-lg px-3 py-1.5">
-                    <span className="shrink-0">📎</span>
-                    {href ? (
-                      <a href={href} target="_blank" rel="noreferrer" className="flex-1 truncate text-indigo-600 hover:underline">{a.name || href}</a>
-                    ) : (
-                      <span className="flex-1 truncate text-[var(--twilio-navy)]">{a.name}</span>
-                    )}
-                    <button onClick={() => void handleDeleteAttachment(a.id)} className="shrink-0 text-gray-300 hover:text-red-400 transition-colors">×</button>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* Save button */}
-      <button
-        disabled={saving}
-        onClick={() => void handleSave()}
-        className={`w-full py-2 text-sm font-semibold rounded-lg transition-colors ${
-          saved
-            ? "bg-emerald-600 text-white"
-            : "bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-40"
-        }`}
-      >
-        {saved ? "✓ Saved" : saving ? "Saving…" : "Save changes"}
-      </button>
     </div>
   );
 }
@@ -2593,7 +2277,7 @@ function ContactSidePanelContent({
   );
 }
 
-function SidePanel({ panel, onClose, onCreatedActionItem, onMeetingUpdated, onUpdatedActionItem, teamMembers = [], airtableAccountId, account, contacts, onContactsChange }: { panel: PanelItem; onClose: () => void; onCreatedActionItem?: (item: AirtableActionItem) => void; onMeetingUpdated?: (updated: AirtableMeeting) => void; onUpdatedActionItem?: (updated: AirtableActionItem) => void; teamMembers?: TeamMember[]; airtableAccountId?: number | null; account?: Account | null; contacts?: CustomerContact[]; onContactsChange?: (c: CustomerContact[]) => void }) {
+function SidePanel({ panel, onClose, onCreatedActionItem, onMeetingUpdated, teamMembers = [], airtableAccountId, account, contacts, onContactsChange }: { panel: PanelItem; onClose: () => void; onCreatedActionItem?: (item: AirtableActionItem) => void; onMeetingUpdated?: (updated: AirtableMeeting) => void; teamMembers?: TeamMember[]; airtableAccountId?: number | null; account?: Account | null; contacts?: CustomerContact[]; onContactsChange?: (c: CustomerContact[]) => void }) {
   return (
     <div className="w-full h-full bg-white flex flex-col">
       <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100">
@@ -2603,13 +2287,6 @@ function SidePanel({ panel, onClose, onCreatedActionItem, onMeetingUpdated, onUp
         <button onClick={onClose} className="text-lg leading-none hover:opacity-60 transition-opacity" style={{ color: "var(--text-secondary, #888)" }}>✕</button>
       </div>
       <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3 text-sm text-[var(--twilio-navy)]">
-        {panel.kind === "action" && (
-          <ActionItemSidePanelContent
-            item={panel.item}
-            teamMembers={teamMembers}
-            onUpdated={onUpdatedActionItem}
-          />
-        )}
         {panel.kind === "meeting" && (
           <>
             <p className="font-semibold text-base leading-snug">{panel.item.name || <span className="italic opacity-50">Untitled meeting</span>}</p>
@@ -3576,11 +3253,6 @@ function ArtifactsPanel({ accountId, airtableAccountId }: { accountId: number; a
     }
   }
 
-  const isPreviewable = (a: AccountArtifact) => {
-    const mime = a.mime_type.toLowerCase();
-    const url = a.file_url ?? a.url ?? "";
-    return mime.startsWith("image/") || mime === "application/pdf" || /docs\.google\.com/i.test(url);
-  };
 
   return (
     <div
@@ -3759,8 +3431,8 @@ function ArtifactsPanel({ accountId, airtableAccountId }: { accountId: number; a
           key={`${viewer.id}-${viewer.updated_at}`}
           artifact={viewer}
           onClose={() => setViewer(null)}
-          canPreview={isPreviewable(viewer)}
           canEdit={canEditArtifact(viewer)}
+          airtableAccountId={airtableAccountId}
           onUpdated={(u) => { setViewer(u); setArtifacts((prev) => prev.map((x) => (x.id === u.id ? u : x))); }}
         />
       )}
@@ -4041,86 +3713,6 @@ function AddArtifactModal({
             {saving ? "Adding…" : "Add link"}
           </button>
         </div>
-      </div>
-    </div>
-  );
-}
-
-function ArtifactViewer({
-  artifact,
-  onClose,
-  canPreview,
-  canEdit = false,
-  onUpdated = () => {},
-}: {
-  artifact: AccountArtifact;
-  onClose: () => void;
-  canPreview: boolean;
-  canEdit?: boolean;
-  onUpdated?: (a: AccountArtifact) => void;
-}) {
-  const href = artifact.file_url ?? artifact.url ?? "";
-  const references = artifact.references ?? [];
-  const usedIn = artifact.used_in ?? [];
-  const hasDetails = Boolean(artifact.description?.trim()) || references.length > 0 || usedIn.length > 0 || Boolean(artifact.uploaded_by_username);
-
-  return (
-    <div className="fixed inset-0 z-[9000] flex flex-col bg-black/70 backdrop-blur-sm" onClick={onClose}>
-      <div
-        style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 20px", background: "rgba(0,0,0,0.6)", flexShrink: 0 }}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <p style={{ margin: 0, fontSize: "0.875rem", fontWeight: 600, color: "#fff", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "60%" }}>
-          {resolveEmojiShortcodes(artifact.name)}
-        </p>
-        <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
-          {artifact.icon_key === "lucidchart" && artifact.secondary_url && (
-            <a
-              href={artifact.secondary_url}
-              target="_blank"
-              rel="noopener noreferrer"
-              style={{ fontSize: "0.75rem", fontWeight: 600, color: "#fff", background: "rgba(8,145,178,0.4)", padding: "6px 12px", borderRadius: "6px", textDecoration: "none" }}
-              onClick={(e) => e.stopPropagation()}
-            >Published ↗</a>
-          )}
-          {href && (
-            <a
-              href={href}
-              target="_blank"
-              rel="noopener noreferrer"
-              style={{ fontSize: "0.75rem", fontWeight: 600, color: "#fff", background: "rgba(255,255,255,0.15)", padding: "6px 12px", borderRadius: "6px", textDecoration: "none" }}
-              onClick={(e) => e.stopPropagation()}
-            >
-              {artifact.icon_key === "lucidchart" ? "Edit ↗" : "Open in new tab ↗"}
-            </a>
-          )}
-          <button className="card-btn" onClick={onClose} style={{ background: "transparent", border: "none", color: "#fff", fontSize: "1.25rem", cursor: "pointer", lineHeight: 1, padding: "2px 6px" }}>×</button>
-        </div>
-      </div>
-
-      <div style={{ flex: 1, overflow: "hidden", display: "flex", minHeight: 0 }} onClick={(e) => e.stopPropagation()}>
-        <div style={{ flex: 1, overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center" }}>
-        {canPreview && artifact.mime_type.startsWith("image/") ? (
-          <img src={href} alt={artifact.name} style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }} />
-        ) : canPreview ? (
-          <iframe src={href} title={artifact.name} style={{ width: "100%", height: "100%", border: "none", background: "var(--surface-card)" }} />
-        ) : (
-          <div style={{ textAlign: "center", color: "#fff" }}>
-            <div style={{ fontSize: "3rem", marginBottom: "12px", display: "flex", justifyContent: "center" }}>
-              <ArtifactIcon artifactType={artifact.artifact_type} mime={artifact.mime_type} name={artifact.name} url={artifact.url} iconKey={artifact.icon_key} imageUrl={artifact.image_url} size={48} />
-            </div>
-            <p style={{ fontSize: "1rem", fontWeight: 600, marginBottom: "8px" }}>{resolveEmojiShortcodes(artifact.name)}</p>
-            <p style={{ fontSize: "0.8125rem", color: "rgba(255,255,255,0.6)", marginBottom: "20px" }}>Preview not available</p>
-            <a href={href} target="_blank" rel="noopener noreferrer" style={{ fontSize: "0.875rem", fontWeight: 600, color: "#fff", background: "var(--twilio-red, #e22)", padding: "10px 20px", borderRadius: "8px", textDecoration: "none" }}>
-              Open file ↗
-            </a>
-          </div>
-        )}
-        </div>
-
-        {(hasDetails || canEdit) && (
-          <ArtifactDetailsRail artifact={artifact} canEdit={canEdit} onUpdated={onUpdated} />
-        )}
       </div>
     </div>
   );
@@ -4733,6 +4325,7 @@ function SidebarField({
   options,
   readOnly = false,
   renderValue,
+  sensitive,
 }: {
   label: string;
   value: string;
@@ -4741,6 +4334,7 @@ function SidebarField({
   options?: { value: string; label: string }[];
   readOnly?: boolean;
   renderValue?: (val: string) => React.ReactNode;
+  sensitive?: { resourceType: SensitiveResourceType; resourceId: string | number | null | undefined; field: string };
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(value);
@@ -4756,7 +4350,11 @@ function SidebarField({
   }
 
   const empty = <span style={{ color: "var(--twilio-gray-60)", fontStyle: "italic", fontSize: "0.75rem" }}>—</span>;
-  const display = renderValue ? renderValue(value) : (value ? <span className="text-xs">{value}</span> : empty);
+  const plainDisplay = renderValue ? renderValue(value) : (value ? <span className="text-xs">{value}</span> : empty);
+  const display = sensitive && value
+    ? <SensitiveText resourceType={sensitive.resourceType} resourceId={sensitive.resourceId} field={sensitive.field} text={value}
+        renderPlain={() => plainDisplay} />
+    : plainDisplay;
 
   return (
     <div>
@@ -4817,10 +4415,13 @@ function SidebarField({
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function AccountDetailPage() {
-  const { id } = useParams<{ id: string }>();
+  const { id: routeParam } = useParams<{ id: string }>();
   const navigate = useNavigate();
 
   const [account, setAccount] = useState<Account | null>(null);
+  // The URL carries the account's name (or, for old links, its number); every API call below
+  // keeps using the numeric id.
+  const { id, resolving: resolvingAccount } = useAccountRoute(routeParam, account);
   const [airtableAccount, setAirtableAccount] = useState<AirtableAccount | null>(null);
   const [actionItems, setActionItems] = useState<AirtableActionItem[]>([]);
   // Ordering for the kanban status columns: Open chronological, every other column by the
@@ -4875,6 +4476,13 @@ export default function AccountDetailPage() {
     () => actionItems.filter((item) => !claimedActionItemIds.has(item.airtable_id)),
     [actionItems, claimedActionItemIds],
   );
+  // Same single-owner rule for meetings. Recurring meetings repeat under one name and the strip
+  // shows one chip per name, so a name is claimed if ANY occurrence is filed on a project/goal.
+  const unclaimedStripMeetings = useMemo(() => {
+    const claimedIds = new Set(goals.flatMap((g) => g.meetingIds));
+    const claimedNames = new Set(meetings.filter((m) => claimedIds.has(m.airtable_id)).map((m) => m.name ?? ""));
+    return meetings.filter((m) => !claimedIds.has(m.airtable_id) && !claimedNames.has(m.name ?? ""));
+  }, [goals, meetings]);
   const [projectMembers, setProjectMembers] = useState<ProjectMember[]>([]);
   // Outcome of the Cloud Coach membership push that assigning a member can trigger.
   const [cloudCoachPushes, setCloudCoachPushes] = useState<CloudCoachPushResult[] | null>(null);
@@ -4942,7 +4550,11 @@ export default function AccountDetailPage() {
   }, [id]);
 
   useEffect(() => {
-    if (!id) return;
+    if (!id) {
+      // A slug that matches no account (or several) is "not found"; one still resolving keeps loading.
+      if (!resolvingAccount) { setAccount(null); setLoading(false); }
+      return;
+    }
     const numId = Number(id);
     setLoading(true);
     setGoals([]);
@@ -5017,7 +4629,7 @@ export default function AccountDetailPage() {
     // Load customer contacts and quick links in parallel
     accountsApi.listContacts(numId).then(({ data }) => setContacts(data.results)).catch(() => {});
     accountsApi.listQuickLinks(numId).then(({ data }) => setQuickLinks(data)).catch(() => {});
-  }, [id]);
+  }, [id, resolvingAccount]);
 
   // Seed default project sections for the Admin account
   const ADMIN_PROJECT_DESCRIPTIONS: Record<string, string> = {
@@ -5434,7 +5046,7 @@ export default function AccountDetailPage() {
     <div ref={pageRef} className="relative h-full overflow-hidden flex">
 
       {/* ── Left: Account Details sidebar ──────────────────────────────────── */}
-      <div data-testid="left-sidebar" className={`${leftCollapsed ? "w-9" : "w-56"} relative shrink-0 flex flex-col overflow-y-auto transition-[width] duration-150`} style={{ background: "var(--surface, #fff)", borderRight: "1px solid var(--border, rgba(0,0,0,0.08))", fontFamily: "var(--font-base)" }}>
+      <div data-testid="left-sidebar" className={`${leftCollapsed ? "w-9" : "w-64"} relative shrink-0 flex flex-col overflow-y-auto transition-[width] duration-150`} style={{ background: "var(--surface, #fff)", borderRight: "1px solid var(--border, rgba(0,0,0,0.08))", fontFamily: "var(--font-base)" }}>
         <button
           type="button"
           onClick={() => sectionCollapse.toggle(SECTION_IDS.leftSidebar)}
@@ -5464,6 +5076,7 @@ export default function AccountDetailPage() {
               <SidebarField
                 label=""
                 value={account.company_name}
+                sensitive={{ resourceType: "account", resourceId: account.id, field: "company_name" }}
                 onSave={async (v) => {
                   const { data } = await accountsApi.updateAccount(account.id, { company_name: v } as Partial<Account>);
                   setAccount(data);
@@ -5497,6 +5110,7 @@ export default function AccountDetailPage() {
           <SidebarField
             label="Industry"
             value={account.industry ?? ""}
+            sensitive={{ resourceType: "account", resourceId: account.id, field: "industry" }}
             onSave={async (v) => {
               const { data } = await accountsApi.updateAccount(account.id, { industry: v } as Partial<Account>);
               setAccount(data);
@@ -5515,6 +5129,7 @@ export default function AccountDetailPage() {
           <SidebarField
             label="Website"
             value={account.website ?? ""}
+            sensitive={{ resourceType: "account", resourceId: account.id, field: "website" }}
             type="url"
             onSave={async (v) => {
               const { data } = await accountsApi.updateAccount(account.id, { website: v } as Partial<Account>);
@@ -5542,6 +5157,7 @@ export default function AccountDetailPage() {
             label="Primary Contact"
             value={account.primary_contact_text?.trim() || mainContactName(contacts) || account.primary_contact_name || ""}
             readOnly
+            sensitive={{ resourceType: "account", resourceId: account.id, field: "primary_contact" }}
             renderValue={(v) => v ? <span className="text-xs">{v}</span> : <span style={{ color: "var(--twilio-gray-60)", fontStyle: "italic", fontSize: "0.75rem" }}>—</span>}
           />
           <SidebarField
@@ -5627,6 +5243,9 @@ export default function AccountDetailPage() {
           <div style={{ padding: "0.75rem 1rem" }}>
             <PinnedSkillsSection page="account-detail" variant="column" context={{ accountIds: [account.id] }} />
           </div>
+        </CollapsibleAccountSection>
+        <CollapsibleAccountSection id="sidebar-pinned-tools" title="Pinned tools" bare>
+          <AccountPinnedTools accountId={account.id} />
         </CollapsibleAccountSection>
         </div>
       </div>
@@ -6391,12 +6010,12 @@ export default function AccountDetailPage() {
           </div>
 
           {/* Drag sources */}
-          {(unclaimedStripActionItems.length > 0 || meetings.length > 0) && (
+          {(unclaimedStripActionItems.length > 0 || unclaimedStripMeetings.length > 0) && (
             <div className="mb-3 p-2 bg-gray-50 rounded-md border border-dashed border-gray-300">
               <p className="text-[10px] text-[var(--twilio-gray-60)] uppercase tracking-wide mb-1.5">Drag to a goal section below · drag to calendar to set due date</p>
-              {meetings.length > 0 && (
+              {unclaimedStripMeetings.length > 0 && (
                 <div className="flex flex-wrap gap-1.5 mb-1.5">
-                  {meetings.filter((m, i, all) => all.findIndex((x) => x.name === m.name) === i).map((m) => (
+                  {unclaimedStripMeetings.filter((m, i, all) => all.findIndex((x) => x.name === m.name) === i).map((m) => (
                     <div
                       key={m.airtable_id}
                       draggable
@@ -6492,6 +6111,8 @@ export default function AccountDetailPage() {
           onOpenEvent={openCalEventPanel}
           onOpenMeeting={(m) => setPanel({ kind: "meeting", item: m })}
           noteLinks={noteLinkIndex}
+          onCreatedActionItem={(item) => setActionItems((prev) => [item, ...prev])}
+          teamMembers={allMembers}
         />
 
         </CollapsibleAccountSection>
@@ -6603,7 +6224,7 @@ export default function AccountDetailPage() {
           resourceId: panel.item.id,
           url: `/accounts/${account.id}` + (panel.kind === "meeting" ? `?meeting=${panel.item.id}` : panel.linkedMeeting ? `?meeting=${panel.linkedMeeting.id}` : ""),
           onPinned: (n) => setNotes((prev) => [n, ...prev]),
-        } : null}><SidePanel panel={panel} onClose={() => setPanel(null)} onCreatedActionItem={(item) => setActionItems((prev) => [item, ...prev])} onMeetingUpdated={(updated) => { setMeetings((prev) => prev.map((m) => m.id === updated.id ? updated : m)); setPanel((p) => { if (!p) return p; if (p.kind === "meeting" && p.item.id === updated.id) return { kind: "meeting", item: updated }; if (p.kind === "calendar" && p.linkedMeeting?.id === updated.id) return { ...p, linkedMeeting: updated }; return p; }); }} onUpdatedActionItem={(updated) => { setActionItems((prev) => prev.map((a) => a.id === updated.id ? updated : a)); setPanel((p) => p?.kind === "action" && p.item.id === updated.id ? { kind: "action", item: updated } : p); }} teamMembers={allMembers} airtableAccountId={airtableAccount?.id} account={account} contacts={contacts} onContactsChange={setContacts} /></PinNoteProvider>}
+        } : null}><SidePanel panel={panel} onClose={() => setPanel(null)} onCreatedActionItem={(item) => setActionItems((prev) => [item, ...prev])} onMeetingUpdated={(updated) => { setMeetings((prev) => prev.map((m) => m.id === updated.id ? updated : m)); setPanel((p) => { if (!p) return p; if (p.kind === "meeting" && p.item.id === updated.id) return { kind: "meeting", item: updated }; if (p.kind === "calendar" && p.linkedMeeting?.id === updated.id) return { ...p, linkedMeeting: updated }; return p; }); }} teamMembers={allMembers} airtableAccountId={airtableAccount?.id} account={account} contacts={contacts} onContactsChange={setContacts} /></PinNoteProvider>}
         </div>
       </div>
 

@@ -215,6 +215,9 @@ class AccountArtifact(models.Model):
     file_size = models.PositiveIntegerField(null=True, blank=True)  # bytes
     # Optional user-supplied image shown in place of the icon. See accounts/artifact_images.py.
     custom_image = models.FileField(upload_to="artifact_images/%Y/%m/", null=True, blank=True)
+    # Optional user-supplied screenshot shown in the preview overlay instead of a type-based
+    # preview (see accounts/artifact_preview.py). Never SVG; validated like `custom_image`.
+    preview_image = models.FileField(upload_to="artifact_previews/%Y/%m/", null=True, blank=True)
     description = models.TextField(blank=True, default="")  # rich text (HTML)
     # Records referenced via @# picker inside the description: [{resource_type, resource_id, label, url}]
     references = models.JSONField(default=list, blank=True)
@@ -231,6 +234,23 @@ class AccountArtifact(models.Model):
     def __str__(self):
         account_name = self.account.company_name if self.account_id else "unassigned"
         return f"{self.name} ({self.artifact_type}) — {account_name}"
+
+
+class ArtifactNote(models.Model):
+    """A note on an artifact. Plain account-team content; `parent` makes a reply chain."""
+    artifact = models.ForeignKey(AccountArtifact, on_delete=models.CASCADE, related_name="notes")
+    author = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="artifact_notes")
+    parent = models.ForeignKey("self", on_delete=models.CASCADE, null=True, blank=True, related_name="replies")
+    html = models.TextField(blank=True, default="")   # sanitized rich text
+    text = models.TextField(blank=True, default="")   # plain text of `html` (search, action buttons)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+
+    def __str__(self):
+        return f"Note {self.pk} on artifact {self.artifact_id}"
 
 
 class AccountProject(models.Model):

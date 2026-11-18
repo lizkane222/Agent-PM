@@ -70,6 +70,12 @@ def _user_can_see_resource(user, resource_type: str, resource_id) -> bool:
                     id=rid, author=user,
                 ).exists()
             if resource_type == "artifact":
+                # An artifact's comments and notes are one conversation with one audience: every
+                # Admin (by access level, not only the raw staff flag above) is in, matching
+                # accounts.views._artifacts_for_discussion for the notes.
+                from core.mixins import is_admin
+                if is_admin(user):
+                    return AccountArtifact.objects.filter(id=rid).exists()
                 return AccountArtifact.objects.filter(
                     id=rid, account__team_members__user=user,
                 ).exists() or AccountArtifact.objects.filter(

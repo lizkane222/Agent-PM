@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { CustomerContactNote } from "../../types";
+import SensitiveText from "../shared/SensitiveText";
 
 export function ContactNoteRow({
   note,
@@ -65,7 +66,7 @@ export function ContactNoteRow({
   return (
     <li className={`group/note flex items-start gap-${isXs ? "1.5" : "2"} ${isXs ? "text-[11px]" : "text-xs"}`} style={{ color: "var(--text-ink)" }}>
       <span className="w-1.5 h-1.5 rounded-full bg-gray-300 shrink-0 mt-1.5" />
-      <span className="flex-1 leading-relaxed">{note.content}</span>
+      <span className="flex-1 leading-relaxed"><SensitiveText resourceType="contact_note" resourceId={note.id} field="content" text={note.content} /></span>
       <button
         onClick={() => { setDraft(note.content); setEditing(true); }}
         title="Edit"

@@ -1,5 +1,5 @@
 import React from "react";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, within, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { http, HttpResponse } from "msw";
@@ -176,5 +176,40 @@ describe("AccountDetailPage timeline merge + calendar-event panel", () => {
     expect(name.textContent).toBe("one two three four five six seven eight nine ten…");
     expect(name.className).not.toContain("truncate");
     expect(name.parentElement?.getAttribute("draggable")).toBe("true");
+  });
+
+  const proj = (over: object = {}) => ({
+    id: 7, account: 1, name: "Rollout", description: "", url: "", action_ids: [], meeting_ids: [], goal_ids: [],
+    resources: [], sf_data: {}, kind: "project", sf_project_id: "", ...over,
+  });
+  // The whole strip disappears once nothing is left in it.
+  const stripOf = () => screen.getByText(/Drag to a goal section below/i).parentElement as HTMLElement;
+  const stripGone = () => expect(screen.queryByText(/Drag to a goal section below/i)).toBeNull();
+
+  it("keeps a meeting already filed under a project (saved meeting_ids) out of the drag-source strip", async () => {
+    register([meeting()], []);
+    server.use(http.get("/api/v1/accounts/projects/", () => HttpResponse.json({ results: [proj({ meeting_ids: ["recMTG001"] })], count: 1 })));
+    await renderPage();
+    const row = await screen.findByTestId("project-row-7");
+    expect(await within(row).findByTestId("goal-meeting-row")).toBeTruthy();
+    expect(screen.queryAllByTestId("meeting-chip-name")).toHaveLength(0);
+    stripGone();
+  });
+
+  it("removes a meeting from the strip as soon as it is dropped on a project, and restores it when removed", async () => {
+    register([meeting()], []);
+    server.use(
+      http.get("/api/v1/accounts/projects/", () => HttpResponse.json({ results: [proj()], count: 1 })),
+      http.patch("/api/v1/accounts/projects/:id/", async ({ request }) => HttpResponse.json({ ...proj(), ...(await request.json() as object) })),
+    );
+    await renderPage();
+    const row = await screen.findByTestId("project-row-7");
+    expect(within(stripOf()).getByTestId("meeting-chip-name")).toBeTruthy();
+    fireEvent.drop(row, { dataTransfer: { getData: (k: string) => (k === "goalMeetingId" ? "recMTG001" : ""), types: ["goalMeetingId"] } });
+    await waitFor(() => expect(within(row).getByTestId("goal-meeting-row")).toBeTruthy());
+    stripGone();
+    // Removing it from the project puts it back.
+    fireEvent.click(within(within(row).getByTestId("goal-meeting-row")).getByText("✕"));
+    await waitFor(() => expect(within(stripOf()).getByTestId("meeting-chip-name")).toBeTruthy());
   });
 });

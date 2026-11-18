@@ -1,13 +1,13 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import RichTextMentionEditor from "../shared/RichTextMentionEditor";
-import { sanitizeHtml, plainToHtml } from "../../lib/noteHelpers";
 import { usePublicItems } from "../../hooks/usePublicItems";
 import { useAppError } from "../../context/AppErrorContext";
 import ScheduleCallModal from "./ScheduleCallModal";
 import LeaveNoteModal from "./LeaveNoteModal";
 import HorizontalScroller from "./HorizontalScroller";
 import type { PublicItem, PublicItemType } from "../../types/team";
+import SensitiveText from "../shared/SensitiveText";
 
 interface Props {
   /** TeamMember id of the person whose public section this is. */
@@ -78,11 +78,12 @@ export default function PublicSection({ memberId, personName, personEmail, isSel
 
   function open(item: PublicItem) {
     const href = item.item_type === "artifact_file" ? item.file_url : item.item_type === "record_ref" ? item.ref.url : item.url;
-    if (!href) return <span>{item.title}</span>;
+    const label = <SensitiveText resourceType="public_item" resourceId={item.id} field="title" text={item.title} />;
+    if (!href) return <span>{label}</span>;
     const internal = href.startsWith("/");
     return internal
-      ? <Link to={href} style={{ color: border, fontWeight: 600 }}>{item.title}</Link>
-      : <a href={href} target="_blank" rel="noopener noreferrer" style={{ color: border, fontWeight: 600 }}>{item.title}</a>;
+      ? <Link to={href} style={{ color: border, fontWeight: 600 }}>{label}</Link>
+      : <a href={href} target="_blank" rel="noopener noreferrer" style={{ color: border, fontWeight: 600 }}>{label}</a>;
   }
 
   return (
@@ -129,7 +130,7 @@ export default function PublicSection({ memberId, personName, personEmail, isSel
               </div>
               <div style={{ fontSize: "0.875rem", overflowWrap: "anywhere" }}>{open(item)}</div>
               {item.item_type === "note" && item.body && (
-                <div className="rich-text" style={{ fontSize: "0.8125rem", maxHeight: 120, overflow: "hidden" }} dangerouslySetInnerHTML={{ __html: sanitizeHtml(plainToHtml(item.body)) }} />
+                <SensitiveText resourceType="public_item" resourceId={item.id} field="body" html={item.body} as="div" className="rich-text" style={{ fontSize: "0.8125rem", maxHeight: 120, overflow: "hidden" }} />
               )}
             </div>
           ))}

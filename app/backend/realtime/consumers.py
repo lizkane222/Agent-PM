@@ -225,6 +225,22 @@ class MeetingNotesConsumer(AsyncJsonWebsocketConsumer):
         })
 
 
+@database_sync_to_async
+def _may_view_call(user, call_sid: str) -> bool:
+    """True unless the call is recorded as belonging to someone else (admins see all)."""
+    from core.mixins import is_admin
+    from .models import VoiceSession
+
+    owner_id = (
+        VoiceSession.objects.filter(call_sid=call_sid).values_list("user_id", flat=True).first()
+    )
+    if owner_id is None:
+        # Not recorded yet (the status callback can lag the browser) or an unattributed call.
+        # The SID is Twilio-generated and unguessable; once a session names an owner it is enforced.
+        return not VoiceSession.objects.filter(call_sid=call_sid, user__isnull=False).exists()
+    return owner_id == user.pk or is_admin(user)
+
+
 class VoiceTranscriptConsumer(AsyncJsonWebsocketConsumer):
     """
     Authenticated WebSocket that relays live voice transcript turns to the browser.
@@ -241,6 +257,12 @@ class VoiceTranscriptConsumer(AsyncJsonWebsocketConsumer):
         user = self.scope.get("user")
         if user is None or not user.is_authenticated:
             await self.close(code=4001)
+            return
+
+        # A call's transcript belongs to the user who made it. Without this any signed-in
+        # user who learned a call SID could listen to someone else's live call.
+        if not await _may_view_call(user, self.call_sid):
+            await self.close(code=4003)
             return
 
         await self.channel_layer.group_add(self.group_name, self.channel_name)
@@ -314,6 +336,11 @@ class ConversationRelayConsumer(AsyncWebsocketConsumer):
         from django.conf import settings as django_settings
 
         expected_token = getattr(django_settings, "VOICE_RELAY_TOKEN", "")
+        if not expected_token and getattr(django_settings, "VOICE_RELAY_REQUIRE_TOKEN", True):
+            # Production must not accept an unauthenticated relay socket.
+            logger.error("VOICE_RELAY_TOKEN is not set - refusing ConversationRelay connection")
+            await self.close(code=4001)
+            return
         if expected_token:
             query_string = self.scope.get("query_string", b"").decode()
             params = dict(pair.split("=", 1) for pair in query_string.split("&") if "=" in pair)
@@ -377,7 +404,7 @@ class ConversationRelayConsumer(AsyncWebsocketConsumer):
             utterance = msg.get("voicePrompt", "").strip()
             if not utterance:
                 return
-            logger.info("ConversationRelay prompt [%s]: %r", self._call_sid, utterance)
+            logger.info("ConversationRelay prompt [%s]: %d chars", self._call_sid, len(utterance))
             await self._handle_prompt(utterance)
 
         elif msg_type == "interrupt":

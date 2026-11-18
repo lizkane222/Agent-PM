@@ -340,12 +340,18 @@ describe("ArtifactsPanel", () => {
     expect(panel).toHaveTextContent("Segment rollout");
   });
 
-  it("the viewer omits the details panel when there is nothing to show", async () => {
+  it("the viewer always has a sidebar (notes and comments), but lists no details when there are none", async () => {
     renderPanel();
     await waitFor(() => screen.getByText("Product Spec"));
     fireEvent.click(screen.getByText("Product Spec"));
     await waitFor(() => expect(screen.getByText("Open in new tab ↗")).toBeInTheDocument());
-    expect(screen.queryByTestId("artifact-details")).not.toBeInTheDocument();
+    const sidebar = await screen.findByTestId("artifact-sidebar");
+    expect(sidebar).toHaveTextContent("Notes");
+    expect(sidebar).toHaveTextContent("Comments");
+    const details = screen.getByTestId("artifact-details");
+    expect(details).not.toHaveTextContent("Description");
+    expect(details).not.toHaveTextContent("Used in");
+    expect(details).not.toHaveTextContent("Mentions in description");
   });
 
   it("dragstart sets artifactDrop data with artifact id and name", async () => {

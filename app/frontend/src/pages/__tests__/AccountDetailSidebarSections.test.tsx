@@ -166,12 +166,12 @@ describe("AccountDetailPage — sidebar fields and section folding", () => {
   it("folds the left sidebar to a narrow rail and back", async () => {
     await renderPage();
     const sidebar = await screen.findByTestId("left-sidebar");
-    expect(sidebar.className).toContain("w-56");
+    expect(sidebar.className).toContain("w-64");
     fireEvent.click(within(sidebar).getByRole("button", { name: "Collapse account details sidebar" }));
     expect(sidebar.className).toContain("w-9");
-    expect(sidebar.className).not.toContain("w-56");
+    expect(sidebar.className).not.toContain("w-64");
     fireEvent.click(within(sidebar).getByRole("button", { name: "Expand account details sidebar" }));
-    expect(sidebar.className).toContain("w-56");
+    expect(sidebar.className).toContain("w-64");
   });
 
   it("folds the right detail panel and keeps that choice", async () => {

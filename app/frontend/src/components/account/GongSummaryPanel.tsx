@@ -3,14 +3,16 @@ import React, { useState, useRef, useEffect } from "react";
 import { airtableApi, integrationsApi } from "../../lib/api";
 import type { MeetingNotesSource } from "../../lib/api";
 import type { AirtableActionItem, AirtableMeeting, TeamMember, CommentReference } from "../../types";
-import { NoteActionTooltip } from "./NoteActionTooltip";
+import { NoteBulletActions } from "./NoteBulletActions";
 import { MeetingSummarySourceToggle, preferredMeetingSource } from "./MeetingSummarySourceToggle";
+import SensitiveText from "../shared/SensitiveText";
+import { lineKeyFor } from "../../lib/sensitiveMatch";
 
 // ── Gong / meeting summary paste section ─────────────────────────────────────
 
 // Detect team members mentioned by name in a Gong bullet.
 // Returns the members found and a new display string with @FirstLast substitutions.
-function detectMentions(text: string, teamMembers: TeamMember[]): { members: TeamMember[]; display: string } {
+export function detectMentions(text: string, teamMembers: TeamMember[]): { members: TeamMember[]; display: string } {
   const found: TeamMember[] = [];
   let display = text;
   for (const m of teamMembers) {
@@ -304,23 +306,7 @@ export function _strHash(s: string): number {
 }
 
 export function GongBulletRow({ text, eventId, accountName, airtableAccountId, linkedMeetingId, isLast, onCreatedActionItem, mentionedMembers, persistKey }: { text: string; eventId: number; accountName?: string | null; airtableAccountId?: number | null; linkedMeetingId?: number; isLast: boolean; onCreatedActionItem?: (item: AirtableActionItem) => void; mentionedMembers?: TeamMember[]; persistKey?: string }) {
-  const [openAction, setOpenAction] = useState<"action" | "reminder" | "calendar" | null>(null);
   const [hovered, setHovered] = useState(false);
-  const [tooltipAnchorY, setTooltipAnchorY] = useState<number | undefined>(undefined);
-  const [doneActions, setDoneActions] = useState<Set<"action" | "calendar" | "reminder">>(() => {
-    if (!persistKey) return new Set();
-    try { const v = localStorage.getItem(persistKey); return v ? new Set(JSON.parse(v) as ("action" | "calendar" | "reminder")[]) : new Set(); } catch { return new Set(); }
-  });
-  const tooltipRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!openAction) return;
-    function handler(e: MouseEvent) {
-      if (tooltipRef.current && !tooltipRef.current.contains(e.target as Node)) setOpenAction(null);
-    }
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, [openAction]);
 
   return (
     <div
@@ -337,48 +323,8 @@ export function GongBulletRow({ text, eventId, accountName, airtableAccountId, l
       }}
     >
       <span style={{ width: "5px", height: "5px", borderRadius: "50%", background: "#9ca3af", flexShrink: 0, marginTop: "7px" }} />
-      <p style={{ flex: 1, fontSize: "0.8125rem", color: "var(--text-ink)", lineHeight: 1.5, margin: 0 }}>{renderWithMentions(text)}</p>
-      <div ref={tooltipRef} style={{ display: "flex", alignItems: "center", gap: "2px", flexShrink: 0, position: "relative" }}>
-        <button
-          title="Create action item"
-          onClick={(e) => { setTooltipAnchorY(e.currentTarget.getBoundingClientRect().bottom); setOpenAction(openAction === "action" ? null : "action"); }}
-          style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("action") ? "#2563eb" : "var(--text-gray-400)" }}
-          className={doneActions.has("action") ? "transition-opacity" : "opacity-0 group-hover:opacity-100 transition-opacity"}
-        >
-          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" style={{ width: "12px", height: "12px" }}><path d="M8 5h9M8 10h9M8 15h9" strokeLinecap="round"/><path d="M3 5l1.5 1.5L7 3M3 10l1.5 1.5L7 8M3 15l1.5 1.5L7 13" strokeLinecap="round" strokeLinejoin="round"/></svg>
-        </button>
-        <button
-          title="Set reminder"
-          onClick={(e) => { setTooltipAnchorY(e.currentTarget.getBoundingClientRect().bottom); setOpenAction(openAction === "reminder" ? null : "reminder"); }}
-          style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("reminder") ? "#2563eb" : "var(--text-gray-400)" }}
-          className={doneActions.has("reminder") ? "transition-opacity" : "opacity-0 group-hover:opacity-100 transition-opacity"}
-        >
-          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" style={{ width: "12px", height: "12px" }}><circle cx="10" cy="10" r="7"/><path d="M10 6v4l3 2" strokeLinecap="round" strokeLinejoin="round"/></svg>
-        </button>
-        <button
-          title="Create meeting"
-          onClick={(e) => { setTooltipAnchorY(e.currentTarget.getBoundingClientRect().bottom); setOpenAction(openAction === "calendar" ? null : "calendar"); }}
-          style={{ padding: "2px", borderRadius: "3px", background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", color: doneActions.has("calendar") ? "#2563eb" : "var(--text-gray-400)" }}
-          className={doneActions.has("calendar") ? "transition-opacity" : "opacity-0 group-hover:opacity-100 transition-opacity"}
-        >
-          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" style={{ width: "12px", height: "12px" }}><rect x="2" y="4" width="16" height="14" rx="2"/><path d="M2 8h16M6 2v4M14 2v4" strokeLinecap="round"/></svg>
-        </button>
-        {openAction && (
-          <NoteActionTooltip
-            kind={openAction}
-            noteText={text}
-            eventId={eventId}
-            accountName={accountName}
-            airtableAccountId={airtableAccountId}
-            linkedMeetingId={linkedMeetingId}
-            mentionedMembers={mentionedMembers}
-            anchorY={tooltipAnchorY}
-            onDone={(kind) => setDoneActions((prev) => { const n = new Set([...prev, kind]); if (persistKey) { try { localStorage.setItem(persistKey, JSON.stringify([...n])); } catch {} } return n; })}
-            onCreated={onCreatedActionItem}
-            onClose={() => setOpenAction(null)}
-          />
-        )}
-      </div>
+      <p style={{ flex: 1, fontSize: "0.8125rem", color: "var(--text-ink)", lineHeight: 1.5, margin: 0 }}><SensitiveText resourceType="meeting" resourceId={linkedMeetingId} field="summary" lineKey={lineKeyFor(text)} text={text} renderPlain={renderWithMentions} /></p>
+      <NoteBulletActions text={text} eventId={eventId} accountName={accountName} airtableAccountId={airtableAccountId} linkedMeetingId={linkedMeetingId} mentionedMembers={mentionedMembers} persistKey={persistKey} onCreatedActionItem={onCreatedActionItem} />
     </div>
   );
 }

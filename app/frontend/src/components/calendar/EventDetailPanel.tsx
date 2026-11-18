@@ -20,6 +20,7 @@ import {
 import type { CalCreateForm } from "./calendarHelpers";
 import { DEFAULT_CATEGORY_COLORS, borderFor, readableTextColor } from "../../lib/eventColors";
 import { toLocalDatetimeValue } from "../../lib/datetimeLocal";
+import SensitiveText from "../shared/SensitiveText";
 
 // Labels and icons only — the active pill takes the user's chosen color for that
 // event type (lib/eventColors.ts) so it matches the event on the calendar.
@@ -248,7 +249,7 @@ export default function EventDetailPanel({ event, onClose, onCollapse, linkedAcc
   }, [event.google_event_id, event.start_datetime, event.title]);
   const cleanDescription = event.description
     ? DOMPurify.sanitize(event.description, {
-        ADD_ATTR: ["target"],
+        ADD_ATTR: ["target"], FORBID_TAGS: ["style", "form"],
         FORCE_BODY: true,
       })
     : "";
@@ -301,7 +302,7 @@ export default function EventDetailPanel({ event, onClose, onCollapse, linkedAcc
         style={{ backgroundColor: headerColor }}
       >
         <div className="flex flex-col gap-0.5 pr-2 flex-1 min-w-0">
-          <h3 className="text-sm font-semibold text-white break-words">{event.title}</h3>
+          <h3 className="text-sm font-semibold text-white break-words"><SensitiveText resourceType="calendar_event" resourceId={event.id} field="title" text={event.title} /></h3>
           {isWorkSession && (
             <span className="text-[10px] font-medium text-white/80 uppercase tracking-wide">Work Session · Local only</span>
           )}
@@ -632,7 +633,9 @@ export default function EventDetailPanel({ event, onClose, onCollapse, linkedAcc
           {descriptionWithLinks && (
             <div>
               <p className="text-sm text-[var(--twilio-gray-60)] uppercase tracking-wide mb-1">Description</p>
-              <div className="rich-text text-[var(--twilio-gray-80)] text-sm [&_a]:text-indigo-600 [&_a]:underline [&_a]:break-all hover:[&_a]:text-indigo-800" dangerouslySetInnerHTML={{ __html: descriptionWithLinks }} />
+              <SensitiveText resourceType="calendar_event" resourceId={event.id} field="description" html={event.description ?? ""} as="div"
+                sanitizer={() => descriptionWithLinks}
+                className="rich-text text-[var(--twilio-gray-80)] text-sm [&_a]:text-indigo-600 [&_a]:underline [&_a]:break-all hover:[&_a]:text-indigo-800" />
             </div>
           )}
           {!isWorkSession && event.attendees.length > 0 && (

@@ -8,6 +8,7 @@ import { feedbackHandlers } from "./handlers/feedback";
 import { accountHandlers } from "./handlers/accounts";
 import { actionItemHandlers } from "./handlers/action_items";
 import { commentsHandlers } from "./handlers/comments";
+import { sensitiveHandlers } from "./handlers/sensitive";
 import { stepsHandlers } from "./handlers/steps";
 import { integrationsHandlers } from "./handlers/integrations";
 import { realtimeHandlers } from "./handlers/realtime";
@@ -28,6 +29,7 @@ export const server = setupServer(
   ...accountHandlers,
   ...actionItemHandlers,
   ...commentsHandlers,
+  ...sensitiveHandlers,
   ...stepsHandlers,
   ...integrationsHandlers,
   ...realtimeHandlers,

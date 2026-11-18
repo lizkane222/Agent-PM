@@ -116,6 +116,8 @@ export interface AccountArtifact {
   file_url: string | null;
   /** User-uploaded image shown in place of the icon, or null. */
   image_url: string | null;
+  /** User-supplied screenshot shown in the preview overlay instead of a type-based preview. */
+  preview_image_url?: string | null;
   mime_type: string;
   file_size: number | null;
   description: string;
@@ -129,6 +131,35 @@ export interface AccountArtifact {
   created_at: string;
   updated_at: string;
 }
+
+/** A note on an artifact; `parent` makes a reply chain of any depth. `html` is sanitized server-side. */
+export interface ArtifactNote {
+  id: number;
+  artifact: number;
+  parent: number | null;
+  html: string;
+  /** Plain text of `html`, derived by the server. */
+  text: string;
+  author: number | null;
+  author_display: string;
+  reply_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** What `GET /accounts/artifacts/<id>/preview/` describes for a file the browser can't render itself. */
+export type ArtifactPreviewResult =
+  | { kind: "native" }
+  | { kind: "text"; format: "plain" | "markdown" | "json" | "code"; text: string; truncated: boolean }
+  | { kind: "html"; html: string; truncated: boolean }
+  | { kind: "table"; sheets: { name: string; rows: string[][] }[]; truncated: boolean }
+  | { kind: "document"; text: string; truncated: boolean }
+  | { kind: "slides"; slides: { index: number; lines: string[] }[]; truncated: boolean }
+  | { kind: "archive"; entries: { name: string; size: number }[]; truncated: boolean }
+  | { kind: "too_large"; size?: number; reason?: string }
+  | { kind: "unavailable" }
+  | { kind: "unsupported"; reason?: string }
+  | { kind: "error"; detail: string };
 
 /** A note LINKED to a project/goal (never a copy). `id` is always a string. */
 export interface NoteRef {

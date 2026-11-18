@@ -17,6 +17,7 @@ from django.db.models import Q, Sum
 from django.http import HttpResponse, StreamingHttpResponse
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle, UserRateThrottle
@@ -164,6 +165,19 @@ class AgentSessionViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)
+
+    def _require_owner(self, session):
+        # A person a session was shared with may read and continue it, never rename or delete it.
+        if session.user_id != self.request.user.pk:
+            raise PermissionDenied("Only the session's owner can change or delete it.")
+
+    def perform_update(self, serializer):
+        self._require_owner(serializer.instance)
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        self._require_owner(instance)
+        instance.delete()
 
     @action(detail=True, methods=["post"], url_path="share")
     def share(self, request, pk=None):

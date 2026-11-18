@@ -18,6 +18,7 @@ import ActionItemCalendarNotes from "./ActionItemCalendarNotes";
 import { ArtifactIconImg, CATALOG_BY_KEY, getAutoIconKey } from "./ArtifactIcon";
 import ArtifactPicker from "../action-items/ArtifactPicker";
 import RichTextMentionEditor from "../shared/RichTextMentionEditor";
+import SensitiveEditable from "../shared/SensitiveEditable";
 
 /** A visible field label. `htmlFor` ties it to a control; `id` lets a group be named by it. */
 function FieldLabel({ htmlFor, id, children }: { htmlFor?: string; id?: string; children: React.ReactNode }) {
@@ -309,16 +310,18 @@ export function ActionItemModal({
           {/* Row 1 — Task */}
           <div data-row="task">
             <FieldLabel htmlFor={ids.task}>Task</FieldLabel>
-            <textarea
-              id={ids.task}
-              autoFocus
-              value={form.task ?? ""}
-              onChange={(e) => set({ task: e.target.value })}
-              placeholder="Task name…"
-              rows={2}
-              className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm font-semibold text-[var(--twilio-navy)] placeholder:text-[var(--twilio-gray-60)] focus:bg-white focus:border-indigo-400 focus:outline-none focus:ring-1 focus:ring-indigo-100 resize-none leading-snug"
-              style={{ overflow: "hidden", fieldSizing: "content" } as React.CSSProperties}
-            />
+            <SensitiveEditable resourceType="action_item" resourceId={isLocal ? null : item.id} field="task" value={form.task ?? ""}>
+              <textarea
+                id={ids.task}
+                autoFocus
+                value={form.task ?? ""}
+                onChange={(e) => set({ task: e.target.value })}
+                placeholder="Task name…"
+                rows={2}
+                className="w-full rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm font-semibold text-[var(--twilio-navy)] placeholder:text-[var(--twilio-gray-60)] focus:bg-white focus:border-indigo-400 focus:outline-none focus:ring-1 focus:ring-indigo-100 resize-none leading-snug"
+                style={{ overflow: "hidden", fieldSizing: "content" } as React.CSSProperties}
+              />
+            </SensitiveEditable>
           </div>
 
           {/* Rows 2-4 — one 3 x 3 grid:
@@ -426,12 +429,14 @@ export function ActionItemModal({
           <div data-row="details">
             <FieldLabel id={ids.detailsLabel}>Details</FieldLabel>
             <div role="group" aria-labelledby={ids.detailsLabel}>
-              <RichTextMentionEditor
-                value={form.task_details ?? ""}
-                onChange={(html) => set({ task_details: html })}
-                placeholder="Additional context or notes…"
-                minHeightClassName="min-h-[72px]"
-              />
+              <SensitiveEditable resourceType="action_item" resourceId={isLocal ? null : item.id} field="task_details" value={form.task_details ?? ""} html>
+                <RichTextMentionEditor
+                  value={form.task_details ?? ""}
+                  onChange={(html) => set({ task_details: html })}
+                  placeholder="Additional context or notes…"
+                  minHeightClassName="min-h-[72px]"
+                />
+              </SensitiveEditable>
             </div>
           </div>
 

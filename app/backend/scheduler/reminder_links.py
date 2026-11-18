@@ -11,7 +11,8 @@ app** — never the whole table:
 * action_item    — what the Action Items page lists for them (everything except other people's
                    private Admin items);
 * calendar_event — the user's own calendar, meetings only (not reminder or work-tracking blocks);
-* task           — tasks assigned to the user.
+* task           — tasks assigned to the user;
+* artifact       — artifacts on accounts the user is on, or that they uploaded.
 
 Labels are always read from the database, never trusted from the client, so a link cannot be
 made to display text the record does not have.
@@ -26,7 +27,7 @@ from __future__ import annotations
 from django.db.models import Q
 from rest_framework import serializers
 
-LINK_TYPES = ("account", "action_item", "calendar_event", "task")
+LINK_TYPES = ("account", "action_item", "calendar_event", "task", "artifact")
 MAX_LINKS = 10
 RESULT_LIMIT = 25
 
@@ -58,6 +59,11 @@ def visible_queryset(user, link_type: str):
 
         return Task.objects.filter(assigned_to=user)
 
+    if link_type == "artifact":
+        from accounts.views import _artifacts_visible_to
+
+        return _artifacts_visible_to(user)
+
     raise ValueError(f"Unknown link type {link_type!r}")
 
 
@@ -66,6 +72,8 @@ def _label(link_type: str, obj) -> str:
         return obj.company_name or "Untitled account"
     if link_type == "action_item":
         return obj.task or "Untitled action item"
+    if link_type == "artifact":
+        return obj.name or "Untitled artifact"
     return getattr(obj, "title", "") or f"Untitled {link_type.replace('_', ' ')}"
 
 
@@ -82,7 +90,7 @@ def search(user, link_type: str, term: str = "", limit: int = RESULT_LIMIT) -> l
     """Up to `limit` visible records of the type, filtered by `term`, as picker options."""
     qs = visible_queryset(user, link_type)
     term = (term or "").strip()
-    field = {"account": "company_name", "action_item": "task"}.get(link_type, "title")
+    field = {"account": "company_name", "action_item": "task", "artifact": "name"}.get(link_type, "title")
     if term:
         qs = qs.filter(**{f"{field}__icontains": term})
     order = {
@@ -90,6 +98,7 @@ def search(user, link_type: str, term: str = "", limit: int = RESULT_LIMIT) -> l
         "action_item": ("-updated_at",) if hasattr(qs.model, "updated_at") else ("-pk",),
         "calendar_event": ("-start_datetime",),
         "task": ("-pk",),
+        "artifact": ("-pk",),
     }[link_type]
     out = []
     for obj in qs.order_by(*order)[:limit]:

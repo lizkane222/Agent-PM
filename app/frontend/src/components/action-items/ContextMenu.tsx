@@ -1,5 +1,6 @@
 import { Z } from "../../lib/zLayers";
-import React, { useRef, useEffect } from "react";
+import React, { useRef, useEffect, useState } from "react";
+import { SENSITIVE_NOTE, takeRecentSensitiveItems } from "../shared/sensitiveRecent";
 
 const PIN_PATH = "M9.828.722a.5.5 0 01.354.146l4.95 4.95a.5.5 0 010 .707c-.48.48-1.072.588-1.503.588-.177 0-.335-.018-.46-.039l-3.134 3.134a5.927 5.927 0 01.16 1.013c.046.702-.032 1.687-.72 2.375a.5.5 0 01-.707 0l-2.829-2.828-3.182 3.182c-.195.195-1.219.902-1.414.707-.195-.195.512-1.22.707-1.414l3.182-3.182-2.828-2.829a.5.5 0 010-.707c.688-.688 1.673-.767 2.375-.72a5.922 5.922 0 011.013.16l3.134-3.133a2.772 2.772 0 01-.04-.461c0-.43.108-1.022.589-1.503a.5.5 0 01.353-.146z";
 
@@ -45,13 +46,20 @@ export interface ContextMenuItem {
   separator?: boolean;
 }
 
-export function ContextMenu({ x, y, items, onClose }: {
+export function ContextMenu({ x, y, items: baseItems, onClose, note: baseNote, sensitive = true }: {
   x: number;
   y: number;
   items: ContextMenuItem[];
   onClose: () => void;
+  /** Optional small explanatory footer (e.g. the screen-share note on sensitive-text menus). */
+  note?: string;
+  /** Pick up "hide for screen sharing" entries from the right-click that opened this menu. */
+  sensitive?: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const [extra] = useState<ContextMenuItem[]>(() => (sensitive ? takeRecentSensitiveItems() : []));
+  const items = extra.length ? [...baseItems, { separator: true, label: "", onClick: () => {} }, ...extra] : baseItems;
+  const note = baseNote ?? (extra.length ? SENSITIVE_NOTE : undefined);
 
   useEffect(() => {
     function onOutside(e: MouseEvent) {
@@ -67,7 +75,7 @@ export function ContextMenu({ x, y, items, onClose }: {
   }, [onClose]);
 
   const menuW = 200;
-  const approxH = items.reduce((h, i) => h + (i.separator ? 9 : 32), 8);
+  const approxH = items.reduce((h, i) => h + (i.separator ? 9 : 32), 8) + (note ? 56 : 0);
   const left = x + menuW > window.innerWidth ? Math.max(4, x - menuW) : x;
   const top = y + approxH > window.innerHeight ? Math.max(4, y - approxH) : y;
 
@@ -99,6 +107,11 @@ export function ContextMenu({ x, y, items, onClose }: {
             {item.label}
           </button>
         )
+      )}
+      {note && (
+        <div className="mt-1 border-t border-gray-100 px-3 pt-1.5 pb-1 text-[11px] leading-snug text-gray-500 whitespace-normal" style={{ maxWidth: 260 }}>
+          {note}
+        </div>
       )}
     </div>
   );

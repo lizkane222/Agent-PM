@@ -30,11 +30,12 @@ import { convertEventToActionItem, restoreConversion } from "../../hooks/useConv
 import { logActionItemUpdate } from "../../lib/actionItemLog";
 import { addLog } from "../../lib/appLog";
 import RichTextMentionEditor, { type RichTextMentionEditorHandle } from "../shared/RichTextMentionEditor";
-import { sanitizeHtml, plainToHtml, htmlToPreviewText, renderMeetingNoteText } from "../../lib/noteHelpers";
+import { htmlToPreviewText, renderMeetingNoteText } from "../../lib/noteHelpers";
 import { MeetingSummarySourceToggle, preferredMeetingSource } from "../account/MeetingSummarySourceToggle";
 import type { MeetingNotesSource } from "../../lib/api";
 import { toLocalDatetimeValue } from "../../lib/datetimeLocal";
 import { localDateKey } from "../../lib/timelineDay";
+import SensitiveText from "../shared/SensitiveText";
 
 interface Props {
   event: CalendarEvent;
@@ -1272,11 +1273,9 @@ function NoteRow({
             />
           </div>
         ) : (
-          <div
+          <SensitiveText resourceType="meeting_note" resourceId={note.id} field="html" html={note.html} as="div"
             className="text-sm text-[var(--twilio-navy)] leading-relaxed cursor-text prose prose-sm max-w-none rich-text"
-            onClick={() => { setEditing(true); setEditText(note.html); }}
-            dangerouslySetInnerHTML={{ __html: sanitizeHtml(plainToHtml(note.html)) }}
-          />
+            onClick={() => { setEditing(true); setEditText(note.html); }} />
         )}
         {/* Hover action icons — CSS float so text wraps naturally beneath them */}
         {!editing && (

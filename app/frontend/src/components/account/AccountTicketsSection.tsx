@@ -9,12 +9,14 @@ import CommentPreviewList from "../comments/CommentPreviewList";
 import CommentComposer from "../comments/CommentComposer";
 import { commentsApi } from "../../lib/api";
 import { invalidateCommentSummary } from "../../lib/commentSummaryStore";
-import { plainToHtml, sanitizeHtml, htmlToPreviewText } from "../../lib/noteHelpers";
+import { htmlToPreviewText } from "../../lib/noteHelpers";
 import {
   TICKET_STATUSES, TICKET_STATUS_LABEL, TICKET_STATUS_COLOR, TICKET_KIND_TITLE, TICKET_EMPTY_TEXT,
   formatTicketTime, looksLikeUrl,
 } from "../../lib/tickets";
 import type { Account, AccountTicket, TicketKind, TicketStatus } from "../../types";
+import SensitiveText from "../shared/SensitiveText";
+import SensitiveEditable from "../shared/SensitiveEditable";
 
 const CARD_STYLE = {
   background: "var(--surface, #fff)",
@@ -95,6 +97,7 @@ export function TicketCard({ ticket, onPatch, onRemove, showAccount = false }: {
   return (
     <div className="rounded-lg px-4 py-3" style={CARD_STYLE} data-testid={`ticket-card-${ticket.id}`}>
       <div className="flex items-start gap-2 flex-wrap">
+        <SensitiveEditable resourceType="account_ticket" resourceId={ticket.id} field="title" value={title}>
         <textarea
           ref={titleRef}
           rows={1}
@@ -106,6 +109,7 @@ export function TicketCard({ ticket, onPatch, onRemove, showAccount = false }: {
           onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); (e.target as HTMLTextAreaElement).blur(); } }}
           className="flex-1 min-w-[160px] resize-none overflow-hidden bg-transparent text-sm font-semibold text-[var(--twilio-navy)] leading-snug border-b border-transparent hover:border-gray-200 focus:border-indigo-400 focus:outline-none"
         />
+        </SensitiveEditable>
         {ticket.external_key && (
           <span className="rounded-full bg-gray-100 px-2 py-0.5 text-[11px] font-semibold text-[var(--twilio-gray-60)]">{ticket.external_key}</span>
         )}
@@ -154,8 +158,8 @@ export function TicketCard({ ticket, onPatch, onRemove, showAccount = false }: {
             />
           </div>
         ) : htmlToPreviewText(notes) ? (
-          <div className="rich-text mt-1 text-sm text-[var(--twilio-navy)]" data-testid="ticket-notes-text"
-            dangerouslySetInnerHTML={{ __html: sanitizeHtml(plainToHtml(notes)) }} />
+          <SensitiveText resourceType="account_ticket" resourceId={ticket.id} field="notes" html={notes} as="div"
+            className="rich-text mt-1 text-sm text-[var(--twilio-navy)]" testId="ticket-notes-text" />
         ) : null}
       </div>
 

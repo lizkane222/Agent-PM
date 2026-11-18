@@ -30,8 +30,8 @@ export class Session {
         return;
       case "prompt":
         // partialPrompts is off, but be defensive: only act on a finished utterance.
-        if (msg.last === false || !msg.voicePrompt?.trim()) return;
-        return this.respond(msg.voicePrompt.trim());
+        if (msg.last === false || typeof msg.voicePrompt !== "string" || !msg.voicePrompt.trim()) return;
+        return this.respond(String(msg.voicePrompt).trim().slice(0, 2000));
       case "interrupt":
         return this.interrupt(msg.utteranceUntilInterrupt);
       case "dtmf":

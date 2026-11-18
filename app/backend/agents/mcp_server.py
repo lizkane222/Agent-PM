@@ -557,7 +557,7 @@ async def get_emails(
     label_ids: list[str] | None = None,
 ) -> list[dict]:
     """Search the user's Gmail inbox and return matching messages."""
-    logger.info("get_emails: query=%s", query)
+    logger.info("get_emails: query_chars=%d", len(query or ""))
     return []
 
 
@@ -572,8 +572,8 @@ async def get_emails(
     "type": "object",
     "properties": {
         "table_name": {"type": "string", "description": "One of: action_items, accounts, meetings"},
-        "filter_formula": {"type": "string", "description": "Optional text filter applied to the name/task field"},
-        "max_records": {"type": "integer", "default": 100},
+        "filter_formula": {"type": "string", "maxLength": 200, "description": "Optional text filter applied to the name/task field"},
+        "max_records": {"type": "integer", "default": 100, "minimum": 1, "maximum": 200},
     },
     "required": ["table_name"],
 }})
@@ -586,15 +586,18 @@ async def get_airtable_records(
     """Fetch records from the local Airtable-synced tables (action_items, accounts, or meetings)."""
     from airtable_sync.models import AirtableActionItem, AirtableAccount, AirtableMeeting
     user = _current_user.get()
-    loop = asyncio.get_running_loop()
-    logger.info("get_airtable_records: table=%s filter=%s", table_name, filter_formula)
+    from asgiref.sync import sync_to_async
+    logger.info("get_airtable_records: table=%s", table_name)
 
     def _query():
         tbl = table_name.lower().replace(" ", "_").replace("-", "_")
-        staff = _is_staff(user)
-        allowed_ids = _allowed_airtable_ids_for(user) if not staff else None
-        collab_id = _user_collab_id(user) if not staff else ""
+        # No staff bypass: the agent sees what the caller's own membership allows, exactly as the
+        # app's list endpoints do (staff must not read another user's private Admin items).
+        staff = False
+        allowed_ids = _allowed_airtable_ids_for(user)
+        collab_id = _user_collab_id(user)
         if tbl in ("action_items", "action-items", "actionitems"):
+            from airtable_sync.views import _exclude_private_admin_items
             qs = AirtableActionItem.objects.select_related("account")
             if filter_formula:
                 qs = qs.filter(task__icontains=filter_formula)
@@ -606,6 +609,7 @@ async def get_airtable_records(
                     Q(account__airtable_id__in=allowed_ids)
                     | (Q(assignee_airtable_id=collab_id) if collab_id else Q(pk__in=[]))
                 )
+            qs = _exclude_private_admin_items(qs, user)
             return [
                 {
                     "id": i.id,
@@ -618,7 +622,7 @@ async def get_airtable_records(
                     "assignee_name": i.assignee_name or "",
                     "url": _airtable_url(i.airtable_id, "AIRTABLE_TABLE_ACTION_ITEMS"),
                 }
-                for i in qs[:max_records]
+                for i in qs[:max(1, min(int(max_records), 200))]
             ]
         elif tbl in ("accounts",):
             qs = AirtableAccount.objects.all()
@@ -633,7 +637,7 @@ async def get_airtable_records(
                     "name": a.name,
                     "url": _airtable_url(a.airtable_id, "AIRTABLE_TABLE_ACCOUNTS"),
                 }
-                for a in qs[:max_records]
+                for a in qs[:max(1, min(int(max_records), 200))]
             ]
         elif tbl in ("meetings",):
             qs = AirtableMeeting.objects.select_related("account")
@@ -650,11 +654,11 @@ async def get_airtable_records(
                     "account_name": m.account.name if m.account else None,
                     "url": _airtable_url(m.airtable_id, "AIRTABLE_TABLE_MEETINGS"),
                 }
-                for m in qs[:max_records]
+                for m in qs[:max(1, min(int(max_records), 200))]
             ]
         return {"error": f"Unknown table '{table_name}'. Use: action_items, accounts, meetings"}
 
-    return await loop.run_in_executor(None, _query)
+    return await sync_to_async(_query, thread_sensitive=True)()
 
 
 @mcp_server.tool(group="create", skill_safe=True, schema={"input_schema": {
@@ -1375,7 +1379,8 @@ def _allowed_phone_numbers(user: Any) -> dict[str, str]:
     allowed: dict[str, str] = {}
     for profile in profiles:
         number = re.sub(r"[\s().-]", "", profile.phone_number or "")
-        if _E164_RE.match(number):
+        from core.phone_safety import is_sendable
+        if _E164_RE.match(number) and is_sendable(number):
             label = "you" if profile.user_id == user.pk else (
                 profile.display_name or profile.user.get_full_name() or profile.user.username
             )
@@ -1641,7 +1646,7 @@ async def list_skills(query: str = "") -> list[dict]:
     from asgiref.sync import sync_to_async
 
     user = _current_user.get()
-    logger.info("list_skills: query=%r user=%s", query, user)
+    logger.info("list_skills: user=%s", user)
     return await sync_to_async(_list_skills_sync, thread_sensitive=True)(user, query)
 
 

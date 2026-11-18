@@ -25,7 +25,7 @@ def sync_jira_all_users():
     from integrations.models import OAuthCredential
 
     user_ids = OAuthCredential.objects.filter(
-        provider="jira", is_active=True
+        provider="jira", is_active=True, user__is_active=True
     ).values_list("user_id", flat=True)
 
     for uid in user_ids:

@@ -13,6 +13,7 @@ import { useComments } from "./useComments";
 import { useCurrentUser } from "../../context/CurrentUserContext";
 // useCurrentUser returns UserProfile | null directly
 import CommentComposer from "./CommentComposer";
+import SensitiveText from "../shared/SensitiveText";
 
 interface Props {
   resourceType: CommentResourceType;
@@ -124,12 +125,9 @@ function CommentRow({
         ) : (
           // `overflowWrap: anywhere` so a pasted URL or a long unbroken token wraps
           // instead of forcing the panel to scroll sideways.
-          <div
-            className="text-sm text-gray-700 whitespace-pre-wrap leading-relaxed min-w-0"
-            style={{ overflowWrap: "anywhere" }}
-          >
-            {renderContent(comment.content, comment.references, navigate)}
-          </div>
+          <SensitiveText resourceType="comment" resourceId={comment.id} field="content" text={comment.content}
+            as="div" className="text-sm text-gray-700 whitespace-pre-wrap leading-relaxed min-w-0" style={{ overflowWrap: "anywhere" }}
+            renderPlain={() => renderContent(comment.content, comment.references, navigate)} />
         )}
 
         {/* References */}

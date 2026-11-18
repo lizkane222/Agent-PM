@@ -7,11 +7,11 @@
  */
 
 import { useStatusLabels } from "../../hooks/useStatusLabels";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { MutableRefObject } from "react";
-import { airtableApi, accountsApi, teamApi } from "../../lib/api";
+import { accountsApi, teamApi } from "../../lib/api";
+import { useActionItemList } from "../../hooks/useActionItemList";
 import type { NewEventDraft, EventCategory, GuestEntry } from "../../types/calendar";
-import type { AirtableActionItem } from "../../types/airtable";
 import type { AccountArtifact } from "../../types/accounts";
 import { DEFAULT_CATEGORY_COLORS, EVENT_CATEGORY_META, borderFor, readableTextColor } from "../../lib/eventColors";
 
@@ -110,7 +110,18 @@ export default function CreateEventModal({ draft, onChange, onSave, onCancel, sa
   const [savingContact, setSavingContact] = useState(false);
 
   // ── Linked action items state ─────────────────────────────────────────────
-  const [availableActionItems, setAvailableActionItems] = useState<AirtableActionItem[]>([]);
+  // Open / In Progress action items of the chosen account, offered for linking. The list is the
+  // shared hook's; while a different account is loading nothing is offered (never the last one's).
+  const { items: accountActionItems, loading: actionItemsLoading } = useActionItemList(
+    { account_name: draft.selectedAccount?.name ?? "", page_size: "30" },
+    { enabled: !!draft.selectedAccount, broadcast: false },
+  );
+  const availableActionItems = useMemo(
+    () => (!draft.selectedAccount || actionItemsLoading
+      ? []
+      : accountActionItems.filter((i) => i.status === "Open" || i.status === "In Progress").slice(0, 20)),
+    [draft.selectedAccount, actionItemsLoading, accountActionItems],
+  );
   const [availableArtifacts, setAvailableArtifacts] = useState<AccountArtifact[]>([]);
   const [showLinkItems, setShowLinkItems] = useState(false);
   const [showLinkArtifacts, setShowLinkArtifacts] = useState(false);
@@ -142,7 +153,6 @@ export default function CreateEventModal({ draft, onChange, onSave, onCancel, sa
   useEffect(() => {
     const acct = draft.selectedAccount;
     setAccountContactEntries([]);
-    setAvailableActionItems([]);
     setAvailableArtifacts([]);
     if (!acct) return;
 
@@ -158,12 +168,6 @@ export default function CreateEventModal({ draft, onChange, onSave, onCancel, sa
       })
       .catch(() => {})
       .finally(() => setLoadingGuests(false));
-
-    // Load action items for linking
-    airtableApi.listActionItems({ account_name: acct.name, page_size: "30" }).then((res) => {
-      const items = Array.isArray(res.data) ? res.data : (res.data as { results?: AirtableActionItem[] }).results ?? [];
-      setAvailableActionItems(items.filter((i) => i.status === "Open" || i.status === "In Progress").slice(0, 20));
-    }).catch(() => {});
 
     // Load artifacts for linking
     accountsApi.listArtifacts(acct.id).then((res) => {

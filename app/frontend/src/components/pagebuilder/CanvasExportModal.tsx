@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import DOMPurify from "dompurify";
 import { toPng, toJpeg } from "html-to-image";
 import { integrationsApi } from "../../lib/api";
 import type { CanvasNode } from "./types";
@@ -16,7 +17,13 @@ type Scope = "viewport" | "selected" | "all-pages" | `page:${string}`;
 // ── HTML serializer for Google Drive / Notion exports ─────────────────────────
 
 function escHtml(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+/** Only web links (or relative paths) may become an href; blocks javascript:/data: URLs. */
+export function safeHref(u: string): string {
+  const t = u.trim();
+  return /^(https?:\/\/|mailto:|\/(?!\/))/i.test(t) ? t : "";
 }
 
 function serializeNodeToHtml(n: CanvasNode): string {
@@ -28,14 +35,14 @@ function serializeNodeToHtml(n: CanvasNode): string {
       return `<section style="page-break-before:always"><h2>${escHtml(label)}</h2>${inner}</section>`;
     }
     case "Heading": {
-      const level = (p.level as number) ?? 1;
+      const level = Math.min(6, Math.max(1, Math.floor(Number(p.level)) || 1));
       return `<h${level}>${escHtml((p.text as string) ?? "")}</h${level}>`;
     }
     case "Text":
     case "Label":
       return `<p>${escHtml((p.text as string) ?? "")}</p>`;
     case "RichText":
-      return `<div>${(p.content as string) ?? ""}</div>`;
+      return `<div>${DOMPurify.sanitize((p.content as string) ?? "", { FORBID_TAGS: ["style", "form"] })}</div>`;
     case "Divider":
       return "<hr/>";
     case "Button":
@@ -58,7 +65,8 @@ function serializeNodeToHtml(n: CanvasNode): string {
         (p.accountName as string) ? `— ${escHtml(p.accountName as string)}` : "",
       ].filter(Boolean).join(" ");
       const summary = (p.summary as string) ? `<br/>${escHtml(p.summary as string)}` : "";
-      const url = (p.url as string) ? `<br/><a href="${escHtml(p.url as string)}">${escHtml(p.url as string)}</a>` : "";
+      const href = safeHref((p.url as string) ?? "");
+      const url = href ? `<br/><a href="${escHtml(href)}" rel="noopener noreferrer">${escHtml(href)}</a>` : "";
       return `<p>${parts}${summary}${url}</p>`;
     }
     default:
@@ -300,6 +308,7 @@ export default function CanvasExportModal({
     const html = buildHtmlDocument(scopeNodes, title);
     const win = window.open("", "_blank");
     if (!win) { setError("Pop-up blocked — please allow pop-ups and try again."); return; }
+    win.opener = null;
     win.document.write(html);
     win.document.close();
     win.focus();

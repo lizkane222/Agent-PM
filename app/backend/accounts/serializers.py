@@ -7,7 +7,7 @@ from rest_framework import serializers
 from comments.serializers import _user_display_name
 
 from .artifact_images import delete_image_file, image_upload_error
-from .models import Account, AccountArtifact, AccountNote, AccountProject, AccountQuickLink, AccountRole, AccountTicket, CustomerContact, CustomerContactNote, ProjectMember
+from .models import Account, AccountArtifact, ArtifactNote, AccountNote, AccountProject, AccountQuickLink, AccountRole, AccountTicket, CustomerContact, CustomerContactNote, ProjectMember
 
 
 class AccountArtifactSerializer(serializers.ModelSerializer):
@@ -16,6 +16,7 @@ class AccountArtifactSerializer(serializers.ModelSerializer):
     file_url = serializers.SerializerMethodField()
     used_in = serializers.SerializerMethodField()
     image_url = serializers.SerializerMethodField()
+    preview_image_url = serializers.SerializerMethodField()
     # Write-only: the stored image is read back through `image_url`.
     custom_image = serializers.FileField(write_only=True, required=False, allow_null=True)
     remove_image = serializers.BooleanField(write_only=True, required=False, default=False)
@@ -24,7 +25,7 @@ class AccountArtifactSerializer(serializers.ModelSerializer):
         model = AccountArtifact
         fields = [
             "id", "account", "artifact_type", "name", "url", "secondary_url", "icon_key",
-            "file_url", "image_url", "custom_image", "remove_image",
+            "file_url", "image_url", "preview_image_url", "custom_image", "remove_image",
             "mime_type", "file_size", "description", "references", "used_in",
             "uploaded_by", "uploaded_by_username", "updated_by", "updated_by_username",
             "created_at", "updated_at",
@@ -34,7 +35,7 @@ class AccountArtifactSerializer(serializers.ModelSerializer):
         # bypass storage quotas.
         read_only_fields = [
             "id", "uploaded_by", "uploaded_by_username", "updated_by", "updated_by_username",
-            "file_url", "used_in",
+            "file_url", "used_in", "preview_image_url",
             "mime_type", "file_size",
             "created_at", "updated_at",
         ]
@@ -57,6 +58,12 @@ class AccountArtifactSerializer(serializers.ModelSerializer):
             return None
         request = self.context.get("request")
         return request.build_absolute_uri(obj.custom_image.url) if request else obj.custom_image.url
+
+    def get_preview_image_url(self, obj):
+        if not obj.preview_image:
+            return None
+        request = self.context.get("request")
+        return request.build_absolute_uri(obj.preview_image.url) if request else obj.preview_image.url
 
     def validate_custom_image(self, value):
         if value is not None:
@@ -85,6 +92,48 @@ class AccountArtifactSerializer(serializers.ModelSerializer):
                 return request.build_absolute_uri(obj.file.url)
             return obj.file.url
         return obj.url or None
+
+
+class ArtifactNoteSerializer(serializers.ModelSerializer):
+    """A note on an artifact. `html` is sanitized here; `text` is derived, never client-supplied."""
+    author_display = serializers.SerializerMethodField()
+    reply_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ArtifactNote
+        fields = ["id", "artifact", "parent", "html", "text", "author", "author_display",
+                  "reply_count", "created_at", "updated_at"]
+        read_only_fields = ["id", "text", "author", "author_display", "reply_count",
+                            "created_at", "updated_at"]
+
+    def get_author_display(self, obj):
+        return _user_display_name(obj.author)
+
+    def get_reply_count(self, obj):
+        annotated = getattr(obj, "reply_total", None)
+        return annotated if annotated is not None else obj.replies.count()
+
+    def validate_html(self, value):
+        from core.html_sanitize import sanitize_html
+        from .artifact_notes import html_to_text
+
+        clean = sanitize_html(value or "")
+        if not html_to_text(clean):
+            raise serializers.ValidationError("A note can't be empty.")
+        if len(clean) > 50_000:
+            raise serializers.ValidationError("That note is too long.")
+        return clean
+
+    def validate(self, attrs):
+        parent = attrs.get("parent")
+        artifact = attrs.get("artifact") or (self.instance.artifact if self.instance else None)
+        if parent is not None and artifact is not None and parent.artifact_id != artifact.id:
+            raise serializers.ValidationError({"parent": "A reply must be on the same artifact."})
+        if self.instance is not None:
+            # Moving a note between artifacts or threads would bypass the visibility check.
+            attrs.pop("artifact", None)
+            attrs.pop("parent", None)
+        return attrs
 
 
 class AccountNoteSerializer(serializers.ModelSerializer):

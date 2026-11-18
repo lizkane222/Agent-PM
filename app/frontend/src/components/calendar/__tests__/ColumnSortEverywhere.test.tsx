@@ -118,7 +118,6 @@ describe("every status-column surface is wired to the shared store", () => {
     ["components/calendar/MeetingDetail.tsx", 1],
     ["components/account/ProjectGoals.tsx", 1],
     ["components/calendar/ActionItemsSidebar.tsx", 1],
-    ["pages/CalendarPage.tsx", 1],
   ])("%s renders ColumnSortButton from useColumnSort", (file, minButtons) => {
     const src = read(file);
     expect(src).toContain("useColumnSort");

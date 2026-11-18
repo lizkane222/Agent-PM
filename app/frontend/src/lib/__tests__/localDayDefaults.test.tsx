@@ -1,11 +1,9 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { render } from "@testing-library/react";
 import { http, HttpResponse } from "msw";
 import { server } from "../../test/msw-server";
 import LogTimeModal from "../../components/calendar/LogTimeModal";
-import RemindersTabContent from "../../components/calendar/RemindersTabContent";
 import { convertActionItemToEvent } from "../../hooks/useConvert";
-import { convertActionItemToEvent as convertLib } from "../useConvert";
 import { readFileSync } from "node:fs";
 import type { AirtableActionItem } from "../../types";
 
@@ -24,22 +22,7 @@ describe("evening defaults use the user's local day", () => {
     expect(document.querySelector<HTMLInputElement>('input[type="date"]')?.value).toBe("2026-11-10");
   });
 
-  it("RemindersTabContent shows 5:00 PM local and sends that instant, not 5:00 PM UTC", async () => {
-    let sent: Record<string, string> = {};
-    server.use(http.post("/api/v1/scheduler/reminders/", async ({ request }) => {
-      sent = (await request.json()) as Record<string, string>;
-      return HttpResponse.json({ id: 9, status: "pending", body: "", notify_in_app: true, ...sent });
-    }));
-    render(<RemindersTabContent onDropToast={() => {}} />);
-    fireEvent.click(await screen.findByText("+ New Reminder"));
-    const input = document.querySelector<HTMLInputElement>('input[type="datetime-local"]')!;
-    expect(input.value).toBe("2026-11-10T17:00");
-    fireEvent.change(screen.getByPlaceholderText(/title|what/i), { target: { value: "Call" } });
-    fireEvent.click(screen.getByRole("button", { name: /^(save|add|create)/i }));
-    await waitFor(() => expect(sent.due_at).toBe("2026-11-11T01:00:00.000Z"));
-  });
-
-  for (const [name, fn] of [["hooks/useConvert", convertActionItemToEvent], ["lib/useConvert", convertLib]] as const) {
+  for (const [name, fn] of [["hooks/useConvert", convertActionItemToEvent]] as const) {
     it(`${name}: an item with no due date becomes 9-10 AM local today, as real instants`, async () => {
       let body: Record<string, string> = {};
       server.use(
@@ -56,7 +39,7 @@ describe("evening defaults use the user's local day", () => {
     });
   }
 
-  for (const [name, fn] of [["hooks/useConvert", convertActionItemToEvent], ["lib/useConvert", convertLib]] as const) {
+  for (const [name, fn] of [["hooks/useConvert", convertActionItemToEvent]] as const) {
     it(`${name}: a due date becomes 9-10 AM local on that date, as real instants`, async () => {
       let body: Record<string, string> = {};
       server.use(
@@ -72,9 +55,9 @@ describe("evening defaults use the user's local day", () => {
     });
   }
 
-  // CalendarPage's sidebar can't be rendered in isolation (not exported), so pin the source,
-  // the way sidebarOrderingParity.test.ts does. Both copies must send an instant, not a zoneless string.
-  for (const file of ["src/pages/CalendarPage.tsx", "src/components/calendar/ActionItemsSidebar.tsx"]) {
+  // The action-items sidebar is a single implementation now (CalendarPage imports it). It must send an
+  // instant, not a zoneless string.
+  for (const file of ["src/components/calendar/ActionItemsSidebar.tsx"]) {
     it(`${file} sends the reminder time as a real instant`, () => {
       const src = readFileSync(file, "utf8");
       expect(src).toContain("fromLocalDatetimeValue(`${reminderDate}T${reminderTime}`)");

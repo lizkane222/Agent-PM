@@ -168,23 +168,83 @@ describe("ProjectGoals — single-owner move (project vs. nested goal)", () => {
   });
 });
 
-describe("ProjectGoals — horizontal goal layout", () => {
-  it("lays a project's goals out in a wrapping row, each goal its own column", () => {
-    const project = baseGoal({ id: "1", kind: "project", goalIds: ["10", "11", "12"] });
-    const goals = ["10", "11", "12"].map((id) => baseGoal({ id, kind: "goal", name: `Goal ${id}` }));
-    renderBoard({ goals: [project, ...goals], actionItems: [] });
+describe("ProjectGoals — responsive project layout", () => {
+  const goalSet = (n: number) => Array.from({ length: n }, (_, i) => baseGoal({ id: String(10 + i), kind: "goal", name: `Goal ${10 + i}` }));
 
-    const row = screen.getByTestId("goal-row-10").parentElement!;
-    expect(row.className).toContain("flex-row");
-    expect(row.className).toContain("flex-wrap");
-    expect(row).toContainElement(screen.getByTestId("goal-row-12"));
-    // Widened to fit the goals side by side, not the old fixed 268px column.
-    expect(screen.getByTestId("project-row-1").style.width).toContain("min(100%");
+  it("wraps project cards in a flex-wrap container; cards are flexible, not full width", () => {
+    const projects = [baseGoal({ id: "1", kind: "project" }), baseGoal({ id: "2", kind: "project", name: "B" })];
+    renderBoard({ goals: projects, actionItems: [] });
+    const card = screen.getByTestId("project-row-1");
+    expect(card.parentElement!.className).toContain("flex-wrap");
+    expect(card.className).not.toContain("w-full");
+    expect(card.style.minWidth).toBe("320px");
+    expect(card.style.flex).toContain("1 1 320px");
   });
 
-  it("keeps a project with no goals at the original compact width", () => {
-    renderBoard({ goals: [baseGoal({ id: "1", kind: "project" })], actionItems: [] });
-    expect(screen.getByTestId("project-row-1").style.width).toBe("268px");
+  it("gives a project with 4+ goals a wider, heavier basis and a 2-column goals grid", () => {
+    const goals = goalSet(4);
+    const project = baseGoal({ id: "1", kind: "project", goalIds: goals.map((g) => g.id) });
+    renderBoard({ goals: [project, ...goals], actionItems: [] });
+    const card = screen.getByTestId("project-row-1");
+    expect(card.style.flex.startsWith("2 1")).toBe(true);
+    expect(screen.getByTestId("goals-grid-1").style.gridTemplateColumns).toContain("repeat(2");
+    expect(screen.getByTestId("goals-grid-1")).toContainElement(screen.getByTestId("goal-row-13"));
+  });
+
+  it("lays out fewer than 4 goals in one column", () => {
+    const goals = goalSet(3);
+    const project = baseGoal({ id: "1", kind: "project", goalIds: goals.map((g) => g.id) });
+    renderBoard({ goals: [project, ...goals], actionItems: [] });
+    expect(screen.getByTestId("goals-grid-1").style.gridTemplateColumns).toContain("repeat(1");
+    expect(screen.getByTestId("project-row-1").style.flex.startsWith("1 1")).toBe(true);
+  });
+});
+
+describe("ProjectGoals — action items grouped by status", () => {
+  function setup(items: AirtableActionItem[]) {
+    const goal = baseGoal({ id: "10", kind: "goal", name: "G", actionIds: items.map((i) => i.airtable_id) });
+    const project = baseGoal({ id: "1", kind: "project", goalIds: ["10"] });
+    renderBoard({ goals: [project, goal], actionItems: items });
+    fireEvent.click(within(screen.getByTestId("goal-row-10")).getAllByRole("button")[0]);
+  }
+
+  it("renders a collapsible group per status with counts, newest-updated first, empty groups hidden", () => {
+    setup([
+      makeActionItem({ id: 1, airtable_id: "a1", task: "old open", status: "Open", updated_at: "2026-01-01T00:00:00Z" }),
+      makeActionItem({ id: 2, airtable_id: "a2", task: "new open", status: "Open", updated_at: "2026-03-01T00:00:00Z" }),
+      makeActionItem({ id: 3, airtable_id: "a3", task: "undated open", status: "Open", updated_at: "" }),
+      makeActionItem({ id: 4, airtable_id: "a4", task: "blocked one", status: "Blocked", updated_at: "2026-02-01T00:00:00Z" }),
+    ]);
+    const open = screen.getByTestId("status-group-10-open");
+    expect(within(open).getByRole("button", { name: /Open \(3\)/ })).toHaveAttribute("aria-expanded", "true");
+    const text = open.textContent ?? "";
+    expect(text.indexOf("new open")).toBeLessThan(text.indexOf("old open"));
+    expect(text.indexOf("old open")).toBeLessThan(text.indexOf("undated open"));
+    expect(screen.getByTestId("status-group-10-blocked")).toBeInTheDocument();
+    expect(screen.queryByTestId("status-group-10-done")).toBeNull();
+    expect(screen.queryByTestId("status-group-10-pending")).toBeNull();
+  });
+
+  it("collapses and expands a group independently", () => {
+    setup([
+      makeActionItem({ id: 1, airtable_id: "a1", task: "open one", status: "Open" }),
+      makeActionItem({ id: 2, airtable_id: "a2", task: "done one", status: "Done" }),
+    ]);
+    const openBtn = within(screen.getByTestId("status-group-10-open")).getByRole("button", { name: /Open/ });
+    fireEvent.click(openBtn);
+    expect(openBtn).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("open one")).toBeNull();
+    expect(screen.getByText("done one")).toBeInTheDocument();
+    fireEvent.click(openBtn);
+    expect(screen.getByText("open one")).toBeInTheDocument();
+  });
+
+  it("starts with Done collapsed once a card has more than 8 action items", () => {
+    const items = Array.from({ length: 9 }, (_, i) =>
+      makeActionItem({ id: i + 1, airtable_id: `a${i + 1}`, task: `t${i}`, status: i === 0 ? "Done" : "Open" }));
+    setup(items);
+    expect(within(screen.getByTestId("status-group-10-done")).getByRole("button")).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("t0")).toBeNull();
   });
 });
 

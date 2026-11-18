@@ -5,6 +5,8 @@ import { renderNoteInline, handleLinkPaste } from "../../lib/noteHelpers";
 import { useCurrentUser } from "../../context/CurrentUserContext";
 import { useRightClickComment } from "../comments/CommentContext";
 import CommentPreviewList from "../comments/CommentPreviewList";
+import SensitiveText from "../shared/SensitiveText";
+import { lineKeyFor } from "../../lib/sensitiveMatch";
 
 // ── Account Notes helpers ─────────────────────────────────────────────────────
 
@@ -311,7 +313,7 @@ export function AccountNoteRow({
               return (
                 <div key={li} style={isSub ? { display: "flex", alignItems: "flex-start", gap: "5px", marginLeft: "12px", marginTop: li > 0 ? "2px" : undefined } : { marginTop: li > 0 ? "2px" : undefined }}>
                   {isSub && <span style={{ width: "4px", height: "4px", borderRadius: "50%", background: "#9ca3af", flexShrink: 0, marginTop: "8px" }} />}
-                  <span>{renderNoteInline(content)}</span>
+                  <SensitiveText resourceType="account_note" resourceId={note.id} field="content" lineKey={lineKeyFor(line)} text={content} renderPlain={renderNoteInline} />
                 </div>
               );
             })}

@@ -12,6 +12,8 @@ import { useCommentMenuItem } from "../comments/commentMenuItem";
 import { useFocusPins } from "../../hooks/useFocusPins";
 import { sanitizeHtml, plainToHtml } from "../../lib/noteHelpers";
 import { CALENDAR_DRAG_KEY } from "./calendarHelpers";
+import SensitiveText from "../../components/shared/SensitiveText";
+import { actionItemMarkId } from "../../hooks/useSensitiveMarks";
 
 interface Props {
   item: AirtableActionItem;
@@ -109,7 +111,7 @@ export default function KanbanCard({ item, onStatusChange, onDoubleClick }: Prop
       {/* Collapsed header */}
       <div className="flex items-start gap-2 px-3 py-2.5">
         <div className="flex-1 min-w-0">
-          <p className="text-sm font-semibold text-[var(--twilio-navy)] leading-tight">{item.task}</p>
+          <p className="text-sm font-semibold text-[var(--twilio-navy)] leading-tight"><SensitiveText resourceType="action_item" resourceId={actionItemMarkId(item)} field="task" text={item.task} /></p>
           <div className="flex items-center gap-1.5 mt-1 flex-wrap">
             <span className={`text-sm font-medium px-1.5 py-0.5 rounded-full ${PRIORITY_COLORS[item.priority] ?? "bg-gray-100 text-[var(--twilio-gray-80)]"}`}>
               {item.priority}

@@ -399,3 +399,118 @@ class SyncEchoLoopTests(_Base):
         with patch.object(integrations_views, "_push_event_to_google") as push:
             self.sync()
         self.assertEqual(push.call_count, 5)
+
+
+class SyncTwinGuardTests(_Base):
+    """
+    2026-11-16: two stale workers each inserted the same unpushed AgentPM block, so Google held
+    two events for one row and the pull drew two identical blocks. The pull now removes the extra
+    Google event (through the gateway) instead of importing it.
+    """
+
+    def setUp(self):
+        super().setUp()
+        SyncState.objects.create(user=self.user, provider="google", resource="calendar",
+                                 sync_token="T", last_synced_at=timezone.now() - timedelta(minutes=5))
+        self.start = (timezone.now() + timedelta(days=2)).replace(second=0, microsecond=0)
+
+    def _marked(self, gid, airtable_id="rec1", start=None, source="action_item", **kw):
+        start = start or self.start
+        item = {
+            "id": gid, "summary": kw.pop("summary", "⏲ Task"), "status": "confirmed",
+            "start": {"dateTime": start.isoformat()},
+            "end": {"dateTime": (start + timedelta(minutes=15)).isoformat()},
+        }
+        if airtable_id is not None:
+            item["extendedProperties"] = {"private": {
+                "agentpm_source": source, "agentpm_airtable_id": airtable_id}}
+        return item
+
+    def _original(self, gid="orig", **kw):
+        return CalendarEvent.objects.create(
+            owner=self.user, google_event_id=gid, title="⏲ Task", calendar_id="work_tracking",
+            agentpm_airtable_id="rec1", start_datetime=self.start,
+            end_datetime=self.start + timedelta(minutes=15), is_synced=True, origin="agentpm", **kw)
+
+    def _deleted_ids(self):
+        from integrations.models import GoogleWriteLog
+        return list(GoogleWriteLog.objects.filter(action="delete").values_list("google_event_id", flat=True))
+
+    def _run(self, items):
+        self.pages = [{"items": items, "nextSyncToken": "T2"}]
+        return self.sync()
+
+    def test_a_twin_is_deleted_in_google_and_not_imported(self):
+        orig = self._original()
+        self._run([self._marked("twin")])
+        self.assertEqual(CalendarEvent.objects.filter(owner=self.user, agentpm_airtable_id="rec1").count(), 1)
+        self.assertEqual(self._deleted_ids(), ["twin"])
+        delete = self.service.events.return_value.delete
+        delete.assert_called_once()
+        self.assertEqual(delete.call_args.kwargs["eventId"], "twin")
+        self.assertEqual(delete.call_args.kwargs["sendUpdates"], "none")
+        orig.refresh_from_db()
+        self.assertEqual(orig.google_event_id, "orig")
+
+    def test_the_linked_original_is_never_deleted(self):
+        self._original()
+        self._run([self._marked("orig")])
+        self.assertEqual(self._deleted_ids(), [])
+        self.assertEqual(CalendarEvent.objects.filter(google_event_id="orig").count(), 1)
+
+    def test_an_unmarked_event_with_the_same_title_is_imported(self):
+        self._original()
+        self._run([self._marked("real", airtable_id=None, summary="⏲ Task")])
+        self.assertEqual(self._deleted_ids(), [])
+        self.assertTrue(CalendarEvent.objects.filter(google_event_id="real").exists())
+
+    def test_two_schedulings_at_different_minutes_are_both_kept(self):
+        self._original()
+        later = self.start + timedelta(minutes=15)
+        self._run([self._marked("second", start=later)])
+        self.assertEqual(self._deleted_ids(), [])
+        self.assertTrue(CalendarEvent.objects.filter(google_event_id="second").exists())
+
+    def test_a_row_still_being_claimed_is_not_a_twin_original(self):
+        self._original(gid="claiming:abc")
+        self._run([self._marked("inflight")])
+        self.assertEqual(self._deleted_ids(), [])
+        self.assertTrue(CalendarEvent.objects.filter(google_event_id="inflight").exists())
+
+    def test_another_users_row_is_not_an_original(self):
+        other = User.objects.create_user("other", password="x")
+        CalendarEvent.objects.create(
+            owner=other, google_event_id="theirs", calendar_id="work_tracking", title="t",
+            agentpm_airtable_id="rec1", start_datetime=self.start,
+            end_datetime=self.start + timedelta(minutes=15))
+        self._run([self._marked("mine")])
+        self.assertEqual(self._deleted_ids(), [])
+        self.assertTrue(CalendarEvent.objects.filter(owner=self.user, google_event_id="mine").exists())
+
+    def test_idempotent_on_rerun(self):
+        self._original()
+        self._run([self._marked("twin")])
+        self._run([self._marked("twin")])  # Google re-delivers the same twin
+        self.assertEqual(CalendarEvent.objects.filter(owner=self.user, agentpm_airtable_id="rec1").count(), 1)
+        self.assertEqual(self._deleted_ids().count("twin"), 2)  # retried harmlessly, never the original
+        self.assertNotIn("orig", self._deleted_ids())
+
+    def test_a_gateway_failure_is_non_fatal_and_leaves_both(self):
+        self._original()
+        self.service.events.return_value.delete.return_value.execute.side_effect = RuntimeError("boom")
+        with self.assertLogs("integrations.views", level="ERROR"):
+            result = self._run([self._marked("twin")])
+        self.assertEqual(result["created"], 1)
+        self.assertEqual(CalendarEvent.objects.filter(owner=self.user, agentpm_airtable_id="rec1").count(), 2)
+
+    def test_the_per_sync_cap_stops_deleting(self):
+        cap = integrations_views.MAX_TWIN_DELETES_PER_SYNC
+        items = []
+        for i in range(cap + 2):
+            start = self.start + timedelta(minutes=15 * i)
+            CalendarEvent.objects.create(
+                owner=self.user, google_event_id=f"o{i}", calendar_id="work_tracking", title="t",
+                agentpm_airtable_id="rec1", start_datetime=start, end_datetime=start + timedelta(minutes=15))
+            items.append(self._marked(f"t{i}", start=start))
+        self._run(items)
+        self.assertEqual(len(self._deleted_ids()), cap)

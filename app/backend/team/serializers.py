@@ -143,6 +143,11 @@ class UserProfileSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 "Enter the number with its country code, e.g. +1 415 555 0123."
             )
+        from core.phone_safety import check_number
+        try:
+            check_number(cleaned)
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc))
         return cleaned
 
     # Allowed display names per canonical action-item status (display only).

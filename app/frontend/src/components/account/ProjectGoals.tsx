@@ -278,6 +278,32 @@ function statusBucket(status: string): ClusterView | null {
   }
 }
 
+// Status groups shown inside a card's action-item list, in display order.
+const STATUS_GROUPS: { key: string; label: string; statuses: string[] }[] = [
+  { key: "open", label: "Open", statuses: ["Open"] },
+  { key: "pending", label: "In Progress", statuses: ["In Progress"] },
+  { key: "blocked", label: "Blocked/Backlogged", statuses: ["Blocked", "Backlogged"] },
+  { key: "done", label: "Done", statuses: ["Done"] },
+];
+// Default-collapse rule (kept deliberately simple): every group starts expanded, except that a
+// card holding more than this many action items starts with Done collapsed.
+const MANY_ITEMS_THRESHOLD = 8;
+
+function updatedMs(item: { updated_at?: string | null }): number {
+  const t = item.updated_at ? Date.parse(item.updated_at) : NaN;
+  return Number.isNaN(t) ? -Infinity : t;
+}
+
+/** Group by status (empty groups dropped); inside a group, newest `updated_at` first, items
+ *  without one last. Array.sort is stable, so ties keep their incoming order. */
+function groupByStatus<T extends { item: AirtableActionItem }>(entries: T[]): { key: string; label: string; entries: T[] }[] {
+  return STATUS_GROUPS.map((g) => ({
+    key: g.key,
+    label: g.label,
+    entries: entries.filter((e) => g.statuses.includes(e.item.status)).sort((a, b) => updatedMs(b.item) - updatedMs(a.item)),
+  })).filter((g) => g.entries.length > 0);
+}
+
 type StatusTab = "open" | "pending" | "closed" | "blocked";
 // The status whose shared sort direction each status tab follows. "Blocked/Backlogged" is one
 // merged tab, so it follows Blocked's direction.
@@ -892,6 +918,9 @@ export function ProjectGoals({
   // Per-project aggregate view (across all of a project's goals) — keyed by project id
   // since renderProjectCard is a plain function called from a .map, not a component.
   const [clusterViewByProject, setClusterViewByProject] = useState<Record<string, ClusterView>>({});
+  // Explicit expand/collapse choices for status groups, keyed `${cardId}:${groupKey}`; absent =
+  // the default (see MANY_ITEMS_THRESHOLD). Session state, per card + group.
+  const [groupCollapsed, setGroupCollapsed] = useState<Record<string, boolean>>({});
   const [clusterSearchByProject, setClusterSearchByProject] = useState<Record<string, string>>({});
 
   const actionMap = Object.fromEntries(actionItems.map((a) => [a.airtable_id, a]));
@@ -1096,6 +1125,34 @@ export function ProjectGoals({
     );
   }
 
+  // Status-grouped action items with a collapsible header per group (chevron, name, count).
+  function renderStatusGroups(
+    cardId: string,
+    entries: { aid: string; item: AirtableActionItem; ownerId: string; ownerLabel: string }[],
+    showOwnerBadge: boolean,
+  ) {
+    const groups = groupByStatus(entries);
+    return groups.map((g) => {
+      const k = `${cardId}:${g.key}`;
+      const collapsed = groupCollapsed[k] ?? (g.key === "done" && entries.length > MANY_ITEMS_THRESHOLD);
+      return (
+        <div key={g.key} data-testid={`status-group-${cardId}-${g.key}`} className="flex flex-col gap-1">
+          <button
+            type="button"
+            aria-expanded={!collapsed}
+            onClick={(e) => { e.stopPropagation(); setGroupCollapsed((prev) => ({ ...prev, [k]: !collapsed })); }}
+            className="flex items-center gap-1 text-left text-[9px] font-semibold uppercase tracking-wide text-[var(--twilio-gray-60)] hover:opacity-70"
+          >
+            <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" className="w-2 h-2 shrink-0" style={{ transform: collapsed ? "rotate(0deg)" : "rotate(90deg)" }}><path d="M4 2l4 4-4 4"/></svg>
+            <span>{g.label}</span>
+            <span>({g.entries.length})</span>
+          </button>
+          {!collapsed && g.entries.map((e) => renderActionItemEntry(e.aid, e.item, e.ownerId, e.ownerLabel, showOwnerBadge))}
+        </div>
+      );
+    });
+  }
+
   // ── Shared goal body renderer (items inside a goal) ────────────────────────
 
   function renderGoalItems(goal: GoalSection) {
@@ -1160,11 +1217,11 @@ export function ProjectGoals({
         {goal.actionIds.length > 0 && (
           <div className="flex flex-col gap-1.5">
             <p className="text-[9px] font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide">Action Items</p>
-            {goal.actionIds.map((aid) => {
-              const item = actionMap[aid];
-              if (!item) return null;
-              return renderActionItemEntry(aid, item, goal.id, goal.name);
-            })}
+            {renderStatusGroups(
+              goal.id,
+              goal.actionIds.flatMap((aid) => (actionMap[aid] ? [{ aid, item: actionMap[aid], ownerId: goal.id, ownerLabel: goal.name }] : [])),
+              false,
+            )}
           </div>
         )}
         {itemDropTarget === goal.id && (
@@ -1327,6 +1384,9 @@ export function ProjectGoals({
         entries = sorted.map((it) => byId.get(it)!);
       }
     }
+    // Views that mix statuses (the default tree/search and Blocked/Backlogged) list actions
+    // grouped by status; single-status tabs keep their shared sort and no redundant header.
+    const mixed = view === "tree" || view === "blocked";
     const q = search.trim().toLowerCase();
     if (q) {
       entries = entries.filter((e) => (e.kind === "resource" ? e.resource.label : e.item.task || "").toLowerCase().includes(q));
@@ -1338,7 +1398,16 @@ export function ProjectGoals({
             {q ? "No matches." : "Nothing here yet."}
           </p>
         )}
-        {entries.map(renderClusterEntry)}
+        {mixed ? (
+          <>
+            {entries.filter((e) => e.kind === "resource").map(renderClusterEntry)}
+            {renderStatusGroups(
+              `cluster-${project.id}`,
+              (entries.filter((e) => e.kind === "action") as ClusterActionEntry[]).map((e) => ({ aid: e.item.airtable_id, item: e.item, ownerId: e.ownerId, ownerLabel: e.ownerName })),
+              true,
+            )}
+          </>
+        ) : entries.map(renderClusterEntry)}
       </div>
     );
   }
@@ -1346,6 +1415,7 @@ export function ProjectGoals({
   // ── Project card with nested goals ─────────────────────────────────────────
 
   const GOAL_COLUMN_WIDTH = 232;
+  const PROJECT_MIN_WIDTH = 320;
 
   function renderProjectCard(project: GoalSection) {
     const sf = project.sfData ?? {};
@@ -1372,7 +1442,7 @@ export function ProjectGoals({
     const clusterView = clusterViewByProject[project.id] ?? "tree";
     const clusterSearch = clusterSearchByProject[project.id] ?? "";
     const showClusterView = clusterView !== "tree" || clusterSearch.trim().length > 0;
-    const wideLayout = nestedGoals.length > 0 && !showClusterView;
+    const manyGoals = nestedGoals.length >= 4 && !showClusterView;
 
     return (
       <div
@@ -1402,12 +1472,14 @@ export function ProjectGoals({
             handleItemDrop(e, project.id);
           }
         }}
-        className="flex flex-col rounded-lg transition-all shrink-0"
+        className="flex flex-col rounded-lg transition-all"
         style={{
-          // A project with goals grows to fit them side by side (capped at the section width);
-          // goals wrap to a new row rather than stacking in one tall column.
-          width: wideLayout ? `min(100%, ${nestedGoals.length * GOAL_COLUMN_WIDTH + (nestedGoals.length - 1) * 8 + 20}px)` : 268,
-          minWidth: 268, minHeight: 90,
+          // Wrap the GOALS inside a project before wrapping the PROJECT to a new row: cards are
+          // flexible (basis + min width, never full width), so two projects share a row when they
+          // fit. A project with 4+ goals gets a wider basis and double the grow weight, and lays
+          // its goals out two per row.
+          flex: `${manyGoals ? 2 : 1} 1 ${manyGoals ? GOAL_COLUMN_WIDTH * 2 + 28 : PROJECT_MIN_WIDTH}px`,
+          minWidth: PROJECT_MIN_WIDTH, maxWidth: "100%", minHeight: 90,
           ...(isGoalDrop
             ? { border: "2px dashed #6366f1", background: "rgba(99,102,241,0.06)", boxShadow: "0 4px 16px rgba(99,102,241,0.15)" }
             : isItemDrop
@@ -1499,7 +1571,11 @@ export function ProjectGoals({
           {nestedGoals.length > 0 && (
             <div className="mb-2">
               <p className="text-[9px] font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide mb-1.5">Goals</p>
-              <div className="flex flex-row flex-wrap items-start gap-2">
+              <div
+                data-testid={`goals-grid-${project.id}`}
+                className="grid items-start gap-2"
+                style={{ gridTemplateColumns: nestedGoals.length >= 4 ? "repeat(2, minmax(0, 1fr))" : "repeat(1, minmax(0, 1fr))" }}
+              >
               {nestedGoals.map((goal) => {
                 const isExpanded = expandedGoals.has(goal.id);
                 const itemCount = goal.actionIds.length + dedupeByName(goal.meetingIds).length + goal.resources.length + (goal.noteRefs?.length ?? 0);
@@ -1528,7 +1604,7 @@ export function ProjectGoals({
                     }}
                     className="rounded-md transition-all"
                     style={{
-                      width: GOAL_COLUMN_WIDTH, maxWidth: "100%",
+                      width: "100%", minWidth: 0,
                       background: isGoalItemDrop ? "rgba(226,34,34,0.04)" : "#ede9fe",
                       border: isGoalItemDrop ? "1px solid var(--twilio-red,#e22)" : "1px solid rgba(99,102,241,0.2)",
                     }}

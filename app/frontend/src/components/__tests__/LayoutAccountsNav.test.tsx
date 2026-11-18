@@ -120,3 +120,26 @@ describe("sidebar accounts list", () => {
     expect(screen.queryByText("Customer 1")).toBeNull();
   });
 });
+
+describe("sidebar account links use the account name", () => {
+  it("links to /accounts/<slug>, falls back to the id for a shared slug, and navigates there", async () => {
+    server.use(
+      http.get("*/api/v1/accounts/accounts/", () => HttpResponse.json({
+        count: 4, next: null, previous: null,
+        results: [acct(10, "Festival Foods & Schnucks"), acct(11, "Acme, Inc."), acct(12, "Acme Inc"), acct(13, "Autodesk")],
+      })),
+      http.get("*/api/v1/accounts/admin-account/", () => HttpResponse.json(acct(1, "Admin", { is_admin_account: true }))),
+    );
+    renderLayout();
+    await screen.findByText("Autodesk");
+    const href = (name: string) => screen.getByText(name).closest("a")!.getAttribute("href");
+    expect(href("Festival Foods & Schnucks")).toBe("/accounts/festivalfoodsschnucks");
+    expect(href("Admin")).toBe("/accounts/admin");
+    expect(href("Acme, Inc.")).toBe("/accounts/11");
+    expect(href("Acme Inc")).toBe("/accounts/12");
+    fireEvent.click(screen.getByText("Autodesk"));
+    expect(screen.getByTestId("where").textContent).toBe("/accounts/autodesk");
+    // Active highlight follows the slug URL.
+    expect(screen.getByText("Autodesk").closest("a")).toHaveAttribute("aria-current", "page");
+  });
+});

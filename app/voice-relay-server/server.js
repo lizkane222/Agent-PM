@@ -1,7 +1,15 @@
 import http from "node:http";
+import crypto from "node:crypto";
 import { WebSocketServer } from "ws";
 import { buildClient, assertAnthropicModel } from "./gateway.js";
 import { Session } from "./session.js";
+
+// Constant-time comparison so the token cannot be recovered by timing.
+function tokenMatches(provided, expected) {
+  const a = crypto.createHash("sha256").update(String(provided)).digest();
+  const b = crypto.createHash("sha256").update(String(expected)).digest();
+  return crypto.timingSafeEqual(a, b);
+}
 
 export function createServer(env = process.env, deps = {}) {
   const model = assertAnthropicModel(env.MODEL || "claude-haiku-4-5");
@@ -11,12 +19,12 @@ export function createServer(env = process.env, deps = {}) {
     // Health check only; the relay itself is WebSocket.
     res.writeHead(req.url === "/health" ? 200 : 404).end(req.url === "/health" ? "ok" : "");
   });
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
 
   server.on("upgrade", (req, socket, head) => {
     const url = new URL(req.url, "http://x");
     const provided = url.searchParams.get("relay_token") || "";
-    if (url.pathname !== "/relay" || !env.RELAY_TOKEN || provided !== env.RELAY_TOKEN) {
+    if (url.pathname !== "/relay" || !env.RELAY_TOKEN || !tokenMatches(provided, env.RELAY_TOKEN)) {
       socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
       return socket.destroy();
     }
@@ -43,5 +51,6 @@ export function createServer(env = process.env, deps = {}) {
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const port = Number(process.env.PORT) || 8765;
-  createServer().listen(port, () => console.log(`voice relay listening on :${port} (ws path /relay)`));
+  // Loopback by default: the Cloudflare tunnel runs on this machine. Set HOST to expose it.
+  createServer().listen(port, process.env.HOST || "127.0.0.1", () => console.log(`voice relay listening on :${port} (ws path /relay)`));
 }

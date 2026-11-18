@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { accountsApi } from "../../lib/api";
 import type { CustomerContact } from "../../types";
 import { ContactNoteRow } from "./ContactNoteRow";
+import SensitiveText from "../shared/SensitiveText";
 
 export function CustomerContactsPanel({ accountId, accountName }: { accountId: number; accountName: string }) {
   const [contacts, setContacts] = useState<CustomerContact[]>([]);
@@ -171,8 +172,8 @@ export function CustomerContactsPanel({ accountId, accountName }: { accountId: n
                 {initials}
               </div>
               <div className="flex-1 min-w-0">
-                <p className="text-xs font-semibold text-[var(--twilio-navy)] truncate">{c.name}</p>
-                {c.role && <p className="text-[10px] text-[var(--twilio-gray-60)] truncate">{c.role}</p>}
+                <p className="text-xs font-semibold text-[var(--twilio-navy)] truncate"><SensitiveText resourceType="customer_contact" resourceId={c.id} field="name" text={c.name} /></p>
+                {c.role && <p className="text-[10px] text-[var(--twilio-gray-60)] truncate"><SensitiveText resourceType="customer_contact" resourceId={c.id} field="role" text={c.role} /></p>}
               </div>
               {c.email && (
                 <a
@@ -205,7 +206,7 @@ export function CustomerContactsPanel({ accountId, accountName }: { accountId: n
             {isOpen && (
               <div className="px-4 pb-3 space-y-2" style={{ background: "var(--surface-subtle)" }}>
                 {c.description && (
-                  <p className="text-[11px] text-[var(--twilio-navy)] opacity-70 leading-relaxed">{c.description}</p>
+                  <p className="text-[11px] text-[var(--twilio-navy)] opacity-70 leading-relaxed"><SensitiveText resourceType="customer_contact" resourceId={c.id} field="description" text={c.description} /></p>
                 )}
                 {c.email && (
                   <a href={`mailto:${c.email}`} className="text-[11px] text-indigo-600 hover:underline">{c.email}</a>

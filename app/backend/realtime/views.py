@@ -268,7 +268,12 @@ class VoiceStatusCallbackView(TwilioSignatureRequiredMixin, APIView):
         call_status = request.data.get("CallStatus", "")
         from_number = request.data.get("From", "")
         to_number = request.data.get("To", "")
-        duration = int(request.data.get("CallDuration", 0) or 0)
+        try:
+            duration = max(0, int(request.data.get("CallDuration", 0) or 0))
+        except (TypeError, ValueError):
+            duration = 0
+        if not call_sid:
+            return HttpResponse("", status=204)
 
         STATUS_MAP = {
             "ringing": "ringing",
@@ -320,7 +325,10 @@ class VoiceRecordingCallbackView(TwilioSignatureRequiredMixin, APIView):
     def post(self, request):
         call_sid = request.data.get("CallSid", "")
         recording_url = request.data.get("RecordingUrl", "")
-        if call_sid and recording_url:
+        # Only ever store a link on Twilio's own API host; anything else would be shown to
+        # the owner as a "recording" link to an arbitrary site.
+        host = (urllib.parse.urlparse(recording_url).hostname or "").lower()
+        if call_sid and recording_url and host == "api.twilio.com":
             VoiceSession.objects.filter(call_sid=call_sid).update(
                 recording_url=recording_url + ".mp3"
             )

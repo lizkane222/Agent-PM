@@ -1,6 +1,7 @@
 import {
   useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode,
 } from "react";
+import { accountPath } from "../lib/accountSlug";
 import SkillRunDialog from "../components/skills/SkillRunDialog";
 import { reminderTimes } from "../lib/reminderSections";
 import { ArtifactBrowseBar } from "../components/account/ArtifactBrowseBar";
@@ -9,11 +10,13 @@ import {
 } from "../components/profile/fullscreen";
 import { NotificationsFull, PublicFull, NotepadFull, MiniCanvasFull, TicketsFull } from "../components/profile/FullViews";
 import ProfileTicketsSection from "../components/profile/ProfileTicketsSection";
+import ProfilePinnedTools from "../components/profile/ProfilePinnedTools";
 import PageSectionsPanel from "../components/profile/PageSectionsPanel";
 import { loadIdList, revealSection } from "../components/profile/sectionLayout";
 import { TICKET_KIND_TITLE } from "../lib/tickets";
 import type { TicketKind } from "../types";
 import { useQuickLinks } from "../hooks/useQuickLinks";
+import { useActionItemList } from "../hooks/useActionItemList";
 import { DEFAULT_ARTIFACT_BROWSE, browseArtifacts, type ArtifactBrowseState } from "../lib/artifactBrowse";
 import { ACTION_ITEMS_UPDATED_KEY } from "../lib/actionItemEvents";
 import { useParams, Navigate, Link, useNavigate } from "react-router-dom";
@@ -31,7 +34,7 @@ import { CSS } from "@dnd-kit/utilities";
 import RichTextMentionEditor from "../components/shared/RichTextMentionEditor";
 import { htmlToPreviewText } from "../lib/noteHelpers";
 import {
-  agentSkillsApi, skillsApi, accountsApi, teamApi, airtableApi,
+  agentSkillsApi, skillsApi, accountsApi, teamApi,
   schedulerApi, commentsApi, layoutsApi,
   userPageNoteApi, workingSessionApi,
 } from "../lib/api";
@@ -337,6 +340,8 @@ import {
   parseSavedCanvases, savedCanvasToSnapshot, type MiniNode, type SavedCanvas,
 } from "../components/profile/miniCanvas";
 import SkillLaunchButtons from "../components/skills/SkillLaunchButtons";
+import SensitiveText from "../components/shared/SensitiveText";
+import { actionItemMarkId } from "../hooks/useSensitiveMarks";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Mini-canvas — a self-contained pared-down page builder embedded in the role page
@@ -1207,7 +1212,7 @@ function MiniCanvasPanel({ accentColor, textColor }: { accentColor: string; text
         sessionStorage.removeItem(MINI_CANVAS_HANDOFF_KEY);
       }
     } catch { /* storage unavailable — open the builder without the handoff */ }
-    navigate("/edit-preview");
+    navigate("/layouts");
   }, [nodes, navigate]);
 
   const editNode = editNodeId ? findMiniNode(nodes, editNodeId) : null;
@@ -1472,7 +1477,7 @@ function SessionRecordCard({
                   e.stopPropagation();
                   // The same single-use handoff the mini-canvas's "Open full builder" uses.
                   try { sessionStorage.setItem(MINI_CANVAS_HANDOFF_KEY, JSON.stringify(savedCanvasNodes)); } catch { /* storage blocked */ }
-                  navigate("/edit-preview");
+                  navigate("/layouts");
                 }}
                 style={{ marginTop: 4, fontSize: "0.6875rem", fontWeight: 600, color, background: "none", border: `1px solid ${color}`, borderRadius: 6, padding: "1px 8px", cursor: "pointer" }}
               >Open in builder →</button>
@@ -1973,6 +1978,7 @@ const ALL_SECTION_TILES = [
   { id: "jira_tickets",    label: "JIRAs / Engineering Tickets", icon: "🛠" },
   { id: "zendesk_tickets", label: "Zendesk / Support Tickets",   icon: "🎧" },
   { id: "product_gaps",    label: "Product Gaps",    icon: "🧩" },
+  { id: "pinned_tools",     label: "Pinned from Discovery", icon: "📌" },
   { id: "artifacts",       label: "My Artifacts",    icon: "📎" },
   { id: "time_allocation", label: "Time Allocation", icon: "📊" },
   { id: "notepad",         label: "Notepad",         icon: "📝" },
@@ -2014,7 +2020,10 @@ function borderSides(
 }
 
 const SECTIONS_KEY = "profileVisibleSections-v1";
-const DEFAULT_SECTIONS: SectionTileId[] = ["skills", "accounts", "jira_tickets", "zendesk_tickets", "product_gaps", "artifacts", "time_allocation", "notifications", "public"];
+const DEFAULT_SECTIONS: SectionTileId[] = ["skills", "accounts", "jira_tickets", "zendesk_tickets", "product_gaps", "pinned_tools", "artifacts", "time_allocation", "notifications", "public"];
+
+/** "Pinned from Discovery" is new; add it once (after My Accounts) for people with a saved layout. */
+const PINNED_TOOLS_SEEN_KEY = "profilePinnedToolsSectionAdded-v1";
 
 /** The three ticket sections are new; add them once for people who already have a saved layout. */
 const TICKET_SECTIONS_SEEN_KEY = "profileTicketSectionsAdded-v1";
@@ -2033,6 +2042,13 @@ function loadVisibleSections(): SectionTileId[] {
         const at = ids.indexOf("accounts");
         const missing = TICKET_SECTION_IDS.filter(id => !ids.includes(id));
         ids.splice(at >= 0 ? at + 1 : ids.length, 0, ...missing);
+      }
+      if (!localStorage.getItem(PINNED_TOOLS_SEEN_KEY)) {
+        localStorage.setItem(PINNED_TOOLS_SEEN_KEY, "1");
+        if (!ids.includes("pinned_tools")) {
+          const at = Math.max(ids.indexOf("accounts"), ids.indexOf("product_gaps"));
+          ids.splice(at >= 0 ? at + 1 : ids.length, 0, "pinned_tools");
+        }
       }
       return ids;
     }
@@ -2312,7 +2328,6 @@ function RolePageInner({ titleRole }: { titleRole: TitleRole }) {
   const [artifacts, setArtifacts] = useState<AccountArtifact[]>([]);
   // Same search / sort / category / creator / linked-to-action-item controls as an account's artifacts.
   const [artifactBrowse, setArtifactBrowse] = useState<ArtifactBrowseState>(DEFAULT_ARTIFACT_BROWSE);
-  const [actionItems, setActionItems] = useState<AirtableActionItem[]>([]);
   const [reminders, setReminders] = useState<Reminder[]>([]);
   const [comments, setComments] = useState<Comment[]>([]);
   const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
@@ -2391,18 +2406,24 @@ function RolePageInner({ titleRole }: { titleRole: TitleRole }) {
   // caller can see (what the Action Items page's In Progress column lists - not only ones assigned to
   // them, and not the agent's separate `scheduler` follow-ups) and reminders by due date (a reminder that has already fired is
   // "sent", so asking only for "pending" dropped everything due earlier today).
+  // The action-item list is the shared hook's (silent reloads, params-keyed); this page keeps its own
+  // refresh cadence (focus, tab visibility, a 30s timer, the broadcast), so the hook's own broadcast
+  // listener is off and the page calls its `refetch`.
+  const { items: actionItems, refetch: refetchActionItems } = useActionItemList(
+    IN_PROGRESS_PARAMS,
+    { enabled: !!currentUser, broadcast: false },
+  );
   useEffect(() => {
     if (!currentUser) return;
     let alive = true;
-    const refresh = () => {
-      airtableApi.listActionItems({ status: "In Progress", page_size: "500" })
-        .then(r => { if (alive) setActionItems(r.data); }).catch(() => {});
+    const loadReminders = () => {
       const { from, to } = reminderWindow(new Date());
       schedulerApi.listReminders({ due_before: to.toISOString(), ordering: "-due_at" })
         .then(r => { if (alive) setReminders(r.data.results.filter(x => visibleReminder(x, from, to))); })
         .catch(() => {});
     };
-    refresh();
+    const refresh = () => { refetchActionItems(); loadReminders(); };
+    loadReminders(); // the hook loads the action items itself on mount
     const onStorage = (e: StorageEvent) => { if (e.key === ACTION_ITEMS_UPDATED_KEY) refresh(); };
     const onVisible = () => { if (document.visibilityState === "visible") refresh(); };
     window.addEventListener("storage", onStorage);
@@ -2416,7 +2437,7 @@ function RolePageInner({ titleRole }: { titleRole: TitleRole }) {
       document.removeEventListener("visibilitychange", onVisible);
       window.clearInterval(timer);
     };
-  }, [currentUser]);
+  }, [currentUser, refetchActionItems]);
 
   useEffect(() => { setOpenSkill(null); }, [titleRole]);
 
@@ -2513,14 +2534,14 @@ function RolePageInner({ titleRole }: { titleRole: TitleRole }) {
     title: l.name,
     subtitle: l.is_public ? "Public layout" : "Private layout",
     fields: fieldsOf(l, { hide: ["id", "nodes", "creator", "forked_from"] }),
-    actions: <Link to={`/edit-preview?layout=${l.id}`} style={cardBtn}>Open in Page Builder</Link>,
+    actions: <Link to={`/layouts?layout=${l.id}`} style={cardBtn}>Open in Page Builder</Link>,
   }));
   const accountCards: FullCard[] = myAccounts.map(a => ({
     id: a.id,
     title: a.company_name,
     subtitle: a.industry ?? undefined,
     fields: fieldsOf(a, { hide: ["id"] }),
-    actions: <Link to={`/accounts/${a.id}`} style={cardBtn}>Open account</Link>,
+    actions: <Link to={accountPath(a, myAccounts)} style={cardBtn}>Open account</Link>,
   }));
   const skillCards: FullCard[] = [
     ...skills.map(sk => ({
@@ -2669,7 +2690,7 @@ function RolePageInner({ titleRole }: { titleRole: TitleRole }) {
           ) : (
             <div style={{ background: "var(--surface, #fff)", border: "1px solid var(--border, rgba(0,0,0,0.08))", borderRadius: 10, padding: 12, display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))", gap: 10 }}>
               {myAccounts.map(account => (
-                <Link key={account.id} to={`/accounts/${account.id}`} style={{ textDecoration: "none" }}>
+                <Link key={account.id} to={accountPath(account, myAccounts)} style={{ textDecoration: "none" }}>
                   <div style={{ background: "var(--bg, #f9f9f9)", border: "1px solid var(--border, rgba(0,0,0,0.06))", borderTop: `3px solid ${meta.border}`, borderRadius: 8, padding: "10px 12px", transition: "box-shadow 0.15s" }}
                     onMouseEnter={e => { (e.currentTarget as HTMLDivElement).style.boxShadow = "0 4px 12px rgba(0,0,0,0.1)"; }}
                     onMouseLeave={e => { (e.currentTarget as HTMLDivElement).style.boxShadow = "none"; }}>
@@ -2694,6 +2715,13 @@ function RolePageInner({ titleRole }: { titleRole: TitleRole }) {
           </CollapsibleSection>
         );
       }
+
+      case "pinned_tools": return (
+        <CollapsibleSection key={id} sectionId={id} title="Pinned from Discovery" accentColor={meta.border} textColor={meta.text}
+          defaultOpen={false} full={() => <ProfilePinnedTools />} headerRight={removeBtn}>
+          <ProfilePinnedTools />
+        </CollapsibleSection>
+      );
 
       case "artifacts": return (
         <CollapsibleSection key="artifacts" sectionId="artifacts" title={`My Artifacts${artifacts.length ? ` (${artifacts.length})` : ""}`} accentColor={meta.border} textColor={meta.text} defaultOpen={false} full={artifactFull} headerRight={
@@ -2832,7 +2860,7 @@ function RolePageInner({ titleRole }: { titleRole: TitleRole }) {
                         {actionItems.map(ai => (
                           <button key={ai.id} type="button" onClick={() => setModalItem(ai)} title={ai.task}
                             style={{ display: "block", width: "100%", boxSizing: "border-box", height: ACTION_ROW_PX, textAlign: "left", cursor: "pointer", fontFamily: "inherit", color: "inherit", padding: "0 10px", borderRadius: 8, marginBottom: ACTION_ROW_GAP_PX, background: "var(--bg, #f9f9f9)", border: "1px solid var(--border, rgba(0,0,0,0.06))", fontSize: "0.8125rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                            {ai.task}
+                            <SensitiveText resourceType="action_item" resourceId={actionItemMarkId(ai)} field="task" text={ai.task} />
                           </button>
                         ))}
                       </div>
@@ -2852,7 +2880,7 @@ function RolePageInner({ titleRole }: { titleRole: TitleRole }) {
                   </div>
                   {nearReminders.length === 0
                     ? <p style={{ margin: 0, fontSize: "0.75rem", color: "var(--text-secondary, #aaa)", fontStyle: "italic" }}>No reminders due soon.</p>
-                    : <div data-testid="reminders-scroll" style={{ maxHeight: ACTION_ITEMS_VISIBLE * 42, overflowY: "auto" }}>{nearReminders.map(r => <div key={r.id} style={{ padding: "7px 10px", borderRadius: 8, marginBottom: 6, background: "var(--bg, #f9f9f9)", border: "1px solid var(--border, rgba(0,0,0,0.06))", fontSize: "0.8125rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={r.title}>{r.title}</div>)}</div>
+                    : <div data-testid="reminders-scroll" style={{ maxHeight: ACTION_ITEMS_VISIBLE * 42, overflowY: "auto" }}>{nearReminders.map(r => <div key={r.id} style={{ padding: "7px 10px", borderRadius: 8, marginBottom: 6, background: "var(--bg, #f9f9f9)", border: "1px solid var(--border, rgba(0,0,0,0.06))", fontSize: "0.8125rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={r.title}><SensitiveText resourceType="reminder" resourceId={r.id} field="title" text={r.title} /></div>)}</div>
                   }
                 </ExpandableSection>
 
@@ -2882,12 +2910,12 @@ function RolePageInner({ titleRole }: { titleRole: TitleRole }) {
                 <ExpandableSection key="side_layouts" sectionId="side_layouts" title="Layouts" accent={accent} renderFull={listFull(layoutCards, "No pinned layouts.")} style={{ background: "var(--surface, #fff)", border: "1px solid var(--border, rgba(0,0,0,0.08))", borderRadius: 12, padding: 14, marginBottom: 24 }}>
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
                     <span style={{ fontSize: "0.6875rem", fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: meta.text }}>LAYOUTS</span>
-                    <Link to="/edit-preview" style={{ fontSize: "0.6875rem", color: meta.border, textDecoration: "none", fontWeight: 600 }}>View all →</Link>
+                    <Link to="/layouts" style={{ fontSize: "0.6875rem", color: meta.border, textDecoration: "none", fontWeight: 600 }}>View all →</Link>
                   </div>
                   {pinnedLayouts.length === 0
-                    ? <p style={{ margin: 0, fontSize: "0.75rem", color: "var(--text-secondary, #aaa)", fontStyle: "italic" }}>Pin from <Link to="/edit-preview" style={{ color: meta.border }}>Page Builder</Link>.</p>
+                    ? <p style={{ margin: 0, fontSize: "0.75rem", color: "var(--text-secondary, #aaa)", fontStyle: "italic" }}>Pin from <Link to="/layouts" style={{ color: meta.border }}>Page Builder</Link>.</p>
                     : pinnedLayouts.slice(0, 4).map(l => (
-                      <Link key={l.id} to={`/edit-preview?layout=${l.id}`} style={{ textDecoration: "none", display: "block", marginBottom: 5 }}>
+                      <Link key={l.id} to={`/layouts?layout=${l.id}`} style={{ textDecoration: "none", display: "block", marginBottom: 5 }}>
                         <div style={{ padding: "7px 10px", borderRadius: 8, background: "var(--bg, #f9f9f9)", border: "1px solid var(--border, rgba(0,0,0,0.06))", fontSize: "0.8125rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{l.name}</div>
                       </Link>
                     ))
@@ -3136,6 +3164,8 @@ const ACTION_ROW_GAP_PX = 6;
 
 /** How often the action-item and reminder lists re-read while the tab is visible. */
 const PROFILE_REFRESH_MS = 30_000;
+/** Every In Progress action item the caller can see — what the Action Items page's column lists. */
+const IN_PROGRESS_PARAMS = { status: "In Progress", page_size: "500" };
 
 export default function ProfilePage() {
   const { memberId } = useParams<{ memberId: string }>();

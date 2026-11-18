@@ -3,9 +3,8 @@
  *
  * `roundUpToQuarterHour` and `buildLogDescription` are the browser halves of
  * `salesforce_sync/log_week.py`'s `round_up_to_quarter_hour` / `_build_description`.
- * They live here rather than inside a panel component because the two Log Time panel
- * copies (the live one inside `pages/CalendarPage.tsx` and its unreachable twin in
- * `components/calendar/LogTimePanel.tsx`) each had their own copy, and the hours the
+ * They live here rather than inside a panel component because the Log Time panel
+ * (inside `pages/CalendarPage.tsx`) must not carry its own copy, and the hours the
  * panel shows must equal the hours the server writes.
  */
 

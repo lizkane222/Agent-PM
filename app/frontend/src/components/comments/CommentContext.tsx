@@ -13,6 +13,7 @@ import { createContext, useCallback, useContext, useState } from "react";
 import { createPortal } from "react-dom";
 import type { CommentResourceType } from "../../types";
 import CommentPanel, { COMMENT_PANEL_HEIGHT, COMMENT_PANEL_WIDTH } from "./CommentPanel";
+import { openSensitiveMenu, sensitiveMenuItems, withSensitiveItems } from "../shared/sensitiveMenu";
 
 interface CommentTarget {
   resourceType: CommentResourceType;
@@ -52,7 +53,15 @@ export function useRightClickComment<T extends HTMLElement>(
       if (!resourceId) return;
       e.preventDefault();
       e.stopPropagation();
-      openComments({ resourceType, resourceId, resourceLabel, x: e.clientX, y: e.clientY });
+      const open = () => openComments({ resourceType, resourceId, resourceLabel, x: e.clientX, y: e.clientY });
+      // Right-click on text that can be hidden for screen sharing: one menu offering
+      // Comment plus the hide options, instead of jumping straight into the panel.
+      const sensitive = sensitiveMenuItems(e);
+      if (sensitive.length > 0) {
+        openSensitiveMenu(e.clientX, e.clientY, withSensitiveItems([{ label: "Comment", onClick: open }], sensitive));
+        return;
+      }
+      open();
     },
     [openComments, resourceType, resourceId, resourceLabel]
   );

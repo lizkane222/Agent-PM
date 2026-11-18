@@ -5,12 +5,18 @@ import os
 from django.conf import settings
 from django.conf.urls.static import static
 from django.contrib import admin
-from django.http import FileResponse, JsonResponse
+from django.http import FileResponse, HttpResponse, JsonResponse
 from django.urls import include, path, re_path
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
 from core import google_login
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.throttling import AnonRateThrottle
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+
+
+def health(request):
+    """Unauthenticated liveness probe for load balancers. Returns no data."""
+    return HttpResponse(status=200)
 
 
 def vapid_public_key(request):
@@ -71,8 +77,16 @@ class ThrottledTokenObtainPairView(TokenObtainPairView):
 
 
 urlpatterns = [
+    # Liveness probes (no auth, no data) — exempt from the HTTPS redirect.
+    path("health/", health, name="health"),
+    path("api/v1/health/", health, name="api-health"),
+
     # Django Admin (superadmins only — team data management, user assignment, health)
-    path("admin/", admin.site.urls),
+    # Mounted only in DEBUG unless DJANGO_ADMIN_ENABLED=True (its login form is not throttled and
+    # bypasses the SSO-only policy). DJANGO_ADMIN_URL can move it off the guessable path.
+    *([path(os.getenv("DJANGO_ADMIN_URL", "admin/"), admin.site.urls)]
+      if os.getenv("DJANGO_ADMIN_ENABLED", "True" if settings.DEBUG else "False").strip().lower() in ("true", "1", "on", "yes")
+      else []),
 
     # Okta OIDC — only mount mozilla_django_oidc routes when Okta is configured.
     # When Okta is absent, mount a lightweight logout fallback so the frontend's
@@ -84,10 +98,11 @@ urlpatterns = [
     path("api/v1/auth/google/callback/", google_login.callback, name="google-login-callback"),
 
     # OpenAPI schema + Swagger UI
-    path("api/schema/", SpectacularAPIView.as_view(), name="schema"),
+    # Authenticated only: the schema enumerates every internal route and parameter.
+    path("api/schema/", SpectacularAPIView.as_view(permission_classes=[IsAuthenticated]), name="schema"),
     path(
         "api/schema/swagger-ui/",
-        SpectacularSwaggerView.as_view(url_name="schema"),
+        SpectacularSwaggerView.as_view(url_name="schema", permission_classes=[IsAuthenticated]),
         name="swagger-ui",
     ),
 
@@ -111,6 +126,7 @@ urlpatterns = [
     path("api/v1/search/", include("search.urls")),
     path("api/v1/layouts/", include("layouts.urls")),
     path("api/v1/comments/", include("comments.urls")),
+    path("api/v1/sensitive/", include("sensitive.urls")),
     path("api/v1/discover/", include("discover.urls")),
     path("api/v1/feedback/", include("feedback.urls")),
     path("api/v1/account-feed/", include("account_feed.urls")),
@@ -119,6 +135,19 @@ urlpatterns = [
 
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+elif os.getenv("DJANGO_SERVE_MEDIA", "False") == "True":
+    # Single-instance hosting without S3: serve uploads through Django so
+    # MediaSecurityHeadersMiddleware (sandbox CSP + nosniff) still applies. Move to
+    # object storage before running more than one instance.
+    from django.views.static import serve as _serve_media
+
+    urlpatterns += [
+        re_path(
+            r"^%s(?P<path>.*)$" % settings.MEDIA_URL.lstrip("/"),
+            _serve_media,
+            {"document_root": settings.MEDIA_ROOT},
+        )
+    ]
 
 # Serve the React SPA for any URL not matched above.
 # In production, WhiteNoise handles /static/; this view handles everything else
@@ -129,4 +158,4 @@ def _react_index(request):
     return FileResponse(open(_REACT_INDEX, "rb"), content_type="text/html")
 
 if _REACT_INDEX.exists():
-    urlpatterns += [re_path(r"^(?!api/|admin/|oidc/|ws/).*$", _react_index)]
+    urlpatterns += [re_path(r"^(?!api/|admin/|oidc/|ws/|health/).*$", _react_index)]

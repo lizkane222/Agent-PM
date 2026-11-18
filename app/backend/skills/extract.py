@@ -12,7 +12,16 @@ logger = logging.getLogger(__name__)
 # Stored text feeds every run prompt, so it is capped at upload.
 MAX_EXTRACTED_CHARS = 60_000
 
-_TAG_RE = re.compile(r"<[^>]+>")
+# Resource caps: an upload is untrusted. A .docx is a zip (decompression bomb), a PDF can have
+# thousands of pages, and the tag regexes below are quadratic on input full of unclosed "<".
+MAX_HTML_CHARS = 1_000_000
+MAX_DOCX_UNCOMPRESSED_BYTES = 30 * 1024 * 1024
+MAX_ZIP_MEMBERS = 500
+MAX_PDF_PAGES = 200
+MAX_DOCX_PARAGRAPHS = 20_000
+
+_BLOCK_START_RE = re.compile(r"<(script|style)\b")
+_TAG_RE = re.compile(r"<[^<>]{1,2000}>")
 _BLOCK_END_RE = re.compile(r"</(p|div|li|h[1-6]|tr|br)>|<br\s*/?>", re.I)
 
 
@@ -26,16 +35,39 @@ def _decode(raw: bytes) -> str:
 
 
 def _html_to_text(markup: str) -> str:
-    markup = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", markup, flags=re.S | re.I)
+    markup = markup[:MAX_HTML_CHARS]
+    markup = _strip_blocks(markup)
     return unescape(_TAG_RE.sub("", _BLOCK_END_RE.sub("\n", markup)))
 
 
+def _strip_blocks(markup: str) -> str:
+    """Drop <script>/<style> blocks in one linear pass (a nested-scan regex is quadratic on hostile input)."""
+    lowered = markup.lower()
+    out, pos = [], 0
+    for m in _BLOCK_START_RE.finditer(lowered):
+        if m.start() < pos:
+            continue
+        end = lowered.find(f"</{m.group(1)}>", m.end())
+        out.append(markup[pos:m.start()])
+        if end == -1:  # unclosed: drop the rest
+            return "".join(out)
+        pos = end + len(m.group(1)) + 3
+    out.append(markup[pos:])
+    return "".join(out)
+
+
 def _docx_text(raw: bytes) -> str:
+    import zipfile
+
     import docx
 
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        infos = zf.infolist()
+        if len(infos) > MAX_ZIP_MEMBERS or sum(i.file_size for i in infos) > MAX_DOCX_UNCOMPRESSED_BYTES:
+            raise ValueError("docx expands beyond the allowed size")
     document = docx.Document(io.BytesIO(raw))
     lines = []
-    for p in document.paragraphs:
+    for p in document.paragraphs[:MAX_DOCX_PARAGRAPHS]:
         text = p.text.strip()
         if not text:
             continue
@@ -53,7 +85,18 @@ def _docx_text(raw: bytes) -> str:
 def _pdf_text(raw: bytes) -> str:
     from pypdf import PdfReader
 
-    return "\n".join((page.extract_text() or "") for page in PdfReader(io.BytesIO(raw)).pages)
+    reader = PdfReader(io.BytesIO(raw))
+    if reader.is_encrypted:
+        return ""
+    out: list[str] = []
+    total = 0
+    for page in reader.pages[:MAX_PDF_PAGES]:
+        chunk = page.extract_text() or ""
+        out.append(chunk)
+        total += len(chunk)
+        if total > MAX_EXTRACTED_CHARS:
+            break
+    return "\n".join(out)
 
 
 def extract_text(name: str, raw: bytes) -> str:
@@ -61,9 +104,9 @@ def extract_text(name: str, raw: bytes) -> str:
     ext = name.lower().rsplit(".", 1)[-1] if "." in name else ""
     try:
         if ext in ("md", "markdown", "txt", "csv", "json"):
-            text = _decode(raw)
+            text = _decode(raw[:MAX_HTML_CHARS * 2])
         elif ext in ("html", "htm"):
-            text = _html_to_text(_decode(raw))
+            text = _html_to_text(_decode(raw[:MAX_HTML_CHARS * 2]))
         elif ext == "docx":
             text = _docx_text(raw)
         elif ext == "pdf":

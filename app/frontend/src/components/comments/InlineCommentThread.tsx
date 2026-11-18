@@ -12,6 +12,7 @@ import { useComments } from "./useComments";
 import { useCurrentUser } from "../../context/CurrentUserContext";
 import CommentComposer from "./CommentComposer";
 import type { CommentResourceType } from "../../types";
+import SensitiveText from "../shared/SensitiveText";
 
 function timeAgo(dateStr: string): string {
   const diff = (Date.now() - new Date(dateStr).getTime()) / 1000;
@@ -39,6 +40,7 @@ function CommentRow({
   onDelete,
   currentUserId,
   depth = 0,
+  renderActions,
 }: {
   comment: Comment;
   onReply: (parentId: number) => void;
@@ -46,6 +48,7 @@ function CommentRow({
   onDelete: (id: number) => void;
   currentUserId: number | null;
   depth?: number;
+  renderActions?: (comment: Comment) => React.ReactNode;
 }) {
   const navigate = useNavigate();
   const [editing, setEditing] = useState(false);
@@ -67,8 +70,9 @@ function CommentRow({
           {comment.updated_at !== comment.created_at && (
             <span className="text-[10px] text-gray-300 italic">edited</span>
           )}
+          {renderActions && !editing && <span className="ml-auto flex items-center">{renderActions(comment)}</span>}
           {isMine && !editing && (
-            <span className="ml-auto flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+            <span className={`${renderActions ? "" : "ml-auto"} flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity`}>
               <button className="text-[10px] text-gray-400 hover:text-indigo-600" onClick={() => setEditing(true)}>Edit</button>
               <button className="text-[10px] text-gray-400 hover:text-red-500" onClick={() => onDelete(comment.id)}>Delete</button>
             </span>
@@ -96,12 +100,9 @@ function CommentRow({
         ) : (
           // `overflowWrap: anywhere` so a pasted URL or a long unbroken token wraps
           // instead of forcing the panel to scroll sideways.
-          <div
-            className="text-sm text-gray-700 whitespace-pre-wrap leading-relaxed min-w-0"
-            style={{ overflowWrap: "anywhere" }}
-          >
-            {renderContent(comment.content)}
-          </div>
+          <SensitiveText resourceType="comment" resourceId={comment.id} field="content" text={comment.content}
+            as="div" className="text-sm text-gray-700 whitespace-pre-wrap leading-relaxed min-w-0" style={{ overflowWrap: "anywhere" }}
+            renderPlain={() => renderContent(comment.content)} />
         )}
 
         {!editing && comment.references.length > 0 && (
@@ -135,6 +136,7 @@ function CommentRow({
           onDelete={onDelete}
           currentUserId={currentUserId}
           depth={1}
+          renderActions={renderActions}
         />
       ))}
     </div>
@@ -147,9 +149,15 @@ interface Props {
   resourceLabel?: string;
   /** Compact layout — no header, tighter spacing */
   compact?: boolean;
+  /** Replaces the compact layout's "New Comments" label. */
+  heading?: string;
+  /** Overrides the thread's scroll box (default: a short, scrolling list). */
+  listClassName?: string;
+  /** Extra controls on every comment and reply (e.g. the create-action-item buttons). */
+  renderActions?: (comment: Comment) => React.ReactNode;
 }
 
-export default function InlineCommentThread({ resourceType, resourceId, resourceLabel, compact = false }: Props) {
+export default function InlineCommentThread({ resourceType, resourceId, resourceLabel, compact = false, heading, listClassName, renderActions }: Props) {
   const { comments, loading, addComment, editComment, deleteComment } = useComments(resourceType, resourceId);
   const currentUser = useCurrentUser();
   const [replyTo, setReplyTo] = useState<number | null>(null);
@@ -171,7 +179,7 @@ export default function InlineCommentThread({ resourceType, resourceId, resource
       {compact && (
         <div className="flex items-center justify-between mb-2">
           <p className="text-xs font-semibold text-[var(--twilio-gray-60)] uppercase tracking-wide">
-            New Comments
+            {heading ?? "New Comments"}
           </p>
           {comments.length > 0 && (
             <span className="text-[11px] text-gray-400">{comments.length}</span>
@@ -180,7 +188,7 @@ export default function InlineCommentThread({ resourceType, resourceId, resource
       )}
 
       {/* Thread */}
-      <div ref={scrollRef} className={`divide-y divide-gray-100 ${compact ? "max-h-48 overflow-y-auto" : "max-h-64 overflow-y-auto"}`}>
+      <div ref={scrollRef} className={`divide-y divide-gray-100 ${listClassName ?? (compact ? "max-h-48 overflow-y-auto" : "max-h-64 overflow-y-auto")}`}>
         {loading && <p className="text-xs text-gray-400 py-3 text-center">Loading…</p>}
         {!loading && comments.length === 0 && (
           <p className="text-xs text-gray-400 py-3 text-center italic">No comments yet.</p>
@@ -193,6 +201,7 @@ export default function InlineCommentThread({ resourceType, resourceId, resource
               onEdit={editComment}
               onDelete={deleteComment}
               currentUserId={currentUser?.id ?? null}
+              renderActions={renderActions}
             />
             {replyTo === comment.id && (
               <div className="mt-1 mb-2 pl-6 border-l-2 border-indigo-200">

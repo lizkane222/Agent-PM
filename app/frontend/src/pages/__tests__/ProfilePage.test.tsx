@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { render, screen, waitFor, fireEvent, configure, cleanup, within, act } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { http } from "msw";
+import { http, HttpResponse } from "msw";
 import { server } from "../../test/msw-server";
 import ProfilePage, { nextFreeSlot, reminderWindow, visibleReminder } from "../ProfilePage";
 import { CurrentUserProvider } from "../../context/CurrentUserContext";
@@ -15,6 +15,7 @@ import { mockUserProfile } from "../../test/handlers/team";
 import { mockComment } from "../../test/handlers/comments";
 import { EXPORT_ITEM_DRAG_KEY } from "../../components/ExportBar";
 import { layoutsPage, mockWorkingSession, mockUserPageNote } from "../../test/handlers/layouts";
+import { mockPin } from "../../test/handlers/discover";
 import { mockMemberProfile, mockPublicItem, mockNotification, mockAllocation } from "../../test/handlers/profile";
 
 // ActionItemModal imports an SVG as a component (`?react`), which the test transform cannot do.
@@ -78,7 +79,7 @@ function renderProfilePage(path = "/profile") {
           <Route path="/profile" element={<ProfilePage />} />
           <Route path="/profile/:memberId" element={<ProfilePage />} />
           <Route path="/team" element={<div>team page</div>} />
-          <Route path="/edit-preview" element={<div>full builder</div>} />
+          <Route path="/layouts" element={<div>full builder</div>} />
         </Routes>
         </CommentProvider>
        </AppErrorProvider>
@@ -2065,5 +2066,55 @@ describe("profile list helpers", () => {
     expect(visibleReminder(onCalendarToday, from, to)).toBe(true);
     expect(visibleReminder(onCalendarLater, from, to)).toBe(false);
     expect(visibleReminder(dismissedButOnCalendar, from, to)).toBe(false);
+  });
+});
+
+
+describe("ProfilePage: Pinned from Discovery", () => {
+  beforeEach(() => { localStorage.clear(); });
+
+  it("lists my profile pins as favicon + name links that open in a new tab, and asks only for profile pins", async () => {
+    const seen: string[] = [];
+    server.use(http.get("/api/v1/discover/pins/", ({ request }) => {
+      seen.push(new URL(request.url).search);
+      return HttpResponse.json([mockPin]);
+    }));
+    renderProfilePage();
+    fireEvent.click(await screen.findByRole("button", { name: /Expand Pinned from Discovery/ }));
+    const link = (await screen.findByText("CRM Sync Tool")).closest("a") as HTMLAnchorElement;
+    expect(link.href).toBe("https://example.com/crm-sync");
+    expect(link.target).toBe("_blank");
+    expect(link.rel).toBe("noopener noreferrer");
+    expect(seen).toContain("?profile=1");
+  });
+
+  it("unpins with the X and re-reads", async () => {
+    let deleted = "";
+    server.use(
+      http.get("/api/v1/discover/pins/", () => HttpResponse.json([mockPin])),
+      http.delete("/api/v1/discover/pins/:id/", ({ params }) => { deleted = String(params.id); return new HttpResponse(null, { status: 204 }); }),
+    );
+    renderProfilePage();
+    fireEvent.click(await screen.findByRole("button", { name: /Expand Pinned from Discovery/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Unpin CRM Sync Tool" }));
+    await waitFor(() => expect(deleted).toBe("7"));
+  });
+
+  it("shows an empty hint when nothing is pinned", async () => {
+    renderProfilePage();
+    fireEvent.click(await screen.findByRole("button", { name: /Expand Pinned from Discovery/ }));
+    expect(await screen.findByText(/Nothing pinned yet/)).toBeInTheDocument();
+  });
+
+  it("is added once to a saved layout (after the ticket sections) and a later removal sticks", async () => {
+    localStorage.setItem("profileVisibleSections-v1", JSON.stringify(["skills", "accounts", "artifacts"]));
+    localStorage.setItem("profileTicketSectionsAdded-v1", "1");
+    const first = renderProfilePage();
+    await screen.findByRole("button", { name: /Expand Pinned from Discovery/ });
+    first.unmount();
+    localStorage.setItem("profileVisibleSections-v1", JSON.stringify(["skills", "accounts"]));
+    renderProfilePage();
+    await screen.findByRole("button", { name: /Collapse My Accounts/ });
+    expect(screen.queryByRole("button", { name: /Pinned from Discovery/ })).toBeNull();
   });
 });

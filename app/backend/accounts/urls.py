@@ -3,12 +3,13 @@
 from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
-from .views import AccountArtifactViewSet, AccountNoteViewSet, AccountProjectViewSet, AccountQuickLinkViewSet, AccountRoleViewSet, AccountTicketViewSet, AccountViewSet, AdminAccountView, CustomerContactNoteViewSet, CustomerContactViewSet, ProjectMemberViewSet
+from .views import AccountArtifactViewSet, AccountNoteViewSet, ArtifactNoteViewSet, AccountProjectViewSet, AccountQuickLinkViewSet, AccountRoleViewSet, AccountTicketViewSet, AccountViewSet, AdminAccountView, CustomerContactNoteViewSet, CustomerContactViewSet, ProjectMemberViewSet
 
 router = DefaultRouter()
 router.register("accounts", AccountViewSet, basename="account")
 router.register("notes", AccountNoteViewSet, basename="account-note")
 router.register("artifacts", AccountArtifactViewSet, basename="account-artifact")
+router.register("artifact-notes", ArtifactNoteViewSet, basename="artifact-note")
 router.register("quick-links", AccountQuickLinkViewSet, basename="account-quick-link")
 router.register("contacts", CustomerContactViewSet, basename="customer-contact")
 router.register("contact-notes", CustomerContactNoteViewSet, basename="customer-contact-note")

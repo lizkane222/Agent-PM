@@ -1,14 +1,35 @@
 import { useState, useRef } from "react";
 import { useCurrentUser } from "../../context/CurrentUserContext";
 import { airtableApi, schedulerApi } from "../../lib/api";
-import type { AirtableActionItem, TeamMember } from "../../types";
+import type { AirtableActionItem, CommentReference, TeamMember } from "../../types";
 
 import { localDateKey } from "../../lib/timelineDay";
 import { toLocalDatetimeValue } from "../../lib/datetimeLocal";
-export function NoteActionTooltip({ kind, noteText, eventId, accountName, airtableAccountId, linkedMeetingId, mentionedMembers, anchorY, onDone, onCreated, onClose }: {
+/**
+ * Where a note or comment came from when it is not a meeting: today, an artifact. The new
+ * action item / reminder / meeting says so ("From artifact: …") and links back to it.
+ */
+export interface NoteSource {
+  resourceType: "artifact";
+  resourceId: number;
+  label: string;
+  /** Where the artifact lives (its file or link URL); lets an action item attach it. */
+  url?: string | null;
+  /** accounts.Account id of the artifact, so a new meeting is filed under it. */
+  accountId?: number | null;
+}
+
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+export function NoteActionTooltip({ kind, noteText, eventId, source, onLinked, accountName, airtableAccountId, linkedMeetingId, mentionedMembers, anchorY, onDone, onCreated, onClose }: {
   kind: "action" | "reminder" | "calendar";
   noteText: string;
-  eventId: number;
+  eventId?: number;
+  source?: NoteSource;
+  /** Called with a record the action just linked to `source` (so the sidebar can list it). */
+  onLinked?: (ref: CommentReference) => void;
   accountName?: string | null;
   airtableAccountId?: number | null;
   linkedMeetingId?: number;
@@ -43,15 +64,44 @@ export function NoteActionTooltip({ kind, noteText, eventId, accountName, airtab
         assignee_name: assignee?.full_name || currentUser?.display_name || "",
         assignee_airtable_id: assignee ? String(assignee.id) : currentUser?.airtable_collaborator_id || "",
         linked_meeting: linkedMeetingId ?? null,
+        ...(source ? {
+          task_details: `<p>From artifact: ${escapeHtml(source.label)}</p>`,
+          references: [{
+            resource_type: source.resourceType, resource_id: source.resourceId, label: source.label,
+            url: source.accountId ? `/accounts/${source.accountId}` : "/accounts",
+          }],
+        } : {}),
       } as Parameters<typeof airtableApi.createActionItem>[0]);
+      if (source?.url) {
+        // Attach the artifact itself so it reports where it is used. The item already exists, so
+        // a failure here must not undo or hide it.
+        try { await airtableApi.addAttachmentLink(data.id, source.label, source.url, source.resourceId); } catch { /* best effort */ }
+      }
+      if (source) onLinked?.({ resource_type: "action_item", resource_id: data.id, label: data.task || stripped, url: "/action-items" });
       onCreated?.(data);
       // Signal ActionItemsPage to reload so zone placement picks up account_name
       localStorage.setItem("actionItemsUpdated", String(Date.now()));
       window.dispatchEvent(new StorageEvent("storage", { key: "actionItemsUpdated", newValue: String(Date.now()) }));
     } else if (kind === "reminder") {
-      await schedulerApi.createReminder({ title: stripped.slice(0, 200) || "Note reminder", body: noteText, resource_type: "calendar_event", resource_id: eventId, due_at: new Date(`${remDate}T${remTime}:00`).toISOString() } as Parameters<typeof schedulerApi.createReminder>[0]);
+      const title = stripped.slice(0, 200) || "Note reminder";
+      const dueAt = new Date(`${remDate}T${remTime}:00`).toISOString();
+      if (source) {
+        const { data } = await schedulerApi.createReminder({
+          title, body: `${noteText}\n\nFrom artifact: ${source.label}`, due_at: dueAt,
+          links: [{ resource_type: source.resourceType, resource_id: source.resourceId, resource_label: source.label }],
+        } as Parameters<typeof schedulerApi.createReminder>[0]);
+        onLinked?.({ resource_type: "reminder", resource_id: data.id, label: title, url: "/reminders" });
+      } else {
+        await schedulerApi.createReminder({ title, body: noteText, resource_type: "calendar_event", resource_id: eventId, due_at: dueAt } as Parameters<typeof schedulerApi.createReminder>[0]);
+      }
     } else {
-      await schedulerApi.createEvent({ title: calTitle, description: `From meeting note: ${noteText}`, start_datetime: new Date(calStart).toISOString(), end_datetime: new Date(calEnd).toISOString() } as Parameters<typeof schedulerApi.createEvent>[0]);
+      const { data } = await schedulerApi.createEvent({
+        title: calTitle,
+        description: source ? `From artifact: ${source.label}\n${noteText}` : `From meeting note: ${noteText}`,
+        start_datetime: new Date(calStart).toISOString(), end_datetime: new Date(calEnd).toISOString(),
+        ...(source ? { artifact_ids: [source.resourceId], account: source.accountId ?? undefined } : {}),
+      } as Parameters<typeof schedulerApi.createEvent>[0]);
+      if (source && source.accountId) onLinked?.({ resource_type: "calendar_event", resource_id: data.id, label: calTitle, url: "/calendar" });
     }
     setDone(true);
     onDone?.(kind);

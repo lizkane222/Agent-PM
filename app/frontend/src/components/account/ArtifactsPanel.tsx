@@ -1,5 +1,6 @@
-import React, { useState, useEffect, useRef, useCallback } from "react";
-import { accountsApi, airtableApi, searchApi } from "../../lib/api";
+import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import { accountsApi, searchApi } from "../../lib/api";
+import { useActionItemList } from "../../hooks/useActionItemList";
 import type { SearchResult } from "../../lib/api";
 import type { AccountArtifact, ActionItemAttachment, CommentReference, GoalSection } from "../../types";
 import { resolveEmojiShortcodes } from "../../lib/emojiShortcodes";
@@ -8,6 +9,7 @@ import { ArtifactImageField } from "./ArtifactImageField";
 import { UploadFileDialog, type PendingUpload } from "./UploadFileDialog";
 import { ArtifactViewer } from "./ArtifactViewer";
 import RichTextMentionEditor from "../shared/RichTextMentionEditor";
+import SensitiveText from "../shared/SensitiveText";
 
 function _stripMentions(text: string) {
   return text.replace(/@\S+/g, "").replace(/\s{2,}/g, " ").trim();
@@ -662,7 +664,16 @@ export function ArtifactsPanel({
   onGoalsChange?: (g: GoalSection[]) => void;
 }) {
   const [artifacts, setArtifacts] = useState<AccountArtifact[]>([]);
-  const [actionItemAttachments, setActionItemAttachments] = useState<ActionItemAttachment[]>([]);
+  // Attachments of this account's action items, flattened. The list is the shared hook's; the
+  // attachments are derived from it.
+  const { items: accountActionItems } = useActionItemList(
+    { account: String(airtableAccountId ?? "") },
+    { enabled: !!airtableAccountId, broadcast: false },
+  );
+  const actionItemAttachments = useMemo<ActionItemAttachment[]>(
+    () => accountActionItems.flatMap((item) => item.attachments ?? []),
+    [accountActionItems],
+  );
   const [showAddModal, setShowAddModal] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -680,21 +691,7 @@ export function ArtifactsPanel({
       .catch(() => {});
   }, [accountId]);
 
-  const loadActionItemAttachments = useCallback(() => {
-    if (!airtableAccountId) return;
-    airtableApi.listActionItems({ account: String(airtableAccountId) })
-      .then(({ data }) => {
-        const all: ActionItemAttachment[] = [];
-        for (const item of data) {
-          if (item.attachments?.length) all.push(...item.attachments);
-        }
-        setActionItemAttachments(all);
-      })
-      .catch(() => {});
-  }, [airtableAccountId]);
-
   useEffect(() => { load(); }, [load]);
-  useEffect(() => { loadActionItemAttachments(); }, [loadActionItemAttachments]);
   useEffect(() => {
     const handler = () => load();
     window.addEventListener("artifact-added", handler);
@@ -747,12 +744,6 @@ export function ArtifactsPanel({
       setViewer(artifact);
     }
   }
-
-  const isPreviewable = (a: AccountArtifact) => {
-    const mime = a.mime_type.toLowerCase();
-    const url = a.file_url ?? a.url ?? "";
-    return mime.startsWith("image/") || mime === "application/pdf" || /docs\.google\.com/i.test(url);
-  };
 
   // ── Grouping logic ────────────────────────────────────────────────────────
 
@@ -856,7 +847,7 @@ export function ArtifactsPanel({
         )}
         <div style={{ minWidth: 0, flex: 1 }}>
           <p style={{ margin: 0, fontSize: "0.75rem", fontWeight: 600, color: "var(--text-primary, #111)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            {resolveEmojiShortcodes(a.name)}
+            <SensitiveText resourceType="artifact" resourceId={a.id} field="name" text={a.name} renderPlain={resolveEmojiShortcodes} />
           </p>
           {categories[a.id] && (
             <p style={{ margin: 0, fontSize: "0.5625rem", color: "#f59e0b", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.04em" }}>
@@ -1094,7 +1085,7 @@ export function ArtifactsPanel({
         <ArtifactViewer
           artifact={viewer}
           onClose={() => setViewer(null)}
-          canPreview={isPreviewable(viewer)}
+          airtableAccountId={airtableAccountId}
         />
       )}
 
@@ -1171,7 +1162,7 @@ export function ArtifactsPanel({
                     <ArtifactIcon artifactType={a.artifact_type} mime={a.mime_type} name={a.name} url={a.url} iconKey={a.icon_key} />
                   )}
                   <div style={{ minWidth: 0, flex: 1 }}>
-                    <p style={{ margin: 0, fontSize: "0.75rem", fontWeight: 600, color: "var(--text-primary, #111)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{resolveEmojiShortcodes(a.name)}</p>
+                    <p style={{ margin: 0, fontSize: "0.75rem", fontWeight: 600, color: "var(--text-primary, #111)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}><SensitiveText resourceType="artifact" resourceId={a.id} field="name" text={a.name} renderPlain={resolveEmojiShortcodes} /></p>
                     {a.file_size != null && (
                       <p style={{ margin: 0, fontSize: "0.625rem", color: "var(--text-secondary, #aaa)" }}>{formatBytes(a.file_size)}</p>
                     )}

@@ -17,6 +17,8 @@ import axios, {
 import type {
   Account,
   AccountArtifact,
+  ArtifactNote,
+  ArtifactPreviewResult,
   AccountTicket,
   TicketKind,
   AccountNote,
@@ -52,6 +54,8 @@ import type {
   FeedbackItem,
   FeedbackComment as FeedbackCommentType,
   DiscoverApplet,
+  DiscoverTag,
+  AppletPin,
   EventMatchResult,
   MeetingNote,
   OAuthCredential,
@@ -608,6 +612,13 @@ export const discoverApi = {
   updateApplet: (id: number, data: Partial<DiscoverApplet>) =>
     apiClient.patch<DiscoverApplet>(`/discover/applets/${id}/`, data),
   deleteApplet: (id: number) => apiClient.delete(`/discover/applets/${id}/`),
+  listTags: () => apiClient.get<{ tags: DiscoverTag[] }>("/discover/applets/tags/"),
+  /** `{profile: "1"}` = my profile pins; `{account: id}` = an account's pins; none = everything I can see. */
+  listPins: (params?: Record<string, string>) =>
+    apiClient.get<AppletPin[]>("/discover/pins/", { params }),
+  createPin: (data: { applet: number; account: number | null }) =>
+    apiClient.post<AppletPin>("/discover/pins/", data),
+  deletePin: (id: number) => apiClient.delete(`/discover/pins/${id}/`),
 };
 
 export type AccountLogCategory =
@@ -751,6 +762,28 @@ export const accountsApi = {
       headers: { "Content-Type": "multipart/form-data" },
     });
   },
+  /** What the preview overlay shows for a file the browser can't render itself. */
+  getArtifactPreview: (artifactId: number) =>
+    apiClient.get<ArtifactPreviewResult>(`/accounts/artifacts/${artifactId}/preview/`),
+  /** Sets the screenshot that replaces the type-based preview (multipart `image`). */
+  uploadArtifactPreviewImage: (artifactId: number, image: File) => {
+    const fd = new FormData();
+    fd.append("image", image);
+    return apiClient.post<AccountArtifact>(`/accounts/artifacts/${artifactId}/preview-image/`, fd, {
+      headers: { "Content-Type": "multipart/form-data" },
+    });
+  },
+  deleteArtifactPreviewImage: (artifactId: number) =>
+    apiClient.delete<AccountArtifact>(`/accounts/artifacts/${artifactId}/preview-image/`),
+  listArtifactNotes: (artifactId: number) =>
+    apiClient.get<PaginatedResponse<ArtifactNote>>("/accounts/artifact-notes/", {
+      params: { artifact: artifactId, page_size: 500 },
+    }),
+  createArtifactNote: (data: { artifact: number; html: string; parent?: number | null }) =>
+    apiClient.post<ArtifactNote>("/accounts/artifact-notes/", data),
+  updateArtifactNote: (id: number, html: string) =>
+    apiClient.patch<ArtifactNote>(`/accounts/artifact-notes/${id}/`, { html }),
+  deleteArtifactNote: (id: number) => apiClient.delete(`/accounts/artifact-notes/${id}/`),
   listQuickLinks: (accountId: number) =>
     apiClient.get<AccountQuickLink[]>(`/accounts/accounts/${accountId}/quick-links/`),
   createQuickLink: (accountId: number, name: string, url: string) =>

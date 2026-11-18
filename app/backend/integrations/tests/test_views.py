@@ -59,6 +59,7 @@ class ConfluenceOAuthInitViewTest(APITestCase):
 
 # ── Confluence OAuth Callback ──────────────────────────────────────────────────
 
+@override_settings(OAUTH_STATE_BIND_ENFORCE=False)  # legacy unbound states; binding is tested in test_oauth_state.py
 class ConfluenceOAuthCallbackViewTest(APITestCase):
     def setUp(self):
         self.user = User.objects.create_user(username="alice", password="pass")
@@ -140,6 +141,7 @@ class JiraOAuthInitViewTest(APITestCase):
 
 # ── JIRA OAuth Callback ────────────────────────────────────────────────────────
 
+@override_settings(OAUTH_STATE_BIND_ENFORCE=False)  # legacy unbound states; binding is tested in test_oauth_state.py
 class JiraOAuthCallbackViewTest(APITestCase):
     def setUp(self):
         self.user = User.objects.create_user(username="bob", password="pass")
@@ -226,6 +228,7 @@ class ZendeskOAuthInitViewTest(APITestCase):
 
 # ── Zendesk OAuth Callback ─────────────────────────────────────────────────────
 
+@override_settings(OAUTH_STATE_BIND_ENFORCE=False)  # legacy unbound states; binding is tested in test_oauth_state.py
 class ZendeskOAuthCallbackViewTest(APITestCase):
     def setUp(self):
         self.user = User.objects.create_user(username="carol", password="pass")
@@ -403,6 +406,7 @@ class ZendeskAdminConnectViewTest(APITestCase):
         self.assertIn("mycompany.zendesk.com/oauth/authorizations/new", data["authorization_url"])
 
 
+@override_settings(OAUTH_STATE_BIND_ENFORCE=False)  # legacy unbound states; binding is tested in test_oauth_state.py
 class ZendeskAdminCallbackViewTest(APITestCase):
     URL = "/api/v1/integrations/zendesk/admin-callback/"
 
@@ -1240,6 +1244,7 @@ GOOGLE_SETTINGS = {
 }
 
 
+@override_settings(OAUTH_STATE_BIND_ENFORCE=False)  # legacy unbound states; binding is tested in test_oauth_state.py
 class GoogleOAuthPKCERegressionTest(APITestCase):
     """
     Regression coverage for a real bug: GoogleOAuthInitView and GoogleOAuthCallbackView
@@ -1469,6 +1474,7 @@ class ExtractSfUserIdTest(APITestCase):
 
 
 @override_settings(**SALESFORCE_SETTINGS)
+@override_settings(OAUTH_STATE_BIND_ENFORCE=False)  # legacy unbound states; binding is tested in test_oauth_state.py
 class SalesforceOAuthCallbackIdentityTest(APITestCase):
     """
     The callback is `AllowAny`, so every test here spends from the process-wide anon

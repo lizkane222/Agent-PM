@@ -20,18 +20,15 @@ const SRC = resolve(__dirname, "../../..");
 /**
  * Every surface that renders editable action item detail.
  *
- * `components/calendar/ActionItemsSidebar.tsx` is deliberately **not** here any more, and
- * neither is `pages/CalendarPage.tsx`'s local copy of it. Both calendar sidebars are now
+ * `components/calendar/ActionItemsSidebar.tsx` is deliberately **not** here any more. It is
  * collapsed-only: clicking a card opens `ActionItemModal` (already in this list, and the
- * surface that renders the checklist), so neither is an editable detail surface. Enforced by
- * `components/calendar/__tests__/sidebarOrderingParity.test.ts`, which asserts neither copy
- * reintroduces an inline editor.
+ * surface that renders the checklist), so it is not an editable detail surface. Enforced by
+ * `components/calendar/__tests__/ActionItemsSidebarStructure.test.ts`, which asserts it
+ * does not reintroduce an inline editor.
  */
 const DETAIL_SURFACES = [
   "components/account/ActionItemModal.tsx",
-  "components/account/ActionItemSidePanelContent.tsx",
   "pages/ActionItemsPage.tsx",
-  "pages/AccountDetailPage.tsx",
 ];
 
 function read(relativePath: string): string {
@@ -57,7 +54,7 @@ describe("action item checklist parity", () => {
   it("AccountDetailPage mounts it only in its side panel (its modal is the shared ActionItemModal now)", () => {
     // The local modal copy was retired; the shared modal (listed above) renders the checklist.
     const source = read("pages/AccountDetailPage.tsx");
-    expect(source.split("<StepsPanel").length - 1).toBe(1);
+    expect(source.split("<StepsPanel").length - 1).toBe(0);
     expect(source).not.toContain("function ActionItemModal(");
   });
 
@@ -69,6 +66,7 @@ describe("action item checklist parity", () => {
     // Includes the create forms, which have no checklist but must not contradict it either.
     for (const file of [
       ...DETAIL_SURFACES,
+      "pages/AccountDetailPage.tsx",
       "components/account/NewActionItemCard.tsx",
     ]) {
       expect(read(file)).not.toContain("Additional context, steps, or notes");
@@ -79,8 +77,6 @@ describe("action item checklist parity", () => {
 /** Every surface that renders an action item's attachment controls. */
 const ATTACHMENT_SURFACES = [
   "components/account/ActionItemModal.tsx",
-  "components/account/ActionItemSidePanelContent.tsx",
-  "pages/AccountDetailPage.tsx",
   "pages/ActionItemsPage.tsx",
 ];
 
@@ -104,12 +100,12 @@ describe("action item attachment parity", () => {
     expect(source).not.toContain("catch { /* skip */ }");
   });
 
-  it("AccountDetailPage offers it only in its side panel (its modal is the shared ActionItemModal now)", () => {
-    expect(read("pages/AccountDetailPage.tsx").split("<ArtifactPicker").length - 1).toBe(1);
+  it("AccountDetailPage renders no picker of its own (action items open in the shared ActionItemModal)", () => {
+    expect(read("pages/AccountDetailPage.tsx").split("<ArtifactPicker").length - 1).toBe(0);
   });
 
   it("nobody hand-rolls their own artifact dropdown any more", () => {
-    for (const file of ATTACHMENT_SURFACES) {
+    for (const file of [...ATTACHMENT_SURFACES, "pages/AccountDetailPage.tsx"]) {
       const source = read(file);
       // The one remaining "+ Artifact" string lives inside ArtifactPicker itself.
       expect(source).not.toContain(">+ Artifact<");

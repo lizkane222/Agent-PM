@@ -7,6 +7,8 @@ import {
   buildAccountTree, countItems, groupByStatus,
   type GoalNode, type ProjectNode,
 } from "../../lib/projectTree";
+import SensitiveText from "../../components/shared/SensitiveText";
+import { actionItemMarkId } from "../../hooks/useSensitiveMarks";
 
 /**
  * Account > Project > Goal > Action item.
@@ -168,7 +170,7 @@ export default function ProjectsTreeView({
           {statusLabel(item.status)}
         </span>
         <span className="flex-1 min-w-0 truncate font-medium text-[var(--twilio-navy)]">
-          {item.task || <span className="italic opacity-50">Untitled</span>}
+          {item.task ? <SensitiveText resourceType="action_item" resourceId={actionItemMarkId(item)} field="task" text={item.task} /> : <span className="italic opacity-50">Untitled</span>}
         </span>
         {item.assignee_name && <span className="shrink-0 text-[var(--twilio-gray-60)] truncate max-w-[120px]">{item.assignee_name}</span>}
         {due && <span className="shrink-0 text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded-full text-[10px] font-semibold">{due}</span>}

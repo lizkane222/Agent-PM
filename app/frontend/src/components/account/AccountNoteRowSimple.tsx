@@ -3,6 +3,8 @@ import { renderNoteInline, handleLinkPaste } from "../../lib/noteHelpers";
 import { NoteActionButton } from "./NoteActionButton";
 import { NoteActionTooltip } from "./NoteActionTooltip";
 import type { MeetingNote, AirtableActionItem } from "../../types";
+import SensitiveText from "../shared/SensitiveText";
+import { lineKeyFor } from "../../lib/sensitiveMatch";
 
 // Inline editable note row for the account panel (no @mention, minimal UI)
 export function AccountNoteRowSimple({
@@ -82,7 +84,7 @@ export function AccountNoteRowSimple({
               return (
                 <div key={li} style={isSub ? { display: "flex", alignItems: "flex-start", gap: "5px", marginLeft: "12px", marginTop: li > 0 ? "1px" : undefined } : { marginTop: li > 0 ? "1px" : undefined }}>
                   {isSub && <span style={{ width: "4px", height: "4px", borderRadius: "50%", background: "#9ca3af", flexShrink: 0, marginTop: "7px" }} />}
-                  <span>{renderNoteInline(content)}</span>
+                  <SensitiveText resourceType="meeting_note" resourceId={note.id} field="text" lineKey={lineKeyFor(line)} text={content} renderPlain={renderNoteInline} />
                 </div>
               );
             })}

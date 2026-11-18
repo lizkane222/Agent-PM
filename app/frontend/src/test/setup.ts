@@ -5,6 +5,9 @@ import { cleanup } from "@testing-library/react";
 import { server } from "./msw-server";
 import { resetRequestCache } from "../lib/requestCache";
 import { resetCommentSummaries } from "../lib/commentSummaryStore";
+import { resetSensitiveMarks } from "../lib/sensitiveStore";
+import { resetSensitiveMenu } from "../components/shared/sensitiveMenu";
+import { sensitiveHandlers } from "./handlers/sensitive";
 import { reloadActionItemZones } from "../hooks/useActionItemZoneSets";
 import { reloadStatusArrivalOrder, reloadColumnSort } from "../hooks/useStatusArrivalOrder";
 import { reloadQuickLinks } from "../hooks/useQuickLinks";
@@ -31,6 +34,7 @@ const extraHandlers = [
   ...accountHandlers,
   ...actionItemHandlers,
   ...commentsHandlers,
+  ...sensitiveHandlers,
   ...stepsHandlers,
   ...integrationsHandlers,
   ...realtimeHandlers,
@@ -82,6 +86,9 @@ afterEach(() => {
   // module-level and shared by every card, so a summary fetched in one test would
   // otherwise still be cached (and never re-requested) in the next.
   resetCommentSummaries();
+  // Same for sensitive-text marks (lib/sensitiveStore.ts) and its open context menu.
+  resetSensitiveMarks();
+  resetSensitiveMenu();
   // The actionItemZones store (hooks/useActionItemZoneSets.ts) is module-level too, and
   // `localStorage.clear()` fires no storage event — so without this a zone set by one test
   // still groups the next test's cards. Same trap reloadFocusPins() exists for.
